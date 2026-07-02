@@ -3,9 +3,9 @@
 [![CI](https://github.com/RexVane/Wormhole/actions/workflows/ci.yml/badge.svg)](https://github.com/RexVane/Wormhole/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 基于 Python 标准库 socket 实现的 FTP 服务器，支持三种可切换并发模型、断点续传、每用户 chroot 隔离、登录锁定与限速。
+> 基于 Python 标准库 socket 实现的 FTP 服务器 + 局域网 P2P 虫洞文件传输。FTP 支持三种并发模型、断点续传、chroot 隔离、限速；虫洞用 mDNS 自动发现设备、TCP 直连传文件，无需任何服务器。
 
-PyFTP 是一个 FTP 服务器，严格遵循 RFC 959 的控制连接/数据连接分离机制，能被 FileZilla、Windows 自带 `ftp` 命令、浏览器 `ftp://` 正常连接、登录、浏览、上传、下载。模块按职责拆分，便于阅读、运行、测试与维护。
+PyFTP 是一个 FTP 服务器，严格遵循 RFC 959 的控制连接/数据连接分离机制，能被 FileZilla、Windows 自带 `ftp` 命令、浏览器 `ftp://` 正常连接、登录、浏览、上传、下载。在 FTP 之上还搭了一个「虫洞」——局域网点对点文件传输应用，拖文件进黑洞桌宠就直连发给对端，不需要架服务器。模块按职责拆分，便于阅读、运行、测试与维护。
 
 ## Features
 
@@ -65,10 +65,14 @@ anonymous / 任意         隔离在 pub, 只读
 ## Tests
 
 ```bash
-make test                                  # 端到端功能测试
+make test                                  # FTP 端到端功能测试
+PYTHONPATH=src python3 tests/test_wormhole.py  # 虫洞 FTP 中转模式测试
+PYTHONPATH=src python3 tests/test_p2p.py       # 虫洞 P2P 直连模式测试
 ```
 
-覆盖：登录认证、错误密码拒绝、LIST/NLST、CWD/PWD/CDUP、RETR 下载、STOR 上传、SIZE、REST 断点续传、RNFR/RNTO 重命名、DELE/MKD/RMD、目录穿越防御、每用户 chroot 隔离、匿名只读、主动/被动模式、10 客户端并发。
+FTP 测试覆盖：登录认证、错误密码拒绝、LIST/NLST、CWD/PWD/CDUP、RETR 下载、STOR 上传、SIZE、REST 断点续传、RNFR/RNTO 重命名、DELE/MKD/RMD、目录穿越防御、每用户 chroot 隔离、匿名只读、主动/被动模式、10 客户端并发。
+
+P2P 测试覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线自动切换、回调触发、多文件连续发送、暂停/恢复、路径穿越防御。
 
 ## 性能对比测试
 
@@ -106,22 +110,22 @@ ftp> bye
 
 ## 虫洞文件传输（Wormhole）
 
-在 FTP 服务器之上做的小应用：把文件拖进桌面上的「虫洞」桌宠（黑洞造型、乳白吸积盘、小图标大小），文件就会自动出现在另一台电脑的收件箱里。两台电脑都连同一台 FTP 服务器的 `/wormhole` 共享频道，一台拖入、另一台自动收到（双向）。已在真实公网环境验证（新加坡云服务器中转，macOS ↔ Windows 双向互传）。默认**阅后即焚**：对方收到后自动删除服务器中转副本。支持**双层加密**：`--tls` FTPS 传输加密 + `--secret` 端到端文件加密（服务器只见密文）。
+局域网点对点文件传输：把文件拖进桌面上的「虫洞」桌宠（黑洞造型、乳白吸积盘、小图标大小），文件就会直接出现在另一台电脑的收件箱里。**无需架设任何服务器**——两台电脑用 mDNS（zeroconf）自动发现彼此，TCP 直连传输文件。
 
 ```bash
-# 1) 服务器电脑：启动 FTP 服务器
-PYTHONPATH=src python3 -m pyftp_server --host 0.0.0.0 --port 2121
+# 两台电脑各跑一个（无需服务器）
+pip install PySide6 zeroconf cryptography
+PYTHONPATH=src python3 -m pyftp_server.wormhole.pet
+PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --name 我的Mac
 
-# 2) 两台客户机：装依赖后启动虫洞桌宠(host 换成服务器局域网 IP)
-pip install PySide6 pyobjc-framework-Cocoa --break-system-packages
-PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --host 192.168.1.10
-
-# 无图形界面时用命令行版(监视发件箱自动发送, 收件箱自动接收)
-PYTHONPATH=src python3 -m pyftp_server.wormhole.sync \
-    --host 192.168.1.10 --inbox ~/Wormhole/收件箱 --outbox ~/Wormhole/发件箱
+# 拖文件进桌宠 → 右键选目标设备 → 直连传输
+# 无图形界面时用命令行版
+PYTHONPATH=src python3 -m pyftp_server.wormhole.p2p --inbox ~/Wormhole/收件箱 --outbox ~/Wormhole/发件箱
 ```
 
-详见 [docs/wormhole-虫洞文件传输.md](docs/wormhole-虫洞文件传输.md)。测试：`PYTHONPATH=src python3 tests/test_wormhole.py`。
+支持**端到端加密**：`--secret 口令` 启用 AES-256-GCM，传输全程只见密文。
+
+详见 [docs/wormhole-虫洞文件传输.md](docs/wormhole-虫洞文件传输.md)。测试：`PYTHONPATH=src python3 tests/test_p2p.py`。
 
 ### 轻量 app（免装 Python，双击即用）
 
@@ -135,7 +139,7 @@ cd packaging && build-windows.bat        # 产物:packaging\dist\虫洞桌宠.ex
 cd packaging && bash build-mac.sh         # 产物:packaging/dist/虫洞桌宠.app
 ```
 
-打包后程序接受与 `pet.py` 完全相同的参数（`--host --tls --secret --password` 等）。
+打包后程序接受与 `pet.py` 完全相同的参数（`--name --secret --inbox` 等）。
 详见 [packaging/README.md](packaging/README.md)。
 
 ## Project Structure
@@ -156,13 +160,16 @@ cd packaging && bash build-mac.sh         # 产物:packaging/dist/虫洞桌宠.a
 │   ├── fs.py                  # 文件系统操作 + 路径穿越防御 + 每用户 chroot
 │   ├── throttle.py            # 令牌桶限速
 │   ├── utils.py               # 日志工具
-│   └── wormhole/              # 虫洞文件传输(FTP 之上的应用层)
-│       ├── sync.py            # 同步引擎(上传/轮询下载/去重/重连)
+│   └── wormhole/              # 虫洞文件传输(P2P 局域网直连)
+│       ├── p2p.py             # P2P 引擎(mDNS 发现 + TCP 直连 + 可选加密)
+│       ├── sync.py            # FTP 中转同步引擎(旧模式，保留兼容)
+│       ├── crypto.py          # 端到端加密(AES-256-GCM)，p2p/sync 共用
 │       ├── pet.py             # 桌宠挂件(PySide6+QML)
 │       └── wormhole.qml       # 黑洞虫洞视觉与动画
 ├── tests/
 │   ├── test_ftp.py            # FTP 端到端功能测试
-│   ├── test_wormhole.py       # 虫洞同步引擎测试
+│   ├── test_wormhole.py       # 虫洞 FTP 中转模式测试
+│   ├── test_p2p.py            # 虫洞 P2P 直连模式测试
 │   └── benchmark.py           # 三种并发模型性能对比脚本
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)
 │   ├── wormhole-pet.spec      # 跨平台打包规格

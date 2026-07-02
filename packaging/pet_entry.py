@@ -2,7 +2,7 @@
 轻量 app 打包入口。
 
 PyInstaller 需要一个顶层脚本作入口;桌宠模块 pet.py 内部用相对导入
-(from .sync import ...),不能直接当 __main__ 跑,故用本文件以"包"的方式
+(from .p2p import ...),不能直接当 __main__ 跑,故用本文件以"包"的方式
 调用 pet.main()。源码运行(python packaging/pet_entry.py)与打包后均适用。
 """
 import os

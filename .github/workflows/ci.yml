@@ -17,5 +17,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run tests
-        run: make test
+      - name: Install dependencies
+        run: pip install zeroconf cryptography
+
+      - name: Run FTP tests
+        run: make test-ftp
+
+      - name: Run P2P tests
+        run: make test-p2p
+
+      - name: Run wormhole sync tests
+        run: make test-wormhole

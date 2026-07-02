@@ -28,7 +28,7 @@ bash build-mac.sh
 # 产物:packaging/dist/虫洞桌宠.app
 ```
 
-依赖(脚本会自动补装):`PySide6`、`cryptography`、`pyinstaller`;
+依赖(脚本会自动补装):`PySide6`、`zeroconf`、`cryptography`、`pyinstaller`;
 macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`(可选,不装功能不受影响)。
 
 ## 运行
@@ -36,18 +36,20 @@ macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`(可
 打包后的程序接受与 `pet.py` 完全相同的命令行参数:
 
 ```
-虫洞桌宠 --host <服务器IP> --port 2121 \
-        --user wormhole --password '<FTP密码>' \
-        --tls --secret '<两端一致的端到端加密口令>'
+虫洞桌宠 --name 我的电脑 \
+        --secret '<两端一致的端到端加密口令>' \
+        --inbox ~/Wormhole/收件箱
 ```
 
-- `--tls`:FTPS 加密连接(服务器需以 `--tls` 启动)
+- `--name`:本机显示名,对端右键菜单里看到的就是这个名字(默认主机名)
 - `--secret`:端到端加密口令,两台设备必须一致
+- `--inbox`:收件箱目录(默认随平台:Win `~/OneDrive/Desktop/wormhole`，Mac `~/Documents/wormhole`)
+- `--port`:P2P 监听端口(0 = 操作系统自动分配)
 - `--size N`:挂件边长像素(0 = 随屏幕自适应)
-- 收到的文件落在 `~/Wormhole/收件箱/`
+- 收到的文件落在收件箱目录
 
-> 直接双击不带参数时,会以默认值(`127.0.0.1:2121`、无加密)启动,仅适合本机自测。
-> 实际使用建议做一个带参数的快捷方式 / 启动脚本。
+> 直接双击不带参数时,会以默认值(主机名、无加密)启动。
+> P2P 模式下无需指定服务器地址——mDNS 自动发现局域网内的其他虫洞设备。
 
 ## 体积说明
 

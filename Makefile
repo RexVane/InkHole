@@ -1,4 +1,4 @@
-.PHONY: run test bench cert clean
+.PHONY: run test test-ftp test-wormhole test-p2p bench cert clean
 
 PYTHON ?= python3
 PYTHONPATH := src
@@ -7,9 +7,20 @@ PYTHONPATH := src
 run:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m pyftp_server $(ARGS)
 
-# 端到端功能测试
-test:
+# 端到端功能测试（FTP）
+test: test-ftp
+
+# FTP 端到端功能测试
+test-ftp:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) tests/test_ftp.py
+
+# 虫洞 FTP 中转模式测试
+test-wormhole:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) tests/test_wormhole.py
+
+# 虫洞 P2P 直连模式测试
+test-p2p:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) tests/test_p2p.py
 
 # 三种并发模型性能对比
 bench:
