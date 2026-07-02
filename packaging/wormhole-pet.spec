@@ -12,6 +12,7 @@
 要点:
   - wormhole.qml 作为数据文件打进包,运行时从 sys._MEIPASS 读取(见 pet.py:_qml_path)。
   - QML 只用 QtQuick / QtQuick.Window,排除一切重型 Qt 模块以压体积。
+  - zeroconf 提供 mDNS 局域网设备发现(P2P 模式核心依赖),已列入 hiddenimports。
   - cryptography 提供端到端加密(--secret),由 PyInstaller 钩子自动收集。
   - console=False:GUI 程序不弹黑窗/终端。
   - macOS 上 pet.py 会尝试 import AppKit(pyobjc)实现"挂件常驻所有桌面";
@@ -42,7 +43,7 @@ a = Analysis(
     pathex=[SRC],
     binaries=[],
     datas=datas,
-    hiddenimports=["pyftp_server.wormhole.sync"],
+    hiddenimports=["pyftp_server.wormhole.p2p", "zeroconf"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
