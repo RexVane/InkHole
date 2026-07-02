@@ -247,11 +247,15 @@ Window {
         onDropped: function(drop) {
             win.hint = ""
             if (drop.hasUrls) {
-                for (var i = 0; i < drop.urls.length; i++)
-                    bridge.dropFile(drop.urls[i].toString());
-                win.playAbsorb(drop.x, drop.y);   // 松手立即播放吸入动画
+                if (bridge.hasTarget()) {
+                    for (var i = 0; i < drop.urls.length; i++)
+                        bridge.dropFile(drop.urls[i].toString());
+                    win.playAbsorb(drop.x, drop.y);   // 有目标才播吸入动画
+                } else {
+                    win.hint = "右键选择目标设备"
+                }
             }
-            if (win.edge >= 0) autoHide.restart()  // 吸完文件,稍后自动收回
+            if (win.edge >= 0) autoHide.restart()
         }
     }
 

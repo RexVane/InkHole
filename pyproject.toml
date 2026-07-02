@@ -1,8 +1,12 @@
 [project]
 name = "pyftp"
-version = "0.2.0"
-description = "A socket-based FTP server with switchable concurrency models, resume, chroot isolation and rate limiting."
+version = "0.3.0"
+description = "A socket-based FTP server with switchable concurrency models, resume, chroot isolation, rate limiting, and a P2P wormhole file transfer app."
 requires-python = ">=3.10"
+
+[project.optional-dependencies]
+wormhole = ["zeroconf", "cryptography"]
+gui = ["PySide6", "zeroconf", "cryptography"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

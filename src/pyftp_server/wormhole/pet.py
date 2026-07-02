@@ -1,21 +1,24 @@
 """
 pet.py
 ======
-桌宠虫洞挂件(PySide6 + QML)。
+桌宠虫洞挂件(PySide6 + QML) — P2P 局域网直连模式，无需服务器。
 
 形态：黑洞吞噬感 —— 中心深邃黑点 + 乳白色吸积盘/光晕，向内吸卷旋转；
       桌面小图标大小，低调浮在角落，无边框、透明、置顶、可拖动。
 
 交互：
-  - 从桌面拖文件到挂件上 -> 黑洞放大"吸入"动画 -> 调 WormholeSync.send_file 上传。
-  - 收到对端文件(sync.on_received 回调) -> 黑洞放大"喷出"动画(文件已落在收件箱)。
-  - 鼠标拖动窗口可挪到桌面任意位置；右键菜单可退出。
+  - 从桌面拖文件到挂件上 -> 黑洞放大"吸入"动画 -> P2P 直连发给目标设备。
+  - 收到对端文件(node.on_received 回调) -> 黑洞放大"喷出"动画(文件已落在收件箱)。
+  - 右键菜单：选择目标设备 / 打开收件箱 / 暂停 / 退出。
+  - 鼠标拖动窗口可挪到桌面任意位置。
 
-后端：复用 sync.WormholeSync(纯后台同步)。本文件只负责"面子"(动画/拖拽)，
-      "里子"(传输)全交给同步引擎。两层解耦，同步引擎已通过自动化测试。
+后端：复用 p2p.P2PNode(mDNS 发现 + TCP 直连)。本文件只负责"面子"(动画/拖拽)，
+      "里子"(传输)全交给 P2P 引擎。两层解耦，P2P 引擎已通过自动化测试。
 
-运行(需在有图形界面的机器上，先 pip install PySide6)：
-  PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --host 192.168.1.10
+运行(需在有图形界面的机器上，先 pip install PySide6 zeroconf)：
+  PYTHONPATH=src python3 -m pyftp_server.wormhole.pet
+  PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --name 我的电脑
+  PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --secret 加密口令
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import os
 import sys
 import argparse
 
-from .sync import WormholeSync, WormholeConfig
+from .p2p import P2PNode, P2PConfig
 
 def _qml_path() -> str:
     """定位 wormhole.qml。
@@ -58,24 +61,20 @@ def _default_inbox() -> str:
 
 
 def _build_config(argv=None):
-    ap = argparse.ArgumentParser(description="虫洞桌宠挂件")
-    ap.add_argument("--host", default="127.0.0.1", help="FTP 服务器地址(局域网填服务器内网IP)")
-    ap.add_argument("--port", type=int, default=2121)
-    ap.add_argument("--user", default="wormhole")
-    ap.add_argument("--password", default="wormhole")
+    ap = argparse.ArgumentParser(description="虫洞桌宠挂件(P2P 局域网直连，无需服务器)")
     ap.add_argument("--inbox", default=_default_inbox(),
                     help="收件箱目录(收到的文件放这;默认随平台,见 --help)")
-    ap.add_argument("--interval", type=float, default=2.0, help="轮询间隔秒")
-    ap.add_argument("--no-burn", action="store_true",
-                    help="关闭阅后即焚(>2台设备时使用，保留中转副本供其他设备下载)")
-    ap.add_argument("--tls", action="store_true", help="FTPS 加密连接(服务器需 --tls 启动)")
-    ap.add_argument("--secret", default="", help="端到端加密口令(两台电脑必须一致；需 cryptography 库)")
+    ap.add_argument("--port", type=int, default=0,
+                    help="P2P 监听端口(0=从 25000-25100 自动选)")
+    ap.add_argument("--name", default="",
+                    help="本机显示名(默认主机名；右键菜单里对端看到的就是这个名字)")
+    ap.add_argument("--secret", default="",
+                    help="端到端加密口令(两台电脑必须一致；需 cryptography 库)")
     ap.add_argument("--size", type=int, default=0,
                     help="挂件边长像素(0=随屏幕自适应，约为系统图标基准的 1.5 倍)")
     args = ap.parse_args(argv)
-    cfg = WormholeConfig(host=args.host, port=args.port, user=args.user,
-                         password=args.password, inbox=args.inbox, interval=args.interval,
-                         burn=not args.no_burn, tls=args.tls, secret=args.secret)
+    cfg = P2PConfig(inbox=args.inbox, listen_port=args.port,
+                    peer_name=args.name, secret=args.secret)
     return cfg, args.size
 
 
@@ -193,37 +192,72 @@ def main(argv=None) -> None:
     def _setup_tray(app, bridge):
         """构建右键菜单 +(可用时)系统托盘图标。
 
-        关键修复:把"菜单的构建"与"系统托盘是否可用"解耦。以前托盘不可用就整体
-        return,bridge._tray_menu 一直是 None,右键桌宠就会走 showMenu 的危险回退直接
-        退出程序——这正是桌宠会"自己断掉"的根因之一。现在只要 QtWidgets 在就先把菜单
-        建好交给 bridge,无论托盘可用与否,右键永远能弹菜单。QtWidgets 完全缺失才返回 None。"""
+        菜单结构：
+          发送目标 ▸  (动态子菜单，列出已发现的设备，可单选)
+          ─────────
+          打开收件箱
+          暂停/恢复
+          ─────────
+          状态：…
+          ─────────
+          退出
+
+        关键修复:把"菜单的构建"与"系统托盘是否可用"解耦(见原版注释)。
+        新增:发送目标子菜单在 aboutToShow 时动态重建——对端随时上下线。
+        """
         if not _HAS_WIDGETS:
             return None
         menu = QMenu()
 
-        act_open = menu.addAction("打开收件箱")
-        act_open.triggered.connect(bridge.openInbox)
+        # ---- 静态部分(每次弹出重建,因为目标子菜单要刷新) ----
+        def _rebuild_menu():
+            menu.clear()
 
-        act_pause = menu.addAction("暂停同步")
-        def _on_pause():
-            paused = bridge.togglePause()
-            act_pause.setText("恢复同步" if paused else "暂停同步")
-        act_pause.triggered.connect(_on_pause)
+            # 发送目标子菜单
+            peers = bridge.node.peers()
+            peer_menu = menu.addMenu("发送目标")
+            if not peers:
+                act = peer_menu.addAction("（等待发现设备…）")
+                act.setEnabled(False)
+            else:
+                selected = bridge.node.selected_peer()
+                for peer in peers:
+                    label = f"● {peer.name}" if peer.name == selected else f"○ {peer.name}"
+                    act = peer_menu.addAction(label)
+                    act.setCheckable(True)
+                    act.setChecked(peer.name == selected)
+                    # lambda 默认绑定技巧:用 name=peer.name 固定当前值
+                    _act = act  # 持引用
+                    act.triggered.connect(
+                        lambda checked=False, name=peer.name: bridge._select_peer(name))
+                peer_menu.addSeparator()
+                act_none = peer_menu.addAction("○ 不选目标")
+                act_none.setCheckable(True)
+                act_none.setChecked(selected is None)
+                act_none.triggered.connect(
+                    lambda checked=False: bridge._select_peer(None))
 
-        menu.addSeparator()
-        act_status = menu.addAction("状态：…")
-        act_status.setEnabled(False)                  # 仅显示,不可点
-        menu.addSeparator()
+            menu.addSeparator()
 
-        act_quit = menu.addAction("退出")
-        act_quit.triggered.connect(bridge.quit)
+            act_open = menu.addAction("打开收件箱")
+            act_open.triggered.connect(bridge.openInbox)
 
-        # 菜单每次弹出前刷新状态行(读标志,零网络开销),并同步暂停项文字
-        def _refresh():
-            act_status.setText("状态：" + bridge.connState())
-            act_pause.setText("恢复同步" if bridge.isPaused() else "暂停同步")
-        menu.aboutToShow.connect(_refresh)
-        bridge._tray_menu = menu          # 先交给 Bridge:桌宠右键时弹同一菜单(与托盘无关)
+            paused = bridge.isPaused()
+            act_pause = menu.addAction("恢复同步" if paused else "暂停同步")
+            def _on_pause():
+                bridge.togglePause()
+            act_pause.triggered.connect(_on_pause)
+
+            menu.addSeparator()
+            act_status = menu.addAction("状态：" + bridge.connState())
+            act_status.setEnabled(False)
+            menu.addSeparator()
+
+            act_quit = menu.addAction("退出")
+            act_quit.triggered.connect(bridge.quit)
+
+        menu.aboutToShow.connect(_rebuild_menu)
+        bridge._tray_menu = menu
 
         # 仅当系统托盘可用时才创建并显示托盘图标;不可用也不影响右键菜单
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -231,53 +265,66 @@ def main(argv=None) -> None:
         tray = QSystemTrayIcon(_make_app_icon(), app)
         tray.setToolTip("虫洞")
         tray.setContextMenu(menu)
-        # 左键点托盘图标也打开收件箱(Win 习惯);菜单靠右键
         tray.activated.connect(
             lambda reason: bridge.openInbox()
             if reason == QSystemTrayIcon.Trigger else None)
         tray.show()
         return tray
 
-    # ---- Python<->QML 桥：把同步引擎的事件转成 QML 信号驱动动画 ----
+    # ---- Python<->QML 桥：把 P2P 引擎的事件转成 QML 信号驱动动画 ----
     class Bridge(QObject):
         absorb = Signal(str)      # 通知 QML 播放"吸入"动画(参数=文件名)
         emit_out = Signal(str)    # 通知 QML 播放"喷出"动画(参数=文件名)
         status = Signal(str)      # 状态文字
 
-        def __init__(self, cfg: WormholeConfig):
+        def __init__(self, cfg: P2PConfig):
             super().__init__()
             self._tray_menu = None        # 由 _setup_tray 注入:桌宠右键时弹出
-            self.sync = WormholeSync(
+            self.node = P2PNode(
                 cfg,
                 on_sent=lambda n: self.absorb.emit(n),
                 on_received=lambda p: self.emit_out.emit(os.path.basename(p)),
                 on_status=lambda s: self.status.emit(s),
+                on_peers_changed=lambda: None,   # 菜单弹出时自然刷新,无需额外处理
             )
-            self.sync.start()
+            self.node.start()
+
+        def _select_peer(self, name):
+            """选中目标设备(由右键菜单触发)。"""
+            self.node.select_peer(name)
 
         @Slot(str)
         def dropFile(self, url: str):
-            """QML DropArea 收到桌面拖来的文件 url，转本地路径后发送。"""
+            """QML DropArea 收到桌面拖来的文件 url，转本地路径后发送。
+            无选中目标时不发,由 QML 侧 hasTarget 判断决定是否播动画。"""
             path = QUrl(url).toLocalFile() if url.startswith("file:") else url
             if path and os.path.isfile(path):
-                # 上传放到后台线程，避免卡住动画
+                if not self.node.selected_peer():
+                    self.status.emit("右键选择目标设备")
+                    return
+                # 发送放到后台线程，避免卡住动画
                 import threading
-                threading.Thread(target=self.sync.send_file, args=(path,), daemon=True).start()
+                threading.Thread(target=self.node.send_file, args=(path,), daemon=True).start()
+
+        @Slot(result=bool)
+        def hasTarget(self) -> bool:
+            """QML 用来判断拖入文件时是否该播吸入动画。"""
+            return self.node.selected_peer() is not None
 
         @Slot(result=str)
         def inboxPath(self) -> str:
-            return os.path.abspath(self.sync.cfg.inbox)
+            return os.path.abspath(self.node.cfg.inbox)
 
         @Slot()
         def openInbox(self):
             """在系统文件管理器中打开收件箱目录(跨平台)。"""
-            path = os.path.abspath(self.sync.cfg.inbox)
+            path = os.path.abspath(self.node.cfg.inbox)
             os.makedirs(path, exist_ok=True)
             try:
                 if sys.platform == "win32":
-                    os.startfile(path)                                   # Windows 资源管理器
+                    os.startfile(path)
                 elif sys.platform == "darwin":
-                    import subprocess; subprocess.Popen(["open", path])  # macOS 访达
+                    import subprocess; subprocess.Popen(["open", path])
                 else:
                     import subprocess; subprocess.Popen(["xdg-open", path])
             except Exception as e:
@@ -286,27 +333,31 @@ def main(argv=None) -> None:
 
         @Slot(result=bool)
         def togglePause(self) -> bool:
-            """暂停/恢复同步,返回切换后的暂停状态(True=已暂停)。"""
-            new_state = not self.sync.is_paused()
-            self.sync.set_paused(new_state)
+            """暂停/恢复,返回切换后的暂停状态(True=已暂停)。"""
+            new_state = not self.node.is_paused()
+            self.node.set_paused(new_state)
             return new_state
 
         @Slot(result=bool)
         def isPaused(self) -> bool:
-            return self.sync.is_paused()
+            return self.node.is_paused()
 
         @Slot(result=str)
         def connState(self) -> str:
-            """给菜单状态行用的当前连接文字(读标志,零网络开销)。"""
-            if self.sync.is_paused():
+            """给菜单状态行用的当前状态文字(零网络开销)。"""
+            if self.node.is_paused():
                 return "⏸ 已暂停"
-            return "✅ 已连接" if self.sync.is_connected() else "⚠️ 未连接"
+            peers = self.node.peers()
+            if not peers:
+                return "🔍 寻找设备中…"
+            selected = self.node.selected_peer()
+            if selected:
+                return f"→ {selected}"
+            return f"🔍 {len(peers)}台设备,右键选择"
 
         @Slot()
         def showMenu(self):
-            """桌宠被右键时,在鼠标位置弹出菜单(打开收件箱/暂停/状态/退出)。
-            菜单在 _setup_tray 里构建,与系统托盘是否可用无关——只要 QtWidgets 在就有菜单。
-            极端情况(QtWidgets 完全缺失,无菜单)退而打开收件箱,绝不静默退出程序。"""
+            """桌宠被右键时,在鼠标位置弹出菜单。"""
             if self._tray_menu is not None:
                 from PySide6.QtGui import QCursor
                 self._tray_menu.popup(QCursor.pos())
@@ -315,7 +366,7 @@ def main(argv=None) -> None:
 
         @Slot()
         def quit(self):
-            self.sync.stop()
+            self.node.stop()
             QGuiApplication.quit()
 
     # 有 QtWidgets 用 QApplication(支持托盘菜单),否则退回 QGuiApplication
