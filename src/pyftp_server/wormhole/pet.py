@@ -399,6 +399,9 @@ def main(argv=None) -> None:
             act_open = menu.addAction("打开收件箱")
             act_open.triggered.connect(bridge.openInbox)
 
+            act_inbox = menu.addAction("更换收件箱...")
+            act_inbox.triggered.connect(bridge.chooseInbox)
+
             # 开机自启（可勾选）
             act_autostart = menu.addAction("开机自启")
             act_autostart.setCheckable(True)
@@ -491,6 +494,20 @@ def main(argv=None) -> None:
             except Exception as e:
                 self.status.emit(f"打开收件箱失败")
                 print(f"[托盘] 打开收件箱失败: {e}", flush=True)
+
+        @Slot()
+        def chooseInbox(self):
+            """打开目录选择对话框，让用户自定义收件箱路径。"""
+            if not _HAS_WIDGETS:
+                self.status.emit("无法打开对话框")
+                return
+            from PySide6.QtWidgets import QFileDialog
+            directory = QFileDialog.getExistingDirectory(
+                None, "选择收件箱目录", self.node.cfg.inbox)
+            if directory:
+                self.node.cfg.inbox = directory
+                os.makedirs(directory, exist_ok=True)
+                self.status.emit(f"收件箱: {os.path.basename(directory)}")
 
         @Slot(result=bool)
         def isAutoStart(self) -> bool:
