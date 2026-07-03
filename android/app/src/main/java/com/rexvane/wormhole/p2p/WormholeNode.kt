@@ -161,35 +161,34 @@ class WormholeNode(
             return false
         }
 
-        scope.launch {
-            try {
-                val socket = Socket()
-                socket.connect(java.net.InetSocketAddress(peer.host, peer.port), 15_000)
-                socket.use { s ->
-                    val out = BufferedOutputStream(s.getOutputStream())
+        return try {
+            val socket = Socket()
+            socket.connect(java.net.InetSocketAddress(peer.host, peer.port), 15_000)
+            socket.use { s ->
+                val out = BufferedOutputStream(s.getOutputStream())
 
-                    if (secret.isNotEmpty()) {
-                        // 加密: 整块读入内存加密
-                        val plain = file.readBytes()
-                        val enc = Crypto.encrypt(secret, plain)
-                        WHPP.writeFrame(
-                            out, file.name, enc.size.toLong(), true,
-                            ByteArrayInputStream(enc)
-                        )
-                    } else {
-                        // 明文: 流式
-                        WHPP.writeFrame(
-                            out, file.name, file.length(), false,
-                            file.inputStream()
-                        )
-                    }
+                if (secret.isNotEmpty()) {
+                    // 加密: 整块读入内存加密
+                    val plain = file.readBytes()
+                    val enc = Crypto.encrypt(secret, plain)
+                    WHPP.writeFrame(
+                        out, file.name, enc.size.toLong(), true,
+                        ByteArrayInputStream(enc)
+                    )
+                } else {
+                    // 明文: 流式
+                    WHPP.writeFrame(
+                        out, file.name, file.length(), false,
+                        file.inputStream()
+                    )
                 }
-                listener.onStatus("已发送: ${file.name}")
-            } catch (e: Exception) {
-                listener.onStatus("发送失败: ${e.message}")
             }
+            listener.onStatus("已发送: ${file.name}")
+            true
+        } catch (e: Exception) {
+            listener.onStatus("发送失败: ${e.message}")
+            false
         }
-        return true
     }
 
     // ---- 对端管理 ----
