@@ -255,8 +255,11 @@ class WormholeNode(
                 listener.onStatus("$name 离线")
             }
 
-            override fun onError(errorCode: Int) {
-                listener.onStatus("NSD 发现错误: $errorCode")
+            override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
+                listener.onStatus("NSD 发现启动失败: $errorCode")
+            }
+            override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {
+                listener.onStatus("NSD 停止发现失败: $errorCode")
             }
         }
         nsdManager!!.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)

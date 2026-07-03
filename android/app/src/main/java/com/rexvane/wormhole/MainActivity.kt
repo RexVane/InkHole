@@ -9,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -143,17 +144,8 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier
                                 .size(28.dp)
                                 .clip(CircleShape)
-                                .background(
-                                    Brush.radialGradient(
-                                        colors = listOf(
-                                            Color(0xFF000000),
-                                            Color(0xFF1a1a2e),
-                                            Color(0xFFe8e8f4),
-                                            Color(0xFF1a1a1a),
-                                        ),
-                                        radius = 14.dp.toPx(),
-                                    )
-                                )
+                                .background(Color(0xFF000000))
+                                .border(1.dp, Color(0xFF444466), CircleShape)
                         )
                         Spacer(Modifier.width(10.dp))
                         Text(
