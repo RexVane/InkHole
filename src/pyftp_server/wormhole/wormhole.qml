@@ -16,7 +16,8 @@ Window {
     y: Math.round(win.petSize * 0.8)
 
     property real scaleF: 1.0         // 整体缩放(吸入/喷出时放大)
-    property string hint: ""          // 顶部提示文字
+    property string hint: ""          // 临时提示文字(2.2s 后消失)
+    property string persistentHint: "" // 持续状态(设备搜索/发现数量，始终显示)
 
     // ---- 边缘吸附(悬浮球)状态 ----
     property int edge: -1             // 贴的是哪条边：-1未贴 0左 1右 2上 3下
@@ -198,16 +199,16 @@ Window {
             }
         }
 
-        // 提示文字(吸入/喷出/状态)：放在窗口顶部、黑洞上方
+        // 提示文字：临时提示优先，消失后显示持续状态(设备数/搜索中)
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.top: parent.top
             anchors.topMargin: 4
-            text: win.hint
+            text: win.hint.length > 0 ? win.hint : win.persistentHint
             color: "white"
             font.pixelSize: Math.max(9, Math.round(win.width * 0.08))
             style: Text.Outline; styleColor: "#000000"
-            visible: win.hint.length > 0
+            visible: text.length > 0
         }
     }
 
@@ -269,10 +270,17 @@ Window {
             win.emitWhenVisible();      // 若缩在边上,先探出再播吐出动画,保证可见
         }
         function onStatus(s) { win.hint = s }
+        function onPeersChanged() { win.persistentHint = bridge.peerStatus() }
     }
 
-    // hint 非空时自动倒计时清除，不会再卡住
+    // hint 非空时自动倒计时清除，临时提示消失后回到持续状态
     Timer { interval: 2200; running: win.hint.length > 0; onTriggered: win.hint = "" }
+
+    // 启动后初始化持续状态(搜索设备中…/已发现N台设备)
+    Timer {
+        interval: 300; running: true; repeat: false
+        onTriggered: win.persistentHint = bridge.peerStatus()
+    }
 
     // 启动后稍候自动吸附到右边缘并收起(留窄条),不占地方
     Timer {

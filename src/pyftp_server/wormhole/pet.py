@@ -437,9 +437,10 @@ def main(argv=None) -> None:
 
     # ---- Python<->QML 桥：把 P2P 引擎的事件转成 QML 信号驱动动画 ----
     class Bridge(QObject):
-        absorb = Signal(str)      # 通知 QML 播放"吸入"动画(参数=文件名)
-        emit_out = Signal(str)    # 通知 QML 播放"喷出"动画(参数=文件名)
-        status = Signal(str)      # 状态文字
+        absorb = Signal(str)          # 通知 QML 播放"吸入"动画(参数=文件名)
+        emit_out = Signal(str)        # 通知 QML 播放"喷出"动画(参数=文件名)
+        status = Signal(str)          # 临时状态文字(2.2s 后消失)
+        peersChanged = Signal()       # 设备列表变化(持续状态刷新)
 
         def __init__(self, cfg: P2PConfig):
             super().__init__()
@@ -449,9 +450,17 @@ def main(argv=None) -> None:
                 on_sent=lambda n: self.absorb.emit(n),
                 on_received=lambda p: self.emit_out.emit(os.path.basename(p)),
                 on_status=lambda s: self.status.emit(s),
-                on_peers_changed=lambda: None,   # 菜单弹出时自然刷新,无需额外处理
+                on_peers_changed=lambda: self.peersChanged.emit(),
             )
             self.node.start()
+
+        @Slot(result=str)
+        def peerStatus(self) -> str:
+            """持续状态：设备搜索/发现数量(始终显示，临时提示消失后回到这里)。"""
+            count = len(self.node.peers())
+            if count == 0:
+                return "搜索设备中…"
+            return f"已发现 {count} 台设备"
 
         def _select_peer(self, name):
             """选中目标设备(由右键菜单触发)。"""
