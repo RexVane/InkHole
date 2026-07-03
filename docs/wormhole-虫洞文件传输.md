@@ -124,6 +124,16 @@ PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --secret '两边一致的口
 - 端到端加密需要 `pip install cryptography`。
 - 两边 `--secret` 不一致时文件按密文保存不丢失，提示「解密失败」。
 
+## 开机自启
+
+右键桌宠 → 「开机自启」可勾选项，勾上后电脑开机/登录时自动启动虫洞。
+
+- **Windows**：在 `~/wormhole-startup.bat` 生成启动脚本，注册到注册表 `HKCU\...\Run`
+- **macOS**：在 `~/Library/LaunchAgents/` 生成 LaunchAgent plist
+- **Linux**：在 `~/.config/autostart/` 生成 .desktop 文件
+
+启动脚本会保留当前的 `--name`、`--secret` 等参数，取消勾选则自动清理。
+
 ## 常见问题
 
 **支持什么格式？** 全部。底层是 TCP 二进制流，逐字节搬运，不关心内容。限制：不能拖文件夹（先压缩成 zip）、同名文件被新版本覆盖。
