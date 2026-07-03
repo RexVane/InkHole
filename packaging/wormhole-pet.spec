@@ -23,9 +23,9 @@ import sys
 
 PROJ = os.path.abspath(os.path.join(SPECPATH, ".."))
 SRC = os.path.join(PROJ, "src")
-QML = os.path.join(SRC, "pyftp_server", "wormhole", "wormhole.qml")
+QML = os.path.join(SRC, "wormhole", "wormhole.qml")
 
-datas = [(QML, os.path.join("pyftp_server", "wormhole"))]
+datas = [(QML, "wormhole")]
 
 # 排除明显用不到的重型 Qt 模块,显著减小单文件体积
 excluded = [
@@ -43,7 +43,7 @@ a = Analysis(
     pathex=[SRC],
     binaries=[],
     datas=datas,
-    hiddenimports=["pyftp_server.wormhole.p2p", "zeroconf"],
+    hiddenimports=["wormhole.p2p", "zeroconf"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

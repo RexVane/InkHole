@@ -1,6 +1,6 @@
 # 虫洞桌宠 · 轻量 app 打包
 
-把虫洞桌宠客户端(`src/pyftp_server/wormhole/pet.py`,PySide6 + QML)打包成
+把虫洞桌宠客户端(`src/wormhole/pet.py`,PySide6 + QML)打包成
 **单文件可执行**,双击即用、免装 Python。Windows 产出 `.exe`,macOS 产出 `.app`。
 
 ## 目录
@@ -59,7 +59,7 @@ spec 已排除 WebEngine、Multimedia、3D、Charts 等无用重型模块以尽�
 ## 原理要点
 
 - `wormhole.qml` 作为数据文件打进包;运行时 `pet.py:_qml_path()` 优先从
-  PyInstaller 解压目录 `sys._MEIPASS/pyftp_server/wormhole/` 读取,源码运行时
+  PyInstaller 解压目录 `sys._MEIPASS/wormhole/` 读取,源码运行时
   回退到模块同级目录——同一份代码兼容两种环境。
 - `console=False`:GUI 程序不弹命令行黑窗。
 - 加密所需的 `cryptography` 由 PyInstaller 钩子自动收集进包。

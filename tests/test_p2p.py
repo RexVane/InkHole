@@ -29,7 +29,7 @@ import threading
 # 把 src 加入 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from pyftp_server.wormhole.p2p import P2PNode, P2PConfig, PeerInfo, _MAGIC
+from wormhole.p2p import P2PNode, P2PConfig, PeerInfo, _MAGIC
 
 
 # ---------- 测试框架 ----------

@@ -14,18 +14,18 @@
 pip install PySide6 zeroconf cryptography
 
 # 2. 两台电脑各跑一个
-PYTHONPATH=src python -m pyftp_server.wormhole.pet
-PYTHONPATH=src python -m pyftp_server.wormhole.pet --name 我的Mac
+PYTHONPATH=src python -m wormhole.pet
+PYTHONPATH=src python -m wormhole.pet --name 我的Mac
 
 # 3. 右键桌宠选目标设备 → 拖文件进去 → 传过去
 ```
 
-也可以直接 `python -m pyftp_server`（等价于启动桌宠）。
+也可以直接 `python -m wormhole`（等价于启动桌宠）。
 
 无图形界面时用命令行版：
 
 ```bash
-PYTHONPATH=src python -m pyftp_server.wormhole.p2p --inbox ~/Wormhole/收件箱 --outbox ~/Wormhole/发件箱
+PYTHONPATH=src python -m wormhole.p2p --inbox ~/Wormhole/收件箱 --outbox ~/Wormhole/发件箱
 ```
 
 ## Features
@@ -74,14 +74,13 @@ make test        # P2P 端到端测试
 
 ```text
 .
-├── src/pyftp_server/
+├── src/wormhole/
 │   ├── __init__.py            # 顶层包
-│   ├── __main__.py            # 入口(python -m pyftp_server 启动桌宠)
-│   └── wormhole/              # 虫洞文件传输
-│       ├── p2p.py             # P2P 引擎(mDNS 发现 + TCP 直连 + 可选加密)
-│       ├── crypto.py          # 端到端加密(AES-256-GCM)
-│       ├── pet.py             # 桌宠挂件(PySide6+QML)
-│       └── wormhole.qml       # 黑洞虫洞视觉与动画
+│   ├── __main__.py            # 入口(python -m wormhole 启动桌宠)
+│   ├── p2p.py                 # P2P 引擎(mDNS 发现 + TCP 直连 + 可选加密)
+│   ├── crypto.py              # 端到端加密(AES-256-GCM)
+│   ├── pet.py                 # 桌宠挂件(PySide6+QML)
+│   └── wormhole.qml           # 黑洞虫洞视觉与动画
 ├── tests/
 │   └── test_p2p.py            # P2P 端到端测试
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)

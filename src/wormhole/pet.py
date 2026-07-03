@@ -16,9 +16,9 @@ pet.py
       "里子"(传输)全交给 P2P 引擎。两层解耦，P2P 引擎已通过自动化测试。
 
 运行(需在有图形界面的机器上，先 pip install PySide6 zeroconf)：
-  PYTHONPATH=src python3 -m pyftp_server.wormhole.pet
-  PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --name 我的电脑
-  PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --secret 加密口令
+  PYTHONPATH=src python3 -m wormhole.pet
+  PYTHONPATH=src python3 -m wormhole.pet --name 我的电脑
+  PYTHONPATH=src python3 -m wormhole.pet --secret 加密口令
 """
 
 from __future__ import annotations
@@ -32,12 +32,12 @@ def _qml_path() -> str:
     """定位 wormhole.qml。
 
     源码运行时它就在本模块同级目录；被 PyInstaller 打包成单文件后,数据文件
-    会解压到临时目录 sys._MEIPASS,需按打包时的相对路径(pyftp_server/wormhole/)
+    会解压到临时目录 sys._MEIPASS,需按打包时的相对路径(wormhole/)
     去那里找。两种环境都覆盖,打包/源码运行同一份代码。
     """
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        bundled = os.path.join(base, "pyftp_server", "wormhole", "wormhole.qml")
+        bundled = os.path.join(base, "wormhole", "wormhole.qml")
         if os.path.exists(bundled):
             return bundled
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "wormhole.qml")
@@ -202,7 +202,7 @@ def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
                     "@echo off",
                     f'cd /d "{proj}"',
                     f'set "PYTHONPATH={src}"',
-                    f'"{python}" -m pyftp_server.wormhole.pet {args}',
+                    f'"{python}" -m wormhole.pet {args}',
                 ])
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
@@ -240,7 +240,7 @@ def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
     <array>
         <string>{python}</string>
         <string>-c</string>
-        <string>import os,sys;os.chdir({proj!r});sys.path.insert(0,{src!r});from pyftp_server.wormhole.pet import main;main()</string>
+        <string>import os,sys;os.chdir({proj!r});sys.path.insert(0,{src!r});from wormhole.pet import main;main()</string>
     </array>
     <key>RunAtLoad</key><true/>
     <key>WorkingDirectory</key><string>{proj}</string>
@@ -259,7 +259,7 @@ def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
             if frozen:
                 exec_line = f'"{python}" {args}'
             else:
-                exec_line = f'sh -c \'cd "{proj}" &amp;&amp; PYTHONPATH="{src}" "{python}" -m pyftp_server.wormhole.pet {args}\''
+                exec_line = f'sh -c \'cd "{proj}" &amp;&amp; PYTHONPATH="{src}" "{python}" -m wormhole.pet {args}\''
             content = f"""[Desktop Entry]
 Type=Application
 Name=Wormhole Pet
@@ -309,7 +309,7 @@ def main(argv=None) -> None:
     except ImportError:
         sys.stderr.write(
             "未安装 PySide6。请先运行：pip install PySide6 --break-system-packages\n"
-            "(P2P 引擎本身无需 GUI，可用 python -m pyftp_server.wormhole.p2p 跑命令行版)\n")
+            "(P2P 引擎本身无需 GUI，可用 python -m wormhole.p2p 跑命令行版)\n")
         raise SystemExit(1)
 
     def _draw_icon_pixmap(size: int) -> QPixmap:
