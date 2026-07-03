@@ -32,7 +32,7 @@ PYTHONPATH=src python -m pyftp_server.wormhole.p2p --inbox ~/Wormhole/收件箱 
 
 - **mDNS 自动发现**：zeroconf 注册 `_wormhole._tcp.local.` 服务，局域网内自动发现其他虫洞设备
 - **TCP 直连传输**：WHPP 协议（magic + JSON 头 + 文件数据），不经过任何中转服务器
-- **右键选目标设备**：发现多台设备时可选择发给谁，首个设备自动选中，离线自动切换
+- **右键选目标设备**：发现多台设备时手动选择发给谁，不自动选中、不自动切换
 - **端到端加密**：`--secret 口令` 启用 AES-256-GCM，传输全程只见密文
 - **黑洞桌宠**：PySide6 + QML，无边框透明置顶可拖动，拖入吸入动画 / 收到喷出动画
 - **开机自启**：右键菜单可勾选，Windows 注册表 / macOS LaunchAgent / Linux .desktop
@@ -66,7 +66,9 @@ cd packaging && bash build-mac.sh         # 产物:packaging/dist/虫洞桌宠.a
 make test        # P2P 端到端测试
 ```
 
-覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线自动切换、回调触发、多文件连续发送、暂停/恢复、路径穿越防御。
+覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线、回调触发、多文件连续发送、路径穿越防御。7 组 28 项全通过。
+
+同名文件直接覆盖（新版本替掉旧版本）。
 
 ## Project Structure
 

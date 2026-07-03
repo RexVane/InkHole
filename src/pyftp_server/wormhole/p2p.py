@@ -38,14 +38,13 @@ from .crypto import encrypt, decrypt, is_encrypted
 _SERVICE_TYPE = "_wormhole._tcp.local."
 _MAGIC = b"WHPP"          # Wormhole P2P Protocol magic
 _BUFFER = 65536           # 64KB 传输块
-_PORT_RANGE = (25000, 25100)   # 自动选端口范围
 
 
 # ---------- 配置 ----------
 @dataclass
 class P2PConfig:
     inbox: str = "received"        # 收件箱：收到的文件落在这里
-    listen_port: int = 0           # TCP 监听端口；0 = 从 _PORT_RANGE 自动选
+    listen_port: int = 0           # TCP 监听端口；0 = 操作系统自动分配
     peer_name: str = ""            # 本机显示名；空则用 hostname
     secret: str = ""               # 端到端加密口令(两台电脑必须一致；空=不加密)
 

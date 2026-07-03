@@ -231,7 +231,7 @@ Window {
             win.decideSnap();      // 松手:靠近边缘则吸附收起,否则自由浮动
         }
         onClicked: function(m) {
-            if (m.button === Qt.RightButton) bridge.showMenu();   // 右键弹菜单(打开收件箱/暂停/状态/退出)
+            if (m.button === Qt.RightButton) bridge.showMenu();   // 右键弹菜单(发送目标/收件箱/自启/状态/退出)
         }
         // 鼠标移到收起的窄条上 -> 探出恢复
         onEntered: { if (win.collapsed) win.expand() }

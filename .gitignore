@@ -8,12 +8,8 @@ build/
 *.egg-info/
 .DS_Store
 
-# 虫洞频道中转目录里的文件是运行期数据，不进仓库(保留 .keep 占位)
-examples/ftproot/wormhole/*
-!examples/ftproot/wormhole/.keep
-
-# TLS 证书与私钥(make cert 生成，私钥绝不进仓库)
-certs/
-
 # 虫洞收件箱：运行期收到的文件，不进仓库
 received/
+
+# 旧版 FTPS 证书(已不使用，私钥绝不进仓库)
+certs/

@@ -7,10 +7,11 @@ test_p2p.py
 测试覆盖：
   1. TCP 直连传输（绕过 mDNS，手动注册对端）
   2. 端到端加密传输
-  3. 自动选择首个对端
-  4. 切换目标设备
-  5. mDNS 自动发现（本地回环，可能受系统防火墙影响）
+  3. 手动切换目标设备
+  4. 对端离线（选中设备不自动切换，由用户重新选）
+  5. 回调触发
   6. 多文件连续发送
+  7. 路径穿越防御
 
 运行：PYTHONPATH=src python3 tests/test_p2p.py
 """
@@ -31,7 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from pyftp_server.wormhole.p2p import P2PNode, P2PConfig, PeerInfo, _MAGIC
 
 
-# ---------- 测试框架(与 test_ftp.py 风格一致) ----------
+# ---------- 测试框架 ----------
 _passed = 0
 _failed = 0
 
@@ -202,9 +203,9 @@ def test_peer_selection():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---------- 测试 4: 对端离线自动切换 ----------
+# ---------- 测试 4: 对端离线 ----------
 def test_peer_offline():
-    print("\n=== 测试 4: 对端离线自动切换 ===")
+    print("\n=== 测试 4: 对端离线 ===")
     tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
@@ -218,11 +219,17 @@ def test_peer_offline():
         node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
         node_a._on_peer_added("Carol", "127.0.0.1", node_c.actual_port)
 
-        check("选中 Bob", node_a.selected_peer() == "Bob")
+        # 发现设备不自动选中，需手动选择
+        check("发现 2 台设备", len(node_a.peers()) == 2)
+        check("未自动选中", node_a.selected_peer() is None)
 
-        # Bob 离线
+        # 手动选中 Bob
+        node_a.select_peer("Bob")
+        check("手动选中 Bob", node_a.selected_peer() == "Bob")
+
+        # Bob 离线：选中被清空，不自动切换到 Carol
         node_a._on_peer_removed("Bob")
-        check("Bob 离线后自动切到 Carol", node_a.selected_peer() == "Carol")
+        check("Bob 离线后选中清空(不自动切)", node_a.selected_peer() is None)
         check("对端列表只剩 Carol", len(node_a.peers()) == 1)
 
         # Carol 也离线

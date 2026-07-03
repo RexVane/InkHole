@@ -9,7 +9,7 @@ pet.py
 交互：
   - 从桌面拖文件到挂件上 -> 黑洞放大"吸入"动画 -> P2P 直连发给目标设备。
   - 收到对端文件(node.on_received 回调) -> 黑洞放大"喷出"动画(文件已落在收件箱)。
-  - 右键菜单：选择目标设备 / 打开收件箱 / 暂停 / 退出。
+  - 右键菜单：发送目标 / 打开收件箱 / 更换收件箱 / 开机自启 / 状态 / 退出。
   - 鼠标拖动窗口可挪到桌面任意位置。
 
 后端：复用 p2p.P2PNode(mDNS 发现 + TCP 直连)。本文件只负责"面子"(动画/拖拽)，
@@ -65,7 +65,7 @@ def _build_config(argv=None):
     ap.add_argument("--inbox", default=_default_inbox(),
                     help="收件箱目录(收到的文件放这;默认随平台,见 --help)")
     ap.add_argument("--port", type=int, default=0,
-                    help="P2P 监听端口(0=从 25000-25100 自动选)")
+                    help="P2P 监听端口(0=操作系统自动分配)")
     ap.add_argument("--name", default="",
                     help="本机显示名(默认主机名；右键菜单里对端看到的就是这个名字)")
     ap.add_argument("--secret", default="",
