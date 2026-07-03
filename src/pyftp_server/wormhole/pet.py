@@ -456,11 +456,11 @@ def main(argv=None) -> None:
 
         @Slot(result=str)
         def peerStatus(self) -> str:
-            """持续状态：设备搜索/发现数量(始终显示，临时提示消失后回到这里)。"""
+            """持续状态：无设备时显示搜索中，有设备时不显示(空字符串)。"""
             count = len(self.node.peers())
             if count == 0:
                 return "搜索设备中…"
-            return f"{count}台设备 · 搜索中"
+            return ""
 
         def _select_peer(self, name):
             """选中目标设备(由右键菜单触发)。"""
@@ -537,8 +537,8 @@ def main(argv=None) -> None:
                 return "🔍 搜索设备中…"
             selected = self.node.selected_peer()
             if selected:
-                return f"→ {selected} · 搜索中"
-            return f"🔍 {len(peers)}台设备 · 搜索中"
+                return f"→ {selected}"
+            return f"🔍 {len(peers)}台设备"
 
         @Slot()
         def showMenu(self):
