@@ -1,11 +1,12 @@
 # Wormhole
 
 [![CI](https://github.com/RexVane/Wormhole/actions/workflows/ci.yml/badge.svg)](https://github.com/RexVane/Wormhole/actions/workflows/ci.yml)
+[![Android APK](https://github.com/RexVane/Wormhole/actions/workflows/android.yml/badge.svg)](https://github.com/RexVane/Wormhole/actions/workflows/android.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 局域网 P2P 文件传输：把文件拖进桌面上的黑洞桌宠，文件直接出现在另一台电脑上。无需服务器。
+> 局域网 P2P 文件传输：把文件拖进桌面上的黑洞桌宠（或手机端虫洞），文件直接出现在另一台设备上。无需服务器。
 
-两台电脑连同一个 WiFi，各跑一个虫洞桌宠，mDNS 自动发现彼此，拖文件进去就 TCP 直连传过去。支持端到端加密、右键选目标设备、开机自启。
+两台设备连同一个 WiFi，各跑一个虫洞，mDNS 自动发现彼此，拖文件进去就 TCP 直连传过去。支持端到端加密、手动选目标设备、开机自启。Windows / macOS / Android 三平台互通。
 
 ## Quick Start
 
@@ -48,7 +49,17 @@ PYTHONPATH=src python -m wormhole.p2p --inbox ~/Wormhole/收件箱 --outbox ~/Wo
 | `--secret` | 端到端加密口令（两台电脑必须一致） | 关 |
 | `--size` | 挂件边长像素（0 = 随系统自适应） | `0` |
 
-## 轻量 app（免装 Python，双击即用）
+## 下载（免装环境，直接用）
+
+前往 [Releases](https://github.com/RexVane/Wormhole/releases/tag/v1.0.0) 下载：
+
+| 平台 | 文件 | 大小 | 用法 |
+|------|------|------|------|
+| Windows | 虫洞桌宠.exe | 165 MB | 双击即用 |
+| macOS | 虫洞桌宠.zip | 148 MB | 解压拖进"应用程序" |
+| Android | 虫洞-android.apk | 14 MB | 传到手机安装 |
+
+也可以自行打包：
 
 ```bash
 # Windows
@@ -56,9 +67,11 @@ cd packaging && build-windows.bat        # 产物:packaging\dist\虫洞桌宠.ex
 
 # macOS
 cd packaging && bash build-mac.sh         # 产物:packaging/dist/虫洞桌宠.app
-```
 
-详见 [packaging/README.md](packaging/README.md)。
+# Android
+# GitHub Actions 自动构建: gh workflow run android.yml
+# 或用 Android Studio 打开 android/ 目录构建 APK
+```
 
 ## Tests
 
@@ -84,6 +97,7 @@ make test        # P2P 端到端测试
 ├── tests/
 │   └── test_p2p.py            # P2P 端到端测试
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)
+├── android/                   # Android 客户端(Kotlin + Jetpack Compose)
 ├── docs/                      # 使用与实现文档
 ├── .github/workflows/         # CI
 ├── Makefile
