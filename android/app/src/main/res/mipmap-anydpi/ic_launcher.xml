@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- 黑底 -->
+    <path
+        android:pathData="M0,0 h48 v48 h-48 z"
+        android:fillColor="#000000"/>
+
+    <!-- 黑洞径向渐变 -->
+    <path
+        android:pathData="M24,24 m-20,0 a20,20 0,1 1,40 0 a20,20 0,1 1,-40 0">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="24"
+                android:centerY="24"
+                android:gradientRadius="20">
+                <item android:offset="0.00" android:color="#FF000000"/>
+                <item android:offset="0.42" android:color="#FF030308"/>
+                <item android:offset="0.60" android:color="#FF484456"/>
+                <item android:offset="0.78" android:color="#FFEEECF4"/>
+                <item android:offset="1.00" android:color="#FF000000"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>
