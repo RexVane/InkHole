@@ -92,8 +92,9 @@ def test_direct_transfer():
         check("Alice 发现了 Bob", len(node_a.peers()) == 1)
         check("Bob 发现了 Alice", len(node_b.peers()) == 1)
 
-        # 自动选中首个对端
-        check("Alice 自动选中 Bob", node_a.selected_peer() == "Bob")
+        # 不自动选中，需手动选择
+        check("未自动选中(需手动选)", node_a.selected_peer() is None)
+        node_a.select_peer("Bob")
 
         # 发送文件
         src = os.path.join(tmpdir, "hello.txt")
@@ -130,6 +131,7 @@ def test_encrypted_transfer():
         time.sleep(0.3)
 
         node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
 
         # 发送文件
         src = os.path.join(tmpdir, "secret.txt")
@@ -170,11 +172,11 @@ def test_peer_selection():
         node_a._on_peer_added("Carol", "127.0.0.1", node_c.actual_port)
 
         check("Alice 发现 2 台设备", len(node_a.peers()) == 2)
-        check("自动选中第一个(Bob)", node_a.selected_peer() == "Bob")
+        check("未自动选中", node_a.selected_peer() is None)
 
-        # 切换到 Carol
+        # 手动切换到 Carol
         node_a.select_peer("Carol")
-        check("切换到 Carol", node_a.selected_peer() == "Carol")
+        check("手动选中 Carol", node_a.selected_peer() == "Carol")
 
         # 发给 Carol
         src = os.path.join(tmpdir, "to_carol.txt")
@@ -255,6 +257,7 @@ def test_callbacks():
         time.sleep(0.3)
 
         node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
 
         # 设置 A 的回调
         node_a.on_sent = lambda n: sent_files.append(n)
@@ -288,6 +291,7 @@ def test_multiple_files():
         time.sleep(0.3)
 
         node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
 
         # 发 5 个文件
         filenames = [f"file_{i}.txt" for i in range(5)]

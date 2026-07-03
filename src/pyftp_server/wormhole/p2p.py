@@ -357,37 +357,23 @@ class P2PNode:
 
     def _on_peer_added(self, name: str, host: str, port: int) -> None:
         """mDNS 发现新节点时调用（由 _WormholeListener 触发）。"""
-        auto_selected = False
         with self._lock:
-            old_count = len(self._peers)
             self._peers[name] = PeerInfo(name, host, port)
-            if self._selected_peer is None:
-                self._selected_peer = name   # 自动选第一个发现的
-                auto_selected = True
 
-        if auto_selected:
-            self._status(f"发现 {name} · 已自动选为目标")
-        else:
-            self._status(f"发现 {name}")
+        self._status(f"发现 {name}")
 
         if self.on_peers_changed:
             self.on_peers_changed()
 
     def _on_peer_removed(self, name: str) -> None:
         """mDNS 节点离线时调用。"""
-        fallback = None
         with self._lock:
             if name in self._peers:
                 del self._peers[name]
             if self._selected_peer == name:
-                # 选中的离线了，自动切到下一个
-                self._selected_peer = next(iter(self._peers), None) if self._peers else None
-                fallback = self._selected_peer
+                self._selected_peer = None    # 选中的离线了，不自动切换，由用户重新选
 
-        if fallback is not None:
-            self._status(f"{name} 离线 · 切换到 {fallback}")
-        else:
-            self._status(f"{name} 离线")
+        self._status(f"{name} 离线")
 
         if self.on_peers_changed:
             self.on_peers_changed()
