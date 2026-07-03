@@ -271,6 +271,7 @@ Window {
         }
         function onStatus(s) { win.hint = s }
         function onPeersChanged() { win.persistentHint = bridge.peerStatus() }
+        function onErrorState(msg) { win.persistentHint = msg }
     }
 
     // hint 非空时自动倒计时清除，临时提示消失后回到持续状态

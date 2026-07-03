@@ -440,7 +440,8 @@ def main(argv=None) -> None:
         absorb = Signal(str)          # 通知 QML 播放"吸入"动画(参数=文件名)
         emit_out = Signal(str)        # 通知 QML 播放"喷出"动画(参数=文件名)
         status = Signal(str)          # 临时状态文字(2.2s 后消失)
-        peersChanged = Signal()       # 设备列表变化(持续状态刷新)
+        peersChanged = Signal()       # 设备列表变化(刷新菜单)
+        errorState = Signal(str)      # 错误信息(持续显示，非空=有错误，空=清除)
 
         def __init__(self, cfg: P2PConfig):
             super().__init__()
@@ -449,17 +450,22 @@ def main(argv=None) -> None:
                 cfg,
                 on_sent=lambda n: self.absorb.emit(n),
                 on_received=lambda p: self.emit_out.emit(os.path.basename(p)),
-                on_status=lambda s: self.status.emit(s),
+                on_status=lambda s: self._route_status(s),
                 on_peers_changed=lambda: self.peersChanged.emit(),
             )
             self.node.start()
 
+        def _route_status(self, msg: str) -> None:
+            """出错信息走 persistentHint(持续显示)，普通信息走 hint(2.2s 消失)。"""
+            if msg and ("失败" in msg or "无法" in msg):
+                self.errorState.emit(msg)
+            else:
+                self.errorState.emit("")  # 清除之前的错误
+                self.status.emit(msg)
+
         @Slot(result=str)
         def peerStatus(self) -> str:
-            """持续状态：无设备时显示搜索中，有设备时不显示(空字符串)。"""
-            count = len(self.node.peers())
-            if count == 0:
-                return "搜索设备中…"
+            """持续状态：始终返回空(桌宠不显示持续文字，只有出错时才显示)。"""
             return ""
 
         def _select_peer(self, name):
