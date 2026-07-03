@@ -2,6 +2,8 @@ package com.rexvane.wormhole
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -17,6 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -24,12 +27,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import com.rexvane.wormhole.p2p.Peer
 import com.rexvane.wormhole.p2p.WormholeListener
 import com.rexvane.wormhole.p2p.WormholeNode
@@ -43,7 +46,7 @@ class MainActivity : ComponentActivity() {
     private val peers = mutableStateListOf<Peer>()
     private val selectedPeer = mutableStateOf<String?>(null)
     private val statusMsg = mutableStateOf("正在启动…")
-    private val receivedFiles = mutableStateListOf<String>()
+    private val receivedFiles = mutableStateListOf<File>()
 
     // 设置
     private val peerName = mutableStateOf(Build.MODEL)
@@ -107,7 +110,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 override fun onFileReceived(filename: String, path: String) {
-                    runOnUiThread { receivedFiles.add(0, filename) }
+                    runOnUiThread { receivedFiles.add(0, File(path)) }
                 }
                 override fun onStatus(msg: String) {
                     runOnUiThread { statusMsg.value = msg }
@@ -126,6 +129,30 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         node?.stop()
+    }
+
+    private fun openFile(file: File) {
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, contentResolver.getType(uri) ?: "*/*")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "打开 ${file.name}"))
+        } catch (e: Exception) {
+            statusMsg.value = "无法打开: ${e.message}"
+        }
+    }
+
+    private fun openInbox() {
+        val inbox = File(getExternalFilesDir(null), "收件箱")
+        // 尝试用系统文件管理器浏览
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+            startActivity(intent)
+        } catch (e: Exception) {
+            statusMsg.value = "收件箱: ${inbox.absolutePath}"
+        }
     }
 
     @Composable
@@ -230,12 +257,18 @@ class MainActivity : ComponentActivity() {
 
                 // 收件箱
                 Spacer(Modifier.height(16.dp))
-                Text(
-                    "收件箱",
-                    color = Color(0xFF888899),
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("收件箱", color = Color(0xFF888899), fontSize = 13.sp)
+                    TextButton(onClick = { openInbox() }) {
+                        Icon(Icons.Default.Folder, contentDescription = null, tint = Color(0xFF88aaff), modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("打开收件箱", color = Color(0xFF88aaff), fontSize = 13.sp)
+                    }
+                }
                 if (receivedFiles.isEmpty()) {
                     Text(
                         "暂无已接收文件",
@@ -248,13 +281,18 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.heightIn(max = 200.dp),
                         verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
-                        items(receivedFiles) { name ->
-                            Text(
-                                "📄 $name",
-                                color = Color(0xFFccccdd),
-                                fontSize = 13.sp,
-                                modifier = Modifier.padding(vertical = 4.dp),
-                            )
+                        items(receivedFiles) { file ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { openFile(file) }
+                                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("📄 ", color = Color(0xFF888899), fontSize = 13.sp)
+                                Text(file.name, color = Color(0xFFaaccff), fontSize = 13.sp)
+                            }
                         }
                     }
                 }
