@@ -7,8 +7,7 @@ pyftp_server.wormhole —— 虫洞文件传输
 模块：
   p2p    P2P 引擎(mDNS 发现 + TCP 直连 + 可选端到端加密)——纯后台，可自动化测试
   pet    桌宠虫洞挂件(PySide6+QML 动画 + 拖拽)——需在有图形界面的机器上运行
-  crypto 端到端加密(AES-256-GCM)——被 p2p 和 sync 共用
-  sync   FTP 中转同步引擎(旧模式，保留兼容)——纯后台，可自动化测试
+  crypto 端到端加密(AES-256-GCM)——被 p2p 使用
 """
 
-__all__ = ["p2p", "pet", "crypto", "sync"]
+__all__ = ["p2p", "pet", "crypto"]

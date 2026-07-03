@@ -66,7 +66,6 @@ anonymous / 任意         隔离在 pub, 只读
 
 ```bash
 make test                                  # FTP 端到端功能测试
-PYTHONPATH=src python3 tests/test_wormhole.py  # 虫洞 FTP 中转模式测试
 PYTHONPATH=src python3 tests/test_p2p.py       # 虫洞 P2P 直连模式测试
 ```
 
@@ -162,13 +161,11 @@ cd packaging && bash build-mac.sh         # 产物:packaging/dist/虫洞桌宠.a
 │   ├── utils.py               # 日志工具
 │   └── wormhole/              # 虫洞文件传输(P2P 局域网直连)
 │       ├── p2p.py             # P2P 引擎(mDNS 发现 + TCP 直连 + 可选加密)
-│       ├── sync.py            # FTP 中转同步引擎(旧模式，保留兼容)
-│       ├── crypto.py          # 端到端加密(AES-256-GCM)，p2p/sync 共用
+│       ├── crypto.py          # 端到端加密(AES-256-GCM)
 │       ├── pet.py             # 桌宠挂件(PySide6+QML)
 │       └── wormhole.qml       # 黑洞虫洞视觉与动画
 ├── tests/
 │   ├── test_ftp.py            # FTP 端到端功能测试
-│   ├── test_wormhole.py       # 虫洞 FTP 中转模式测试
 │   ├── test_p2p.py            # 虫洞 P2P 直连模式测试
 │   └── benchmark.py           # 三种并发模型性能对比脚本
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)

@@ -1,4 +1,4 @@
-.PHONY: run test test-ftp test-wormhole test-p2p bench cert clean
+.PHONY: run test test-ftp test-p2p bench cert clean
 
 PYTHON ?= python3
 PYTHONPATH := src
@@ -13,10 +13,6 @@ test: test-ftp
 # FTP 端到端功能测试
 test-ftp:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) tests/test_ftp.py
-
-# 虫洞 FTP 中转模式测试
-test-wormhole:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) tests/test_wormhole.py
 
 # 虫洞 P2P 直连模式测试
 test-p2p:

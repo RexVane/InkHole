@@ -1,7 +1,7 @@
 """
 crypto.py
 =========
-虫洞端到端加密(AES-256-GCM)，被 sync.py(FTP 中转) 和 p2p.py(局域网直连) 共用。
+虫洞端到端加密(AES-256-GCM)，被 p2p.py(P2P 直连模式) 使用。
 
 加密文件格式: magic"WHE1" + salt(16B) + nonce(12B) + AES-GCM密文(含校验标签)
 密钥由口令经 PBKDF2-HMAC-SHA256 派生，salt/nonce 每个文件随机。

@@ -35,12 +35,10 @@
 src/pyftp_server/wormhole/
 ├── p2p.py        P2P 引擎(mDNS 发现 + TCP 直连 + 可选加密)——纯后台, 已自动化测试
 ├── pet.py         桌宠挂件(PySide6+QML 动画 + 拖拽 + 右键设备选择)——需图形界面
-├── crypto.py     端到端加密(AES-256-GCM)——p2p 和 sync 共用
-├── sync.py       FTP 中转同步引擎(旧模式，保留兼容)
+├── crypto.py     端到端加密(AES-256-GCM)
 ├── wormhole.qml   黑洞虫洞的视觉与动画
 └── __init__.py
 tests/test_p2p.py       P2P 引擎端到端测试(传输/加密/设备切换/离线/回调/路径穿越)
-tests/test_wormhole.py  旧 FTP 中转模式测试(保留兼容)
 ```
 
 ## 准备：两台电脑连同一局域网
@@ -144,7 +142,7 @@ PYTHONPATH=src python3 -m pyftp_server.wormhole.pet --secret '两边一致的口
 
 **多台设备怎么办？** 右键菜单的「发送目标」列出所有已发现的虫洞设备，选择要发给哪一台。每次只发给选中的那一台。
 
-**和旧的 FTP 中转模式有什么区别？** 旧模式（`sync.py`）需要一台 FTP 服务器当中转站，文件先上传到服务器再由对端下载。P2P 模式（`p2p.py`）不需要服务器，两台电脑直接互连。旧模式仍保留可用，但桌宠默认使用 P2P 模式。
+**和旧的 FTP 中转模式有什么区别？** 早期版本曾用 FTP 服务器当中转站（已移除）。现在的 P2P 模式不需要服务器，两台电脑 mDNS 自动发现后直接 TCP 直连，更简单更快。
 
 ## 测试
 

@@ -25,6 +25,3 @@ jobs:
 
       - name: Run P2P tests
         run: make test-p2p
-
-      - name: Run wormhole sync tests
-        run: make test-wormhole

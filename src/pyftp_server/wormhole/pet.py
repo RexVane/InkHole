@@ -101,7 +101,7 @@ def _install_crash_log(inbox: str) -> str:
     """让 GUI 版"莫名自己退出"可排查 + 兜底修复打包后的致命陷阱。
 
     打包成 windowed exe(spec 里 console=False)后,sys.stdout/sys.stderr 会变成
-    None;此时任何 print() 都会抛异常,而 sync 后台线程每次状态变化/重连都 print,
+    None;此时任何 print() 都会抛异常,而后台线程每次状态变化/重连都 print,
     异常逐层上抛会直接打死同步线程——这是 exe 版"自己断掉"的元凶之一。这里把空的
     stdout/stderr 兜底重定向到日志文件,并记录未捕获异常,既消除崩溃源又留下现场。
     源码运行时 stdout 正常,不会被替换。返回日志路径。"""
@@ -309,7 +309,7 @@ def main(argv=None) -> None:
     except ImportError:
         sys.stderr.write(
             "未安装 PySide6。请先运行：pip install PySide6 --break-system-packages\n"
-            "(同步引擎本身无需 GUI，可用 python -m pyftp_server.wormhole.sync 跑命令行版)\n")
+            "(P2P 引擎本身无需 GUI，可用 python -m pyftp_server.wormhole.p2p 跑命令行版)\n")
         raise SystemExit(1)
 
     def _draw_icon_pixmap(size: int) -> QPixmap:
