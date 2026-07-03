@@ -1,9 +1,8 @@
+"""Wormhole 虫洞文件传输 — 入口模块。
+
+python -m pyftp_server  等价于  python -m pyftp_server.wormhole.pet
 """
-__main__.py
-===========
-支持 `python -m pyftp_server` 直接启动，转发到 cli.main()。
-"""
-from .cli import main
+from pyftp_server.wormhole.pet import main
 
 if __name__ == "__main__":
     main()

@@ -20,8 +20,5 @@ jobs:
       - name: Install dependencies
         run: pip install zeroconf cryptography
 
-      - name: Run FTP tests
-        run: make test-ftp
-
       - name: Run P2P tests
-        run: make test-p2p
+        run: make test
