@@ -460,7 +460,7 @@ def main(argv=None) -> None:
             count = len(self.node.peers())
             if count == 0:
                 return "搜索设备中…"
-            return f"已发现 {count} 台设备"
+            return f"{count}台设备 · 搜索中"
 
         def _select_peer(self, name):
             """选中目标设备(由右键菜单触发)。"""
@@ -534,11 +534,11 @@ def main(argv=None) -> None:
             """给菜单状态行用的当前状态文字(零网络开销)。"""
             peers = self.node.peers()
             if not peers:
-                return "🔍 寻找设备中…"
+                return "🔍 搜索设备中…"
             selected = self.node.selected_peer()
             if selected:
-                return f"→ {selected}"
-            return f"🔍 {len(peers)}台设备,右键选择"
+                return f"→ {selected} · 搜索中"
+            return f"🔍 {len(peers)}台设备 · 搜索中"
 
         @Slot()
         def showMenu(self):
