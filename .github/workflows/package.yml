@@ -1,0 +1,57 @@
+name: Package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: 虫洞桌宠.exe
+            path: packaging/dist/虫洞桌宠.exe
+          - os: macos-latest
+            artifact: 虫洞桌宠.app
+            path: packaging/dist/虫洞桌宠.app
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install PySide6 zeroconf cryptography pyinstaller
+          pip install pyobjc-framework-Cocoa || true
+
+      - name: Build
+        working-directory: packaging
+        run: pyinstaller wormhole-pet.spec --noconfirm --clean
+
+      - name: Zip macOS app
+        if: runner.os == 'macOS'
+        working-directory: packaging/dist
+        run: zip -r -y 虫洞桌宠.zip 虫洞桌宠.app
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wormhole-pet-windows
+          path: packaging/dist/虫洞桌宠.exe
+
+      - name: Upload artifact (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wormhole-pet-macos
+          path: packaging/dist/虫洞桌宠.zip
