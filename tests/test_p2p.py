@@ -313,31 +313,9 @@ def test_multiple_files():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---------- 测试 7: 暂停/恢复 ----------
-def test_pause():
-    print("\n=== 测试 7: 暂停/恢复 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
-    try:
-        node_a = make_node(tmpdir, "Alice")
-        node_a.start()
-        time.sleep(0.3)
-
-        check("初始未暂停", not node_a.is_paused())
-
-        node_a.set_paused(True)
-        check("暂停后 is_paused=True", node_a.is_paused())
-
-        node_a.set_paused(False)
-        check("恢复后 is_paused=False", not node_a.is_paused())
-
-        node_a.stop()
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ---------- 测试 8: 路径穿越防御 ----------
+# ---------- 测试 7: 路径穿越防御 ----------
 def test_path_traversal():
-    print("\n=== 测试 8: 路径穿越防御 ===")
+    print("\n=== 测试 7: 路径穿越防御 ===")
     tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
@@ -384,7 +362,6 @@ if __name__ == "__main__":
     test_peer_offline()
     test_callbacks()
     test_multiple_files()
-    test_pause()
     test_path_traversal()
 
     print(f"\n{'='*40}")

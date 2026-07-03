@@ -353,7 +353,6 @@ def main(argv=None) -> None:
           发送目标 ▸  (动态子菜单，列出已发现的设备，可单选)
           ─────────
           打开收件箱
-          暂停/恢复
           ☑/☐ 开机自启  (可勾选，切换开机自动启动)
           ─────────
           状态：…
@@ -399,12 +398,6 @@ def main(argv=None) -> None:
 
             act_open = menu.addAction("打开收件箱")
             act_open.triggered.connect(bridge.openInbox)
-
-            paused = bridge.isPaused()
-            act_pause = menu.addAction("恢复同步" if paused else "暂停同步")
-            def _on_pause():
-                bridge.togglePause()
-            act_pause.triggered.connect(_on_pause)
 
             # 开机自启（可勾选）
             act_autostart = menu.addAction("开机自启")
@@ -500,17 +493,6 @@ def main(argv=None) -> None:
                 print(f"[托盘] 打开收件箱失败: {e}", flush=True)
 
         @Slot(result=bool)
-        def togglePause(self) -> bool:
-            """暂停/恢复,返回切换后的暂停状态(True=已暂停)。"""
-            new_state = not self.node.is_paused()
-            self.node.set_paused(new_state)
-            return new_state
-
-        @Slot(result=bool)
-        def isPaused(self) -> bool:
-            return self.node.is_paused()
-
-        @Slot(result=bool)
         def isAutoStart(self) -> bool:
             """是否已设置开机自启。"""
             return is_autostart_enabled()
@@ -524,8 +506,6 @@ def main(argv=None) -> None:
         @Slot(result=str)
         def connState(self) -> str:
             """给菜单状态行用的当前状态文字(零网络开销)。"""
-            if self.node.is_paused():
-                return "⏸ 已暂停"
             peers = self.node.peers()
             if not peers:
                 return "🔍 寻找设备中…"

@@ -97,7 +97,6 @@ class P2PNode:
         self._lock = threading.Lock()
         self._selected_peer: str | None = None  # 当前选中的目标
         self._running = False
-        self._paused = False
 
         # mDNS 相关
         self._zc = None              # Zeroconf 实例
@@ -393,19 +392,7 @@ class P2PNode:
         if self.on_peers_changed:
             self.on_peers_changed()
 
-    # ---------- 暂停 / 状态 ----------
-    def set_paused(self, paused: bool) -> None:
-        """暂停/恢复。暂停时拒绝发送，但仍接收。"""
-        self._paused = paused
-        self._status("已暂停" if paused else "已恢复")
-
-    def is_paused(self) -> bool:
-        return self._paused
-
-    def is_active(self) -> bool:
-        """是否处于工作状态（非暂停 + 有对端）。"""
-        return not self._paused and len(self._peers) > 0
-
+    # ---------- 工具 ----------
     def _status(self, msg: str, detail: str = "") -> None:
         if detail:
             print(f"[P2P] {msg} | {detail}", flush=True)
