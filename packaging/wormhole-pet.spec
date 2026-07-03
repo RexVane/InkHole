@@ -49,6 +49,7 @@ a = Analysis(
     runtime_hooks=[],
     excludes=excluded,
     noarchive=False,
+    optimize=2,
 )
 pyz = PYZ(a.pure)
 
@@ -61,7 +62,7 @@ exe = EXE(
     name="虫洞桌宠",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    strip=True,
     upx=False,
     runtime_tmpdir=None,
     console=False,
