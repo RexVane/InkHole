@@ -134,6 +134,163 @@ def _install_crash_log(inbox: str) -> str:
     return log_path
 
 
+# ---------- 开机自启 ----------
+_APP_NAME = "WormholePet"
+
+
+def _src_dir() -> str:
+    """src 目录绝对路径(pet.py 上两级)。"""
+    return os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+
+def _startup_args_str(cfg: P2PConfig) -> str:
+    """从配置重建 CLI 参数字符串(用于写进自启脚本)。"""
+    parts = []
+    if cfg.peer_name:
+        parts.append(f'--name "{cfg.peer_name}"')
+    if cfg.secret:
+        parts.append(f'--secret "{cfg.secret}"')
+    if cfg.inbox:
+        parts.append(f'--inbox "{cfg.inbox}"')
+    if cfg.listen_port:
+        parts.append(f'--port {cfg.listen_port}')
+    return " ".join(parts)
+
+
+def _startup_script_path() -> str:
+    """开机自启脚本/配置文件路径(跨平台)。"""
+    if sys.platform == "win32":
+        return os.path.join(os.path.expanduser("~"), "wormhole-startup.bat")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/LaunchAgents/com.rexvane.wormhole-pet.plist")
+    return os.path.expanduser("~/.config/autostart/wormhole-pet.desktop")
+
+
+def is_autostart_enabled() -> bool:
+    """检查当前是否已设置开机自启。"""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Run")
+            winreg.QueryValueEx(key, _APP_NAME)
+            winreg.CloseKey(key)
+            return True
+        except (FileNotFoundError, OSError):
+            return False
+    return os.path.exists(_startup_script_path())
+
+
+def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
+    """设置或取消开机自启，返回操作后的状态。"""
+    path = _startup_script_path()
+    if enabled:
+        src = _src_dir()
+        proj = os.path.dirname(src)
+        python = sys.executable
+        args = _startup_args_str(cfg)
+        frozen = getattr(sys, "frozen", False)
+
+        if sys.platform == "win32":
+            if frozen:
+                # 打包 exe：注册表直接指向 exe
+                cmd = f'"{python}" {args}'
+            else:
+                # 源码运行：生成 .bat 脚本
+                content = "\r\n".join([
+                    "@echo off",
+                    f'cd /d "{proj}"',
+                    f'set "PYTHONPATH={src}"',
+                    f'"{python}" -m pyftp_server.wormhole.pet {args}',
+                ])
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                cmd = f'"{path}"'
+            # 写注册表
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, cmd)
+            winreg.CloseKey(key)
+
+        elif sys.platform == "darwin":
+            if frozen:
+                exec_path = sys.executable  # .app 内的可执行文件
+                content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.rexvane.wormhole-pet</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exec_path}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>"""
+            else:
+                content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.rexvane.wormhole-pet</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>-c</string>
+        <string>import os,sys;os.chdir({proj!r});sys.path.insert(0,{src!r});from pyftp_server.wormhole.pet import main;main()</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>WorkingDirectory</key><string>{proj}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key><string>{src}</string>
+    </dict>
+</dict>
+</plist>"""
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+        else:
+            # Linux: .desktop
+            if frozen:
+                exec_line = f'"{python}" {args}'
+            else:
+                exec_line = f'sh -c \'cd "{proj}" &amp;&amp; PYTHONPATH="{src}" "{python}" -m pyftp_server.wormhole.pet {args}\''
+            content = f"""[Desktop Entry]
+Type=Application
+Name=Wormhole Pet
+Exec={exec_line}
+Terminal=false
+X-GNOME-Autostart-enabled=true"""
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+    else:
+        # 取消自启
+        if sys.platform == "win32":
+            try:
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                     r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                     0, winreg.KEY_SET_VALUE)
+                winreg.DeleteValue(key, _APP_NAME)
+                winreg.CloseKey(key)
+            except (FileNotFoundError, OSError):
+                pass
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    return is_autostart_enabled()
+
+
 def main(argv=None) -> None:
     cfg, size_override = _build_config(argv)
     _install_crash_log(cfg.inbox)   # 尽早安装:之后任何崩溃/print 都安全且留痕
@@ -197,6 +354,7 @@ def main(argv=None) -> None:
           ─────────
           打开收件箱
           暂停/恢复
+          ☑/☐ 开机自启  (可勾选，切换开机自动启动)
           ─────────
           状态：…
           ─────────
@@ -247,6 +405,16 @@ def main(argv=None) -> None:
             def _on_pause():
                 bridge.togglePause()
             act_pause.triggered.connect(_on_pause)
+
+            # 开机自启（可勾选）
+            act_autostart = menu.addAction("开机自启")
+            act_autostart.setCheckable(True)
+            act_autostart.setChecked(bridge.isAutoStart())
+            def _on_autostart():
+                ok = bridge.toggleAutoStart()
+                act_autostart.setChecked(ok)
+                bridge.status.emit("已开启开机自启" if ok else "已关闭开机自启")
+            act_autostart.triggered.connect(_on_autostart)
 
             menu.addSeparator()
             act_status = menu.addAction("状态：" + bridge.connState())
@@ -341,6 +509,17 @@ def main(argv=None) -> None:
         @Slot(result=bool)
         def isPaused(self) -> bool:
             return self.node.is_paused()
+
+        @Slot(result=bool)
+        def isAutoStart(self) -> bool:
+            """是否已设置开机自启。"""
+            return is_autostart_enabled()
+
+        @Slot(result=bool)
+        def toggleAutoStart(self) -> bool:
+            """切换开机自启，返回切换后的状态。"""
+            enabled = not is_autostart_enabled()
+            return set_autostart(enabled, self.node.cfg)
 
         @Slot(result=str)
         def connState(self) -> str:
