@@ -1,13 +1,13 @@
 # 墨洞桌宠 · 轻量 app 打包
 
-把墨洞桌宠客户端(`src/wormhole/pet.py`,PySide6 + QML)打包成
+把墨洞桌宠客户端(`src/inkhole/pet.py`,PySide6 + QML)打包成
 **单文件可执行**,双击即用、免装 Python。Windows 产出 `.exe`,macOS 产出 `.app`。
 
 ## 目录
 
 | 文件 | 作用 |
 |---|---|
-| `wormhole-pet.spec` | PyInstaller 打包规格(跨平台,Win/.exe + Mac/.app 同一份) |
+| `inkhole-pet.spec` | PyInstaller 打包规格(跨平台,Win/.exe + Mac/.app 同一份) |
 | `pet_entry.py` | 打包入口脚本(解决 `pet.py` 相对导入,使其可作顶层入口) |
 | `build-windows.bat` | Windows 一键构建 |
 | `build-mac.sh` | macOS 一键构建 |
@@ -58,8 +58,8 @@ spec 已排除 WebEngine、Multimedia、3D、Charts 等无用重型模块以尽�
 
 ## 原理要点
 
-- `wormhole.qml` 作为数据文件打进包;运行时 `pet.py:_qml_path()` 优先从
-  PyInstaller 解压目录 `sys._MEIPASS/wormhole/` 读取,源码运行时
+- `inkhole.qml` 作为数据文件打进包;运行时 `pet.py:_qml_path()` 优先从
+  PyInstaller 解压目录 `sys._MEIPASS/inkhole/` 读取,源码运行时
   回退到模块同级目录——同一份代码兼容两种环境。
 - `console=False`:GUI 程序不弹命令行黑窗。
 - 加密所需的 `cryptography` 由 PyInstaller 钩子自动收集进包。

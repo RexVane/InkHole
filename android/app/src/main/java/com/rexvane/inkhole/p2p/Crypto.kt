@@ -1,4 +1,4 @@
-package com.rexvane.wormhole.p2p
+package com.rexvane.inkhole.p2p
 
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory

@@ -35,7 +35,7 @@ import threading
 # 把 src 加入 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from wormhole.p2p import P2PNode, P2PConfig, PeerInfo, _MAGIC
+from inkhole.p2p import P2PNode, P2PConfig, PeerInfo, _MAGIC
 
 
 # ---------- 测试框架 ----------
@@ -91,7 +91,7 @@ def wait_for_file(inbox, filename, timeout=5.0):
 # ---------- 测试 1: TCP 直连传输 ----------
 def test_direct_transfer():
     print("\n=== 测试 1: TCP 直连传输 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
         node_b = make_node(tmpdir, "Bob")
@@ -135,7 +135,7 @@ def test_direct_transfer():
 # ---------- 测试 2: 端到端加密 ----------
 def test_encrypted_transfer():
     print("\n=== 测试 2: 端到端加密传输 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         secret = "my-secret-passphrase"
         node_a = make_node(tmpdir, "Alice", secret=secret)
@@ -171,7 +171,7 @@ def test_encrypted_transfer():
 # ---------- 测试 3: 切换目标设备 ----------
 def test_peer_selection():
     print("\n=== 测试 3: 切换目标设备 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
         node_b = make_node(tmpdir, "Bob")
@@ -219,7 +219,7 @@ def test_peer_selection():
 # ---------- 测试 4: 对端离线 ----------
 def test_peer_offline():
     print("\n=== 测试 4: 对端离线 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
         node_b = make_node(tmpdir, "Bob")
@@ -260,7 +260,7 @@ def test_peer_offline():
 # ---------- 测试 5: 回调触发 ----------
 def test_callbacks():
     print("\n=== 测试 5: 回调触发 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         received_files = []
         sent_files = []
@@ -303,7 +303,7 @@ def test_callbacks():
 # ---------- 测试 6: 多文件连续发送 ----------
 def test_multiple_files():
     print("\n=== 测试 6: 多文件连续发送 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
         node_b = make_node(tmpdir, "Bob")
@@ -341,7 +341,7 @@ def test_multiple_files():
 # ---------- 测试 7: 路径穿越防御 ----------
 def test_path_traversal():
     print("\n=== 测试 7: 路径穿越防御 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
         node_b = make_node(tmpdir, "Bob")
@@ -382,7 +382,7 @@ def test_path_traversal():
 # ---------- 测试 8: 半截文件不落盘 ----------
 def test_partial_transfer_not_delivered():
     print("\n=== 测试 8: 半截文件不落盘 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         received = []
         node_b = P2PNode(
@@ -423,7 +423,7 @@ def test_partial_transfer_not_delivered():
 # ---------- 测试 9: 恶意 size 拒收 ----------
 def test_malicious_size_rejected():
     print("\n=== 测试 9: 恶意 size 拒收 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_b = make_node(tmpdir, "Bob")
         node_b.start()
@@ -455,33 +455,33 @@ def test_malicious_size_rejected():
 # ---------- 测试 10: 同显示名设备共存 + 按服务名离线 ----------
 def test_duplicate_names_and_service_removal():
     print("\n=== 测试 10: 同显示名设备 + 按服务名离线 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
         node_a.start()
         time.sleep(0.2)
 
         # 两台不同设备(不同服务名)取了同一个显示名
-        node_a._on_peer_added("Pixel", "10.0.0.2", 1001, service_name="Pixel-aaaa._wormhole._tcp.local.")
-        node_a._on_peer_added("Pixel", "10.0.0.3", 1002, service_name="Pixel-bbbb._wormhole._tcp.local.")
+        node_a._on_peer_added("Pixel", "10.0.0.2", 1001, service_name="Pixel-aaaa._inkhole._tcp.local.")
+        node_a._on_peer_added("Pixel", "10.0.0.3", 1002, service_name="Pixel-bbbb._inkhole._tcp.local.")
         names = sorted(node_a.peer_names())
         check(f"两台同名设备都在列表({names})", names == ["Pixel", "Pixel (2)"])
 
         # 同一服务重复通告(IP 变了)：原地更新，不新增条目
-        node_a._on_peer_added("Pixel", "10.0.0.9", 1003, service_name="Pixel-aaaa._wormhole._tcp.local.")
+        node_a._on_peer_added("Pixel", "10.0.0.9", 1003, service_name="Pixel-aaaa._inkhole._tcp.local.")
         check("重复通告不新增条目", len(node_a.peers()) == 2)
         pixel = next(p for p in node_a.peers() if p.name == "Pixel")
         check("地址已更新", pixel.host == "10.0.0.9" and pixel.port == 1003)
 
         # 第二台离线：按服务名精确删除，第一台不受影响
         node_a.select_peer("Pixel (2)")
-        node_a._on_peer_removed_by_service("Pixel-bbbb._wormhole._tcp.local.")
+        node_a._on_peer_removed_by_service("Pixel-bbbb._inkhole._tcp.local.")
         check("离线的是 Pixel (2)", node_a.peer_names() == ["Pixel"])
         check("选中的离线后清空", node_a.selected_peer() is None)
 
         # 老版本对端(无服务名记录)：回退按服务名前缀解析
         node_a._on_peer_added("OldPC", "10.0.0.4", 1004)   # 手动注册，无 service_name
-        node_a._on_peer_removed_by_service("OldPC._wormhole._tcp.local.")
+        node_a._on_peer_removed_by_service("OldPC._inkhole._tcp.local.")
         check("老版本对端也能正确离线", "OldPC" not in node_a.peer_names())
 
         node_a.stop()
@@ -492,7 +492,7 @@ def test_duplicate_names_and_service_removal():
 # ---------- 测试 11: 口令不一致，发送方感知失败(ACK) ----------
 def test_ack_reports_decrypt_failure():
     print("\n=== 测试 11: 口令不一致 ACK 失败 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice", secret="口令A")
         node_b = make_node(tmpdir, "Bob", secret="口令B")   # 两端口令不同
@@ -521,7 +521,7 @@ def test_ack_reports_decrypt_failure():
 # ---------- 测试 12: 传输进度回调 ----------
 def test_progress_callback():
     print("\n=== 测试 12: 传输进度回调 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         send_events = []
         recv_events = []
@@ -567,8 +567,8 @@ def test_progress_callback():
 # ---------- 测试 13: 分块加密(WHE2)大文件往返 ----------
 def test_chunked_encryption_roundtrip():
     print("\n=== 测试 13: 分块加密大文件往返 ===")
-    import wormhole.p2p as p2p_mod
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    import inkhole.p2p as p2p_mod
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     saved_threshold = p2p_mod._CHUNK_ENC_THRESHOLD
     try:
         # 把分块阈值压到 256KB，1.5MB 文件即可触发 chunked 路径
@@ -606,7 +606,7 @@ def test_chunked_encryption_roundtrip():
 def test_chunked_crypto_tamper():
     print("\n=== 测试 14: 分块流篡改/重排检测 ===")
     import io
-    from wormhole.crypto import encrypt_chunks, ChunkedDecryptor, chunked_wire_size, CHUNK_SIZE
+    from inkhole.crypto import encrypt_chunks, ChunkedDecryptor, chunked_wire_size, CHUNK_SIZE
 
     secret = "tamper-secret"
     plain = os.urandom(CHUNK_SIZE + 12345)   # 两块
@@ -646,7 +646,7 @@ def test_chunked_crypto_tamper():
 # ---------- 测试 15: 发送队列串行 + 批量聚合 ----------
 def test_send_queue():
     print("\n=== 测试 15: 发送队列 ===")
-    from wormhole.pet import SendQueue
+    from inkhole.pet import SendQueue
 
     sent_order = []
     batch_results = []
@@ -670,7 +670,7 @@ def test_send_queue():
 # ---------- 测试 16: 仅接收目标设备(trusted_only) ----------
 def test_trusted_only():
     print("\n=== 测试 16: 仅接收目标设备 ===")
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
         node_b = P2PNode(P2PConfig(inbox=os.path.join(tmpdir, "Bob_inbox"),
@@ -709,8 +709,8 @@ def test_trusted_only():
 # ---------- 测试 17: 多地址回退连接 ----------
 def test_multi_host_fallback():
     print("\n=== 测试 17: 多地址回退 ===")
-    import wormhole.p2p as p2p_mod
-    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    import inkhole.p2p as p2p_mod
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     saved_timeout = p2p_mod._CONNECT_TIMEOUT
     try:
         p2p_mod._CONNECT_TIMEOUT = 1   # 让不可达地址快速超时

@@ -38,7 +38,7 @@ from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
                      chunked_wire_size, ChunkedDecryptor, CHUNK_SIZE)
 
 # ---------- 常量 ----------
-_SERVICE_TYPE = "_wormhole._tcp.local."
+_SERVICE_TYPE = "_inkhole._tcp.local."
 _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
 _BUFFER = 65536           # 64KB 传输块
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
@@ -142,7 +142,7 @@ class P2PNode:
         # mDNS 相关
         self._zc = None              # Zeroconf 实例
         self._browser = None         # ServiceBrowser
-        self._listener = None        # _WormholeListener
+        self._listener = None        # _InkHoleListener
         self._service_info = None    # 自己注册的 ServiceInfo
         self._actual_port = 0        # 实际监听端口
 
@@ -196,7 +196,7 @@ class P2PNode:
         self._zc.register_service(self._service_info, allow_name_change=True)
 
         # 3. 开始发现其他节点
-        self._listener = _WormholeListener(self)
+        self._listener = _InkHoleListener(self)
         self._browser = ServiceBrowser(self._zc, _SERVICE_TYPE, self._listener)
 
         self._status(f"墨洞已开启 · {self.cfg.peer_name} @ {local_ips[0]}:{self._actual_port}")
@@ -553,7 +553,7 @@ class P2PNode:
 
     def _on_peer_added(self, name: str, host: str, port: int, service_name: str = "",
                        hosts: list[str] | None = None) -> None:
-        """mDNS 发现新节点时调用（由 _WormholeListener 触发）。
+        """mDNS 发现新节点时调用（由 _InkHoleListener 触发）。
 
         - 同一服务(service_name 相同)重复通告/地址变化：原地更新，不新增条目。
         - 不同设备撞了显示名：给后来者加 " (2)" 后缀，两台都能选。
@@ -652,7 +652,7 @@ class P2PNode:
 
 
 # ---------- mDNS 监听器 ----------
-class _WormholeListener:
+class _InkHoleListener:
     """zeroconf ServiceBrowser 回调：发现/离线时更新 P2PNode 的对端表。"""
 
     def __init__(self, node: P2PNode):
@@ -671,7 +671,7 @@ class _WormholeListener:
                 props[key] = val
         peer_name = props.get("peer_name", "")
         if not peer_name:
-            # 回退：从服务名 "MyPC._wormhole._tcp.local." 提取 "MyPC"
+            # 回退：从服务名 "MyPC._inkhole._tcp.local." 提取 "MyPC"
             peer_name = name.split(".")[0] if name else "unknown"
 
         # 不添加自己：按实例 ID 判断(可靠)；老版本对端无 instance_id，

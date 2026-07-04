@@ -1,4 +1,4 @@
-package com.rexvane.wormhole.p2p
+package com.rexvane.inkhole.p2p
 
 import android.content.Context
 import android.net.nsd.NsdManager
@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** 检测到设备/收到文件/状态变化时的回调。 */
-interface WormholeListener {
+interface InkHoleListener {
     fun onPeerChanged(peers: List<Peer>)
     fun onFileReceived(filename: String, path: String)
     fun onStatus(msg: String)
@@ -31,21 +31,21 @@ data class Peer(
 /**
  * 墨洞 P2P 引擎 (Android 版)。
  *
- * - NSD (NsdManager) 注册/发现 _wormhole._tcp 服务, 与桌面版 zeroconf 互通。
+ * - NSD (NsdManager) 注册/发现 _inkhole._tcp 服务, 与桌面版 zeroconf 互通。
  *   服务名带唯一实例 ID 后缀(同名设备不冲突)，显示名走 TXT 属性 peer_name。
  * - TCP ServerSocket 接收文件, WHPP 协议与桌面版一致(含 ACK 回执)。
  * - 可选 AES-256-GCM 端到端加密 (与桌面版 crypto.py 兼容)。
  */
-class WormholeNode(
+class InkHoleNode(
     private val context: Context,
     private val peerName: String,
     private val inboxDir: File,
     private val secret: String = "",
     private val trustedOnly: Boolean = false,   // true = 只接受当前选中目标设备的连接
-    private val listener: WormholeListener,
+    private val listener: InkHoleListener,
 ) {
     companion object {
-        private const val SERVICE_TYPE = "_wormhole._tcp."
+        private const val SERVICE_TYPE = "_inkhole._tcp."
         private const val DISK_MARGIN = 256L * 1024 * 1024   // 收完至少还要剩这么多
         private const val PROGRESS_INTERVAL_MS = 250L
         private const val CHUNK_ENC_THRESHOLD = 32L * 1024 * 1024  // 超过走 WHE2 分块

@@ -1,1 +1,1 @@
--keep class com.rexvane.wormhole.** { *; }
+-keep class com.rexvane.inkhole.** { *; }

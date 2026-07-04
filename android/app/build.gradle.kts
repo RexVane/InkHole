@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.rexvane.wormhole"
+    namespace = "com.rexvane.inkhole"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.rexvane.wormhole"
+        applicationId = "com.rexvane.inkhole"
         minSdk = 24
         targetSdk = 34
         versionCode = 2

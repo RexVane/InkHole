@@ -11,7 +11,7 @@
 ## 协议兼容
 
 与桌面版完全互通：
-- mDNS 服务类型: `_wormhole._tcp`（Android NSD 格式，兼容桌面版 zeroconf）
+- mDNS 服务类型: `_inkhole._tcp`（Android NSD 格式，兼容桌面版 zeroconf）
 - WHPP 协议: `[4B "WHPP"] [4B header_len] [JSON header] [文件数据]`
 - AES-256-GCM 加密: PBKDF2-HMAC-SHA256 100k 迭代，格式与桌面版 crypto.py 一致
 

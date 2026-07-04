@@ -13,7 +13,7 @@ python3 -c "import PyInstaller" 2>/dev/null  || pip3 install pyinstaller
 python3 -c "import AppKit" 2>/dev/null || pip3 install pyobjc-framework-Cocoa || true
 
 echo "==> 打包"
-pyinstaller wormhole-pet.spec --noconfirm --clean
+pyinstaller inkhole-pet.spec --noconfirm --clean
 
 echo "==> 完成:dist/墨洞桌宠.app"
 echo "   运行示例:"

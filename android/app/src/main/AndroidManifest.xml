@@ -19,12 +19,12 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Wormhole">
+        android:theme="@style/Theme.InkHole">
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:theme="@style/Theme.Wormhole">
+            android:theme="@style/Theme.InkHole">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -44,7 +44,7 @@
 
         <!-- P2P 节点宿主：前台服务，Activity 关掉也持续收发 -->
         <service
-            android:name=".WormholeService"
+            android:name=".InkHoleService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 

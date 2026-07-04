@@ -35,7 +35,7 @@ jobs:
 
       - name: Build
         working-directory: packaging
-        run: pyinstaller wormhole-pet.spec --noconfirm --clean
+        run: pyinstaller inkhole-pet.spec --noconfirm --clean
 
       - name: Zip macOS app
         if: runner.os == 'macOS'

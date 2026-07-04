@@ -8,12 +8,12 @@ PyInstaller 需要一个顶层脚本作入口;桌宠模块 pet.py 内部用相�
 import os
 import sys
 
-# 源码直跑时把 src 加进路径;打包后 wormhole 已随包冻结,这步无害。
+# 源码直跑时把 src 加进路径;打包后 inkhole 已随包冻结,这步无害。
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 if os.path.isdir(_SRC):
     sys.path.insert(0, _SRC)
 
-from wormhole.pet import main
+from inkhole.pet import main
 
 if __name__ == "__main__":
     main()

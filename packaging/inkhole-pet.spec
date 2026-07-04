@@ -3,14 +3,14 @@
 墨洞桌宠轻量 app 打包规格(跨平台:Windows .exe / macOS .app,均单文件 onefile)。
 
 构建:
-    Windows:  cd packaging && pyinstaller wormhole-pet.spec --noconfirm
-    macOS:    cd packaging && pyinstaller wormhole-pet.spec --noconfirm
+    Windows:  cd packaging && pyinstaller inkhole-pet.spec --noconfirm
+    macOS:    cd packaging && pyinstaller inkhole-pet.spec --noconfirm
 产物:
     Windows:  packaging/dist/墨洞桌宠.exe        (双击即用,免装 Python)
     macOS:    packaging/dist/墨洞桌宠.app        (拖进"应用程序"即用)
 
 要点:
-  - wormhole.qml 作为数据文件打进包,运行时从 sys._MEIPASS 读取(见 pet.py:_qml_path)。
+  - inkhole.qml 作为数据文件打进包,运行时从 sys._MEIPASS 读取(见 pet.py:_qml_path)。
   - QML 只用 QtQuick / QtQuick.Window,排除一切重型 Qt 模块以压体积。
   - zeroconf 提供 mDNS 局域网设备发现(P2P 模式核心依赖),已列入 hiddenimports。
   - cryptography 提供端到端加密(--secret),由 PyInstaller 钩子自动收集。
@@ -23,9 +23,9 @@ import sys
 
 PROJ = os.path.abspath(os.path.join(SPECPATH, ".."))
 SRC = os.path.join(PROJ, "src")
-QML = os.path.join(SRC, "wormhole", "wormhole.qml")
+QML = os.path.join(SRC, "inkhole", "inkhole.qml")
 
-datas = [(QML, "wormhole")]
+datas = [(QML, "inkhole")]
 
 # 排除明显用不到的重型 Qt 模块,显著减小单文件体积
 excluded = [
@@ -43,7 +43,7 @@ a = Analysis(
     pathex=[SRC],
     binaries=[],
     datas=datas,
-    hiddenimports=["wormhole.p2p", "zeroconf"],
+    hiddenimports=["inkhole.p2p", "zeroconf"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

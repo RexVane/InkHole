@@ -10,7 +10,7 @@ python -c "import cryptography" 2>nul || pip install cryptography
 python -c "import PyInstaller" 2>nul || pip install pyinstaller
 
 echo ==^> 打包
-pyinstaller wormhole-pet.spec --noconfirm --clean
+pyinstaller inkhole-pet.spec --noconfirm --clean
 
 echo ==^> 完成:dist\墨洞桌宠.exe
 echo    运行示例:

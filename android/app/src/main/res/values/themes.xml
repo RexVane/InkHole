@@ -1,3 +1,3 @@
 <resources>
-    <style name="Theme.Wormhole" parent="android:Theme.Material.NoActionBar" />
+    <style name="Theme.InkHole" parent="android:Theme.Material.NoActionBar" />
 </resources>

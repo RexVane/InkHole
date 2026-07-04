@@ -1,4 +1,4 @@
-package com.rexvane.wormhole
+package com.rexvane.inkhole
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -16,9 +16,9 @@ import android.os.IBinder
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
-import com.rexvane.wormhole.p2p.Peer
-import com.rexvane.wormhole.p2p.WormholeListener
-import com.rexvane.wormhole.p2p.WormholeNode
+import com.rexvane.inkhole.p2p.Peer
+import com.rexvane.inkhole.p2p.InkHoleListener
+import com.rexvane.inkhole.p2p.InkHoleNode
 import java.io.File
 
 /**
@@ -28,16 +28,16 @@ import java.io.File
  * 重启节点(端口变、设备列表清空、传输中断)。挪进前台服务后手机侧真正
  * "常驻可收"。收到的文件导出到系统 Downloads/InkHole(用户找得到)并发通知。
  */
-class WormholeService : Service() {
+class InkHoleService : Service() {
 
     companion object {
-        private const val CHANNEL_STATUS = "wormhole_status"
-        private const val CHANNEL_FILES = "wormhole_files"
+        private const val CHANNEL_STATUS = "inkhole_status"
+        private const val CHANNEL_FILES = "inkhole_files"
         private const val NOTIF_STATUS_ID = 1
-        private const val ACTION_RELOAD = "com.rexvane.wormhole.RELOAD"
+        private const val ACTION_RELOAD = "com.rexvane.inkhole.RELOAD"
 
         fun start(context: Context) {
-            val intent = Intent(context, WormholeService::class.java)
+            val intent = Intent(context, InkHoleService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
         }
@@ -46,7 +46,7 @@ class WormholeService : Service() {
          * 不能用 stopService+startService：stop 是异步的，服务没销毁完时
          * start 只触发 onStartCommand 不触发 onCreate，节点不会重建。 */
         fun restart(context: Context) {
-            val intent = Intent(context, WormholeService::class.java).setAction(ACTION_RELOAD)
+            val intent = Intent(context, InkHoleService::class.java).setAction(ACTION_RELOAD)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
         }
@@ -58,35 +58,57 @@ class WormholeService : Service() {
         super.onCreate()
         createChannels()
         startForeground(NOTIF_STATUS_ID, buildStatusNotification("正在启动…"))
-        WormholeBus.loadHistory(this)
+        migrateOldPrefs()
+        InkHoleBus.loadHistory(this)
         startNode()
+    }
+
+    /** v1→v2 迁移：旧版用 "wormhole" 作为 SharedPreferences 名，复制到 "inkhole"。 */
+    private fun migrateOldPrefs() {
+        val newPrefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
+        if (newPrefs.all.isNotEmpty()) return  // 已有数据，不覆盖
+        val oldPrefs = getSharedPreferences("wormhole", Context.MODE_PRIVATE)
+        if (oldPrefs.all.isEmpty()) return
+        val editor = newPrefs.edit()
+        for ((key, value) in oldPrefs.all) {
+            when (value) {
+                is String -> editor.putString(key, value)
+                is Boolean -> editor.putBoolean(key, value)
+                is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
+                is Float -> editor.putFloat(key, value)
+                is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
+            }
+        }
+        editor.apply()
+        oldPrefs.edit().clear().apply()  // 清旧数据避免残留
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_RELOAD) {
-            WormholeBus.node?.stop()
-            WormholeBus.node = null
-            WormholeBus.lastPeers = emptyList()
+            InkHoleBus.node?.stop()
+            InkHoleBus.node = null
+            InkHoleBus.lastPeers = emptyList()
             startNode()
         }
         return START_STICKY
     }
 
     private fun startNode() {
-        val prefs = getSharedPreferences("wormhole", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
         val name = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         val secret = prefs.getString("secret", "") ?: ""
         val trustedOnly = prefs.getBoolean("trusted_only", false)
         val inbox = File(getExternalFilesDir(null), "收件箱")
 
-        val node = WormholeNode(this, name, inbox, secret, trustedOnly, listener = forwarder)
-        WormholeBus.node = node
+        val node = InkHoleNode(this, name, inbox, secret, trustedOnly, listener = forwarder)
+        InkHoleBus.node = node
         node.start()
     }
 
     override fun onDestroy() {
-        WormholeBus.node?.stop()
-        WormholeBus.node = null
+        InkHoleBus.node?.stop()
+        InkHoleBus.node = null
         super.onDestroy()
     }
 
@@ -94,29 +116,29 @@ class WormholeService : Service() {
 
     // ---- 事件转发：更新 Bus 缓存 + 通知 + 转给 Activity(在时) ----
 
-    private val forwarder = object : WormholeListener {
+    private val forwarder = object : InkHoleListener {
         override fun onPeerChanged(peers: List<Peer>) {
-            WormholeBus.lastPeers = peers
+            InkHoleBus.lastPeers = peers
             updateStatusNotification(
                 if (peers.isEmpty()) "搜索设备中…" else "发现 ${peers.size} 台设备")
-            WormholeBus.uiListener?.onPeerChanged(peers)
+            InkHoleBus.uiListener?.onPeerChanged(peers)
         }
 
         override fun onFileReceived(filename: String, path: String) {
             val record = exportToDownloads(File(path))
-            WormholeBus.receivedFiles.add(0, record)
-            WormholeBus.saveHistory(this@WormholeService)
+            InkHoleBus.receivedFiles.add(0, record)
+            InkHoleBus.saveHistory(this@InkHoleService)
             notifyFileReceived(record)
-            WormholeBus.uiListener?.onFileReceived(filename, path)
+            InkHoleBus.uiListener?.onFileReceived(filename, path)
         }
 
         override fun onStatus(msg: String) {
-            WormholeBus.lastStatus = msg
-            WormholeBus.uiListener?.onStatus(msg)
+            InkHoleBus.lastStatus = msg
+            InkHoleBus.uiListener?.onStatus(msg)
         }
 
         override fun onProgress(kind: String, filename: String, done: Long, total: Long) {
-            WormholeBus.uiListener?.onProgress(kind, filename, done, total)
+            InkHoleBus.uiListener?.onProgress(kind, filename, done, total)
         }
     }
 

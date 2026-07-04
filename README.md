@@ -17,23 +17,23 @@
 pip install PySide6 zeroconf cryptography
 
 # 2. 两台电脑各跑一个
-PYTHONPATH=src python -m wormhole.pet
-PYTHONPATH=src python -m wormhole.pet --name 我的Mac
+PYTHONPATH=src python -m inkhole.pet
+PYTHONPATH=src python -m inkhole.pet --name 我的Mac
 
 # 3. 右键桌宠选目标设备 → 拖文件进去 → 传过去
 ```
 
-也可以直接 `python -m wormhole`（等价于启动桌宠）。
+也可以直接 `python -m inkhole`（等价于启动桌宠）。
 
 无图形界面时用命令行版：
 
 ```bash
-PYTHONPATH=src python -m wormhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkHole/发件箱
+PYTHONPATH=src python -m inkhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkHole/发件箱
 ```
 
 ## Features
 
-- **mDNS 自动发现**：注册 `_wormhole._tcp.local.` 服务，局域网内自动发现其他墨洞设备；服务名带唯一实例 ID，两台同名设备不冲突；宣告全部本机地址，开 VPN/多网卡也能连上
+- **mDNS 自动发现**：注册 `_inkhole._tcp.local.` 服务，局域网内自动发现其他墨洞设备；服务名带唯一实例 ID，两台同名设备不冲突；宣告全部本机地址，开 VPN/多网卡也能连上
 - **TCP 直连传输**：WHPP 协议（magic + JSON 头 + 文件数据 + 1 字节回执），不经过任何中转服务器
 - **传输回执（ACK）**：接收方落盘成功才算发送成功——对端解密失败、磁盘满、被拒收，发送方都能感知
 - **传输进度**：桌宠外圈亮起青色进度环，Android 端墨洞进度环同步
@@ -106,13 +106,13 @@ make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可
 
 ```text
 .
-├── src/wormhole/              # Python 包名保留 wormhole(内部标识，与协议服务名一致)
+├── src/inkhole/              # Python 包
 │   ├── __init__.py            # 顶层包
-│   ├── __main__.py            # 入口(python -m wormhole 启动桌宠)
+│   ├── __main__.py            # 入口(python -m inkhole 启动桌宠)
 │   ├── p2p.py                 # P2P 引擎(mDNS 发现 + TCP 直连 + ACK/进度 + 加密)
 │   ├── crypto.py              # 端到端加密(AES-256-GCM，WHE1 整块 / WHE2 分块流)
 │   ├── pet.py                 # 桌宠挂件(PySide6+QML) + 设置持久化 + 发送队列
-│   └── wormhole.qml           # 墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
+│   └── inkhole.qml           # 墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
 ├── tests/
 │   └── test_p2p.py            # P2P 端到端测试(17 组 66 项)
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)

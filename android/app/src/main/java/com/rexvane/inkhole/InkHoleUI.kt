@@ -1,4 +1,4 @@
-package com.rexvane.wormhole
+package com.rexvane.inkhole
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
@@ -48,7 +48,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.rexvane.wormhole.p2p.Peer
+import com.rexvane.inkhole.p2p.Peer
 
 // ==================== 墨洞色板 ====================
 
@@ -66,7 +66,7 @@ private val BorderColor   = Color(0xFF172623)
 // ==================== 主题 ====================
 
 @Composable
-fun WormholeTheme(content: @Composable () -> Unit) {
+fun InkHoleTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = darkColorScheme(
             background = BgDark,
@@ -467,7 +467,7 @@ fun PreviewMainScreen() {
         Peer("MacBook Pro", "192.168.1.100", 8848),
         Peer("Pixel 8", "192.168.1.101", 8848),
     )
-    WormholeTheme {
+    InkHoleTheme {
         MainScreen(
             statusMsg = "↓ 年度报告.pdf 63%",
             peers = mockPeers,
@@ -490,7 +490,7 @@ fun PreviewMainScreen() {
 @Preview(showBackground = true, backgroundColor = 0xFF05070A, name = "空状态")
 @Composable
 fun PreviewEmptyState() {
-    WormholeTheme {
+    InkHoleTheme {
         MainScreen(
             statusMsg = "搜索设备中…",
             peers = emptyList(),

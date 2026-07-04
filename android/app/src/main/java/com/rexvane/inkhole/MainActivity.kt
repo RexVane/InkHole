@@ -1,4 +1,4 @@
-package com.rexvane.wormhole
+package com.rexvane.inkhole
 
 import android.app.DownloadManager
 import android.content.Context
@@ -27,12 +27,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.rexvane.wormhole.p2p.Peer
-import com.rexvane.wormhole.p2p.WormholeListener
+import com.rexvane.inkhole.p2p.Peer
+import com.rexvane.inkhole.p2p.InkHoleListener
 import java.io.File
 
 /**
- * 主界面(纯 UI)。P2P 节点的生命周期在 WormholeService(前台服务)：
+ * 主界面(纯 UI)。P2P 节点的生命周期在 InkHoleService(前台服务)：
  * 转屏/锁屏/切后台都不断线，Activity 只是挂上去看状态、发起发送。
  *
  * 发送入口：
@@ -65,7 +65,7 @@ class MainActivity : ComponentActivity() {
         if (!uris.isNullOrEmpty()) sendUris(uris)
     }
 
-    private val uiListener = object : WormholeListener {
+    private val uiListener = object : InkHoleListener {
         override fun onPeerChanged(list: List<Peer>) = runOnUiThread {
             peers.clear()
             peers.addAll(list)
@@ -90,26 +90,26 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val prefs = getSharedPreferences("wormhole", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
         peerName.value = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         secret.value = prefs.getString("secret", "") ?: ""
         trustedOnly.value = prefs.getBoolean("trusted_only", false)
 
         requestNeededPermissions()
-        WormholeService.start(this)
-        WormholeBus.loadHistory(this)
-        WormholeBus.uiListener = uiListener
+        InkHoleService.start(this)
+        InkHoleBus.loadHistory(this)
+        InkHoleBus.uiListener = uiListener
 
         // 服务可能早已在跑(锁屏收文件后点开)：恢复最近状态
-        peers.addAll(WormholeBus.lastPeers)
-        statusMsg.value = WormholeBus.lastStatus
-        selectedPeer.value = WormholeBus.node?.getSelectedPeer()
+        peers.addAll(InkHoleBus.lastPeers)
+        statusMsg.value = InkHoleBus.lastStatus
+        selectedPeer.value = InkHoleBus.node?.getSelectedPeer()
         refreshReceived()
 
         handleShareIntent(intent)
 
         setContent {
-            WormholeTheme {
+            InkHoleTheme {
                 MainScreen(
                     statusMsg = statusMsg.value,
                     peers = peers,
@@ -130,7 +130,7 @@ class MainActivity : ComponentActivity() {
                     onOpenInbox = { openInbox() },
                     onOpenFile = { rec -> openFile(rec) },
                     onClearHistory = {
-                        WormholeBus.clearHistory(this)
+                        InkHoleBus.clearHistory(this)
                         refreshReceived()
                     },
                     onSettingsClick = { showSettings.value = true },
@@ -147,7 +147,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         // 只摘掉 UI 监听；节点在前台服务里继续跑
-        if (WormholeBus.uiListener === uiListener) WormholeBus.uiListener = null
+        if (InkHoleBus.uiListener === uiListener) InkHoleBus.uiListener = null
         super.onDestroy()
     }
 
@@ -156,7 +156,7 @@ class MainActivity : ComponentActivity() {
     private fun onDeviceClicked(peer: Peer) {
         val newSel = if (selectedPeer.value == peer.name) null else peer.name
         selectedPeer.value = newSel
-        WormholeBus.node?.selectPeer(newSel)
+        InkHoleBus.node?.selectPeer(newSel)
         if (newSel != null && pendingShares.isNotEmpty()) {
             val toSend = pendingShares.toList()
             pendingShares.clear()
@@ -197,7 +197,7 @@ class MainActivity : ComponentActivity() {
 
     /** 把 content uri 复制到 cache 后经 P2P 发送(顺序发，避免并发写同名缓存)。 */
     private fun sendUris(uris: List<Uri>) {
-        val node = WormholeBus.node ?: run {
+        val node = InkHoleBus.node ?: run {
             statusMsg.value = "墨洞未就绪"
             return
         }
@@ -236,7 +236,7 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshReceived() {
         receivedFiles.clear()
-        receivedFiles.addAll(WormholeBus.receivedFiles)
+        receivedFiles.addAll(InkHoleBus.receivedFiles)
     }
 
     private fun openFile(rec: ReceivedFile) {
@@ -330,7 +330,7 @@ class MainActivity : ComponentActivity() {
                         peerName.value = nameInput
                         secret.value = secretInput
                         trustedOnly.value = trustedInput
-                        getSharedPreferences("wormhole", Context.MODE_PRIVATE)
+                        getSharedPreferences("inkhole", Context.MODE_PRIVATE)
                             .edit()
                             .putString("peer_name", nameInput)
                             .putString("secret", secretInput)
@@ -340,7 +340,7 @@ class MainActivity : ComponentActivity() {
                         // 重启前台服务里的节点即可，Activity 不用 recreate
                         selectedPeer.value = null
                         peers.clear()
-                        WormholeService.restart(this@MainActivity)
+                        InkHoleService.restart(this@MainActivity)
                     }) { Text("保存") }
                 },
                 dismissButton = {

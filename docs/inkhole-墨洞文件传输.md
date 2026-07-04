@@ -23,7 +23,7 @@
 └──────────────┘    双向互传           └──────────────┘
 ```
 
-- **mDNS 发现**：每个墨洞启动后注册 `_wormhole._tcp.local.` 服务（zeroconf），同时浏览局域网内的同名服务。发现对端后自动加入设备列表，由用户右键手动选择发送目标。
+- **mDNS 发现**：每个墨洞启动后注册 `_inkhole._tcp.local.` 服务（zeroconf），同时浏览局域网内的同名服务。发现对端后自动加入设备列表，由用户右键手动选择发送目标。
 - **TCP 直连**：发送文件时直接连接对端的 TCP 端口，走 WHPP 协议（magic + JSON 头 + 文件数据），不经过任何中转。
 - **设备选择**：右键桌宠 → 「发送目标」子菜单列出已发现设备，可切换目标。对端离线时选中被清空（不自动切换），需重新选择。
 - **端到端加密**（可选）：`--secret 口令` 启用 AES-256-GCM，文件在发送方加密、接收方解密，传输全程只见密文。
@@ -32,11 +32,11 @@
 模块位置：
 
 ```
-src/wormhole/
+src/inkhole/
 ├── p2p.py        P2P 引擎(mDNS 发现 + TCP 直连 + 可选加密)——纯后台, 已自动化测试
 ├── pet.py         桌宠挂件(PySide6+QML 动画 + 拖拽 + 右键设备选择)——需图形界面
 ├── crypto.py     端到端加密(AES-256-GCM)
-├── wormhole.qml   黑洞墨洞的视觉与动画
+├── inkhole.qml   黑洞墨洞的视觉与动画
 └── __init__.py
 tests/test_p2p.py       P2P 引擎端到端测试(传输/加密/设备切换/离线/回调/路径穿越)
 ```
@@ -59,10 +59,10 @@ pip install pyobjc-framework-Cocoa
 
 ```bash
 # 电脑 A
-PYTHONPATH=src python3 -m wormhole.pet
+PYTHONPATH=src python3 -m inkhole.pet
 
 # 电脑 B（可指定显示名，右键菜单里对端看到的就是这个名字）
-PYTHONPATH=src python3 -m wormhole.pet --name 我的Mac
+PYTHONPATH=src python3 -m inkhole.pet --name 我的Mac
 ```
 
 启动后桌面角落出现一个黑洞小挂件（中心纯黑、外圈乳白渐变，大小约为系统程序图标的 1.5 倍）。
@@ -82,7 +82,7 @@ PYTHONPATH=src python3 -m wormhole.pet --name 我的Mac
 改成别的目录：
 
 ```bash
-PYTHONPATH=src python3 -m wormhole.pet --inbox ~/Desktop
+PYTHONPATH=src python3 -m inkhole.pet --inbox ~/Desktop
 ```
 
 ## 没有图形界面？用命令行版
@@ -90,7 +90,7 @@ PYTHONPATH=src python3 -m wormhole.pet --inbox ~/Desktop
 P2P 引擎本身不依赖 GUI。可以用命令行版：监视一个"发送文件夹"，放进去的文件自动发给已发现的对端；收到的文件落入收件箱。
 
 ```bash
-PYTHONPATH=src python3 -m wormhole.p2p \
+PYTHONPATH=src python3 -m inkhole.p2p \
     --inbox ~/InkHole/收件箱 --outbox ~/InkHole/发件箱
 ```
 
@@ -114,7 +114,7 @@ PYTHONPATH=src python3 -m wormhole.p2p \
 
 ```bash
 # 两台电脑都加同一口令
-PYTHONPATH=src python3 -m wormhole.pet --secret '两边一致的口令'
+PYTHONPATH=src python3 -m inkhole.pet --secret '两边一致的口令'
 ```
 
 注意：
