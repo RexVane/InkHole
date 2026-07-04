@@ -38,18 +38,18 @@ macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`(可
 ```
 墨洞桌宠 --name 我的电脑 \
         --secret '<两端一致的端到端加密口令>' \
-        --inbox ~/Wormhole/收件箱
+        --inbox ~/InkHole/收件箱
 ```
 
 - `--name`:本机显示名,对端右键菜单里看到的就是这个名字(默认主机名)
 - `--secret`:端到端加密口令,两台设备必须一致
-- `--inbox`:收件箱目录(默认随平台:Win `~/OneDrive/Desktop/wormhole`，Mac `~/Documents/wormhole`)
+- `--inbox`:收件箱目录(默认随平台:Win `~/OneDrive/Desktop/inkhole`，Mac `~/Documents/inkhole`)
 - `--port`:P2P 监听端口(0 = 操作系统自动分配)
 - `--size N`:挂件边长像素(0 = 随屏幕自适应)
 - 收到的文件落在收件箱目录
 
 > 直接双击不带参数时,会以默认值(主机名、无加密)启动。
-> P2P 模式下无需指定服务器地址——mDNS 自动发现局域网内的其他虫洞设备。
+> P2P 模式下无需指定服务器地址——mDNS 自动发现局域网内的其他墨洞设备。
 
 ## 体积说明
 

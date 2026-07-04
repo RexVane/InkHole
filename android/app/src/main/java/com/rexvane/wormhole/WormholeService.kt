@@ -26,7 +26,7 @@ import java.io.File
  *
  * 之前节点绑在 Activity 上——锁屏/切后台 Activity 被杀就断线，转屏还会
  * 重启节点(端口变、设备列表清空、传输中断)。挪进前台服务后手机侧真正
- * "常驻可收"。收到的文件导出到系统 Downloads/Wormhole(用户找得到)并发通知。
+ * "常驻可收"。收到的文件导出到系统 Downloads/InkHole(用户找得到)并发通知。
  */
 class WormholeService : Service() {
 
@@ -120,7 +120,7 @@ class WormholeService : Service() {
         }
     }
 
-    // ---- 收件箱导出：应用私有目录 -> 系统 Downloads/Wormhole ----
+    // ---- 收件箱导出：应用私有目录 -> 系统 Downloads/InkHole ----
     // 私有目录(Android/data/…)用户在文件管理器里根本找不到(Android 11+ 甚至无法访问)。
 
     private fun exportToDownloads(src: File): ReceivedFile {

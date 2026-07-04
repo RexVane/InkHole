@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Wormhole"
+rootProject.name = "InkHole"
 include(":app")

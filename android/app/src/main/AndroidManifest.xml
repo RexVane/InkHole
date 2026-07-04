@@ -29,7 +29,7 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- 系统分享菜单入口：图库/文件管理器 -> 分享 -> 虫洞 -->
+            <!-- 系统分享菜单入口：图库/文件管理器 -> 分享 -> 墨洞 -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />

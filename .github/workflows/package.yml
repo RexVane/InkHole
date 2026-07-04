@@ -12,11 +12,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: 虫洞桌宠.exe
-            path: packaging/dist/虫洞桌宠.exe
+            artifact: 墨洞桌宠.exe
+            path: packaging/dist/墨洞桌宠.exe
           - os: macos-latest
-            artifact: 虫洞桌宠.app
-            path: packaging/dist/虫洞桌宠.app
+            artifact: 墨洞桌宠.app
+            path: packaging/dist/墨洞桌宠.app
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -40,18 +40,18 @@ jobs:
       - name: Zip macOS app
         if: runner.os == 'macOS'
         working-directory: packaging/dist
-        run: zip -r -y 虫洞桌宠.zip 虫洞桌宠.app
+        run: zip -r -y 墨洞桌宠.zip 墨洞桌宠.app
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: wormhole-pet-windows
-          path: packaging/dist/虫洞桌宠.exe
+          name: inkhole-pet-windows
+          path: packaging/dist/墨洞桌宠.exe
 
       - name: Upload artifact (macOS)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: wormhole-pet-macos
-          path: packaging/dist/虫洞桌宠.zip
+          name: inkhole-pet-macos
+          path: packaging/dist/墨洞桌宠.zip

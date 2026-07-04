@@ -1,4 +1,4 @@
-"""Wormhole 墨洞文件传输 — 入口模块。
+"""墨洞文件传输 — 入口模块。
 
 python -m wormhole  等价于  python -m wormhole.pet
 """

@@ -79,7 +79,7 @@ if sys.platform == "darwin":
         exe,
         name="墨洞桌宠.app",
         icon=None,
-        bundle_identifier="com.rexvane.wormhole-pet",
+        bundle_identifier="com.rexvane.inkhole-pet",
         info_plist={
             "CFBundleName": "墨洞桌宠",
             "CFBundleDisplayName": "墨洞桌宠",

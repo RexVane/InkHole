@@ -41,5 +41,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: wormhole-android-apk
+          name: inkhole-android-apk
           path: android/app/build/outputs/apk/debug/*.apk

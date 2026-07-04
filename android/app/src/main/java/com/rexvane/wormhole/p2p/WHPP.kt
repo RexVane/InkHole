@@ -6,7 +6,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import org.json.JSONObject
 
-/** WHPP (Wormhole P2P Protocol) 常量与读写工具。 */
+/** WHPP (InkHole P2P Protocol) 常量与读写工具。 */
 object WHPP {
     val MAGIC = "WHPP".toByteArray(Charsets.US_ASCII)
     const val BUFFER_SIZE = 65536

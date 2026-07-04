@@ -29,7 +29,7 @@ data class Peer(
 )
 
 /**
- * 虫洞 P2P 引擎 (Android 版)。
+ * 墨洞 P2P 引擎 (Android 版)。
  *
  * - NSD (NsdManager) 注册/发现 _wormhole._tcp 服务, 与桌面版 zeroconf 互通。
  *   服务名带唯一实例 ID 后缀(同名设备不冲突)，显示名走 TXT 属性 peer_name。
@@ -75,7 +75,7 @@ class WormholeNode(
         startTcpServer()
         registerNsd()
         discoverNsd()
-        listener.onStatus("虫洞已开启 · $peerName")
+        listener.onStatus("墨洞已开启 · $peerName")
     }
 
     fun stop() {

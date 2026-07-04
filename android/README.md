@@ -1,6 +1,6 @@
-# Wormhole Android
+# InkHole Android
 
-虫洞安卓端 — 与桌面版协议互通的局域网 P2P 文件传输。
+墨洞安卓端 — 与桌面版协议互通的局域网 P2P 文件传输。
 
 ## 构建
 

@@ -62,7 +62,7 @@ PYTHONPATH=src python -m wormhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/Ink
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `--inbox` | 收件箱目录 | 随平台（Win: `桌面\wormhole`（自动识别 OneDrive 重定向），Mac: `~/Documents/wormhole`） |
+| `--inbox` | 收件箱目录 | 随平台（Win: `桌面\inkhole`（自动识别 OneDrive 重定向），Mac: `~/Documents/inkhole`） |
 | `--port` | P2P 监听端口（0 = 操作系统自动分配） | `0` |
 | `--name` | 本机显示名（对端菜单里看到的名字） | 主机名 |
 | `--secret` | 端到端加密口令（两台设备必须一致） | 关 |

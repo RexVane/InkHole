@@ -1,4 +1,4 @@
-# 墨洞文件传输（Wormhole）
+# 墨洞文件传输（InkHole）
 
 > 局域网点对点文件传输：把文件拖进桌面上的「墨洞」桌宠，文件直接出现在另一台电脑上。无需服务器。
 
@@ -77,7 +77,7 @@ PYTHONPATH=src python3 -m wormhole.pet --name 我的Mac
 
 ## 收件箱在哪 / 怎么改
 
-默认收件箱：Windows `~/OneDrive/Desktop/wormhole/`，macOS `~/Documents/wormhole/`，其他 `~/Wormhole/收件箱/`。
+默认收件箱：Windows `~/OneDrive/Desktop/inkhole/`，macOS `~/Documents/inkhole/`，其他 `~/InkHole/收件箱/`。
 
 改成别的目录：
 
@@ -91,7 +91,7 @@ P2P 引擎本身不依赖 GUI。可以用命令行版：监视一个"发送文�
 
 ```bash
 PYTHONPATH=src python3 -m wormhole.p2p \
-    --inbox ~/Wormhole/收件箱 --outbox ~/Wormhole/发件箱
+    --inbox ~/InkHole/收件箱 --outbox ~/InkHole/发件箱
 ```
 
 把文件丢进 `发件箱` 就会自动发送；对端的文件会自动出现在 `收件箱`。
@@ -100,7 +100,7 @@ PYTHONPATH=src python3 -m wormhole.p2p \
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `--inbox` | 收件箱目录 | 随平台（Win: `~/OneDrive/Desktop/wormhole`，Mac: `~/Documents/wormhole`） |
+| `--inbox` | 收件箱目录 | 随平台（Win: `~/OneDrive/Desktop/inkhole`，Mac: `~/Documents/inkhole`） |
 | `--port` | P2P 监听端口（0 = 操作系统自动分配） | `0` |
 | `--name` | 本机显示名（对端右键菜单里看到的名字） | 主机名 |
 | `--secret 口令` | 端到端文件加密（两台电脑口令必须一致） | 关 |
@@ -126,7 +126,7 @@ PYTHONPATH=src python3 -m wormhole.pet --secret '两边一致的口令'
 
 右键桌宠 → 「开机自启」可勾选项，勾上后电脑开机/登录时自动启动墨洞。
 
-- **Windows**：在 `~/wormhole-startup.bat` 生成启动脚本，注册到注册表 `HKCU\...\Run`
+- **Windows**：在 `~/inkhole-startup.bat` 生成启动脚本，注册到注册表 `HKCU\...\Run`
 - **macOS**：在 `~/Library/LaunchAgents/` 生成 LaunchAgent plist
 - **Linux**：在 `~/.config/autostart/` 生成 .desktop 文件
 

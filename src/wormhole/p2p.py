@@ -8,12 +8,12 @@ p2p.py
   - 直接 TCP 连接传输文件，无中转、无云端
   - 可选 AES-256-GCM 端到端加密(复用 crypto.py)
 
-协议 (WHPP - Wormhole P2P Protocol)：
+协议 (WHPP - InkHole P2P Protocol)：
   [4B magic "WHPP"] [4B header_len] [header_len B JSON] [size B 文件数据]
   JSON header: {"filename": "...", "size": 12345, "encrypted": true/false}
 
 使用：
-  node = P2PNode(P2PConfig(inbox="~/wormhole"),
+  node = P2PNode(P2PConfig(inbox="~/inkhole"),
                  on_sent=..., on_received=..., on_status=..., on_peers_changed=...)
   node.start()           # 注册 mDNS + 启动 TCP 监听 + 开始发现
   node.select_peer(name) # 右键菜单选目标
@@ -39,7 +39,7 @@ from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
 
 # ---------- 常量 ----------
 _SERVICE_TYPE = "_wormhole._tcp.local."
-_MAGIC = b"WHPP"          # Wormhole P2P Protocol magic
+_MAGIC = b"WHPP"          # InkHole P2P Protocol magic
 _BUFFER = 65536           # 64KB 传输块
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
 _MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
