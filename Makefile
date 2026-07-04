@@ -1,6 +1,7 @@
 .PHONY: test clean
 
-PYTHON ?= python3
+# Windows(Git Bash) 没有 python3 命令，自动回退到 python
+PYTHON ?= $(shell command -v python3 2>/dev/null || echo python)
 PYTHONPATH := src
 
 # P2P 端到端测试

@@ -2,7 +2,7 @@
 """
 test_p2p.py
 ===========
-虫洞 P2P 引擎端到端测试。
+墨洞 P2P 引擎端到端测试。
 
 测试覆盖：
   1. TCP 直连传输（绕过 mDNS，手动注册对端）
@@ -59,7 +59,7 @@ def make_node(tmpdir, name="test", secret="", port=0):
     """创建一个 P2P 节点，收件箱在 tmpdir 下。
 
     enable_mdns=False：只起 TCP 层，手动注册对端。测试不碰真实 mDNS，
-    否则测试节点会互相发现、局域网里真实运行的虫洞也会污染结果。
+    否则测试节点会互相发现、局域网里真实运行的墨洞也会污染结果。
     """
     inbox = os.path.join(tmpdir, name + "_inbox")
     cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name,
@@ -113,7 +113,7 @@ def test_direct_transfer():
         # 发送文件
         src = os.path.join(tmpdir, "hello.txt")
         with open(src, "w", encoding="utf-8") as f:
-            f.write("Hello from Alice!\n你好，虫洞！")
+            f.write("Hello from Alice!\n你好，墨洞！")
 
         ok = node_a.send_file(src)
         check("send_file 返回 True", ok)
@@ -124,7 +124,7 @@ def test_direct_transfer():
         if recv:
             with open(recv, "r", encoding="utf-8") as f:
                 content = f.read()
-            check("文件内容一致", content == "Hello from Alice!\n你好，虫洞！")
+            check("文件内容一致", content == "Hello from Alice!\n你好，墨洞！")
 
         node_a.stop()
         node_b.stop()
@@ -564,6 +564,183 @@ def test_progress_callback():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试 13: 分块加密(WHE2)大文件往返 ----------
+def test_chunked_encryption_roundtrip():
+    print("\n=== 测试 13: 分块加密大文件往返 ===")
+    import wormhole.p2p as p2p_mod
+    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    saved_threshold = p2p_mod._CHUNK_ENC_THRESHOLD
+    try:
+        # 把分块阈值压到 256KB，1.5MB 文件即可触发 chunked 路径
+        p2p_mod._CHUNK_ENC_THRESHOLD = 256 * 1024
+        secret = "chunk-secret"
+        node_a = make_node(tmpdir, "Alice", secret=secret)
+        node_b = make_node(tmpdir, "Bob", secret=secret)
+        node_a.start()
+        node_b.start()
+        time.sleep(0.3)
+
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        src = os.path.join(tmpdir, "big_encrypted.bin")
+        payload = os.urandom(1536 * 1024)   # 1.5MB 随机数据
+        with open(src, "wb") as f:
+            f.write(payload)
+
+        ok = node_a.send_file(src)
+        check("分块加密发送成功", ok)
+        recv = wait_for_file(node_b.cfg.inbox, "big_encrypted.bin", timeout=10)
+        check("接收成功", recv is not None)
+        with open(recv, "rb") as f:
+            check("解密后内容逐字节一致", f.read() == payload)
+
+        node_a.stop()
+        node_b.stop()
+    finally:
+        p2p_mod._CHUNK_ENC_THRESHOLD = saved_threshold
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------- 测试 14: 分块加密的篡改/重排检测 ----------
+def test_chunked_crypto_tamper():
+    print("\n=== 测试 14: 分块流篡改/重排检测 ===")
+    import io
+    from wormhole.crypto import encrypt_chunks, ChunkedDecryptor, chunked_wire_size, CHUNK_SIZE
+
+    secret = "tamper-secret"
+    plain = os.urandom(CHUNK_SIZE + 12345)   # 两块
+    blobs = list(encrypt_chunks(secret, io.BytesIO(plain)))
+    check("流头 + 两帧", len(blobs) == 3)
+    wire = b"".join(blobs)
+    check("线上长度与预计算一致", len(wire) == chunked_wire_size(len(plain)))
+
+    def frames(bs):
+        """[(len_bytes, ct), ...]"""
+        out = []
+        for b in bs[1:]:
+            out.append((b[:4], b[4:]))
+        return out
+
+    # 正常解密
+    dec = ChunkedDecryptor(secret, blobs[0])
+    got = b"".join(dec.decrypt_chunk(ct) for _, ct in frames(blobs))
+    check("正常解密一致", got == plain)
+
+    # 篡改一个字节 -> 该块解密失败
+    dec2 = ChunkedDecryptor(secret, blobs[0])
+    _, ct0 = frames(blobs)[0]
+    bad = bytearray(ct0); bad[100] ^= 0x01
+    check("篡改块被拒", dec2.decrypt_chunk(bytes(bad)) is None)
+
+    # 交换两块顺序 -> 第一块就失败(nonce/AAD 序号不匹配)
+    dec3 = ChunkedDecryptor(secret, blobs[0])
+    _, ct1 = frames(blobs)[1]
+    check("重排块被拒", dec3.decrypt_chunk(ct1) is None)
+
+    # 口令不对 -> 失败
+    dec4 = ChunkedDecryptor("wrong", blobs[0])
+    check("错误口令被拒", dec4.decrypt_chunk(ct0) is None)
+
+
+# ---------- 测试 15: 发送队列串行 + 批量聚合 ----------
+def test_send_queue():
+    print("\n=== 测试 15: 发送队列 ===")
+    from wormhole.pet import SendQueue
+
+    sent_order = []
+    batch_results = []
+    done = threading.Event()
+
+    def fake_send(path):
+        sent_order.append(path)
+        time.sleep(0.05)
+        return path != "b"        # b 发送失败
+
+    q = SendQueue(fake_send,
+                  on_batch_done=lambda ok, total: (batch_results.append((ok, total)),
+                                                   done.set()))
+    for p in ("a", "b", "c"):
+        q.put(p)
+    check("批量完成回调触发", done.wait(timeout=5))
+    check("按放入顺序串行发送", sent_order == ["a", "b", "c"])
+    check("聚合结果 2/3", batch_results == [(2, 3)])
+
+
+# ---------- 测试 16: 仅接收目标设备(trusted_only) ----------
+def test_trusted_only():
+    print("\n=== 测试 16: 仅接收目标设备 ===")
+    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    try:
+        node_a = make_node(tmpdir, "Alice")
+        node_b = P2PNode(P2PConfig(inbox=os.path.join(tmpdir, "Bob_inbox"),
+                                   peer_name="Bob", enable_mdns=False,
+                                   trusted_only=True))
+        node_a.start()
+        node_b.start()
+        time.sleep(0.3)
+
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        src = os.path.join(tmpdir, "hello.txt")
+        with open(src, "w") as f:
+            f.write("hi")
+
+        # B 没选中任何目标 -> 拒收 A(发送方能感知失败)
+        ok = node_a.send_file(src)
+        check("B 未选目标时 A 发送失败", ok is False)
+        check("B 没收到文件", not os.path.exists(os.path.join(node_b.cfg.inbox, "hello.txt")))
+
+        # B 选中 A(地址 127.0.0.1) -> 放行
+        node_b._on_peer_added("Alice", "127.0.0.1", node_a.actual_port)
+        node_b.select_peer("Alice")
+        ok2 = node_a.send_file(src)
+        check("B 选中 A 后发送成功", ok2 is True)
+        recv = wait_for_file(node_b.cfg.inbox, "hello.txt")
+        check("B 收到文件", recv is not None)
+
+        node_a.stop()
+        node_b.stop()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------- 测试 17: 多地址回退连接 ----------
+def test_multi_host_fallback():
+    print("\n=== 测试 17: 多地址回退 ===")
+    import wormhole.p2p as p2p_mod
+    tmpdir = tempfile.mkdtemp(prefix="wormhole_test_")
+    saved_timeout = p2p_mod._CONNECT_TIMEOUT
+    try:
+        p2p_mod._CONNECT_TIMEOUT = 1   # 让不可达地址快速超时
+        node_a = make_node(tmpdir, "Alice")
+        node_b = make_node(tmpdir, "Bob")
+        node_a.start()
+        node_b.start()
+        time.sleep(0.3)
+
+        # 第一个地址不可达(TEST-NET-3 保留段)，第二个才是真的
+        node_a._on_peer_added("Bob", "203.0.113.1", node_b.actual_port,
+                              hosts=["203.0.113.1", "127.0.0.1"])
+        node_a.select_peer("Bob")
+
+        src = os.path.join(tmpdir, "fallback.txt")
+        with open(src, "w") as f:
+            f.write("via second address")
+
+        ok = node_a.send_file(src)
+        check("第一地址失败后回退第二地址成功", ok is True)
+        recv = wait_for_file(node_b.cfg.inbox, "fallback.txt")
+        check("文件送达", recv is not None)
+
+        node_a.stop()
+        node_b.stop()
+    finally:
+        p2p_mod._CONNECT_TIMEOUT = saved_timeout
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -579,6 +756,11 @@ if __name__ == "__main__":
         test_duplicate_names_and_service_removal,
         test_ack_reports_decrypt_failure,
         test_progress_callback,
+        test_chunked_encryption_roundtrip,
+        test_chunked_crypto_tamper,
+        test_send_queue,
+        test_trusted_only,
+        test_multi_host_fallback,
     ]
     for _t in _tests:
         try:
