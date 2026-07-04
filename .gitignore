@@ -13,3 +13,4 @@ received/
 
 # 旧版 FTPS 证书(已不使用，私钥绝不进仓库)
 certs/
+.idea/
