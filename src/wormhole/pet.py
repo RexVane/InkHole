@@ -24,6 +24,7 @@ pet.py
 from __future__ import annotations
 import os
 import sys
+import json
 import argparse
 
 from .p2p import P2PNode, P2PConfig
@@ -46,35 +47,107 @@ def _qml_path() -> str:
 _QML_FILE = _qml_path()
 
 
+def _windows_desktop() -> str:
+    """Windows 真实桌面目录：经 SHGetKnownFolderPath 查询。
+
+    桌面可能被 OneDrive/域策略重定向到任意位置，不能假设 ~/Desktop
+    或 ~/OneDrive/Desktop。查询失败回退 ~/Desktop。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+        guid = _GUID(0xB4BFCC3A, 0xDB2C, 0x424C,
+                     (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41))
+        path_ptr = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(guid), 0, None, ctypes.byref(path_ptr)) == 0:
+            desktop = path_ptr.value
+            ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+            if desktop:
+                return desktop
+    except Exception:
+        pass
+    return os.path.expanduser(os.path.join("~", "Desktop"))
+
+
 def _default_inbox() -> str:
     """默认收件箱目录,按平台给出常用位置(均可被 --inbox 覆盖)。
 
-    Windows: ~/OneDrive/Desktop/wormhole  (本机即 C:\\Users\\guica\\OneDrive\\Desktop\\wormhole)
-    macOS:   ~/Documents/wormhole         (本机即 /Users/kaijimima/Documents/wormhole)
+    Windows: <真实桌面>/wormhole (桌面可能被 OneDrive 重定向,动态查询)
+    macOS:   ~/Documents/wormhole
     其他:    ~/Wormhole/收件箱
     """
     if sys.platform == "win32":
-        return os.path.expanduser(os.path.join("~", "OneDrive", "Desktop", "wormhole"))
+        return os.path.join(_windows_desktop(), "wormhole")
     if sys.platform == "darwin":
         return os.path.expanduser(os.path.join("~", "Documents", "wormhole"))
     return os.path.expanduser(os.path.join("~", "Wormhole", "收件箱"))
 
 
+# ---------- 设置持久化 ----------
+# 双击 exe 的用户没有命令行：名字/口令/收件箱改一次就记住。
+# 显式 CLI 参数 > 配置文件 > 默认值；显式参数会写回配置(下次不带参数也生效)。
+
+def _config_path() -> str:
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "Wormhole", "config.json")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Wormhole/config.json")
+    return os.path.expanduser("~/.config/wormhole/config.json")
+
+
+def _load_saved_config() -> dict:
+    try:
+        with open(_config_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_config(cfg: P2PConfig) -> None:
+    path = _config_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"name": cfg.peer_name, "secret": cfg.secret,
+                       "inbox": cfg.inbox, "port": cfg.listen_port},
+                      f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
 def _build_config(argv=None):
+    saved = _load_saved_config()
     ap = argparse.ArgumentParser(description="虫洞桌宠挂件(P2P 局域网直连，无需服务器)")
-    ap.add_argument("--inbox", default=_default_inbox(),
-                    help="收件箱目录(收到的文件放这;默认随平台,见 --help)")
-    ap.add_argument("--port", type=int, default=0,
+    ap.add_argument("--inbox", default=None,
+                    help="收件箱目录(收到的文件放这;默认随平台,改一次会记住)")
+    ap.add_argument("--port", type=int, default=None,
                     help="P2P 监听端口(0=操作系统自动分配)")
-    ap.add_argument("--name", default="",
+    ap.add_argument("--name", default=None,
                     help="本机显示名(默认主机名；右键菜单里对端看到的就是这个名字)")
-    ap.add_argument("--secret", default="",
-                    help="端到端加密口令(两台电脑必须一致；需 cryptography 库)")
+    ap.add_argument("--secret", default=None,
+                    help="端到端加密口令(两台设备必须一致；需 cryptography 库)")
     ap.add_argument("--size", type=int, default=0,
                     help="挂件边长像素(0=随屏幕自适应，约为系统图标基准的 1.5 倍)")
     args = ap.parse_args(argv)
-    cfg = P2PConfig(inbox=args.inbox, listen_port=args.port,
-                    peer_name=args.name, secret=args.secret)
+
+    inbox = args.inbox if args.inbox is not None else str(saved.get("inbox") or "") or _default_inbox()
+    try:
+        port = args.port if args.port is not None else int(saved.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    name = args.name if args.name is not None else str(saved.get("name") or "")
+    secret = args.secret if args.secret is not None else str(saved.get("secret") or "")
+
+    cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret)
+    if any(a is not None for a in (args.inbox, args.port, args.name, args.secret)):
+        _save_config(cfg)   # 显式 CLI 参数视为用户意图，记住
     return cfg, args.size
 
 
@@ -144,20 +217,6 @@ def _src_dir() -> str:
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 
-def _startup_args_str(cfg: P2PConfig) -> str:
-    """从配置重建 CLI 参数字符串(用于写进自启脚本)。"""
-    parts = []
-    if cfg.peer_name:
-        parts.append(f'--name "{cfg.peer_name}"')
-    if cfg.secret:
-        parts.append(f'--secret "{cfg.secret}"')
-    if cfg.inbox:
-        parts.append(f'--inbox "{cfg.inbox}"')
-    if cfg.listen_port:
-        parts.append(f'--port {cfg.listen_port}')
-    return " ".join(parts)
-
-
 def _startup_script_path() -> str:
     """开机自启脚本/配置文件路径(跨平台)。"""
     if sys.platform == "win32":
@@ -183,26 +242,29 @@ def is_autostart_enabled() -> bool:
 
 
 def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
-    """设置或取消开机自启，返回操作后的状态。"""
+    """设置或取消开机自启，返回操作后的状态。
+
+    自启项不带任何参数：名字/口令/收件箱都在配置文件(config.json)里，
+    启动时自动读取——口令不会明文进注册表/自启脚本。
+    """
     path = _startup_script_path()
     if enabled:
         src = _src_dir()
         proj = os.path.dirname(src)
         python = sys.executable
-        args = _startup_args_str(cfg)
         frozen = getattr(sys, "frozen", False)
 
         if sys.platform == "win32":
             if frozen:
                 # 打包 exe：注册表直接指向 exe
-                cmd = f'"{python}" {args}'
+                cmd = f'"{python}"'
             else:
                 # 源码运行：生成 .bat 脚本
                 content = "\r\n".join([
                     "@echo off",
                     f'cd /d "{proj}"',
                     f'set "PYTHONPATH={src}"',
-                    f'"{python}" -m wormhole.pet {args}',
+                    f'"{python}" -m wormhole.pet',
                 ])
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
@@ -257,9 +319,9 @@ def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
         else:
             # Linux: .desktop
             if frozen:
-                exec_line = f'"{python}" {args}'
+                exec_line = f'"{python}"'
             else:
-                exec_line = f'sh -c \'cd "{proj}" &amp;&amp; PYTHONPATH="{src}" "{python}" -m wormhole.pet {args}\''
+                exec_line = f'sh -c \'cd "{proj}" && PYTHONPATH="{src}" "{python}" -m wormhole.pet\''
             content = f"""[Desktop Entry]
 Type=Application
 Name=Wormhole Pet
@@ -402,6 +464,13 @@ def main(argv=None) -> None:
             act_inbox = menu.addAction("更换收件箱...")
             act_inbox.triggered.connect(bridge.chooseInbox)
 
+            act_name = menu.addAction("设备名称...")
+            act_name.triggered.connect(bridge.renameDevice)
+
+            secret_on = bool(bridge.node.cfg.secret)
+            act_secret = menu.addAction("加密口令..." + ("　🔒" if secret_on else ""))
+            act_secret.triggered.connect(bridge.changeSecret)
+
             # 开机自启（可勾选）
             act_autostart = menu.addAction("开机自启")
             act_autostart.setCheckable(True)
@@ -446,14 +515,42 @@ def main(argv=None) -> None:
         def __init__(self, cfg: P2PConfig):
             super().__init__()
             self._tray_menu = None        # 由 _setup_tray 注入:桌宠右键时弹出
-            self.node = P2PNode(
+            self.node = self._make_node(cfg)
+            self.node.start()
+
+        def _make_node(self, cfg: P2PConfig) -> P2PNode:
+            """用统一的回调钩子构造 P2P 节点(初始启动与改设置重启共用)。"""
+            return P2PNode(
                 cfg,
                 on_sent=lambda n: self.absorb.emit(n),
                 on_received=lambda p: self.emit_out.emit(os.path.basename(p)),
                 on_status=lambda s: self._route_status(s),
                 on_peers_changed=lambda: self.peersChanged.emit(),
+                on_progress=lambda kind, name, done, total: self.status.emit(
+                    f"{'↑' if kind == 'send' else '↓'} {name} "
+                    f"{done * 100 // total if total else 100}%"),
             )
+
+        def _apply_settings(self, peer_name: str | None = None,
+                            secret: str | None = None) -> None:
+            """改名/改口令：写回配置并重启 P2P 节点(mDNS 需重新注册)。"""
+            cfg = self.node.cfg
+            self.node.stop()
+            if peer_name is not None:
+                cfg.peer_name = peer_name
+            if secret is not None:
+                cfg.secret = secret
+            _save_config(cfg)
+            try:
+                self.node = self._make_node(cfg)
+            except SystemExit:
+                # 设了口令但没装 cryptography：退回不加密，保持能用
+                cfg.secret = ""
+                _save_config(cfg)
+                self.node = self._make_node(cfg)
+                self.status.emit("缺少 cryptography 库，加密未开启")
             self.node.start()
+            self.peersChanged.emit()
 
         def _route_status(self, msg: str) -> None:
             """出错信息走 persistentHint(持续显示)，普通信息走 hint(2.2s 消失)。"""
@@ -522,7 +619,39 @@ def main(argv=None) -> None:
             if directory:
                 self.node.cfg.inbox = directory
                 os.makedirs(directory, exist_ok=True)
+                _save_config(self.node.cfg)   # 记住，重启后仍生效
                 self.status.emit(f"收件箱: {os.path.basename(directory)}")
+
+        @Slot()
+        def renameDevice(self):
+            """改本机显示名(对端右键菜单里看到的名字)。"""
+            if not _HAS_WIDGETS:
+                self.status.emit("无法打开对话框")
+                return
+            from PySide6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getText(
+                None, "设备名称", "对端设备看到的名字：",
+                text=self.node.cfg.peer_name)
+            if ok:
+                name = name.strip()
+                if name and name != self.node.cfg.peer_name:
+                    self._apply_settings(peer_name=name)
+                    self.status.emit(f"设备名: {name}")
+
+        @Slot()
+        def changeSecret(self):
+            """设置/修改/清除端到端加密口令。"""
+            if not _HAS_WIDGETS:
+                self.status.emit("无法打开对话框")
+                return
+            from PySide6.QtWidgets import QInputDialog, QLineEdit
+            secret, ok = QInputDialog.getText(
+                None, "端到端加密口令",
+                "两台设备口令必须一致；留空关闭加密：",
+                QLineEdit.Password, self.node.cfg.secret)
+            if ok and secret != self.node.cfg.secret:
+                self._apply_settings(secret=secret)
+                self.status.emit("已开启端到端加密" if secret else "已关闭加密")
 
         @Slot(result=bool)
         def isAutoStart(self) -> bool:

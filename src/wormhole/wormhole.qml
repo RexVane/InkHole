@@ -274,8 +274,10 @@ Window {
         function onErrorState(msg) { win.persistentHint = msg }
     }
 
-    // hint 非空时自动倒计时清除，临时提示消失后回到持续状态
-    Timer { interval: 2200; running: win.hint.length > 0; onTriggered: win.hint = "" }
+    // hint 非空时倒计时清除；每次内容变化都重置倒计时——
+    // 连续刷新的进度提示(↑ 文件 45%)不会中途被清掉闪烁
+    Timer { id: hintClear; interval: 2200; onTriggered: win.hint = "" }
+    onHintChanged: { if (win.hint.length > 0) hintClear.restart(); else hintClear.stop() }
 
     // 启动后初始化持续状态(搜索设备中…/已发现N台设备)
     Timer {
