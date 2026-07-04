@@ -1,7 +1,8 @@
 import QtQuick
 import QtQuick.Window
 
-// 虫洞桌宠：黑洞吞噬感 + 乳白色吸积盘，小图标大小，无边框透明置顶可拖动。
+// 墨洞桌宠：墨黑核心 + 青色视界光晕，双层吸积弧缓慢反向旋转，
+// 传输时外圈亮起青色进度环。小图标大小，无边框透明置顶可拖动。
 Window {
     id: win
     // 尺寸由 Python 按屏幕自适应传入(petSizePx，约系统图标基准的 1.5 倍)；未注入时回退 140
@@ -15,9 +16,13 @@ Window {
     x: Screen.width - win.petSize
     y: Math.round(win.petSize * 0.8)
 
-    property real scaleF: 1.0         // 整体缩放(吸入/喷出时放大)
-    property string hint: ""          // 临时提示文字(2.2s 后消失)
-    property string persistentHint: "" // 持续状态(设备搜索/发现数量，始终显示)
+    property real scaleF: 1.0          // 整体缩放(吸入/喷出时放大)
+    property string hint: ""           // 临时提示文字(2.2s 后消失)
+    property string persistentHint: "" // 持续状态(错误信息等，始终显示)
+
+    // ---- 传输进度环 ----
+    property real transferPct: -1      // -1=无传输; 0-100 显示进度环
+    property string transferKind: ""   // "send"=吞入 / "recv"=吐出
 
     // ---- 边缘吸附(悬浮球)状态 ----
     property int edge: -1             // 贴的是哪条边：-1未贴 0左 1右 2上 3下
@@ -58,13 +63,13 @@ Window {
         else if (win.edge === 2) win.y = 0;
         else if (win.edge === 3) win.y = Screen.height - win.petSize;
     }
-    // 探出后无人理睬则自动收回(鼠标不在其上、且未在拖动)
+    // 探出后无人理睬则自动收回(鼠标不在其上、且未在拖动、且没在传文件)
     Timer {
         id: autoHide
         interval: 800
-        onTriggered: if (win.edge >= 0 && !win.collapsed && !dragArea.containsMouse) win.collapse()
+        onTriggered: if (win.edge >= 0 && !win.collapsed && !dragArea.containsMouse
+                         && win.transferPct < 0) win.collapse()
     }
-
 
     // 吸入/喷出时的放大-回弹动画
     SequentialAnimation {
@@ -73,10 +78,7 @@ Window {
         NumberAnimation { target: win; property: "scaleF"; to: 1.0; duration: 360; easing.type: Easing.OutBack }
     }
 
-    // ===== 玻璃碎片系统:文件吸入时碎成玻璃片卷入黑洞;吐出时碎片飞拢拼合 =====
-    // 设计:一个文件 = N 块半透明玻璃碎片,平时拼成一个方形"文件";
-    //   吸入 -> 每片各自旋转、缩小、螺旋卷向黑洞中心;
-    //   吐出 -> 每片从中心四散弹出 -> 旋转放大飞回原位,拼回完整文件。
+    // ===== 玻璃碎片系统:文件吸入时碎成青玻璃片卷入墨洞;吐出时碎片飞拢拼合 =====
     property int shardCols: 4
     property int shardRows: 4
     property real fileIconSize: Math.round(win.width * 0.30)   // 拼合后"文件"的边长
@@ -97,29 +99,25 @@ Window {
                 id: shard
                 property int col: index % win.shardCols
                 property int row: Math.floor(index / win.shardCols)
-                // 每片在"完整文件"里的原位
                 property real homeX: col * (shardField.width / win.shardCols)
                 property real homeY: row * (shardField.height / win.shardRows)
-                // 每片被吸时的随机飞散方向(用 index 生成稳定的伪随机角度/距离)
                 property real ang: (index * 137.5) * Math.PI / 180.0
-                property real spin: ((index % 3) - 1) * 540      // 旋转量
+                property real spin: ((index % 3) - 1) * 540
                 property real fling: shardField.width * (0.6 + (index % 5) * 0.12)
 
                 width: shardField.width / win.shardCols - 1
                 height: shardField.height / win.shardRows - 1
                 radius: 1
                 antialiasing: true
-                // 玻璃质感:淡青白半透明 + 细边
-                color: Qt.rgba(0.88, 0.93, 1.0, 0.42)
-                border.color: Qt.rgba(1, 1, 1, 0.65)
+                // 青玻璃质感:半透明青白 + 细边
+                color: Qt.rgba(0.55, 0.95, 0.85, 0.40)
+                border.color: Qt.rgba(0.72, 1.0, 0.94, 0.62)
                 border.width: 1
 
-                // p=进度(0完整拼合 -> 1碎裂卷入黑洞中心)。位置在"原位"与"中心"间插值,
-                // 叠加按 ang 的横向散开,使吸入/吐出有螺旋飞散感而非直线收拢。
                 property real p: win.shardProgress
-                property real cx: shardField.width / 2 - width / 2     // 碎片场中心
+                property real cx: shardField.width / 2 - width / 2
                 property real cy: shardField.height / 2 - height / 2
-                property real swirl: Math.sin(p * Math.PI) * width * 0.9   // 中途最大散开,两端归零
+                property real swirl: Math.sin(p * Math.PI) * width * 0.9
                 x: homeX + (cx - homeX) * p + Math.cos(ang) * swirl
                 y: homeY + (cy - homeY) * p + Math.sin(ang) * swirl
                 rotation: spin * p
@@ -129,14 +127,14 @@ Window {
         }
     }
 
-    // 吸入:碎裂 0 -> 1(完整文件被撕碎卷入黑洞)
+    // 吸入:碎裂 0 -> 1(完整文件被撕碎卷入墨洞)
     SequentialAnimation {
         id: shatterAbsorb
         ScriptAction { script: { win.shardEmit = false; shardField.visible = true } }
         NumberAnimation { target: win; property: "shardProgress"; from: 0; to: 1; duration: 620; easing.type: Easing.InCubic }
         ScriptAction { script: shardField.visible = false }
     }
-    // 吐出:拼合 1 -> 0(碎片从黑洞飞回拼成完整文件),停顿后淡出
+    // 吐出:拼合 1 -> 0(碎片从墨洞飞回拼成完整文件),停顿后淡出
     SequentialAnimation {
         id: shatterEmit
         ScriptAction { script: { win.shardEmit = true; win.shardProgress = 1; shardField.visible = true } }
@@ -160,11 +158,11 @@ Window {
     // 收到对端文件时:若缩在边上,先探出,等滑回完整再播吐出动画(否则动画在屏幕外看不见)
     Timer {
         id: emitDelay
-        interval: 300                 // 略大于探出动画时长(260ms),确保已完整露出
+        interval: 300
         onTriggered: { win.playEmit(); if (win.edge >= 0) autoHide.restart() }
     }
     function emitWhenVisible() {
-        if (win.collapsed) { win.expand(); emitDelay.restart(); }   // 先探出,延后播
+        if (win.collapsed) { win.expand(); emitDelay.restart(); }
         else { win.playEmit(); if (win.edge >= 0) autoHide.restart(); }
     }
 
@@ -176,7 +174,7 @@ Window {
             xScale: win.scaleF; yScale: win.scaleF
         }
 
-        // 黑洞主体：中间黑向外围平滑渐变
+        // 墨洞主体：墨黑核心 -> 暗青过渡 -> 青色视界光晕 -> 透明
         Canvas {
             id: holeCanvas
             anchors.fill: parent
@@ -185,30 +183,123 @@ Window {
                 var w = width, h = height;
                 var cx = w / 2, cy = h / 2;
                 ctx.clearRect(0, 0, w, h);
-                var R = Math.min(w, h) * 0.48;   // 黑洞撑满挂件窗口(与窗口同尺寸感)
+                var R = Math.min(w, h) * 0.48;
 
-                // 中心纯黑 -> 暗过渡 -> 乳白光晕 -> 边缘完全透明
                 var base = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
                 base.addColorStop(0.00, "rgba(0,0,0,1.0)");
-                base.addColorStop(0.42, "rgba(3,3,8,1.0)");          // 深黑视界
-                base.addColorStop(0.60, "rgba(72,68,86,0.75)");      // 暗->亮过渡带
-                base.addColorStop(0.78, "rgba(238,236,244,0.40)");   // 乳白光晕
-                base.addColorStop(1.00, "rgba(255,255,255,0.0)");    // 淡出到透明
+                base.addColorStop(0.42, "rgba(2,8,7,1.0)");          // 深墨视界
+                base.addColorStop(0.60, "rgba(10,42,37,0.85)");      // 暗青过渡带
+                base.addColorStop(0.76, "rgba(88,230,200,0.42)");    // 青色光晕
+                base.addColorStop(0.90, "rgba(30,80,70,0.16)");
+                base.addColorStop(1.00, "rgba(88,230,200,0.0)");     // 淡出到透明
                 ctx.fillStyle = base;
                 ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.fill();
             }
         }
 
-        // 提示文字：临时提示优先，消失后显示持续状态(设备数/搜索中)
-        Text {
+        // 吸积弧·内层：两段青弧顺时针缓转(不对称才看得出旋转)
+        Item {
+            id: disk1
+            anchors.fill: parent
+            Canvas {
+                anchors.fill: parent
+                onPaint: {
+                    var ctx = getContext("2d");
+                    var w = width, h = height, cx = w / 2, cy = h / 2;
+                    ctx.clearRect(0, 0, w, h);
+                    var r = Math.min(w, h) * 0.335;
+                    ctx.lineCap = "round";
+                    ctx.lineWidth = Math.max(1.5, w * 0.020);
+                    ctx.strokeStyle = "rgba(120,235,205,0.30)";
+                    ctx.beginPath(); ctx.arc(cx, cy, r, 0.3, 2.1); ctx.stroke();
+                    ctx.lineWidth = Math.max(1, w * 0.012);
+                    ctx.strokeStyle = "rgba(120,235,205,0.16)";
+                    ctx.beginPath(); ctx.arc(cx, cy, r * 0.88, 3.4, 4.6); ctx.stroke();
+                }
+            }
+            RotationAnimation on rotation {
+                from: 0; to: 360; duration: 46000
+                loops: Animation.Infinite; running: win.visible
+            }
+        }
+        // 吸积弧·外层：一段更淡的弧逆时针更慢
+        Item {
+            id: disk2
+            anchors.fill: parent
+            Canvas {
+                anchors.fill: parent
+                onPaint: {
+                    var ctx = getContext("2d");
+                    var w = width, h = height, cx = w / 2, cy = h / 2;
+                    ctx.clearRect(0, 0, w, h);
+                    var r = Math.min(w, h) * 0.415;
+                    ctx.lineCap = "round";
+                    ctx.lineWidth = Math.max(1, w * 0.010);
+                    ctx.strokeStyle = "rgba(140,240,215,0.13)";
+                    ctx.beginPath(); ctx.arc(cx, cy, r, 1.1, 3.5); ctx.stroke();
+                }
+            }
+            RotationAnimation on rotation {
+                from: 360; to: 0; duration: 71000
+                loops: Animation.Infinite; running: win.visible
+            }
+        }
+
+        // 光晕呼吸：极缓的透明度起伏，让洞"活着"
+        SequentialAnimation {
+            running: win.visible
+            loops: Animation.Infinite
+            NumberAnimation { target: disk1; property: "opacity"; from: 1.0; to: 0.55; duration: 2600; easing.type: Easing.InOutSine }
+            NumberAnimation { target: disk1; property: "opacity"; from: 0.55; to: 1.0; duration: 2600; easing.type: Easing.InOutSine }
+        }
+
+        // 传输进度环：青色圆弧，吞入顺时针填充、吐出同样从顶部起
+        Canvas {
+            id: ring
+            anchors.fill: parent
+            visible: win.transferPct >= 0
+            z: 6
+            onPaint: {
+                var ctx = getContext("2d");
+                var w = width, h = height, cx = w / 2, cy = h / 2;
+                ctx.clearRect(0, 0, w, h);
+                if (win.transferPct < 0) return;
+                var r = Math.min(w, h) * 0.455;
+                var start = -Math.PI / 2;
+                // 底环(暗)
+                ctx.lineWidth = Math.max(2, w * 0.030);
+                ctx.lineCap = "round";
+                ctx.strokeStyle = "rgba(40,90,80,0.35)";
+                ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+                // 进度(亮青)
+                ctx.strokeStyle = "rgba(96,240,208,0.95)";
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, start, start + Math.PI * 2 * (win.transferPct / 100));
+                ctx.stroke();
+            }
+        }
+
+        // 提示药丸：半透明墨底 + 细青边，替代裸描边文字
+        Rectangle {
+            id: hintPill
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.top: parent.top
-            anchors.topMargin: 4
-            text: win.hint.length > 0 ? win.hint : win.persistentHint
-            color: "white"
-            font.pixelSize: Math.max(9, Math.round(win.width * 0.08))
-            style: Text.Outline; styleColor: "#000000"
-            visible: text.length > 0
+            anchors.topMargin: 2
+            width: hintText.implicitWidth + 14
+            height: hintText.implicitHeight + 6
+            radius: height / 2
+            color: "#d90a1210"
+            border.color: "#4058e6c8"
+            border.width: 1
+            visible: hintText.text.length > 0
+            z: 7
+            Text {
+                id: hintText
+                anchors.centerIn: parent
+                text: win.hint.length > 0 ? win.hint : win.persistentHint
+                color: "#d8fff8"
+                font.pixelSize: Math.max(9, Math.round(win.width * 0.075))
+            }
         }
     }
 
@@ -228,22 +319,20 @@ Window {
         }
         onReleased: function(m) {
             win.dragging = false;
-            win.decideSnap();      // 松手:靠近边缘则吸附收起,否则自由浮动
+            win.decideSnap();
         }
         onClicked: function(m) {
-            if (m.button === Qt.RightButton) bridge.showMenu();   // 右键弹菜单(发送目标/收件箱/自启/状态/退出)
+            if (m.button === Qt.RightButton) bridge.showMenu();   // 右键弹菜单
         }
-        // 鼠标移到收起的窄条上 -> 探出恢复
         onEntered: { if (win.collapsed) win.expand() }
-        // 鼠标离开且已贴边 -> 启动倒计时自动收回
         onExited: { if (win.edge >= 0 && !win.dragging) autoHide.restart() }
     }
 
 
-    // 接收桌面拖来的文件 -> 吸入动画 -> 发送；拖文件靠近收起的窄条时自动探出
+    // 接收桌面拖来的文件 -> 吸入动画 -> 入发送队列；拖文件靠近收起的窄条时自动探出
     DropArea {
         anchors.fill: parent
-        onEntered: { if (win.collapsed) win.expand(); win.hint = "松手吸入" }
+        onEntered: { if (win.collapsed) win.expand(); win.hint = "松手吞入" }
         onExited: { win.hint = ""; if (win.edge >= 0 && !dragArea.containsMouse) autoHide.restart() }
         onDropped: function(drop) {
             win.hint = ""
@@ -251,7 +340,7 @@ Window {
                 if (bridge.hasTarget()) {
                     for (var i = 0; i < drop.urls.length; i++)
                         bridge.dropFile(drop.urls[i].toString());
-                    win.playAbsorb(drop.x, drop.y);   // 有目标才播吸入动画
+                    win.playAbsorb(drop.x, drop.y);
                 } else {
                     win.hint = "右键选择目标设备"
                 }
@@ -261,17 +350,31 @@ Window {
     }
 
 
-    // 来自 Python 的事件 -> 提示/动画(吸入动画已在松手时播放，这里只确认结果)
+    // 来自 Python 的事件 -> 提示/动画
     Connections {
         target: bridge
-        function onAbsorb(name) { win.hint = "吸入 " + name }
+        function onAbsorb(name) { win.hint = "吞入 " + name }
         function onEmit_out(name) {
             win.hint = "吐出 " + name;
-            win.emitWhenVisible();      // 若缩在边上,先探出再播吐出动画,保证可见
+            win.emitWhenVisible();
         }
         function onStatus(s) { win.hint = s }
         function onPeersChanged() { win.persistentHint = bridge.peerStatus() }
         function onErrorState(msg) { win.persistentHint = msg }
+        function onProgress(kind, pct) {
+            win.transferKind = kind;
+            win.transferPct = pct;
+            ring.requestPaint();
+            if (win.collapsed) win.expand();          // 传输中探出来给用户看进度
+            if (pct >= 100) ringHide.restart();
+        }
+    }
+
+    // 传完后进度环稍作停留再消失
+    Timer {
+        id: ringHide
+        interval: 900
+        onTriggered: { win.transferPct = -1; if (win.edge >= 0) autoHide.restart() }
     }
 
     // hint 非空时倒计时清除；每次内容变化都重置倒计时——
@@ -279,7 +382,7 @@ Window {
     Timer { id: hintClear; interval: 2200; onTriggered: win.hint = "" }
     onHintChanged: { if (win.hint.length > 0) hintClear.restart(); else hintClear.stop() }
 
-    // 启动后初始化持续状态(搜索设备中…/已发现N台设备)
+    // 启动后初始化持续状态
     Timer {
         interval: 300; running: true; repeat: false
         onTriggered: win.persistentHint = bridge.peerStatus()
@@ -289,6 +392,6 @@ Window {
     Timer {
         id: startupSnap
         interval: 700; running: true; repeat: false
-        onTriggered: { win.edge = 1; win.collapse(); }   // edge=1 右边
+        onTriggered: { win.edge = 1; win.collapse(); }
     }
 }

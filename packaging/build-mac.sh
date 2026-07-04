@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# macOS 上构建虫洞桌宠.app(单文件 onefile -> .app 包)。
+# macOS 上构建墨洞桌宠.app(单文件 onefile -> .app 包)。
 # 用法:bash packaging/build-mac.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -15,6 +15,6 @@ python3 -c "import AppKit" 2>/dev/null || pip3 install pyobjc-framework-Cocoa ||
 echo "==> 打包"
 pyinstaller wormhole-pet.spec --noconfirm --clean
 
-echo "==> 完成:dist/虫洞桌宠.app"
+echo "==> 完成:dist/墨洞桌宠.app"
 echo "   运行示例:"
-echo "   ./dist/虫洞桌宠.app/Contents/MacOS/虫洞桌宠 --name 我的Mac --secret '口令'"
+echo "   ./dist/墨洞桌宠.app/Contents/MacOS/墨洞桌宠 --name 我的Mac --secret '口令'"

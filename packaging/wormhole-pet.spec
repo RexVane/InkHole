@@ -1,13 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-虫洞桌宠轻量 app 打包规格(跨平台:Windows .exe / macOS .app,均单文件 onefile)。
+墨洞桌宠轻量 app 打包规格(跨平台:Windows .exe / macOS .app,均单文件 onefile)。
 
 构建:
     Windows:  cd packaging && pyinstaller wormhole-pet.spec --noconfirm
     macOS:    cd packaging && pyinstaller wormhole-pet.spec --noconfirm
 产物:
-    Windows:  packaging/dist/虫洞桌宠.exe        (双击即用,免装 Python)
-    macOS:    packaging/dist/虫洞桌宠.app        (拖进"应用程序"即用)
+    Windows:  packaging/dist/墨洞桌宠.exe        (双击即用,免装 Python)
+    macOS:    packaging/dist/墨洞桌宠.app        (拖进"应用程序"即用)
 
 要点:
   - wormhole.qml 作为数据文件打进包,运行时从 sys._MEIPASS 读取(见 pet.py:_qml_path)。
@@ -59,7 +59,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="虫洞桌宠",
+    name="墨洞桌宠",
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
@@ -77,12 +77,12 @@ exe = EXE(
 if sys.platform == "darwin":
     app = BUNDLE(
         exe,
-        name="虫洞桌宠.app",
+        name="墨洞桌宠.app",
         icon=None,
         bundle_identifier="com.rexvane.wormhole-pet",
         info_plist={
-            "CFBundleName": "虫洞桌宠",
-            "CFBundleDisplayName": "虫洞桌宠",
+            "CFBundleName": "墨洞桌宠",
+            "CFBundleDisplayName": "墨洞桌宠",
             "LSUIElement": False,          # 显示 Dock 图标
             "NSHighResolutionCapable": True,
         },

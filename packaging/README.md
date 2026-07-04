@@ -1,6 +1,6 @@
-# 虫洞桌宠 · 轻量 app 打包
+# 墨洞桌宠 · 轻量 app 打包
 
-把虫洞桌宠客户端(`src/wormhole/pet.py`,PySide6 + QML)打包成
+把墨洞桌宠客户端(`src/wormhole/pet.py`,PySide6 + QML)打包成
 **单文件可执行**,双击即用、免装 Python。Windows 产出 `.exe`,macOS 产出 `.app`。
 
 ## 目录
@@ -18,14 +18,14 @@
 ```bat
 cd packaging
 build-windows.bat
-:: 产物:packaging\dist\虫洞桌宠.exe
+:: 产物:packaging\dist\墨洞桌宠.exe
 ```
 
 **macOS**
 ```bash
 cd packaging
 bash build-mac.sh
-# 产物:packaging/dist/虫洞桌宠.app
+# 产物:packaging/dist/墨洞桌宠.app
 ```
 
 依赖(脚本会自动补装):`PySide6`、`zeroconf`、`cryptography`、`pyinstaller`;
@@ -36,7 +36,7 @@ macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`(可
 打包后的程序接受与 `pet.py` 完全相同的命令行参数:
 
 ```
-虫洞桌宠 --name 我的电脑 \
+墨洞桌宠 --name 我的电脑 \
         --secret '<两端一致的端到端加密口令>' \
         --inbox ~/Wormhole/收件箱
 ```

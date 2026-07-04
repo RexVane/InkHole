@@ -1,7 +1,7 @@
 """
 pet.py
 ======
-桌宠虫洞挂件(PySide6 + QML) — P2P 局域网直连模式，无需服务器。
+桌宠墨洞挂件(PySide6 + QML) — P2P 局域网直连模式，无需服务器。
 
 形态：黑洞吞噬感 —— 中心深邃黑点 + 乳白色吸积盘/光晕，向内吸卷旋转；
       桌面小图标大小，低调浮在角落，无边框、透明、置顶、可拖动。
@@ -25,7 +25,10 @@ from __future__ import annotations
 import os
 import sys
 import json
+import queue
 import argparse
+import threading
+from collections import deque
 
 from .p2p import P2PNode, P2PConfig
 
@@ -116,15 +119,61 @@ def _save_config(cfg: P2PConfig) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"name": cfg.peer_name, "secret": cfg.secret,
-                       "inbox": cfg.inbox, "port": cfg.listen_port},
+                       "inbox": cfg.inbox, "port": cfg.listen_port,
+                       "trusted_only": cfg.trusted_only},
                       f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 
 
+class SendQueue:
+    """串行发送队列：一次拖 N 个文件不再开 N 个并发连接互踩。
+
+    单工作线程按序发送；一批(队列清空)结束后回调 on_batch_done(成功数, 总数)，
+    多文件时给用户一个聚合结果。纯标准库实现，不依赖 Qt，可单测。
+    """
+
+    def __init__(self, send_fn, on_batch_done=None):
+        self._send = send_fn
+        self._on_batch_done = on_batch_done
+        self._q: queue.Queue[str] = queue.Queue()
+        self._lock = threading.Lock()
+        self._batch_total = 0
+        self._batch_ok = 0
+        self._worker = threading.Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    def put(self, path: str) -> None:
+        with self._lock:
+            self._batch_total += 1
+        self._q.put(path)
+
+    def _loop(self) -> None:
+        while True:
+            path = self._q.get()
+            ok = False
+            try:
+                ok = bool(self._send(path))
+            except Exception:
+                pass
+            batch_done = None
+            with self._lock:
+                if ok:
+                    self._batch_ok += 1
+                if self._q.empty():
+                    batch_done = (self._batch_ok, self._batch_total)
+                    self._batch_ok = 0
+                    self._batch_total = 0
+            if batch_done and self._on_batch_done:
+                try:
+                    self._on_batch_done(*batch_done)
+                except Exception:
+                    pass
+
+
 def _build_config(argv=None):
     saved = _load_saved_config()
-    ap = argparse.ArgumentParser(description="虫洞桌宠挂件(P2P 局域网直连，无需服务器)")
+    ap = argparse.ArgumentParser(description="墨洞桌宠挂件(P2P 局域网直连，无需服务器)")
     ap.add_argument("--inbox", default=None,
                     help="收件箱目录(收到的文件放这;默认随平台,改一次会记住)")
     ap.add_argument("--port", type=int, default=None,
@@ -144,8 +193,10 @@ def _build_config(argv=None):
         port = 0
     name = args.name if args.name is not None else str(saved.get("name") or "")
     secret = args.secret if args.secret is not None else str(saved.get("secret") or "")
+    trusted_only = bool(saved.get("trusted_only", False))
 
-    cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret)
+    cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret,
+                    trusted_only=trusted_only)
     if any(a is not None for a in (args.inbox, args.port, args.name, args.secret)):
         _save_config(cfg)   # 显式 CLI 参数视为用户意图，记住
     return cfg, args.size
@@ -375,7 +426,7 @@ def main(argv=None) -> None:
         raise SystemExit(1)
 
     def _draw_icon_pixmap(size: int) -> QPixmap:
-        """画单一尺寸的图标位图：圆角黑底 + 居中黑洞。"""
+        """画单一尺寸的图标位图：圆角黑底 + 居中墨洞(青色视界环)。"""
         from PySide6.QtGui import QPainterPath
         from PySide6.QtCore import QRectF
         pm = QPixmap(size, size)
@@ -386,15 +437,16 @@ def main(argv=None) -> None:
         clip = QPainterPath()
         clip.addRoundedRect(QRectF(0, 0, size, size), radius, radius)
         p.setClipPath(clip)
-        p.fillPath(clip, QColor(0, 0, 0))         # 圆角黑底
+        p.fillPath(clip, QColor(5, 7, 10))        # 圆角墨黑底
         cx = cy = size / 2
         R = size * 0.42
-        g = QRadialGradient(cx, cy, R)            # 中心黑 -> 乳白光晕 -> 融回黑背景
+        g = QRadialGradient(cx, cy, R)            # 墨黑核心 -> 青色视界环 -> 融回黑底
         g.setColorAt(0.00, QColor(0, 0, 0, 255))
-        g.setColorAt(0.42, QColor(3, 3, 8, 255))
-        g.setColorAt(0.60, QColor(72, 68, 86, 255))
-        g.setColorAt(0.80, QColor(238, 236, 244, 255))
-        g.setColorAt(1.00, QColor(0, 0, 0, 255))
+        g.setColorAt(0.45, QColor(2, 8, 7, 255))
+        g.setColorAt(0.62, QColor(14, 58, 50, 255))
+        g.setColorAt(0.76, QColor(88, 230, 200, 255))   # 亮青视界环
+        g.setColorAt(0.86, QColor(20, 64, 56, 255))
+        g.setColorAt(1.00, QColor(5, 7, 10, 255))
         p.setBrush(g)
         p.setPen(Qt.NoPen)
         p.drawEllipse(QPointF(cx, cy), R, R)
@@ -461,6 +513,18 @@ def main(argv=None) -> None:
             act_open = menu.addAction("打开收件箱")
             act_open.triggered.connect(bridge.openInbox)
 
+            # 最近接收子菜单：点一下直接打开文件
+            recents = bridge.recentFiles()
+            recent_menu = menu.addMenu("最近接收")
+            if not recents:
+                act_none = recent_menu.addAction("（暂无）")
+                act_none.setEnabled(False)
+            else:
+                for rp in recents:
+                    act_r = recent_menu.addAction(os.path.basename(rp))
+                    act_r.triggered.connect(
+                        lambda checked=False, p=rp: bridge.openPath(p))
+
             act_inbox = menu.addAction("更换收件箱...")
             act_inbox.triggered.connect(bridge.chooseInbox)
 
@@ -470,6 +534,16 @@ def main(argv=None) -> None:
             secret_on = bool(bridge.node.cfg.secret)
             act_secret = menu.addAction("加密口令..." + ("　🔒" if secret_on else ""))
             act_secret.triggered.connect(bridge.changeSecret)
+
+            # 仅接收目标设备（可勾选）：拦掉陌生设备的投喂
+            act_trusted = menu.addAction("仅接收目标设备")
+            act_trusted.setCheckable(True)
+            act_trusted.setChecked(bridge.isTrustedOnly())
+            def _on_trusted():
+                on = bridge.toggleTrustedOnly()
+                act_trusted.setChecked(on)
+                bridge.status.emit("只收目标设备的文件" if on else "接收所有设备的文件")
+            act_trusted.triggered.connect(_on_trusted)
 
             # 开机自启（可勾选）
             act_autostart = menu.addAction("开机自启")
@@ -496,7 +570,7 @@ def main(argv=None) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return None
         tray = QSystemTrayIcon(_make_app_icon(), app)
-        tray.setToolTip("虫洞")
+        tray.setToolTip("墨洞")
         tray.setContextMenu(menu)
         tray.activated.connect(
             lambda reason: bridge.openInbox()
@@ -511,25 +585,42 @@ def main(argv=None) -> None:
         status = Signal(str)          # 临时状态文字(2.2s 后消失)
         peersChanged = Signal()       # 设备列表变化(刷新菜单)
         errorState = Signal(str)      # 错误信息(持续显示，非空=有错误，空=清除)
+        progress = Signal(str, int)   # 传输进度(kind "send"/"recv", 百分比 0-100)
 
         def __init__(self, cfg: P2PConfig):
             super().__init__()
             self._tray_menu = None        # 由 _setup_tray 注入:桌宠右键时弹出
+            self._recent: deque[str] = deque(maxlen=8)   # 最近收到的文件(路径)
             self.node = self._make_node(cfg)
             self.node.start()
+            # 串行发送队列：拖一堆文件不再开一堆并发连接
+            self._sendq = SendQueue(
+                lambda p: self.node.send_file(p),
+                on_batch_done=lambda ok, total: (
+                    self.status.emit(f"已吞入 {ok}/{total} 个文件") if total > 1 else None),
+            )
 
         def _make_node(self, cfg: P2PConfig) -> P2PNode:
             """用统一的回调钩子构造 P2P 节点(初始启动与改设置重启共用)。"""
             return P2PNode(
                 cfg,
                 on_sent=lambda n: self.absorb.emit(n),
-                on_received=lambda p: self.emit_out.emit(os.path.basename(p)),
+                on_received=lambda p: self._on_received_file(p),
                 on_status=lambda s: self._route_status(s),
                 on_peers_changed=lambda: self.peersChanged.emit(),
-                on_progress=lambda kind, name, done, total: self.status.emit(
-                    f"{'↑' if kind == 'send' else '↓'} {name} "
-                    f"{done * 100 // total if total else 100}%"),
+                on_progress=lambda kind, name, done, total: self._on_progress(
+                    kind, name, done, total),
             )
+
+        def _on_received_file(self, path: str) -> None:
+            self._recent.appendleft(path)
+            self.emit_out.emit(os.path.basename(path))
+
+        def _on_progress(self, kind: str, name: str, done: int, total: int) -> None:
+            pct = done * 100 // total if total else 100
+            self.progress.emit(kind, pct)
+            arrow = "↑" if kind == "send" else "↓"
+            self.status.emit(f"{arrow} {name} {pct}%")
 
         def _apply_settings(self, peer_name: str | None = None,
                             secret: str | None = None) -> None:
@@ -571,21 +662,48 @@ def main(argv=None) -> None:
 
         @Slot(str)
         def dropFile(self, url: str):
-            """QML DropArea 收到桌面拖来的文件 url，转本地路径后发送。
-            无选中目标时不发,由 QML 侧 hasTarget 判断决定是否播动画。"""
+            """QML DropArea 收到桌面拖来的文件 url，转本地路径后入发送队列。
+            队列单线程串行发送：一次拖 N 个文件不会开 N 个并发连接。"""
             path = QUrl(url).toLocalFile() if url.startswith("file:") else url
             if path and os.path.isfile(path):
                 if not self.node.selected_peer():
                     self.status.emit("右键选择目标设备")
                     return
-                # 发送放到后台线程，避免卡住动画
-                import threading
-                threading.Thread(target=self.node.send_file, args=(path,), daemon=True).start()
+                self._sendq.put(path)
 
         @Slot(result=bool)
         def hasTarget(self) -> bool:
             """QML 用来判断拖入文件时是否该播吸入动画。"""
             return self.node.selected_peer() is not None
+
+        @Slot(result=bool)
+        def isTrustedOnly(self) -> bool:
+            return self.node.cfg.trusted_only
+
+        @Slot(result=bool)
+        def toggleTrustedOnly(self) -> bool:
+            """切换「仅接收目标设备」：拦掉局域网里陌生设备的投喂。"""
+            self.node.cfg.trusted_only = not self.node.cfg.trusted_only
+            _save_config(self.node.cfg)
+            return self.node.cfg.trusted_only
+
+        @Slot(result="QVariantList")
+        def recentFiles(self) -> list:
+            """最近收到的文件路径列表(新的在前)。"""
+            return [p for p in self._recent if os.path.exists(p)]
+
+        @Slot(str)
+        def openPath(self, path: str):
+            """用系统默认程序打开一个文件(最近接收菜单用)。"""
+            try:
+                if sys.platform == "win32":
+                    os.startfile(path)
+                elif sys.platform == "darwin":
+                    import subprocess; subprocess.Popen(["open", path])
+                else:
+                    import subprocess; subprocess.Popen(["xdg-open", path])
+            except Exception:
+                self.status.emit("无法打开文件")
 
         @Slot(result=str)
         def inboxPath(self) -> str:
@@ -691,8 +809,8 @@ def main(argv=None) -> None:
 
     # 有 QtWidgets 用 QApplication(支持托盘菜单),否则退回 QGuiApplication
     app = (QApplication if _HAS_WIDGETS else QGuiApplication)(sys.argv)
-    app.setApplicationName("虫洞")
-    app.setWindowIcon(_make_app_icon())          # Dock/任务栏：黑底居中黑洞
+    app.setApplicationName("墨洞")
+    app.setWindowIcon(_make_app_icon())          # Dock/任务栏：墨黑底青环墨洞
     app.setQuitOnLastWindowClosed(False)         # 关挂件窗口不退出(托盘还在),仅菜单"退出"才退
     bridge = Bridge(cfg)
     engine = QQmlApplicationEngine()
