@@ -75,21 +75,26 @@ exe = EXE(
     entitlements_file=None,
 )
 
-# onedir 模式：先 COLLECT 把所有依赖收进目录，再按平台处理
-# Windows: COLLECT 产物是文件夹，zip 打包发布，不解压到 %TEMP%，绕开 Defender 拦截
-# macOS:   COLLECT → BUNDLE 包成 .app（标准应用包格式）
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=True,
-    upx=False,
-    name="InkHolePet",
-)
-
+# Windows: onedir 模式——产物是文件夹，不解压到 %TEMP%，绕开 Defender 拦截
+# macOS:   保持 onefile EXE + BUNDLE，.app 本身就是目录格式，不存在 Defender 问题
 if sys.platform == "darwin":
     app = BUNDLE(
-        coll,
+        EXE(
+            pyz,
+            a.scripts,
+            a.binaries,
+            a.datas,
+            [],
+            name="InkHolePet",
+            debug=False,
+            strip=False,
+            upx=False,
+            console=False,
+            argv_emulation=False,
+            target_arch=None,
+            codesign_identity=None,
+            entitlements_file=None,
+        ),
         name="InkHolePet.app",
         icon=None,
         bundle_identifier="com.rexvane.inkhole-pet",
@@ -99,5 +104,14 @@ if sys.platform == "darwin":
             "LSUIElement": False,
             "NSHighResolutionCapable": True,
         },
+    )
+else:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="InkHolePet",
     )
 
