@@ -1,6 +1,6 @@
 [project]
 name = "inkhole"
-version = "2.0.0"
+version = "1.0.0"
 description = "P2P LAN file transfer: drag files into a black-hole desktop pet, they appear on the other machine. mDNS auto-discovery, TCP direct, no server needed."
 requires-python = ">=3.10"
 
