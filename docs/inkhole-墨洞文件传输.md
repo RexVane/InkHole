@@ -33,12 +33,20 @@
 
 ```
 src/inkhole/
-├── p2p.py        P2P 引擎(mDNS 发现 + TCP 直连 + 可选加密)——纯后台, 已自动化测试
-├── pet.py         桌宠挂件(PySide6+QML 动画 + 拖拽 + 右键设备选择)——需图形界面
-├── crypto.py     端到端加密(AES-256-GCM)
-├── inkhole.qml   黑洞墨洞的视觉与动画
-└── __init__.py
-tests/test_p2p.py       P2P 引擎端到端测试(传输/加密/设备切换/离线/回调/路径穿越)
+├── p2p.py        P2P 引擎(mDNS 发现 + TCP 直连 + WHE2 分块加密)——纯后台, 已自动化测试
+├── crypto.py     端到端加密(AES-256-GCM，WHE1 整块 / WHE2 分块流)
+├── pet.py        桌宠挂件(PySide6+QML 动画 + 拖拽 + 右键菜单 + 设置持久化)——需图形界面
+├── inkhole.qml   墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
+├── __init__.py
+└── __main__.py   入口(python -m inkhole 启动桌宠)
+tests/test_p2p.py       P2P 引擎端到端测试(17 组 66 项)
+android/app/src/main/java/com/rexvane/inkhole/
+├── p2p/InkHoleNode.kt  Android P2P 引擎(NSD + TCP)
+├── p2p/Crypto.kt       加密(与桌面版逐字节兼容)
+├── p2p/WHPP.kt         协议常量与读写
+├── InkHoleService.kt   前台服务(P2P 节点生命周期)
+├── MainActivity.kt     主 UI(Jetpack Compose)
+└── InkHoleUI.kt        Compose UI 组件
 ```
 
 ## 准备：两台电脑连同一局域网
@@ -77,7 +85,7 @@ PYTHONPATH=src python3 -m inkhole.pet --name 我的Mac
 
 ## 收件箱在哪 / 怎么改
 
-默认收件箱：Windows `~/OneDrive/Desktop/inkhole/`，macOS `~/Documents/inkhole/`，其他 `~/InkHole/收件箱/`。
+默认收件箱：Windows `桌面\inkhole\`（自动识别 OneDrive 重定向），macOS `~/Documents/inkhole/`，其他 `~/InkHole/收件箱/`。
 
 改成别的目录：
 
@@ -100,7 +108,7 @@ PYTHONPATH=src python3 -m inkhole.p2p \
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `--inbox` | 收件箱目录 | 随平台（Win: `~/OneDrive/Desktop/inkhole`，Mac: `~/Documents/inkhole`） |
+| `--inbox` | 收件箱目录 | 随平台（Win: `桌面\inkhole`，Mac: `~/Documents/inkhole`） |
 | `--port` | P2P 监听端口（0 = 操作系统自动分配） | `0` |
 | `--name` | 本机显示名（对端右键菜单里看到的名字） | 主机名 |
 | `--secret 口令` | 端到端文件加密（两台电脑口令必须一致） | 关 |
@@ -136,13 +144,11 @@ PYTHONPATH=src python3 -m inkhole.pet --secret '两边一致的口令'
 
 **支持什么格式？** 全部。底层是 TCP 二进制流，逐字节搬运，不关心内容。限制：不能拖文件夹（先压缩成 zip）、同名文件被新版本覆盖。
 
-**网络要求？** 两台电脑连同一局域网（WiFi/路由器）即可。mDNS 是局域网广播协议，不经过公网。不需要公网 IP、不需要端口映射。
+**网络要求？** 两台设备连同一局域网（WiFi/路由器）即可。mDNS 是局域网广播协议，不经过公网。不需要公网 IP、不需要端口映射。
 
 **会一直监视吗？** 挂件运行期间持续 mDNS 广播和监听。右键退出后一切停止，无后台残留。只有亲手拖进黑洞的文件才会发送。
 
 **多台设备怎么办？** 右键菜单的「发送目标」列出所有已发现的墨洞设备，选择要发给哪一台。每次只发给选中的那一台。
-
-**和旧的 FTP 中转模式有什么区别？** 早期版本曾用 FTP 服务器当中转站（已移除）。现在的 P2P 模式不需要服务器，两台电脑 mDNS 自动发现后直接 TCP 直连，更简单更快。
 
 ## 测试
 
@@ -150,4 +156,4 @@ PYTHONPATH=src python3 -m inkhole.pet --secret '两边一致的口令'
 PYTHONPATH=src python3 tests/test_p2p.py
 ```
 
-覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线（不自动切换）、回调触发、多文件连续发送、路径穿越防御。7 组 28 项全通过。
+覆盖：TCP 直连传输、端到端加密（WHE1/WHE2 分块）、设备选择切换、对端离线（不自动切换）、回调触发、多文件连续发送、路径穿越防御、半截文件不落盘、恶意 size 拒收、同名设备共存与精确离线、口令不一致 ACK 失败、传输进度回调、分块加密往返、分块流篡改/重排检测、发送队列、仅接收目标设备、多地址回退。**17 组 66 项全通过**（也兼容 `pytest`）。

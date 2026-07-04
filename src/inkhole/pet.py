@@ -404,64 +404,7 @@ X-GNOME-Autostart-enabled=true"""
     return is_autostart_enabled()
 
 
-def _migrate_from_old_version() -> None:
-    """从旧版(Wormhole 路径)迁移到新版(InkHole 路径)。
-
-    配置文件：旧路径有、新路径没有 → 搬过来，旧用户设置不丢。
-    自启项：旧名称的注册表键/plist/desktop 清掉，下次开自启用新名称。
-    """
-    import shutil
-
-    # ---- 配置文件迁移 ----
-    new_cfg = _config_path()
-    if not os.path.exists(new_cfg):
-        if sys.platform == "win32":
-            base = os.environ.get("APPDATA") or os.path.expanduser("~")
-            old_cfg = os.path.join(base, "Wormhole", "config.json")
-        elif sys.platform == "darwin":
-            old_cfg = os.path.expanduser("~/Library/Application Support/Wormhole/config.json")
-        else:
-            old_cfg = os.path.expanduser("~/.config/wormhole/config.json")
-        if os.path.exists(old_cfg):
-            try:
-                os.makedirs(os.path.dirname(new_cfg), exist_ok=True)
-                shutil.move(old_cfg, new_cfg)
-                old_dir = os.path.dirname(old_cfg)
-                if os.path.isdir(old_dir) and not os.listdir(old_dir):
-                    os.rmdir(old_dir)
-            except (OSError, shutil.Error):
-                pass
-
-    # ---- 旧自启项清理 ----
-    if sys.platform == "win32":
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                 r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
-                                 winreg.KEY_SET_VALUE)
-            try: winreg.DeleteValue(key, "WormholePet")
-            except FileNotFoundError: pass
-            winreg.CloseKey(key)
-        except OSError: pass
-        old_bat = os.path.join(os.path.expanduser("~"), "wormhole-startup.bat")
-        if os.path.exists(old_bat):
-            try: os.remove(old_bat)
-            except OSError: pass
-    elif sys.platform == "darwin":
-        old_plist = os.path.expanduser(
-            "~/Library/LaunchAgents/com.rexvane.wormhole-pet.plist")
-        if os.path.exists(old_plist):
-            try: os.remove(old_plist)
-            except OSError: pass
-    else:
-        old_desktop = os.path.expanduser("~/.config/autostart/wormhole-pet.desktop")
-        if os.path.exists(old_desktop):
-            try: os.remove(old_desktop)
-            except OSError: pass
-
-
 def main(argv=None) -> None:
-    _migrate_from_old_version()
     cfg, size_override = _build_config(argv)
     _install_crash_log(cfg.inbox)   # 尽早安装:之后任何崩溃/print 都安全且留痕
     try:

@@ -58,30 +58,8 @@ class InkHoleService : Service() {
         super.onCreate()
         createChannels()
         startForeground(NOTIF_STATUS_ID, buildStatusNotification("正在启动…"))
-        migrateOldPrefs()
         InkHoleBus.loadHistory(this)
         startNode()
-    }
-
-    /** v1→v2 迁移：旧版用 "wormhole" 作为 SharedPreferences 名，复制到 "inkhole"。 */
-    private fun migrateOldPrefs() {
-        val newPrefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-        if (newPrefs.all.isNotEmpty()) return  // 已有数据，不覆盖
-        val oldPrefs = getSharedPreferences("wormhole", Context.MODE_PRIVATE)
-        if (oldPrefs.all.isEmpty()) return
-        val editor = newPrefs.edit()
-        for ((key, value) in oldPrefs.all) {
-            when (value) {
-                is String -> editor.putString(key, value)
-                is Boolean -> editor.putBoolean(key, value)
-                is Int -> editor.putInt(key, value)
-                is Long -> editor.putLong(key, value)
-                is Float -> editor.putFloat(key, value)
-                is Set<*> -> editor.putStringSet(key, value.filterIsInstance<String>().toSet())
-            }
-        }
-        editor.apply()
-        oldPrefs.edit().clear().apply()  // 清旧数据避免残留
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
