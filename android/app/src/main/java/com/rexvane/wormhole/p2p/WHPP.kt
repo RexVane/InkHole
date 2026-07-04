@@ -20,6 +20,7 @@ object WHPP {
         val size: Long,
         val encrypted: Boolean,
         val wantAck: Boolean,
+        val encMode: String = "",   // "" = WHE1 整块; "chunked" = WHE2 分块流
     )
 
     /** 把 header JSON 序列化(与桌面版 Python 完全一致)。 */
@@ -29,6 +30,7 @@ object WHPP {
         json.put("size", h.size)
         json.put("encrypted", h.encrypted)
         json.put("want_ack", h.wantAck)
+        if (h.encMode.isNotEmpty()) json.put("enc_mode", h.encMode)
         return json.toString().toByteArray(Charsets.UTF_8)
     }
 
@@ -40,7 +42,18 @@ object WHPP {
             size = json.getLong("size"),
             encrypted = json.optBoolean("encrypted", false),
             wantAck = json.optBoolean("want_ack", false),
+            encMode = json.optString("enc_mode", ""),
         )
+    }
+
+    /** 只写 WHPP 帧头(magic + header)，数据体由调用方自己写(分块加密用)。 */
+    fun writeHeader(out: OutputStream, h: Header) {
+        val header = encodeHeader(h)
+        val dout = DataOutputStream(out)
+        dout.write(MAGIC)
+        dout.writeInt(header.size)          // big-endian, 与 Python struct.pack("!I") 一致
+        dout.write(header)
+        dout.flush()
     }
 
     /** 向输出流写 WHPP 帧(magic + header + 数据)。onProgress 传已发送字节数。 */
@@ -53,12 +66,7 @@ object WHPP {
         wantAck: Boolean = true,
         onProgress: ((Long) -> Unit)? = null,
     ) {
-        val header = encodeHeader(Header(filename, size, encrypted, wantAck))
-        val dout = DataOutputStream(out)
-        dout.write(MAGIC)
-        dout.writeInt(header.size)          // big-endian, 与 Python struct.pack("!I") 一致
-        dout.write(header)
-        dout.flush()
+        writeHeader(out, Header(filename, size, encrypted, wantAck))
         // 写文件数据
         val buf = ByteArray(BUFFER_SIZE)
         var sent = 0L

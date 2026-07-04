@@ -58,6 +58,7 @@ class WormholeService : Service() {
         super.onCreate()
         createChannels()
         startForeground(NOTIF_STATUS_ID, buildStatusNotification("正在启动…"))
+        WormholeBus.loadHistory(this)
         startNode()
     }
 
@@ -75,9 +76,10 @@ class WormholeService : Service() {
         val prefs = getSharedPreferences("wormhole", Context.MODE_PRIVATE)
         val name = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         val secret = prefs.getString("secret", "") ?: ""
+        val trustedOnly = prefs.getBoolean("trusted_only", false)
         val inbox = File(getExternalFilesDir(null), "收件箱")
 
-        val node = WormholeNode(this, name, inbox, secret, listener = forwarder)
+        val node = WormholeNode(this, name, inbox, secret, trustedOnly, listener = forwarder)
         WormholeBus.node = node
         node.start()
     }
@@ -103,6 +105,7 @@ class WormholeService : Service() {
         override fun onFileReceived(filename: String, path: String) {
             val record = exportToDownloads(File(path))
             WormholeBus.receivedFiles.add(0, record)
+            WormholeBus.saveHistory(this@WormholeService)
             notifyFileReceived(record)
             WormholeBus.uiListener?.onFileReceived(filename, path)
         }
@@ -122,13 +125,15 @@ class WormholeService : Service() {
 
     private fun exportToDownloads(src: File): ReceivedFile {
         val mime = guessMime(src.name)
+        val size = src.length()
+        val now = System.currentTimeMillis()
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, src.name)
                     put(MediaStore.MediaColumns.MIME_TYPE, mime)
                     put(MediaStore.MediaColumns.RELATIVE_PATH,
-                        Environment.DIRECTORY_DOWNLOADS + "/Wormhole")
+                        Environment.DIRECTORY_DOWNLOADS + "/InkHole")
                 }
                 val uri = contentResolver.insert(
                     MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
@@ -137,18 +142,18 @@ class WormholeService : Service() {
                         src.inputStream().use { it.copyTo(out) }
                     }
                     src.delete()
-                    return ReceivedFile(src.name, uri, mime)
+                    return ReceivedFile(src.name, uri, mime, size, now)
                 }
             } else if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 == PackageManager.PERMISSION_GRANTED) {
                 val dir = File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS), "Wormhole")
+                    Environment.DIRECTORY_DOWNLOADS), "InkHole")
                 dir.mkdirs()
                 val dst = File(dir, src.name)
                 src.copyTo(dst, overwrite = true)
                 src.delete()
                 val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", dst)
-                return ReceivedFile(dst.name, uri, mime)
+                return ReceivedFile(dst.name, uri, mime, size, now)
             }
         } catch (_: Exception) {
             // 导出失败不丢文件：留在私有收件箱，仍可从 App 内打开
@@ -156,7 +161,7 @@ class WormholeService : Service() {
         val uri = try {
             FileProvider.getUriForFile(this, "$packageName.fileprovider", src)
         } catch (_: Exception) { null }
-        return ReceivedFile(src.name, uri, mime)
+        return ReceivedFile(src.name, uri, mime, size, now)
     }
 
     private fun guessMime(name: String): String {
@@ -170,7 +175,7 @@ class WormholeService : Service() {
         if (Build.VERSION.SDK_INT < 26) return
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(NotificationChannel(
-            CHANNEL_STATUS, "虫洞运行状态", NotificationManager.IMPORTANCE_MIN))
+            CHANNEL_STATUS, "墨洞运行状态", NotificationManager.IMPORTANCE_MIN))
         nm.createNotificationChannel(NotificationChannel(
             CHANNEL_FILES, "收到文件", NotificationManager.IMPORTANCE_DEFAULT))
     }
@@ -183,7 +188,7 @@ class WormholeService : Service() {
             Notification.Builder(this, CHANNEL_STATUS) else Notification.Builder(this)
         return builder
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle("虫洞")
+            .setContentTitle("墨洞")
             .setContentText(text)
             .setContentIntent(openApp)
             .setOngoing(true)
@@ -206,7 +211,7 @@ class WormholeService : Service() {
         val builder = if (Build.VERSION.SDK_INT >= 26)
             Notification.Builder(this, CHANNEL_FILES) else Notification.Builder(this)
         builder.setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle("虫洞吐出文件")
+            .setContentTitle("墨洞吐出文件")
             .setContentText(record.name)
             .setAutoCancel(true)
         if (record.uri != null) {

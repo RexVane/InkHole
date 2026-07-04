@@ -6,7 +6,7 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- 黑洞：径向渐变 中心纯黑 → 暗过渡 → 乳白吸积盘 → 融回黑背景 -->
+    <!-- 墨洞：径向渐变 墨黑核心 → 暗青过渡 → 亮青视界环 → 融回墨黑底 -->
     <path
         android:pathData="M54,54 m-42,0 a42,42 0,1 1,84 0 a42,42 0,1 1,-84 0">
         <aapt:attr name="android:fillColor">
@@ -16,10 +16,11 @@
                 android:centerY="54"
                 android:gradientRadius="42">
                 <item android:offset="0.00" android:color="#FF000000"/>
-                <item android:offset="0.42" android:color="#FF030308"/>
-                <item android:offset="0.60" android:color="#FF484456"/>
-                <item android:offset="0.78" android:color="#FFEEECF4"/>
-                <item android:offset="1.00" android:color="#FF000000"/>
+                <item android:offset="0.45" android:color="#FF020807"/>
+                <item android:offset="0.62" android:color="#FF0E3A32"/>
+                <item android:offset="0.76" android:color="#FF58E6C8"/>
+                <item android:offset="0.86" android:color="#FF144038"/>
+                <item android:offset="1.00" android:color="#FF05070A"/>
             </gradient>
         </aapt:attr>
     </path>

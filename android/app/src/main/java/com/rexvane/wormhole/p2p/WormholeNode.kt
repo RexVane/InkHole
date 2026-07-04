@@ -41,12 +41,15 @@ class WormholeNode(
     private val peerName: String,
     private val inboxDir: File,
     private val secret: String = "",
+    private val trustedOnly: Boolean = false,   // true = 只接受当前选中目标设备的连接
     private val listener: WormholeListener,
 ) {
     companion object {
         private const val SERVICE_TYPE = "_wormhole._tcp."
         private const val DISK_MARGIN = 256L * 1024 * 1024   // 收完至少还要剩这么多
         private const val PROGRESS_INTERVAL_MS = 250L
+        private const val CHUNK_ENC_THRESHOLD = 32L * 1024 * 1024  // 超过走 WHE2 分块
+        private const val DRAIN_CAP = 8L * 1024 * 1024       // 拒收时最多帮对端消化的字节数
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -116,6 +119,22 @@ class WormholeNode(
         var wantAck = false
         var ok = false
         try {
+            // 仅接收目标设备：来源 IP 不是当前选中设备就直接拒
+            if (trustedOnly) {
+                val src = conn.inetAddress?.hostAddress
+                val sel = selectedPeer?.let { s ->
+                    synchronized(peersLock) { peers.values.find { it.name == s } }
+                }
+                if (sel == null || src != sel.host) {
+                    listener.onStatus("已拒收 ${src ?: "?"} 的连接（仅接收目标设备）")
+                    try {
+                        conn.getOutputStream().apply { write(WHPP.ACK_FAIL); flush() }
+                    } catch (_: IOException) {}
+                    drain(conn.getInputStream(), DRAIN_CAP)
+                    return
+                }
+            }
+
             val input = BufferedInputStream(conn.getInputStream())
             val header = WHPP.readHeader(input)
             wantAck = header.wantAck
@@ -130,49 +149,89 @@ class WormholeNode(
             }
             if (header.size + DISK_MARGIN > inboxDir.usableSpace) {
                 listener.onStatus("拒收 $safeName：存储空间不足")
+                drain(input, minOf(header.size, DRAIN_CAP))
+                return
+            }
+            if (header.encrypted && secret.isEmpty()) {
+                listener.onStatus("拒收 $safeName：对方启用了加密，本机未设口令")
+                drain(input, minOf(header.size, DRAIN_CAP))
                 return
             }
 
             val dst = File(inboxDir, safeName)
             partFile = File(inboxDir, "$safeName.part")
-
-            // 写 .part, 完成后原子改名
             var lastReport = 0L
-            FileOutputStream(partFile).use { fout ->
-                val buf = ByteArray(WHPP.BUFFER_SIZE)
-                var remaining = header.size
-                while (remaining > 0) {
-                    val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                    val n = input.read(buf, 0, toRead)
-                    if (n < 0) break
-                    fout.write(buf, 0, n)
-                    remaining -= n
-                    val now = System.currentTimeMillis()
-                    if (remaining == 0L || now - lastReport >= PROGRESS_INTERVAL_MS) {
-                        lastReport = now
-                        listener.onProgress("recv", safeName, header.size - remaining, header.size)
-                    }
-                }
-                // 对端中途断连：半截文件绝不能顶着完整文件名落盘(会覆盖同名完整文件)
-                if (remaining > 0) {
-                    listener.onStatus("接收中断: $safeName")
-                    return
+            fun report(done: Long) {
+                val now = System.currentTimeMillis()
+                if (done >= header.size || now - lastReport >= PROGRESS_INTERVAL_MS) {
+                    lastReport = now
+                    listener.onProgress("recv", safeName, done, header.size)
                 }
             }
 
-            // 端到端加密文件：解密成功才算收到
-            if (header.encrypted) {
-                if (secret.isEmpty()) {
-                    listener.onStatus("拒收 $safeName：对方启用了加密，本机未设口令")
+            if (header.encrypted && header.encMode == "chunked") {
+                // WHE2 分块流：边收边解密边落盘，内存峰值 4MB
+                val hdr32 = ByteArray(32)
+                DataInputStream(input).readFully(hdr32)
+                val decryptor = try {
+                    Crypto.ChunkedDecryptor(secret, hdr32)
+                } catch (e: IllegalArgumentException) {
+                    listener.onStatus("拒收 $safeName：加密流头非法")
                     return
                 }
-                val blob = partFile.readBytes()
-                val plain = Crypto.decrypt(secret, blob)
-                if (plain == null) {
-                    listener.onStatus("解密失败: $safeName（两端口令不一致？）")
+                var consumed = 32L
+                var intact = true
+                val din = DataInputStream(input)
+                FileOutputStream(partFile).use { fout ->
+                    while (consumed < header.size) {
+                        val ctLen = try { din.readInt() } catch (_: IOException) { intact = false; break }
+                        if (ctLen < 16 || ctLen > Crypto.CHUNK_SIZE + 16) { intact = false; break }
+                        val ct = ByteArray(ctLen)
+                        try { din.readFully(ct) } catch (_: IOException) { intact = false; break }
+                        val plain = decryptor.decryptChunk(ct)
+                        if (plain == null) {
+                            listener.onStatus("解密失败: $safeName（两端口令不一致？）")
+                            return
+                        }
+                        fout.write(plain)
+                        consumed += 4 + ctLen
+                        report(consumed)
+                    }
+                }
+                if (!intact || consumed != header.size) {
+                    listener.onStatus("接收中断: $safeName")
                     return
                 }
-                partFile.writeBytes(plain)
+            } else {
+                // 明文 / WHE1 整块加密：写 .part
+                FileOutputStream(partFile).use { fout ->
+                    val buf = ByteArray(WHPP.BUFFER_SIZE)
+                    var remaining = header.size
+                    while (remaining > 0) {
+                        val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                        val n = input.read(buf, 0, toRead)
+                        if (n < 0) break
+                        fout.write(buf, 0, n)
+                        remaining -= n
+                        report(header.size - remaining)
+                    }
+                    // 对端中途断连：半截文件绝不能顶着完整文件名落盘
+                    if (remaining > 0) {
+                        listener.onStatus("接收中断: $safeName")
+                        return
+                    }
+                }
+
+                // WHE1 整块加密：解密成功才算收到
+                if (header.encrypted) {
+                    val blob = partFile.readBytes()
+                    val plain = Crypto.decrypt(secret, blob)
+                    if (plain == null) {
+                        listener.onStatus("解密失败: $safeName（两端口令不一致？）")
+                        return
+                    }
+                    partFile.writeBytes(plain)
+                }
             }
 
             // 原子改名 (覆盖同名)
@@ -200,6 +259,20 @@ class WormholeNode(
             try { conn.close() } catch (_: IOException) {}
             partFile?.delete()
         }
+    }
+
+    /** 拒收时把对端已发出的最多 n 字节读掉再关连接——
+     *  不读就 close 会触发 RST，可能冲掉已排队的失败回执。 */
+    private fun drain(input: InputStream, n: Long) {
+        try {
+            val buf = ByteArray(WHPP.BUFFER_SIZE)
+            var left = n
+            while (left > 0) {
+                val got = input.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                if (got < 0) return
+                left -= got
+            }
+        } catch (_: IOException) {}
     }
 
     // ---- 发送文件 ----
@@ -233,23 +306,50 @@ class WormholeNode(
                     }
                 }
 
-                if (secret.isNotEmpty()) {
-                    // 加密: 整块读入内存加密(已知限制：特大文件受设备内存约束)
+                if (secret.isNotEmpty() && file.length() > CHUNK_ENC_THRESHOLD) {
+                    // 大文件走 WHE2 分块流式加密：内存峰值 4MB
+                    val wireSize = Crypto.chunkedWireSize(file.length())
+                    WHPP.writeHeader(out, WHPP.Header(
+                        file.name, wireSize, encrypted = true, wantAck = true,
+                        encMode = "chunked"))
+                    val enc = Crypto.ChunkedEncryptor(secret)
+                    out.write(enc.streamHeader)
+                    var sent = enc.streamHeader.size.toLong()
+                    val dout = DataOutputStream(out)
+                    file.inputStream().use { fin ->
+                        val buf = ByteArray(Crypto.CHUNK_SIZE)
+                        while (true) {
+                            val n = readFull(fin, buf)
+                            if (n <= 0) break
+                            val ct = enc.encryptChunk(buf, n)
+                            dout.writeInt(ct.size)
+                            dout.write(ct)
+                            sent += 4 + ct.size
+                            progress(sent, wireSize)
+                        }
+                    }
+                    dout.flush()
+                } else if (secret.isNotEmpty()) {
+                    // 小文件 WHE1 整块(与所有旧版本互通)
                     val plain = file.readBytes()
                     val enc = Crypto.encrypt(secret, plain)
-                    WHPP.writeFrame(out, file.name, enc.size.toLong(), true,
-                        ByteArrayInputStream(enc)) { progress(it, enc.size.toLong()) }
+                    WHPP.writeFrame(
+                        out, file.name, enc.size.toLong(), true,
+                        ByteArrayInputStream(enc)
+                    ) { progress(it, enc.size.toLong()) }
                 } else {
                     // 明文: 流式
-                    WHPP.writeFrame(out, file.name, file.length(), false,
-                        file.inputStream()) { progress(it, file.length()) }
+                    WHPP.writeFrame(
+                        out, file.name, file.length(), false,
+                        file.inputStream()
+                    ) { progress(it, file.length()) }
                 }
 
                 // 等接收方回执。老版本对端读完即关连接 -> read 返回 -1，按成功；超时也不误报
                 s.soTimeout = 60_000
                 val resp = try { s.getInputStream().read() } catch (_: SocketTimeoutException) { -1 }
                 if (resp == WHPP.ACK_FAIL) {
-                    listener.onStatus("${peer.name} 接收失败（口令不一致或存储问题）")
+                    listener.onStatus("${peer.name} 接收失败（口令不一致、被拒收或存储问题）")
                     return false
                 }
             }
@@ -259,6 +359,17 @@ class WormholeNode(
             listener.onStatus("发送失败: ${e.message}")
             false
         }
+    }
+
+    /** 尽量读满 buf(文件尾可能不足)，返回实际读到的字节数；EOF 返回 -1。 */
+    private fun readFull(input: InputStream, buf: ByteArray): Int {
+        var off = 0
+        while (off < buf.size) {
+            val n = input.read(buf, off, buf.size - off)
+            if (n < 0) break
+            off += n
+        }
+        return if (off == 0) -1 else off
     }
 
     // ---- 对端管理 ----
