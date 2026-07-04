@@ -25,10 +25,12 @@ from __future__ import annotations
 import os
 import sys
 import json
+import shutil
 import socket
 import struct
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable
 
@@ -38,6 +40,11 @@ from .crypto import encrypt, decrypt, is_encrypted
 _SERVICE_TYPE = "_wormhole._tcp.local."
 _MAGIC = b"WHPP"          # Wormhole P2P Protocol magic
 _BUFFER = 65536           # 64KB 传输块
+_MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
+_MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
+_DISK_MARGIN = 256 * 1024 * 1024   # 收完文件后磁盘至少还要剩这么多才接收
+_ACK_OK = b"\x01"                  # 接收方回执：成功落盘
+_ACK_FAIL = b"\x00"                # 接收方回执：失败(中断/解密失败/写盘失败)
 
 
 # ---------- 配置 ----------
@@ -47,6 +54,7 @@ class P2PConfig:
     listen_port: int = 0           # TCP 监听端口；0 = 操作系统自动分配
     peer_name: str = ""            # 本机显示名；空则用 hostname
     secret: str = ""               # 端到端加密口令(两台电脑必须一致；空=不加密)
+    enable_mdns: bool = True       # False = 只起 TCP 不碰 mDNS(测试用，手动注册对端)
 
     def __post_init__(self):
         if not self.peer_name:
@@ -54,19 +62,36 @@ class P2PConfig:
 
 
 class PeerInfo:
-    """一个已发现的对端节点。"""
-    __slots__ = ("name", "host", "port")
+    """一个已发现的对端节点。
 
-    def __init__(self, name: str, host: str, port: int):
+    name         显示名(菜单里看到的；重名设备会带 " (2)" 后缀)
+    service_name mDNS 完整服务名(唯一，用于离线事件精确匹配；手动注册可为空)
+    """
+    __slots__ = ("name", "host", "port", "service_name")
+
+    def __init__(self, name: str, host: str, port: int, service_name: str = ""):
         self.name = name
         self.host = host
         self.port = port
+        self.service_name = service_name
 
     def __repr__(self):
         return f"PeerInfo({self.name!r}, {self.host}:{self.port})"
 
     def __str__(self):
         return f"{self.name} ({self.host})"
+
+
+def _service_label(name: str, instance_id: str) -> str:
+    """mDNS 服务实例标签：显示名 + 实例 ID 后缀，保证局域网内唯一。
+
+    显示名里的 "." 会破坏服务名解析(DNS 标签分隔符)，替换掉；
+    单个 DNS 标签最长 63 字节，utf-8 截断到 40 字节给后缀留余量。
+    """
+    label = name.replace(".", "-")
+    raw = label.encode("utf-8")[:40]
+    label = raw.decode("utf-8", errors="ignore")
+    return f"{label}-{instance_id}"
 
 
 # ---------- P2P 引擎 ----------
@@ -85,14 +110,20 @@ class P2PNode:
                  on_sent: Callable[[str], None] | None = None,
                  on_received: Callable[[str], None] | None = None,
                  on_status: Callable[[str], None] | None = None,
-                 on_peers_changed: Callable[[], None] | None = None):
+                 on_peers_changed: Callable[[], None] | None = None,
+                 on_progress: Callable[[str, str, int, int], None] | None = None):
         self.cfg = cfg
         self.on_sent = on_sent
         self.on_received = on_received
         self.on_status = on_status
         self.on_peers_changed = on_peers_changed
+        self.on_progress = on_progress   # (kind:"send"/"recv", 文件名, 已传字节, 总字节)
 
-        self._peers: dict[str, PeerInfo] = {}   # name -> PeerInfo
+        # 本节点唯一实例 ID：进服务名保证唯一(两台设备同名不再冲突)，
+        # 进 TXT 属性用于"不发现自己"(比按显示名过滤可靠)
+        self._instance_id = uuid.uuid4().hex[:8]
+
+        self._peers: dict[str, PeerInfo] = {}   # 显示名 -> PeerInfo
         self._lock = threading.Lock()
         self._selected_peer: str | None = None  # 当前选中的目标
         self._running = False
@@ -126,7 +157,11 @@ class P2PNode:
         # 1. 启动 TCP 监听
         self._start_tcp_server()
 
-        # 2. 注册 mDNS 服务
+        # 2. 注册 mDNS 服务(测试模式跳过：只测 TCP 层，不受局域网环境干扰)
+        if not self.cfg.enable_mdns:
+            self._status(f"虫洞已开启(无 mDNS) · {self.cfg.peer_name} @ 127.0.0.1:{self._actual_port}")
+            return
+
         try:
             from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
         except ImportError:
@@ -136,12 +171,16 @@ class P2PNode:
         self._zc = Zeroconf()
         self._service_info = ServiceInfo(
             type_=_SERVICE_TYPE,
-            name=f"{self.cfg.peer_name}.{_SERVICE_TYPE}",
+            name=f"{_service_label(self.cfg.peer_name, self._instance_id)}.{_SERVICE_TYPE}",
             addresses=[socket.inet_aton(local_ip)],
             port=self._actual_port,
-            properties={b"peer_name": self.cfg.peer_name.encode("utf-8")},
+            properties={
+                b"peer_name": self.cfg.peer_name.encode("utf-8"),
+                b"instance_id": self._instance_id.encode("ascii"),
+            },
         )
-        self._zc.register_service(self._service_info)
+        # 服务名已带唯一后缀，理论上不会撞名；万一撞了让 zeroconf 自动改名而不是崩溃
+        self._zc.register_service(self._service_info, allow_name_change=True)
 
         # 3. 开始发现其他节点
         self._listener = _WormholeListener(self)
@@ -204,8 +243,15 @@ class P2PNode:
             threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True).start()
 
     def _handle_connection(self, conn: socket.socket, addr) -> None:
-        """接收一个文件：读 WHPP 头 + 文件数据，落盘到收件箱。"""
+        """接收一个文件：读 WHPP 头 + 文件数据，落盘到收件箱。
+
+        任何失败(中断/解密失败/写盘失败)都不允许把残缺文件顶着正式文件名
+        落盘——否则半截文件会覆盖收件箱里同名的完整文件。
+        对端 header 带 want_ack 时，结束前回 1 字节回执告知成败。
+        """
         part_path = None
+        want_ack = False
+        ok = False
         try:
             # 读 magic
             magic = _recv_exact(conn, 4)
@@ -217,18 +263,34 @@ class P2PNode:
             if not hdr_len_bytes:
                 return
             hdr_len = struct.unpack("!I", hdr_len_bytes)[0]
+            if not 0 < hdr_len <= _MAX_HEADER:
+                return
             hdr_bytes = _recv_exact(conn, hdr_len)
             if not hdr_bytes:
                 return
             header = json.loads(hdr_bytes.decode("utf-8"))
 
-            filename = os.path.basename(header.get("filename", "unknown"))  # 防 ../ 路径穿越
+            filename = os.path.basename(str(header.get("filename", ""))) or "unknown"  # 防 ../ 路径穿越
             size = header.get("size", 0)
-            encrypted = header.get("encrypted", False)
+            encrypted = bool(header.get("encrypted", False))
+            want_ack = bool(header.get("want_ack", False))
+
+            # size 来自网络，不可信：必须是合法范围内的整数
+            if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= _MAX_FILE_SIZE:
+                self._status(f"拒收 {filename}：文件大小非法")
+                return
+            # 磁盘装不下就直接拒收，别收到一半才发现
+            try:
+                if size + _DISK_MARGIN > shutil.disk_usage(self.cfg.inbox).free:
+                    self._status(f"拒收 {filename}：磁盘空间不足")
+                    return
+            except OSError:
+                pass
 
             # 流式写入 .part，完成后原子改名
             dst = os.path.join(self.cfg.inbox, filename)
             part_path = dst + ".part"
+            progress = _Progress(self.on_progress, "recv", filename, size)
             remaining = size
             with open(part_path, "wb") as f:
                 while remaining > 0:
@@ -237,30 +299,43 @@ class P2PNode:
                         break
                     f.write(chunk)
                     remaining -= len(chunk)
+                    progress.update(size - remaining)
+            if remaining > 0:
+                self._status(f"接收中断：{filename}")
+                return
 
-            # 端到端加密文件：落盘前原地解密
-            if encrypted and self.cfg.secret:
+            # 端到端加密文件：解密成功才算收到
+            if encrypted:
+                if not self.cfg.secret:
+                    self._status(f"拒收 {filename}：对方启用了加密，本机未设口令")
+                    return
                 with open(part_path, "rb") as f:
                     blob = f.read()
                 plain = decrypt(self.cfg.secret, blob)
-                if plain is not None:
-                    with open(part_path, "wb") as f:
-                        f.write(plain)
-                else:
-                    self._status("解密失败")
-            elif encrypted and not self.cfg.secret:
-                self._status("收到加密文件，但未设口令")
+                if plain is None:
+                    self._status(f"解密失败：{filename}（两端口令不一致？）")
+                    return
+                with open(part_path, "wb") as f:
+                    f.write(plain)
 
             os.replace(part_path, dst)
             part_path = None
+            ok = True
 
-            sender = f"{addr[0]}:{addr[1]}"
             if self.on_received:
                 self.on_received(dst)
         except Exception as e:
             self._status("接收失败", str(e))
         finally:
-            conn.close()
+            if want_ack:
+                try:
+                    conn.sendall(_ACK_OK if ok else _ACK_FAIL)
+                except OSError:
+                    pass
+            try:
+                conn.close()
+            except OSError:
+                pass
             if part_path and os.path.exists(part_path):
                 try:
                     os.remove(part_path)
@@ -269,7 +344,11 @@ class P2PNode:
 
     # ---------- 发送文件 ----------
     def send_file(self, local_path: str) -> bool:
-        """把文件直接发给选中的对端。成功返回 True。"""
+        """把文件直接发给选中的对端。成功返回 True。
+
+        header 带 want_ack：新版接收方处理完回 1 字节回执，落盘失败能被
+        发送方感知；老版接收方(v1.0.0)读完数据直接关连接，按成功处理。
+        """
         if not os.path.isfile(local_path):
             return False
 
@@ -295,20 +374,23 @@ class P2PNode:
                 "filename": name,
                 "size": file_size,
                 "encrypted": encrypted,
+                "want_ack": True,
             }).encode("utf-8")
 
+            progress = _Progress(self.on_progress, "send", name, file_size)
             sock = socket.create_connection((peer.host, peer.port), timeout=15)
             try:
                 sock.sendall(_MAGIC)
                 sock.sendall(struct.pack("!I", len(header)))
                 sock.sendall(header)
 
+                sent = 0
                 if data is not None:
                     # 加密数据已在内存，分块发送
-                    offset = 0
-                    while offset < len(data):
-                        sock.sendall(data[offset:offset + _BUFFER])
-                        offset += _BUFFER
+                    while sent < len(data):
+                        sock.sendall(data[sent:sent + _BUFFER])
+                        sent = min(sent + _BUFFER, len(data))
+                        progress.update(sent)
                 else:
                     # 明文：流式从磁盘读
                     with open(local_path, "rb") as f:
@@ -317,6 +399,19 @@ class P2PNode:
                             if not chunk:
                                 break
                             sock.sendall(chunk)
+                            sent += len(chunk)
+                            progress.update(sent)
+
+                # 等接收方回执。老版本对端读完即关连接 -> recv 返回 b""，按成功；
+                # 超时(对端解密大文件等)也不误报失败。
+                sock.settimeout(60)
+                try:
+                    resp = sock.recv(1)
+                except (socket.timeout, OSError):
+                    resp = b""
+                if resp == _ACK_FAIL:
+                    self._status(f"{peer.name} 接收失败（口令不一致或磁盘问题）")
+                    return False
             finally:
                 sock.close()
         except (ConnectionRefusedError, socket.timeout, OSError) as e:
@@ -354,18 +449,36 @@ class P2PNode:
         label = name if name else "未选择"
         self._status(f"目标: {label}")
 
-    def _on_peer_added(self, name: str, host: str, port: int) -> None:
-        """mDNS 发现新节点时调用（由 _WormholeListener 触发）。"""
-        with self._lock:
-            self._peers[name] = PeerInfo(name, host, port)
+    def _on_peer_added(self, name: str, host: str, port: int, service_name: str = "") -> None:
+        """mDNS 发现新节点时调用（由 _WormholeListener 触发）。
 
-        self._status(f"发现 {name}")
+        - 同一服务(service_name 相同)重复通告/地址变化：原地更新，不新增条目。
+        - 不同设备撞了显示名：给后来者加 " (2)" 后缀，两台都能选。
+        """
+        with self._lock:
+            updated = False
+            if service_name:
+                for p in self._peers.values():
+                    if p.service_name == service_name:
+                        p.host, p.port = host, port
+                        updated = True
+                        break
+            if not updated:
+                display = name
+                n = 2
+                while display in self._peers and self._peers[display].service_name != service_name:
+                    display = f"{name} ({n})"
+                    n += 1
+                self._peers[display] = PeerInfo(display, host, port, service_name)
+
+        if not updated:
+            self._status(f"发现 {name}")
 
         if self.on_peers_changed:
             self.on_peers_changed()
 
     def _on_peer_removed(self, name: str) -> None:
-        """mDNS 节点离线时调用。"""
+        """按显示名移除节点(离线)。"""
         with self._lock:
             if name in self._peers:
                 del self._peers[name]
@@ -376,6 +489,25 @@ class P2PNode:
 
         if self.on_peers_changed:
             self.on_peers_changed()
+
+    def _on_peer_removed_by_service(self, service_name: str) -> None:
+        """mDNS 节点离线时调用：按唯一服务名精确匹配，找不到再回退按名字解析。
+
+        显示名可能被去重加过后缀、或与服务名前缀不一致(TXT 里的 peer_name)，
+        只有 service_name 能可靠对上离线事件，否则会留下永不消失的幽灵设备。
+        """
+        display = None
+        with self._lock:
+            for n, p in self._peers.items():
+                if p.service_name == service_name:
+                    display = n
+                    break
+        if display is None:
+            # 老版本对端/手动注册的条目：回退按服务名前缀解析显示名
+            suffix = "." + _SERVICE_TYPE
+            display = service_name[:-len(suffix)] if service_name.endswith(suffix) \
+                else service_name.split(".")[0]
+        self._on_peer_removed(display)
 
     # ---------- 工具 ----------
     def _status(self, msg: str, detail: str = "") -> None:
@@ -409,7 +541,7 @@ class _WormholeListener:
     def __init__(self, node: P2PNode):
         self._node = node
 
-    def add_service(self, zc, type_: str, name: str) -> None:
+    def _upsert(self, zc, type_: str, name: str) -> None:
         info = zc.get_service_info(type_, name, timeout=2000)
         if info is None:
             return
@@ -425,27 +557,30 @@ class _WormholeListener:
             # 回退：从服务名 "MyPC._wormhole._tcp.local." 提取 "MyPC"
             peer_name = name.split(".")[0] if name else "unknown"
 
-        # 不添加自己
-        if peer_name == self._node.cfg.peer_name:
+        # 不添加自己：按实例 ID 判断(可靠)；老版本对端无 instance_id，
+        # 回退按显示名判断(与 v1.0.0 行为一致)
+        instance_id = props.get("instance_id", "")
+        if instance_id:
+            if instance_id == self._node._instance_id:
+                return
+        elif peer_name == self._node.cfg.peer_name:
             return
 
         addresses = info.parsed_addresses()
         if not addresses:
             return
 
-        self._node._on_peer_added(peer_name, addresses[0], info.port)
+        self._node._on_peer_added(peer_name, addresses[0], info.port, service_name=name)
+
+    def add_service(self, zc, type_: str, name: str) -> None:
+        self._upsert(zc, type_, name)
 
     def remove_service(self, zc, type_: str, name: str) -> None:
-        # 从 properties 拿不到离线节点信息，回退到服务名解析
-        peer_name = name.split(".")[0] if name else "unknown"
-        # 但我们自己登记时用了 properties，这里也试试更精确的解析
-        suffix = "." + _SERVICE_TYPE
-        if name.endswith(suffix):
-            peer_name = name[:-len(suffix)]
-        self._node._on_peer_removed(peer_name)
+        self._node._on_peer_removed_by_service(name)
 
     def update_service(self, zc, type_: str, name: str) -> None:
-        pass  # 不需要处理
+        # 对端 IP/端口变化(DHCP 换租、重启换端口)时刷新，否则发送会连旧地址
+        self._upsert(zc, type_, name)
 
 
 # ---------- 网络工具 ----------
@@ -458,6 +593,34 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
             return None
         buf += chunk
     return buf
+
+
+class _Progress:
+    """传输进度节流上报：最多每 0.25s 回调一次，完成时必回调。
+
+    回调签名 on_progress(kind, filename, done, total)，kind = "send"/"recv"。
+    回调里抛异常不打断传输。
+    """
+    __slots__ = ("_cb", "_kind", "_name", "_total", "_last")
+
+    def __init__(self, cb, kind: str, name: str, total: int):
+        self._cb = cb
+        self._kind = kind
+        self._name = name
+        self._total = total
+        self._last = 0.0
+
+    def update(self, done: int) -> None:
+        if self._cb is None:
+            return
+        now = time.monotonic()
+        if done < self._total and now - self._last < 0.25:
+            return
+        self._last = now
+        try:
+            self._cb(self._kind, self._name, done, self._total)
+        except Exception:
+            pass
 
 
 # ---------- 命令行入口 ----------
@@ -480,6 +643,9 @@ def _run_cli(argv=None) -> None:
         on_received=lambda p: print(f"[接收] 虫洞吐出 -> {p}"),
         on_status=lambda s: print(f"[状态] {s}"),
         on_peers_changed=lambda: print(f"[设备] {', '.join(node.peer_names()) or '无'}"),
+        on_progress=lambda kind, name, done, total: print(
+            f"[{'↑' if kind == 'send' else '↓'}] {name} "
+            f"{done * 100 // total if total else 100}% ({done}/{total})"),
     )
     node.start()
     print(f"虫洞 P2P 已启动 · 收件箱={os.path.abspath(args.inbox)}")
