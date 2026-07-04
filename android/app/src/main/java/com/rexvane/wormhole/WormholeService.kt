@@ -34,6 +34,7 @@ class WormholeService : Service() {
         private const val CHANNEL_STATUS = "wormhole_status"
         private const val CHANNEL_FILES = "wormhole_files"
         private const val NOTIF_STATUS_ID = 1
+        private const val ACTION_RELOAD = "com.rexvane.wormhole.RELOAD"
 
         fun start(context: Context) {
             val intent = Intent(context, WormholeService::class.java)
@@ -41,10 +42,13 @@ class WormholeService : Service() {
             else context.startService(intent)
         }
 
-        /** 设置(名字/口令)变更后重启节点。 */
+        /** 设置(名字/口令)变更后重建节点。
+         * 不能用 stopService+startService：stop 是异步的，服务没销毁完时
+         * start 只触发 onStartCommand 不触发 onCreate，节点不会重建。 */
         fun restart(context: Context) {
-            context.stopService(Intent(context, WormholeService::class.java))
-            start(context)
+            val intent = Intent(context, WormholeService::class.java).setAction(ACTION_RELOAD)
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
+            else context.startService(intent)
         }
     }
 
@@ -54,7 +58,20 @@ class WormholeService : Service() {
         super.onCreate()
         createChannels()
         startForeground(NOTIF_STATUS_ID, buildStatusNotification("正在启动…"))
+        startNode()
+    }
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_RELOAD) {
+            WormholeBus.node?.stop()
+            WormholeBus.node = null
+            WormholeBus.lastPeers = emptyList()
+            startNode()
+        }
+        return START_STICKY
+    }
+
+    private fun startNode() {
         val prefs = getSharedPreferences("wormhole", Context.MODE_PRIVATE)
         val name = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         val secret = prefs.getString("secret", "") ?: ""
@@ -64,8 +81,6 @@ class WormholeService : Service() {
         WormholeBus.node = node
         node.start()
     }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         WormholeBus.node?.stop()
