@@ -6,17 +6,21 @@ on:
     tags:
       - "v*"
 
+# 推 v* tag 时自动发布桌面二进制到对应 Release
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
       matrix:
         include:
           - os: windows-latest
-            artifact: 墨洞桌宠.exe
-            path: packaging/dist/墨洞桌宠.exe
+            artifact: inkhole-pet-windows
+            asset: packaging/dist/InkHolePet.exe
           - os: macos-latest
-            artifact: 墨洞桌宠.app
-            path: packaging/dist/墨洞桌宠.app
+            artifact: inkhole-pet-macos
+            asset: packaging/dist/InkHolePet-macos.zip
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -37,21 +41,23 @@ jobs:
         working-directory: packaging
         run: pyinstaller inkhole-pet.spec --noconfirm --clean
 
+      # 产物文件名用 ASCII(InkHolePet):GitHub Release 附件不支持非 ASCII 文件名,
+      # 中文名上传后会被剥成 default.exe。界面/Finder 显示名仍是中文(见 spec/pet.py)。
       - name: Zip macOS app
         if: runner.os == 'macOS'
         working-directory: packaging/dist
-        run: zip -r -y 墨洞桌宠.zip 墨洞桌宠.app
+        run: zip -r -y InkHolePet-macos.zip InkHolePet.app
 
-      - name: Upload artifact (Windows)
-        if: runner.os == 'Windows'
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: inkhole-pet-windows
-          path: packaging/dist/墨洞桌宠.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.asset }}
 
-      - name: Upload artifact (macOS)
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+      # 仅在 tag 推送时把二进制发布到对应 Release(名字已是 ASCII,不会被剥)
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
         with:
-          name: inkhole-pet-macos
-          path: packaging/dist/墨洞桌宠.zip
+          files: ${{ matrix.asset }}
+          fail_on_unmatched_files: true

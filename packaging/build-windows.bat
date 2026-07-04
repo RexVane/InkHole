@@ -12,7 +12,7 @@ python -c "import PyInstaller" 2>nul || pip install pyinstaller
 echo ==^> 打包
 pyinstaller inkhole-pet.spec --noconfirm --clean
 
-echo ==^> 完成:dist\墨洞桌宠.exe
+echo ==^> 完成:dist\InkHolePet.exe(界面显示名仍是"墨洞")
 echo    运行示例:
-echo    dist\墨洞桌宠.exe --name 我的电脑 --secret "口令"
+echo    dist\InkHolePet.exe --name 我的电脑 --secret "口令"
 pause

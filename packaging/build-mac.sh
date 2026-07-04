@@ -15,6 +15,6 @@ python3 -c "import AppKit" 2>/dev/null || pip3 install pyobjc-framework-Cocoa ||
 echo "==> 打包"
 pyinstaller inkhole-pet.spec --noconfirm --clean
 
-echo "==> 完成:dist/墨洞桌宠.app"
+echo "==> 完成:dist/InkHolePet.app(Finder 显示名仍是墨洞桌宠)"
 echo "   运行示例:"
-echo "   ./dist/墨洞桌宠.app/Contents/MacOS/墨洞桌宠 --name 我的Mac --secret '口令'"
+echo "   ./dist/InkHolePet.app/Contents/MacOS/InkHolePet --name 我的Mac --secret '口令'"

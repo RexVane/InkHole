@@ -8,8 +8,6 @@
 
 两台设备连同一个 WiFi，各开一个墨洞，mDNS 自动发现彼此，拖文件进去就 TCP 直连传过去。支持端到端加密（大文件分块流式）、传输回执与进度、手动选目标设备、开机自启。Windows / macOS / Android 三平台互通。
 
-> 项目原名 Wormhole（虫洞），因与 [wormhole.app](https://wormhole.app)、[magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) 等多个现有传输工具重名，更名为**墨洞 InkHole**——墨黑之洞，吞文件于此端，吐文件于彼端。
-
 ## Quick Start
 
 ```bash
@@ -70,25 +68,25 @@ PYTHONPATH=src python -m inkhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkH
 
 ## 下载（免装环境，直接用）
 
-前往 [Releases](https://github.com/RexVane/InkHole/releases) 下载（v1.0.0 为更名前的"虫洞"版本，协议互通）：
+前往 [Releases](https://github.com/RexVane/InkHole/releases) 下载：
 
-| 平台 | 用法 |
-|------|------|
-| Windows | `墨洞桌宠.exe` 双击即用 |
-| macOS | `墨洞桌宠.zip` 解压拖进"应用程序" |
-| Android | `.apk` 传到手机安装 |
+| 平台 | 文件 | 用法 |
+|------|------|------|
+| Windows | `InkHolePet.exe` | 双击即用 |
+| macOS | `InkHolePet-macos.zip` | 解压拖进"应用程序" |
+| Android | `InkHole-v*.apk` | 传到手机安装 |
 
 也可以自行打包：
 
 ```bash
 # Windows
-cd packaging && build-windows.bat        # 产物:packaging\dist\墨洞桌宠.exe
+cd packaging && build-windows.bat        # 产物:packaging\dist\InkHolePet.exe
 
 # macOS
-cd packaging && bash build-mac.sh         # 产物:packaging/dist/墨洞桌宠.app
+cd packaging && bash build-mac.sh         # 产物:packaging/dist/InkHolePet.app
 
 # Android
-cd android && ./gradlew assembleDebug     # 产物:android/app/build/outputs/apk/debug/
+cd android && ./gradlew assembleDebug     # 产物:android/app/build/outputs/apk/debug/app-debug.apk
 # 或 GitHub Actions 自动构建: gh workflow run android.yml
 ```
 

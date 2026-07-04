@@ -6,8 +6,13 @@
     Windows:  cd packaging && pyinstaller inkhole-pet.spec --noconfirm
     macOS:    cd packaging && pyinstaller inkhole-pet.spec --noconfirm
 产物:
-    Windows:  packaging/dist/墨洞桌宠.exe        (双击即用,免装 Python)
-    macOS:    packaging/dist/墨洞桌宠.app        (拖进"应用程序"即用)
+    Windows:  packaging/dist/InkHolePet.exe      (双击即用,免装 Python)
+    macOS:    packaging/dist/InkHolePet.app       (拖进"应用程序"即用)
+
+产物文件名用 ASCII(InkHolePet)而非中文:GitHub Release 附件不支持非 ASCII
+文件名,中文名上传后会被剥成 default.exe 之类。文件名与界面显示名无关——
+窗口/任务栏名由 setApplicationName("墨洞")、Finder 名由 CFBundleDisplayName
+控制,见下方 info_plist 与 pet.py。
 
 要点:
   - inkhole.qml 作为数据文件打进包,运行时从 sys._MEIPASS 读取(见 pet.py:_qml_path)。
@@ -59,7 +64,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="墨洞桌宠",
+    name="InkHolePet",
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
@@ -77,7 +82,7 @@ exe = EXE(
 if sys.platform == "darwin":
     app = BUNDLE(
         exe,
-        name="墨洞桌宠.app",
+        name="InkHolePet.app",
         icon=None,
         bundle_identifier="com.rexvane.inkhole-pet",
         info_plist={
