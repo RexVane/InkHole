@@ -61,15 +61,12 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
     name="InkHolePet",
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,
     upx=False,
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -78,7 +75,8 @@ exe = EXE(
     entitlements_file=None,
 )
 
-# macOS:把单文件可执行进一步包成 .app 应用包(双击启动、Dock 图标、可拖入"应用程序")
+# Windows: onedir 模式——产物是文件夹，不解压到 %TEMP%，绕开 Defender 拦截
+# macOS:   onedir → 再包成 .app（BUNDLE 本身就是目录格式）
 if sys.platform == "darwin":
     app = BUNDLE(
         exe,
@@ -88,8 +86,17 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "墨洞桌宠",
             "CFBundleDisplayName": "墨洞桌宠",
-            "LSUIElement": False,          # 显示 Dock 图标
+            "LSUIElement": False,
             "NSHighResolutionCapable": True,
         },
+    )
+else:
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=True,
+        upx=False,
+        name="InkHolePet",
     )
 
