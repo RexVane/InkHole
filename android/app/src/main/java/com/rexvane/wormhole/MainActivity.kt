@@ -1,8 +1,9 @@
 package com.rexvane.wormhole
 
-import android.app.Activity
+import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,336 +11,261 @@ import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Send
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.*
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import com.rexvane.wormhole.p2p.Peer
 import com.rexvane.wormhole.p2p.WormholeListener
-import com.rexvane.wormhole.p2p.WormholeNode
 import java.io.File
 
+/**
+ * 主界面(纯 UI)。P2P 节点的生命周期在 WormholeService(前台服务)：
+ * 转屏/锁屏/切后台都不断线，Activity 只是挂上去看状态、发起发送。
+ *
+ * 发送入口有两个：
+ *   1. App 内"发送文件"按钮 -> 系统文件选择器(可多选)
+ *   2. 系统分享菜单(图库/文件管理器 -> 分享 -> 虫洞)，未选设备时先排队
+ */
 class MainActivity : ComponentActivity() {
-
-    private var node: WormholeNode? = null
 
     // UI 状态
     private val peers = mutableStateListOf<Peer>()
     private val selectedPeer = mutableStateOf<String?>(null)
     private val statusMsg = mutableStateOf("正在启动…")
-    private val receivedFiles = mutableStateListOf<File>()
+    private val receivedFiles = mutableStateListOf<ReceivedFile>()
+    private val pendingShares = mutableStateListOf<Uri>()   // 分享进来、等选设备的文件
 
     // 设置
     private val peerName = mutableStateOf(Build.MODEL)
     private val secret = mutableStateOf("")
     private var showSettings = mutableStateOf(false)
 
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()) { /* 拒绝也能用，只是没通知/旧机型不导出 */ }
+
     private val filePicker = registerForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            // 把选中文件复制到临时文件再发送
-            Thread {
-                try {
-                    val tmp = File(cacheDir, "send_${System.currentTimeMillis()}")
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        tmp.outputStream().use { input.copyTo(it) }
-                    }
-                    // 从 URI 取文件名
-                    var name = "file"
-                    contentResolver.query(uri, null, null, null, null)?.use { c ->
-                        val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        if (idx >= 0 && c.moveToFirst()) name = c.getString(idx)
-                    }
-                    val dst = File(cacheDir, name)
-                    tmp.renameTo(dst)
-                    runOnUiThread { statusMsg.value = "发送中: $name" }
-                    val ok = node?.sendFile(dst.absolutePath) ?: false
-                    runOnUiThread {
-                        statusMsg.value = if (ok) "已发送: $name" else "发送失败"
-                    }
-                    dst.delete()
-                } catch (e: Exception) {
-                    runOnUiThread { statusMsg.value = "发送失败: ${e.message}" }
-                }
-            }.start()
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (!uris.isNullOrEmpty()) sendUris(uris)
+    }
+
+    private val uiListener = object : WormholeListener {
+        override fun onPeerChanged(list: List<Peer>) = runOnUiThread {
+            peers.clear()
+            peers.addAll(list)
+            if (selectedPeer.value != null && list.none { it.name == selectedPeer.value }) {
+                selectedPeer.value = null   // 选中的设备离线了
+            }
         }
+        override fun onFileReceived(filename: String, path: String) = runOnUiThread {
+            refreshReceived()
+        }
+        override fun onStatus(msg: String) = runOnUiThread { statusMsg.value = msg }
+        override fun onProgress(kind: String, filename: String, done: Long, total: Long) =
+            runOnUiThread {
+                val pct = if (total > 0) done * 100 / total else 100
+                statusMsg.value = "${if (kind == "send") "↑" else "↓"} $filename $pct%"
+            }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 从 SharedPreferences 读设置
         val prefs = getSharedPreferences("wormhole", Context.MODE_PRIVATE)
         peerName.value = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         secret.value = prefs.getString("secret", "") ?: ""
 
-        // 收件箱
-        val inbox = File(getExternalFilesDir(null), "收件箱")
+        requestNeededPermissions()
+        WormholeService.start(this)
+        WormholeBus.uiListener = uiListener
 
-        // 创建 P2P 节点
-        node = WormholeNode(
-            context = this,
-            peerName = peerName.value,
-            inboxDir = inbox,
-            secret = secret.value,
-            listener = object : WormholeListener {
-                override fun onPeerChanged(list: List<Peer>) {
-                    runOnUiThread {
-                        peers.clear()
-                        peers.addAll(list)
-                    }
-                }
-                override fun onFileReceived(filename: String, path: String) {
-                    runOnUiThread { receivedFiles.add(0, File(path)) }
-                }
-                override fun onStatus(msg: String) {
-                    runOnUiThread { statusMsg.value = msg }
-                }
-            },
-        )
-        node?.start()
+        // 服务可能早已在跑(锁屏收文件后点开)：恢复最近状态
+        peers.addAll(WormholeBus.lastPeers)
+        statusMsg.value = WormholeBus.lastStatus
+        selectedPeer.value = WormholeBus.node?.getSelectedPeer()
+        refreshReceived()
+
+        handleShareIntent(intent)
 
         setContent {
             WormholeTheme {
-                MainScreen()
-            }
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        node?.stop()
-    }
-
-    private fun openFile(file: File) {
-        try {
-            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, contentResolver.getType(uri) ?: "*/*")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            startActivity(Intent.createChooser(intent, "打开 ${file.name}"))
-        } catch (e: Exception) {
-            statusMsg.value = "无法打开: ${e.message}"
-        }
-    }
-
-    private fun openInbox() {
-        val inbox = File(getExternalFilesDir(null), "收件箱")
-        // 尝试用系统文件管理器浏览
-        try {
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
-            startActivity(intent)
-        } catch (e: Exception) {
-            statusMsg.value = "收件箱: ${inbox.absolutePath}"
-        }
-    }
-
-    @Composable
-    private fun MainScreen() {
-        Scaffold(
-            topBar = {
-                Surface(color = Color(0xFF1a1a1a)) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        // 黑洞图标
-                        Box(
-                            modifier = Modifier
-                                .size(28.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF000000))
-                                .border(1.dp, Color(0xFF444466), CircleShape)
-                        )
-                        Spacer(Modifier.width(10.dp))
-                        Text(
-                            "虫洞",
-                            color = Color.White,
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        Spacer(Modifier.weight(1f))
-                        IconButton(onClick = { showSettings.value = true }) {
-                            Icon(Icons.Default.Settings, contentDescription = "设置", tint = Color.White)
-                        }
-                    }
-                }
-            },
-        ) { padding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color(0xFF0d0d0d))
-                    .padding(padding)
-                    .padding(horizontal = 16.dp),
-            ) {
-                // 状态行
-                Text(
-                    statusMsg.value,
-                    color = Color(0xFFaaaacc),
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(vertical = 12.dp),
-                )
-
-                // 设备列表
-                Text(
-                    "设备",
-                    color = Color(0xFF888899),
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(bottom = 8.dp),
-                )
-                if (peers.isEmpty()) {
-                    Text(
-                        "🔍 搜索设备中…",
-                        color = Color(0xFF666677),
-                        fontSize = 14.sp,
-                        modifier = Modifier.padding(vertical = 16.dp),
-                    )
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        items(peers) { peer ->
-                            DeviceRow(peer, peer.name == selectedPeer.value) {
-                                selectedPeer.value = if (selectedPeer.value == peer.name) null else peer.name
-                                node?.selectPeer(selectedPeer.value)
-                            }
-                        }
-                    }
-                }
-
-                // 发送按钮
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = {
+                MainScreen(
+                    statusMsg = statusMsg.value,
+                    peers = peers,
+                    selectedPeer = selectedPeer.value,
+                    receivedFiles = receivedFiles.map { it.name },
+                    pendingCount = pendingShares.size,
+                    onDeviceClick = { peer -> onDeviceClicked(peer) },
+                    onSendClick = {
                         if (selectedPeer.value == null) {
                             statusMsg.value = "请先选择目标设备"
                         } else {
                             filePicker.launch(arrayOf("*/*"))
                         }
                     },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF4a4a6e),
-                    ),
-                    shape = RoundedCornerShape(12.dp),
-                ) {
-                    Icon(Icons.Default.Send, contentDescription = null, tint = Color.White)
-                    Spacer(Modifier.width(8.dp))
-                    Text("发送文件", color = Color.White)
-                }
-
-                // 收件箱
-                Spacer(Modifier.height(16.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("收件箱", color = Color(0xFF888899), fontSize = 13.sp)
-                    TextButton(onClick = { openInbox() }) {
-                        Icon(Icons.Default.Folder, contentDescription = null, tint = Color(0xFF88aaff), modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("打开收件箱", color = Color(0xFF88aaff), fontSize = 13.sp)
-                    }
-                }
-                if (receivedFiles.isEmpty()) {
-                    Text(
-                        "暂无已接收文件",
-                        color = Color(0xFF555566),
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(bottom = 16.dp),
-                    )
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.heightIn(max = 200.dp),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        items(receivedFiles) { file ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .clickable { openFile(file) }
-                                    .padding(vertical = 6.dp, horizontal = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text("📄 ", color = Color(0xFF888899), fontSize = 13.sp)
-                                Text(file.name, color = Color(0xFFaaccff), fontSize = 13.sp)
-                            }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(16.dp))
+                    onOpenInbox = { openInbox() },
+                    onOpenFile = { name -> openFile(name) },
+                    onSettingsClick = { showSettings.value = true },
+                )
+                SettingsDialog()
             }
         }
     }
 
-    @Composable
-    private fun DeviceRow(peer: Peer, selected: Boolean, onClick: () -> Unit) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .background(if (selected) Color(0xFF3a3a5e) else Color(0xFF1a1a1a))
-                .clickable { onClick() }
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                if (selected) "●" else "○",
-                color = if (selected) Color(0xFF88aaff) else Color(0xFF555566),
-                fontSize = 16.sp,
-            )
-            Spacer(Modifier.width(10.dp))
-            Text(peer.name, color = Color.White, fontSize = 15.sp)
-            Spacer(Modifier.weight(1f))
-            Text(peer.host, color = Color(0xFF666677), fontSize = 12.sp)
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    override fun onDestroy() {
+        // 只摘掉 UI 监听；节点在前台服务里继续跑
+        if (WormholeBus.uiListener === uiListener) WormholeBus.uiListener = null
+        super.onDestroy()
+    }
+
+    // ---- 发送 ----
+
+    private fun onDeviceClicked(peer: Peer) {
+        val newSel = if (selectedPeer.value == peer.name) null else peer.name
+        selectedPeer.value = newSel
+        WormholeBus.node?.selectPeer(newSel)
+        if (newSel != null && pendingShares.isNotEmpty()) {
+            val toSend = pendingShares.toList()
+            pendingShares.clear()
+            sendUris(toSend)   // 分享排队的文件，选中设备后立刻发出
         }
     }
 
-    @Composable
-    private fun WormholeTheme(content: @Composable () -> Unit) {
-        MaterialTheme(
-            colorScheme = darkColorScheme(
-                background = Color(0xFF0d0d0d),
-                surface = Color(0xFF1a1a1a),
-                primary = Color(0xFF88aaff),
-            ),
-            content = content,
-        )
+    private fun handleShareIntent(intent: Intent?) {
+        val uris = intent?.streamUris().orEmpty()
+        if (uris.isEmpty()) return
+        if (selectedPeer.value != null) {
+            sendUris(uris)
+        } else {
+            pendingShares.addAll(uris)
+            statusMsg.value = "收到 ${pendingShares.size} 个待发文件，点选目标设备即发送"
+        }
     }
 
-    // 设置弹窗
-    // (Compose 中用 AlertDialog 实现, 此处省略详细实现, 用最简版本)
+    private fun Intent.streamUris(): List<Uri> {
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return emptyList()
+        return if (Build.VERSION.SDK_INT >= 33) {
+            when (action) {
+                Intent.ACTION_SEND ->
+                    listOfNotNull(getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))
+                else ->
+                    getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            when (action) {
+                Intent.ACTION_SEND ->
+                    listOfNotNull(getParcelableExtra(Intent.EXTRA_STREAM) as? Uri)
+                else ->
+                    getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM).orEmpty()
+            }
+        }
+    }
+
+    /** 把 content uri 复制到 cache 后经 P2P 发送(顺序发，避免并发写同名缓存)。 */
+    private fun sendUris(uris: List<Uri>) {
+        val node = WormholeBus.node ?: run {
+            statusMsg.value = "虫洞未就绪"
+            return
+        }
+        Thread {
+            var okCount = 0
+            for (uri in uris) {
+                var tmp: File? = null
+                try {
+                    val name = File(queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}").name
+                    val dst = File(cacheDir, name)
+                    tmp = dst
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        dst.outputStream().use { input.copyTo(it) }
+                    } ?: continue
+                    runOnUiThread { statusMsg.value = "发送中: $name" }
+                    if (node.sendFile(dst.absolutePath)) okCount++
+                } catch (e: Exception) {
+                    runOnUiThread { statusMsg.value = "发送失败: ${e.message}" }
+                } finally {
+                    tmp?.delete()
+                }
+            }
+            if (uris.size > 1) {
+                runOnUiThread { statusMsg.value = "已发送 $okCount/${uris.size} 个文件" }
+            }
+        }.start()
+    }
+
+    private fun queryDisplayName(uri: Uri): String? =
+        contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+        }
+
+    // ---- 接收侧 UI ----
+
+    private fun refreshReceived() {
+        receivedFiles.clear()
+        receivedFiles.addAll(WormholeBus.receivedFiles)
+    }
+
+    private fun openFile(name: String) {
+        val record = receivedFiles.find { it.name == name } ?: return
+        val uri = record.uri ?: run {
+            statusMsg.value = "文件在 Downloads/Wormhole"
+            return
+        }
+        try {
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, record.mime)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "打开 $name"))
+        } catch (e: Exception) {
+            statusMsg.value = "无法打开: ${e.message}"
+        }
+    }
+
+    private fun openInbox() {
+        // 收到的文件都导出在系统 Downloads/Wormhole，打开系统下载页最直接
+        try {
+            startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            statusMsg.value = "收件箱: Downloads/Wormhole"
+        }
+    }
+
+    // ---- 权限 ----
+
+    private fun requestNeededPermissions() {
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED) {
+            perms.add(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (Build.VERSION.SDK_INT < 29 &&
+            checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            != PackageManager.PERMISSION_GRANTED) {
+            perms.add(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+        if (perms.isNotEmpty()) permissionLauncher.launch(perms.toTypedArray())
+    }
+
+    // ---- 设置 ----
+
     @Composable
-    fun SettingsDialog() {
+    private fun SettingsDialog() {
         if (showSettings.value) {
             var nameInput by remember { mutableStateOf(peerName.value) }
             var secretInput by remember { mutableStateOf(secret.value) }
@@ -358,7 +284,7 @@ class MainActivity : ComponentActivity() {
                         OutlinedTextField(
                             value = secretInput,
                             onValueChange = { secretInput = it },
-                            label = { Text("加密口令 (可选)") },
+                            label = { Text("加密口令 (可选，两端一致)") },
                             singleLine = true,
                         )
                     }
@@ -373,10 +299,11 @@ class MainActivity : ComponentActivity() {
                             .putString("secret", secretInput)
                             .apply()
                         showSettings.value = false
-                        // 重启节点以应用新设置
-                        node?.stop()
-                        recreate()
-                    }) { Text("保存并重启") }
+                        // 重启前台服务里的节点即可，Activity 不用 recreate
+                        selectedPeer.value = null
+                        peers.clear()
+                        WormholeService.restart(this@MainActivity)
+                    }) { Text("保存") }
                 },
                 dismissButton = {
                     TextButton(onClick = { showSettings.value = false }) { Text("取消") }

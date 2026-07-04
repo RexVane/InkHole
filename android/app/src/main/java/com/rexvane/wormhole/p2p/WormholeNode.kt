@@ -5,29 +5,35 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import kotlinx.coroutines.*
 import java.io.*
-import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.concurrent.ConcurrentHashMap
+import java.net.SocketTimeoutException
+import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** 检测到设备/收到文件/状态变化时的回调。 */
 interface WormholeListener {
     fun onPeerChanged(peers: List<Peer>)
     fun onFileReceived(filename: String, path: String)
     fun onStatus(msg: String)
+    /** 传输进度。kind = "send"/"recv"；节流后最多约 4 次/秒。 */
+    fun onProgress(kind: String, filename: String, done: Long, total: Long) {}
 }
 
 data class Peer(
-    val name: String,
+    val name: String,           // 显示名(重名设备带 " (2)" 后缀)
     val host: String,
     val port: Int,
+    val serviceName: String = "",  // NSD 服务实例名(唯一，用于离线精确匹配)
 )
 
 /**
  * 虫洞 P2P 引擎 (Android 版)。
  *
  * - NSD (NsdManager) 注册/发现 _wormhole._tcp 服务, 与桌面版 zeroconf 互通。
- * - TCP ServerSocket 接收文件, WHPP 协议与桌面版一致。
+ *   服务名带唯一实例 ID 后缀(同名设备不冲突)，显示名走 TXT 属性 peer_name。
+ * - TCP ServerSocket 接收文件, WHPP 协议与桌面版一致(含 ACK 回执)。
  * - 可选 AES-256-GCM 端到端加密 (与桌面版 crypto.py 兼容)。
  */
 class WormholeNode(
@@ -39,15 +45,23 @@ class WormholeNode(
 ) {
     companion object {
         private const val SERVICE_TYPE = "_wormhole._tcp."
+        private const val DISK_MARGIN = 256L * 1024 * 1024   // 收完至少还要剩这么多
+        private const val PROGRESS_INTERVAL_MS = 250L
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var nsdManager: NsdManager? = null
     private var serverSocket: ServerSocket? = null
     private var actualPort = 0
-    private val peers = ConcurrentHashMap<String, Peer>()
-    @Volatile private var selectedPeer: String? = null
+    private val instanceId = UUID.randomUUID().toString().replace("-", "").take(8)
+
+    // serviceName(唯一) -> Peer
+    private val peers = LinkedHashMap<String, Peer>()
+    private val peersLock = Any()
+    @Volatile private var selectedPeer: String? = null   // 显示名
     @Volatile private var running = false
+    /** 系统实际注册下来的服务名(冲突时可能被系统改名)，用于"不发现自己"。 */
+    @Volatile private var registeredName: String? = null
 
     // ---- 生命周期 ----
 
@@ -63,30 +77,31 @@ class WormholeNode(
 
     fun stop() {
         running = false
-        nsdManager?.apply {
-            stopServiceDiscovery(discoveryListener)
-            unregisterService(registrationListener)
+        // 注册/发现可能从未成功，注销时系统会抛 IllegalArgumentException——不能让退出流程崩掉
+        nsdManager?.let { nsd ->
+            try { discoveryListener?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
+            try { registrationListener?.let { nsd.unregisterService(it) } } catch (_: Exception) {}
         }
-        serverSocket?.close()
+        try { serverSocket?.close() } catch (_: IOException) {}
         scope.cancel()
-        peers.clear()
+        synchronized(peersLock) { peers.clear() }
         listener.onPeerChanged(emptyList())
     }
 
     // ---- TCP 服务器 ----
 
     private fun startTcpServer() {
-        try {
-            serverSocket = ServerSocket(0) // OS 自动分配端口
-            actualPort = serverSocket!!.localPort
+        val server = try {
+            ServerSocket(0).also { actualPort = it.localPort } // OS 自动分配端口
         } catch (e: IOException) {
             listener.onStatus("TCP 启动失败: ${e.message}")
             return
         }
+        serverSocket = server
         scope.launch {
             while (running) {
                 try {
-                    val conn = serverSocket!!.accept()
+                    val conn = server.accept()
                     launch { handleConnection(conn) }
                 } catch (e: IOException) {
                     if (running) listener.onStatus("接收连接失败: ${e.message}")
@@ -98,16 +113,31 @@ class WormholeNode(
 
     private fun handleConnection(conn: Socket) {
         var partFile: File? = null
+        var wantAck = false
+        var ok = false
         try {
             val input = BufferedInputStream(conn.getInputStream())
             val header = WHPP.readHeader(input)
+            wantAck = header.wantAck
 
             // basename 防路径穿越
-            val safeName = File(header.filename).name
+            val safeName = File(header.filename).name.ifEmpty { "unknown" }
+
+            // size 来自网络，不可信
+            if (header.size < 0 || header.size > WHPP.MAX_FILE_SIZE) {
+                listener.onStatus("拒收 $safeName：文件大小非法")
+                return
+            }
+            if (header.size + DISK_MARGIN > inboxDir.usableSpace) {
+                listener.onStatus("拒收 $safeName：存储空间不足")
+                return
+            }
+
             val dst = File(inboxDir, safeName)
             partFile = File(inboxDir, "$safeName.part")
 
             // 写 .part, 完成后原子改名
+            var lastReport = 0L
             FileOutputStream(partFile).use { fout ->
                 val buf = ByteArray(WHPP.BUFFER_SIZE)
                 var remaining = header.size
@@ -117,29 +147,57 @@ class WormholeNode(
                     if (n < 0) break
                     fout.write(buf, 0, n)
                     remaining -= n
+                    val now = System.currentTimeMillis()
+                    if (remaining == 0L || now - lastReport >= PROGRESS_INTERVAL_MS) {
+                        lastReport = now
+                        listener.onProgress("recv", safeName, header.size - remaining, header.size)
+                    }
+                }
+                // 对端中途断连：半截文件绝不能顶着完整文件名落盘(会覆盖同名完整文件)
+                if (remaining > 0) {
+                    listener.onStatus("接收中断: $safeName")
+                    return
                 }
             }
 
-            // 解密
-            if (header.encrypted && secret.isNotEmpty()) {
+            // 端到端加密文件：解密成功才算收到
+            if (header.encrypted) {
+                if (secret.isEmpty()) {
+                    listener.onStatus("拒收 $safeName：对方启用了加密，本机未设口令")
+                    return
+                }
                 val blob = partFile.readBytes()
                 val plain = Crypto.decrypt(secret, blob)
-                if (plain != null) partFile.writeBytes(plain)
-                else listener.onStatus("解密失败: $safeName")
-            } else if (header.encrypted && secret.isEmpty()) {
-                listener.onStatus("收到加密文件但未设口令: $safeName")
+                if (plain == null) {
+                    listener.onStatus("解密失败: $safeName（两端口令不一致？）")
+                    return
+                }
+                partFile.writeBytes(plain)
             }
 
             // 原子改名 (覆盖同名)
-            if (partFile.exists()) partFile.renameTo(dst)
+            if (dst.exists()) dst.delete()
+            if (!partFile.renameTo(dst)) {
+                listener.onStatus("落盘失败: $safeName")
+                return
+            }
             partFile = null
+            ok = true
 
             listener.onFileReceived(safeName, dst.absolutePath)
             listener.onStatus("收到: $safeName")
         } catch (e: Exception) {
             listener.onStatus("接收失败: ${e.message}")
         } finally {
-            conn.close()
+            if (wantAck) {
+                try {
+                    conn.getOutputStream().apply {
+                        write(if (ok) WHPP.ACK_OK else WHPP.ACK_FAIL)
+                        flush()
+                    }
+                } catch (_: IOException) {}
+            }
+            try { conn.close() } catch (_: IOException) {}
             partFile?.delete()
         }
     }
@@ -152,11 +210,11 @@ class WormholeNode(
             listener.onStatus("文件不存在")
             return false
         }
-        val peerName = selectedPeer ?: run {
+        val selected = selectedPeer ?: run {
             listener.onStatus("请先选择目标设备")
             return false
         }
-        val peer = peers[peerName] ?: run {
+        val peer = synchronized(peersLock) { peers.values.find { it.name == selected } } ?: run {
             listener.onStatus("目标设备已离线")
             return false
         }
@@ -166,21 +224,33 @@ class WormholeNode(
             socket.connect(java.net.InetSocketAddress(peer.host, peer.port), 15_000)
             socket.use { s ->
                 val out = BufferedOutputStream(s.getOutputStream())
+                var lastReport = 0L
+                val progress: (Long, Long) -> Unit = { done, total ->
+                    val now = System.currentTimeMillis()
+                    if (done >= total || now - lastReport >= PROGRESS_INTERVAL_MS) {
+                        lastReport = now
+                        listener.onProgress("send", file.name, done, total)
+                    }
+                }
 
                 if (secret.isNotEmpty()) {
-                    // 加密: 整块读入内存加密
+                    // 加密: 整块读入内存加密(已知限制：特大文件受设备内存约束)
                     val plain = file.readBytes()
                     val enc = Crypto.encrypt(secret, plain)
-                    WHPP.writeFrame(
-                        out, file.name, enc.size.toLong(), true,
-                        ByteArrayInputStream(enc)
-                    )
+                    WHPP.writeFrame(out, file.name, enc.size.toLong(), true,
+                        ByteArrayInputStream(enc)) { progress(it, enc.size.toLong()) }
                 } else {
                     // 明文: 流式
-                    WHPP.writeFrame(
-                        out, file.name, file.length(), false,
-                        file.inputStream()
-                    )
+                    WHPP.writeFrame(out, file.name, file.length(), false,
+                        file.inputStream()) { progress(it, file.length()) }
+                }
+
+                // 等接收方回执。老版本对端读完即关连接 -> read 返回 -1，按成功；超时也不误报
+                s.soTimeout = 60_000
+                val resp = try { s.getInputStream().read() } catch (_: SocketTimeoutException) { -1 }
+                if (resp == WHPP.ACK_FAIL) {
+                    listener.onStatus("${peer.name} 接收失败（口令不一致或存储问题）")
+                    return false
                 }
             }
             listener.onStatus("已发送: ${file.name}")
@@ -193,7 +263,7 @@ class WormholeNode(
 
     // ---- 对端管理 ----
 
-    fun getPeers(): List<Peer> = peers.values.toList().sortedBy { it.name }
+    fun getPeers(): List<Peer> = synchronized(peersLock) { peers.values.toList().sortedBy { it.name } }
 
     fun selectPeer(name: String?) {
         selectedPeer = name
@@ -201,6 +271,35 @@ class WormholeNode(
     }
 
     fun getSelectedPeer(): String? = selectedPeer
+
+    private fun addPeer(serviceName: String, displayName: String, host: String, port: Int) {
+        var added = false
+        synchronized(peersLock) {
+            val existing = peers[serviceName]
+            if (existing != null) {
+                // 同一服务重新解析(IP 变化)：原地更新
+                peers[serviceName] = existing.copy(host = host, port = port)
+            } else {
+                // 不同设备撞了显示名：给后来者加 " (2)" 后缀
+                var name = displayName
+                var n = 2
+                while (peers.values.any { it.name == name }) {
+                    name = "$displayName (${n++})"
+                }
+                peers[serviceName] = Peer(name, host, port, serviceName)
+                added = true
+            }
+        }
+        if (added) listener.onStatus("发现: $displayName")
+        listener.onPeerChanged(getPeers())
+    }
+
+    private fun removePeer(serviceName: String) {
+        val removed = synchronized(peersLock) { peers.remove(serviceName) } ?: return
+        if (selectedPeer == removed.name) selectedPeer = null
+        listener.onPeerChanged(getPeers())
+        listener.onStatus("${removed.name} 离线")
+    }
 
     // ---- NSD 注册 ----
 
@@ -210,12 +309,19 @@ class WormholeNode(
     private fun registerNsd() {
         nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
         val info = NsdServiceInfo().apply {
-            serviceName = peerName
+            // 服务名带唯一后缀：两台同名手机(如同型号 Build.MODEL)不再撞名
+            serviceName = "${peerName.replace(".", "-")}-$instanceId"
             serviceType = SERVICE_TYPE
             port = actualPort
+            // 与桌面版 zeroconf 互通的 TXT 属性
+            setAttribute("peer_name", peerName)
+            setAttribute("instance_id", instanceId)
         }
         registrationListener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {}
+            override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
+                // 系统冲突改名后这里才是真实注册名，自我过滤必须用它
+                registeredName = serviceInfo.serviceName
+            }
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
                 listener.onStatus("NSD 注册失败: $errorCode")
             }
@@ -226,6 +332,53 @@ class WormholeNode(
     }
 
     // ---- NSD 发现 ----
+    // Android 同一时刻只允许一个 resolveService 在跑，并发会 FAILURE_ALREADY_ACTIVE
+    // (设备"时而发现不了"的经典原因)。这里排队逐个解析。
+
+    private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
+    private val resolving = AtomicBoolean(false)
+
+    private fun enqueueResolve(serviceInfo: NsdServiceInfo) {
+        resolveQueue.add(serviceInfo)
+        drainResolveQueue()
+    }
+
+    private fun drainResolveQueue() {
+        if (!resolving.compareAndSet(false, true)) return
+        val next = resolveQueue.poll()
+        if (next == null) {
+            resolving.set(false)
+            return
+        }
+        // 用"发现时"的服务名做对端表的 key：resolve 返回的名字转义可能不一致
+        // (含空格等字符时)，而 onServiceLost 给的是发现时的名字
+        val discoveryName = next.serviceName
+        nsdManager?.resolveService(next, object : NsdManager.ResolveListener {
+            override fun onServiceResolved(info: NsdServiceInfo) {
+                handleResolved(discoveryName, info)
+                resolving.set(false)
+                drainResolveQueue()
+            }
+            override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
+                if (errorCode == NsdManager.FAILURE_ALREADY_ACTIVE) {
+                    resolveQueue.add(next)   // 稍后重试
+                }
+                resolving.set(false)
+                drainResolveQueue()
+            }
+        }) ?: resolving.set(false)
+    }
+
+    private fun handleResolved(discoveryName: String, info: NsdServiceInfo) {
+        val host = info.host?.hostAddress ?: return
+        val attrs = try { info.attributes } catch (_: Exception) { emptyMap<String, ByteArray>() }
+        val txtInstanceId = attrs["instance_id"]?.toString(Charsets.UTF_8)
+        // 不添加自己：优先按实例 ID(可靠)；老版本对端无此属性，回退按注册名
+        if (txtInstanceId == instanceId) return
+        val displayName = attrs["peer_name"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+            ?: discoveryName
+        addPeer(discoveryName, displayName, host, info.port)
+    }
 
     private fun discoverNsd() {
         discoveryListener = object : NsdManager.DiscoveryListener {
@@ -233,33 +386,19 @@ class WormholeNode(
             override fun onDiscoveryStopped(serviceType: String) {}
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                val name = serviceInfo.serviceName
-                if (name == peerName) return // 跳过自己
-                nsdManager!!.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                    override fun onServiceResolved(info: NsdServiceInfo) {
-                        val host = info.host?.hostAddress ?: return
-                        peers[name] = Peer(name, host, info.port)
-                        listener.onPeerChanged(getPeers())
-                        listener.onStatus("发现: $name")
-                    }
-                    override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {}
-                })
+                // 跳过自己(用系统实际注册名比对；冲突改名场景由 resolve 后的 instance_id 兜底)
+                if (serviceInfo.serviceName == (registeredName ?: "${peerName.replace(".", "-")}-$instanceId")) return
+                enqueueResolve(serviceInfo)
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-                val name = serviceInfo.serviceName
-                peers.remove(name)
-                if (selectedPeer == name) selectedPeer = null
-                listener.onPeerChanged(getPeers())
-                listener.onStatus("$name 离线")
+                removePeer(serviceInfo.serviceName)
             }
 
             override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
                 listener.onStatus("NSD 发现启动失败: $errorCode")
             }
-            override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {
-                listener.onStatus("NSD 停止发现失败: $errorCode")
-            }
+            override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
         }
         nsdManager!!.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
     }

@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
+    <!-- 应用私有收件箱(导出失败时兜底打开用) -->
     <external-files-path name="inbox" path="." />
+    <!-- Android 9 及以下：公共 Downloads/Wormhole 里的文件经 FileProvider 打开 -->
+    <external-path name="downloads" path="Download/Wormhole/" />
 </paths>
