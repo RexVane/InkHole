@@ -1,7 +1,8 @@
 # 墨洞桌宠 · 轻量 app 打包
 
-把墨洞桌宠客户端(`src/inkhole/pet.py`,PySide6 + QML)打包成
-**单文件可执行**,双击即用、免装 Python。Windows 产出 `.exe`,macOS 产出 `.app`。
+把墨洞桌宠客户端(`src/inkhole/pet.py`,PySide6 + QML)打包成免装 Python 的可执行程序。
+Windows 产出 **onedir 目录**(压成 zip 发布,就地运行不写临时目录,绕开 Defender 拦截),
+macOS 产出**单文件 `.app`**。产物名用 ASCII(`InkHolePet`):GitHub Release 附件不支持非 ASCII 文件名。
 
 ## 目录
 
@@ -18,14 +19,14 @@
 ```bat
 cd packaging
 build-windows.bat
-:: 产物:packaging\dist\墨洞桌宠.exe
+:: 产物:packaging\dist\InkHolePet\ (onedir:InkHolePet.exe + _internal 依赖目录,整体压 zip 发布)
 ```
 
 **macOS**
 ```bash
 cd packaging
 bash build-mac.sh
-# 产物:packaging/dist/墨洞桌宠.app
+# 产物:packaging/dist/InkHolePet.app
 ```
 
 依赖(脚本会自动补装):`PySide6`、`zeroconf`、`cryptography`、`pyinstaller`;
@@ -36,7 +37,7 @@ macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`(可
 打包后的程序接受与 `pet.py` 完全相同的命令行参数:
 
 ```
-墨洞桌宠 --name 我的电脑 \
+InkHolePet --name 我的电脑 \
         --secret '<两端一致的端到端加密口令>' \
         --inbox ~/InkHole/收件箱
 ```
@@ -53,8 +54,8 @@ macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`(可
 
 ## 体积说明
 
-单文件包含整个 Qt Quick 运行时,体积约 150–170MB,属 PySide6 应用的正常范围。
-spec 已排除 WebEngine、Multimedia、3D、Charts 等无用重型模块以尽量压缩。
+包含整个 Qt Quick 运行时:Windows zip 约 170MB(解压后约 425MB)、macOS zip 约 150MB,
+属 PySide6 应用的正常范围。spec 已排除 WebEngine、Multimedia、3D、Charts 等无用重型模块以尽量压缩。
 
 ## 原理要点
 
