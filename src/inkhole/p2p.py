@@ -49,6 +49,9 @@ _ACK_FAIL = b"\x00"                # 接收方回执：失败(中断/解密失�
 _CHUNK_ENC_THRESHOLD = 32 * 1024 * 1024   # 加密文件超过此大小自动走 WHE2 分块(内存恒定)
 _CONNECT_TIMEOUT = 10              # 单个地址的连接超时(多地址会逐个尝试)
 _DRAIN_CAP = 8 * 1024 * 1024       # 拒收时最多帮对端消化这么多字节(让回执可靠到达)
+_PROBE_INTERVAL = 10.0             # 对端存活探测间隔(秒)
+_PROBE_TIMEOUT = 1.5               # 探测单个地址的 TCP 连接超时(秒)
+_PROBE_STRIKES = 2                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
 
 
 # ---------- 配置 ----------
@@ -150,6 +153,12 @@ class P2PNode:
         self._server_sock: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
 
+        # 对端存活探测(幽灵设备兜底)；参数做成实例属性主要为了测试提速
+        self._probe_interval = _PROBE_INTERVAL
+        self._probe_timeout = _PROBE_TIMEOUT
+        self._probe_strikes = _PROBE_STRIKES
+        self._probe_thread: threading.Thread | None = None
+
         if cfg.secret:
             try:
                 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
@@ -168,7 +177,11 @@ class P2PNode:
         # 1. 启动 TCP 监听
         self._start_tcp_server()
 
-        # 2. 注册 mDNS 服务(测试模式跳过：只测 TCP 层，不受局域网环境干扰)
+        # 2. 对端存活探测线程(mDNS goodbye 丢包/对端崩溃的兜底，见 _probe_loop)
+        self._probe_thread = threading.Thread(target=self._probe_loop, daemon=True)
+        self._probe_thread.start()
+
+        # 3. 注册 mDNS 服务(测试模式跳过：只测 TCP 层，不受局域网环境干扰)
         if not self.cfg.enable_mdns:
             self._status(f"墨洞已开启(无 mDNS) · {self.cfg.peer_name} @ 127.0.0.1:{self._actual_port}")
             return
@@ -195,7 +208,7 @@ class P2PNode:
         # 服务名已带唯一后缀，理论上不会撞名；万一撞了让 zeroconf 自动改名而不是崩溃
         self._zc.register_service(self._service_info, allow_name_change=True)
 
-        # 3. 开始发现其他节点
+        # 4. 开始发现其他节点
         self._listener = _InkHoleListener(self)
         self._browser = ServiceBrowser(self._zc, _SERVICE_TYPE, self._listener)
 
@@ -612,6 +625,48 @@ class P2PNode:
             display = service_name[:-len(suffix)] if service_name.endswith(suffix) \
                 else service_name.split(".")[0]
         self._on_peer_removed(display)
+
+    # ---------- 对端存活探测 ----------
+    def _probe_loop(self) -> None:
+        """幽灵设备兜底：定期 TCP 探测已发现的对端，连不上的剔除。
+
+        mDNS 的离线通告(goodbye)走 UDP 组播，WiFi 下经常丢；对端崩溃/被
+        强杀更是根本不会发。只靠 remove_service 回调，幽灵设备要挂到 PTR
+        记录 TTL(默认 75 分钟)过期才消失。而对端进程一退监听端口就关了，
+        TCP connect 立刻失败——比等 mDNS 可靠得多。探测连上即断，接收端
+        读不到 magic 会静默丢弃这条空连接(见 _handle_connection)。
+        """
+        strikes: dict[str, int] = {}   # service_name(或显示名) -> 连续失败轮数
+        while self._running:
+            time.sleep(self._probe_interval)
+            if not self._running:
+                break
+            with self._lock:
+                targets = [(p.service_name or n, list(p.hosts), p.port, n)
+                           for n, p in self._peers.items()]
+            seen = set()
+            for key, hosts, port, display in targets:
+                seen.add(key)
+                alive = False
+                for host in hosts:
+                    try:
+                        socket.create_connection((host, port),
+                                                 timeout=self._probe_timeout).close()
+                        alive = True
+                        break
+                    except OSError:
+                        continue
+                if alive:
+                    strikes.pop(key, None)
+                elif strikes.get(key, 0) + 1 >= self._probe_strikes:
+                    strikes.pop(key, None)
+                    self._on_peer_removed(display)
+                else:
+                    strikes[key] = strikes.get(key, 0) + 1
+            # 已经不在对端表里的条目不再计数(正常离线/被 mDNS 先移除)
+            for k in list(strikes):
+                if k not in seen:
+                    del strikes[k]
 
     # ---------- 工具 ----------
     def _status(self, msg: str, detail: str = "") -> None:

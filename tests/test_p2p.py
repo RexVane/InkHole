@@ -741,6 +741,46 @@ def test_multi_host_fallback():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试 18: 幽灵设备探测剔除 ----------
+def test_ghost_peer_eviction():
+    """对端进程死掉(不发 mDNS goodbye)后，存活探测应把它从列表剔除。"""
+    print("\n=== 测试 18: 幽灵设备探测剔除 ===")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    node_a = node_b = None
+    try:
+        changed = []
+        node_a = make_node(tmpdir, "Alice")
+        node_a.on_peers_changed = lambda: changed.append(1)
+        # 探测提速：0.2s 一轮、超时 0.5s、连续 2 轮失败才剔除
+        node_a._probe_interval = 0.2
+        node_a._probe_timeout = 0.5
+        node_b = make_node(tmpdir, "Bob")
+        node_a.start()
+        node_b.start()
+        time.sleep(0.3)
+
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        time.sleep(1.0)   # 约 4~5 轮探测
+        check("对端在线时探测不误杀", "Bob" in node_a.peer_names())
+
+        changed.clear()
+        # 模拟对端崩溃：直接停掉(测试模式无 mDNS，天然不会发 goodbye)
+        node_b.stop()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and "Bob" in node_a.peer_names():
+            time.sleep(0.1)
+        check("对端死亡后被探测剔除", "Bob" not in node_a.peer_names())
+        check("选中的幽灵设备被清空", node_a.selected_peer() is None)
+        check("剔除触发 on_peers_changed", len(changed) > 0)
+    finally:
+        for n in (node_a, node_b):
+            if n:
+                n.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -761,6 +801,7 @@ if __name__ == "__main__":
         test_send_queue,
         test_trusted_only,
         test_multi_host_fallback,
+        test_ghost_peer_eviction,
     ]
     for _t in _tests:
         try:

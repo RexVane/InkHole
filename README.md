@@ -125,7 +125,7 @@ xattr -cr /Applications/InkHolePet.app
 make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可）
 ```
 
-覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线、回调触发、多文件连续发送、路径穿越防御、半截文件不落盘、恶意 size 拒收、同名设备共存与精确离线、口令不一致 ACK 失败、传输进度回调、分块加密往返、分块流篡改/重排检测、发送队列、仅接收目标设备、多地址回退。17 组 66 项全通过（也兼容 `pytest`）。
+覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线、回调触发、多文件连续发送、路径穿越防御、半截文件不落盘、恶意 size 拒收、同名设备共存与精确离线、口令不一致 ACK 失败、传输进度回调、分块加密往返、分块流篡改/重排检测、发送队列、仅接收目标设备、多地址回退、幽灵设备探测剔除。18 组 70 项全通过（也兼容 `pytest`）。
 
 同名文件：桌面端直接覆盖（新版本替掉旧版本）；Android 端进系统下载目录，同名自动加 " (1)" 后缀（系统行为）。传输中断的半截文件不会落盘、不会覆盖已有文件。
 
@@ -141,7 +141,7 @@ make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可
 │   ├── pet.py                 # 桌宠挂件(PySide6+QML) + 设置持久化 + 发送队列
 │   └── inkhole.qml           # 墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
 ├── tests/
-│   └── test_p2p.py            # P2P 端到端测试(17 组 66 项)
+│   └── test_p2p.py            # P2P 端到端测试(18 组 70 项)
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)
 ├── android/                   # Android 客户端(Kotlin + Compose + 前台服务)
 ├── docs/                      # 使用与实现文档
