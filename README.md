@@ -72,7 +72,7 @@ PYTHONPATH=src python -m inkhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkH
 
 | 平台 | 文件 | 用法 |
 |------|------|------|
-| Windows | `InkHolePet.exe` | 双击即用 |
+| Windows | `InkHolePet-windows.zip` | 解压后双击 `InkHolePet\InkHolePet.exe` |
 | macOS | `InkHolePet-macos.zip` | 解压拖进"应用程序" |
 | Android | `InkHole-v*.apk` | 传到手机安装 |
 
@@ -89,6 +89,35 @@ cd packaging && bash build-mac.sh         # 产物:packaging/dist/InkHolePet.app
 cd android && ./gradlew assembleDebug     # 产物:android/app/build/outputs/apk/debug/app-debug.apk
 # 或 GitHub Actions 自动构建: gh workflow run android.yml
 ```
+
+## 常见问题
+
+### Windows：提示"Windows 已保护你的电脑"
+
+应用未做代码签名，SmartScreen 会拦截首次运行：点击**更多信息** → **仍要运行**。
+
+### Windows：首次运行弹出防火墙提示
+
+墨洞需要在局域网收发文件：点击**允许访问**（至少勾选"专用网络"）。
+
+### macOS：提示"无法验证开发者"或"已损坏，无法打开"
+
+右键点击应用 → **打开** → 再点**打开**确认；仍不行则在终端执行：
+
+```bash
+xattr -cr /Applications/InkHolePet.app
+```
+
+### 找不到其他设备
+
+1. 确认两台设备连的是**同一个 WiFi/网段**（`ipconfig` / `ifconfig` 查看 IP 是否同段）
+2. 防火墙放行应用（mDNS 依赖 UDP 5353 端口）
+3. 避开访客网络/企业网络——它们常开 AP 隔离，设备间互相不可见
+4. 开着 VPN 时若发现异常，先断开 VPN 再试
+
+### 问题反馈
+
+提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.0.1）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
 
 ## Tests
 
