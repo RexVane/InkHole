@@ -771,7 +771,7 @@ def main(argv=None) -> None:
             secret, ok = QInputDialog.getText(
                 None, "端到端加密口令",
                 "两台设备口令必须一致；留空关闭加密：",
-                QLineEdit.Password, self.node.cfg.secret)
+                QLineEdit.Normal, self.node.cfg.secret)
             if ok and secret != self.node.cfg.secret:
                 self._apply_settings(secret=secret)
                 self.status.emit("已开启端到端加密" if secret else "已关闭加密")

@@ -145,6 +145,7 @@ class P2PNode:
         self._peers: dict[str, PeerInfo] = {}   # 显示名 -> PeerInfo
         self._lock = threading.Lock()
         self._selected_peer: str | None = None  # 当前选中的目标
+        self._last_selected_service: str | None = None  # 智能保留：记住选中设备的 service_name
         self._running = False
 
         # mDNS 相关
@@ -564,8 +565,13 @@ class P2PNode:
     def select_peer(self, name: str | None) -> None:
         """选择发送目标。传 None 取消选择。"""
         with self._lock:
-            if name is None or name in self._peers:
+            if name is None:
+                self._selected_peer = None
+                self._last_selected_service = None
+            elif name in self._peers:
                 self._selected_peer = name
+                # 智能保留：记住 service_name，离线后重新上线能自动恢复选中
+                self._last_selected_service = self._peers[name].service_name
         label = name if name else "未选择"
         self._status(f"目标: {label}")
 
@@ -575,7 +581,9 @@ class P2PNode:
 
         - 同一服务(service_name 相同)重复通告/地址变化：原地更新，不新增条目。
         - 不同设备撞了显示名：给后来者加 " (2)" 后缀，两台都能选。
+        - 智能保留：若新上线设备的 service_name 匹配之前选中的，自动恢复选择。
         """
+        display_name = name  # 最终显示名（可能带后缀）
         with self._lock:
             updated = False
             if service_name:
@@ -583,6 +591,7 @@ class P2PNode:
                     if p.service_name == service_name:
                         fresh = PeerInfo(p.name, host, port, service_name, hosts)
                         p.host, p.port, p.hosts = fresh.host, fresh.port, fresh.hosts
+                        display_name = p.name
                         updated = True
                         break
             if not updated:
@@ -592,6 +601,13 @@ class P2PNode:
                     display = f"{name} ({n})"
                     n += 1
                 self._peers[display] = PeerInfo(display, host, port, service_name, hosts)
+                display_name = display
+
+            # 智能保留：若此设备的 service_name 匹配之前选中的，自动恢复选择
+            if (service_name and service_name == self._last_selected_service
+                    and self._selected_peer is None):
+                self._selected_peer = display_name
+                self._status(f"目标设备 {display_name} 重新上线，已自动恢复选中")
 
         if not updated:
             self._status(f"发现 {name}")
@@ -600,12 +616,16 @@ class P2PNode:
             self.on_peers_changed()
 
     def _on_peer_removed(self, name: str) -> None:
-        """按显示名移除节点(离线)。"""
+        """按显示名移除节点(离线)。
+
+        智能保留：离线时清空 _selected_peer（避免向已离线设备发送），
+        但保留 _last_selected_service，等对端重新上线时自动恢复选中。
+        """
         with self._lock:
             if name in self._peers:
                 del self._peers[name]
             if self._selected_peer == name:
-                self._selected_peer = None    # 选中的离线了，不自动切换，由用户重新选
+                self._selected_peer = None    # 清空当前选择，但保留 _last_selected_service
 
         self._status(f"{name} 离线")
 

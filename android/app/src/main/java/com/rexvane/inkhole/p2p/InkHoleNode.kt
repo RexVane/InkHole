@@ -73,6 +73,7 @@ class InkHoleNode(
     private val peers = LinkedHashMap<String, Peer>()
     private val peersLock = Any()
     @Volatile private var selectedPeer: String? = null   // 显示名
+    @Volatile private var lastSelectedService: String? = null  // 智能保留：记住选中设备的 serviceName
     @Volatile private var running = false
     /** 系统实际注册下来的服务名(冲突时可能被系统改名)，用于"不发现自己"。 */
     @Volatile private var registeredName: String? = null
@@ -389,6 +390,10 @@ class InkHoleNode(
 
     fun selectPeer(name: String?) {
         selectedPeer = name
+        // 智能保留：记住 serviceName，离线后重新上线能自动恢复选中
+        lastSelectedService = if (name != null) {
+            synchronized(peersLock) { peers.values.find { it.name == name }?.serviceName }
+        } else null
         listener.onStatus(if (name != null) "目标: $name" else "未选择目标")
     }
 
@@ -396,11 +401,13 @@ class InkHoleNode(
 
     private fun addPeer(serviceName: String, displayName: String, host: String, port: Int) {
         var added = false
+        var finalName = displayName
         synchronized(peersLock) {
             val existing = peers[serviceName]
             if (existing != null) {
                 // 同一服务重新解析(IP 变化)：原地更新
                 peers[serviceName] = existing.copy(host = host, port = port)
+                finalName = existing.name
             } else {
                 // 不同设备撞了显示名：给后来者加 " (2)" 后缀
                 var name = displayName
@@ -409,7 +416,13 @@ class InkHoleNode(
                     name = "$displayName (${n++})"
                 }
                 peers[serviceName] = Peer(name, host, port, serviceName)
+                finalName = name
                 added = true
+            }
+            // 智能保留：若此设备的 serviceName 匹配之前选中的，自动恢复选择
+            if (serviceName == lastSelectedService && selectedPeer == null) {
+                selectedPeer = finalName
+                listener.onStatus("目标设备 $finalName 重新上线，已自动恢复选中")
             }
         }
         if (added) listener.onStatus("发现: $displayName")
