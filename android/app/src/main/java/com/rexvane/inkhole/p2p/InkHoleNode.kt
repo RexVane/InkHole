@@ -51,6 +51,10 @@ class InkHoleNode(
         private const val PROGRESS_INTERVAL_MS = 250L
         private const val CHUNK_ENC_THRESHOLD = 32L * 1024 * 1024  // 超过走 WHE2 分块
         private const val DRAIN_CAP = 8L * 1024 * 1024       // 拒收时最多帮对端消化的字节数
+        // onServiceLost 误报兜底：探活参数(连续失败才真移除)
+        private const val LOST_PROBE_TIMEOUT_MS = 1200        // 单次 TCP 探活超时
+        private const val LOST_PROBE_ATTEMPTS = 3             // 连续失败几次才判定真离线
+        private const val LOST_PROBE_INTERVAL_MS = 1000L      // 两次探活间隔
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -72,6 +76,8 @@ class InkHoleNode(
     // serviceName(唯一) -> Peer
     private val peers = LinkedHashMap<String, Peer>()
     private val peersLock = Any()
+    // onServiceLost 误报兜底：正在 TCP 探活确认的 serviceName，避免并发重复探活
+    private val probingLost = java.util.Collections.synchronizedSet(HashSet<String>())
     @Volatile private var selectedPeer: String? = null   // 显示名
     @Volatile private var lastSelectedService: String? = null  // 智能保留：记住选中设备的 serviceName
     @Volatile private var running = false
@@ -445,6 +451,33 @@ class InkHoleNode(
         listener.onStatus("${removed.name} 离线")
     }
 
+    /** onServiceLost 误报兜底：连续 TCP 探活都失败才真移除；任意一次连上视为误报忽略。
+     *  探活期间对端可能被重新发现(addPeer 更新 host/port)，故每次都重读最新地址。 */
+    private fun verifyLostThenRemove(serviceName: String) {
+        if (!probingLost.add(serviceName)) return   // 已在探活，避免并发重复
+        scope.launch {
+            try {
+                repeat(LOST_PROBE_ATTEMPTS) { attempt ->
+                    val peer = synchronized(peersLock) { peers[serviceName] }
+                        ?: return@launch          // 已被别处移除，无需再探
+                    if (probeAlive(peer.host, peer.port)) return@launch  // 还活着，误报忽略
+                    if (attempt < LOST_PROBE_ATTEMPTS - 1) delay(LOST_PROBE_INTERVAL_MS)
+                }
+                // 连续都失败：确认真离线
+                removePeer(serviceName)
+            } finally {
+                probingLost.remove(serviceName)
+            }
+        }
+    }
+
+    private fun probeAlive(host: String, port: Int): Boolean = try {
+        Socket().use { it.connect(java.net.InetSocketAddress(host, port), LOST_PROBE_TIMEOUT_MS) }
+        true
+    } catch (_: Exception) {
+        false
+    }
+
     // ---- NSD 注册 ----
 
     private var registrationListener: NsdManager.RegistrationListener? = null
@@ -551,7 +584,10 @@ class InkHoleNode(
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-                removePeer(serviceInfo.serviceName)
+                // NSD onServiceLost 在 WiFi 组播丢包时经常误报(设备其实还在线)。
+                // 直接移除会导致"离线→仅接收目标拒收→又上线"的反复抖动。
+                // 先 TCP 探活确认真连不上再移除。
+                verifyLostThenRemove(serviceInfo.serviceName)
             }
 
             override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
