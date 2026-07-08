@@ -498,7 +498,10 @@ def main(argv=None) -> None:
             else:
                 selected = bridge.node.selected_peer()
                 for peer in peers:
-                    label = f"● {peer.name}" if peer.name == selected else f"○ {peer.name}"
+                    # 显示设备名 + instance_id 后4位，避免重名混淆
+                    marker = "●" if peer.name == selected else "○"
+                    suffix = f" ({peer.instance_id[-4:]})" if peer.instance_id else ""
+                    label = f"{marker} {peer.name}{suffix}"
                     act = peer_menu.addAction(label)
                     act.setCheckable(True)
                     act.setChecked(peer.name == selected)
@@ -559,6 +562,12 @@ def main(argv=None) -> None:
                 act_autostart.setChecked(ok)
                 bridge.status.emit("已开启开机自启" if ok else "已关闭开机自启")
             act_autostart.triggered.connect(_on_autostart)
+
+            menu.addSeparator()
+            # 本机信息：显示设备名-instance_id，方便与对端核对
+            local_info = f"本机：{bridge.node.peer_name}-{bridge.node._instance_id}"
+            act_local = menu.addAction(local_info)
+            act_local.setEnabled(False)  # 只读，不可点击
 
             menu.addSeparator()
             act_status = menu.addAction("状态：" + bridge.connState())

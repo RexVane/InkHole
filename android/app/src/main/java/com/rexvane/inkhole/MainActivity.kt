@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
@@ -295,6 +296,15 @@ class MainActivity : ComponentActivity() {
                 title = { Text("设置") },
                 text = {
                     Column {
+                        // 本机信息提示：对端看到的设备名-instance_id
+                        val instanceId = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
+                            .getString("instance_id", "") ?: ""
+                        Text(
+                            text = "本机：${peerName.value}-$instanceId",
+                            fontSize = 12.sp,
+                            color = androidx.compose.ui.graphics.Color.Gray,
+                            modifier = Modifier.padding(bottom = 12.dp)
+                        )
                         OutlinedTextField(
                             value = nameInput,
                             onValueChange = { nameInput = it },

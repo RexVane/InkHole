@@ -377,7 +377,12 @@ private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
-            Text(peer.host, color = TextDim, fontSize = 10.sp, maxLines = 1)
+            // 显示 instance_id 后4位（唯一标识，避免重名混淆）
+            val instanceId = peer.serviceName.takeIf { it.contains("-") }
+                ?.substringAfterLast("-")?.takeLast(4) ?: ""
+            if (instanceId.isNotEmpty()) {
+                Text(instanceId, color = TextDim, fontSize = 10.sp, maxLines = 1)
+            }
         }
         if (selected) {
             Spacer(Modifier.width(8.dp))

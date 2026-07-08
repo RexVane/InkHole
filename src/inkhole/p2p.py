@@ -98,6 +98,14 @@ class PeerInfo:
     def __str__(self):
         return f"{self.name} ({self.host})"
 
+    @property
+    def instance_id(self) -> str:
+        """从 service_name 提取 instance_id（最后 8 位十六进制）。
+        service_name 格式：{label}-{instance_id}，无 service_name 返回空。"""
+        if self.service_name and "-" in self.service_name:
+            return self.service_name.rsplit("-", 1)[-1]
+        return ""
+
 
 def _service_label(name: str, instance_id: str) -> str:
     """mDNS 服务实例标签：显示名 + 实例 ID 后缀，保证局域网内唯一。

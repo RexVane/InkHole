@@ -263,8 +263,10 @@ class InkHoleNode(
 
             listener.onFileReceived(safeName, dst.absolutePath)
             listener.onStatus("收到: $safeName")
+        } catch (e: java.io.EOFException) {
+            // 探活空连接(probe)：对端 connect 后立即 close，读协议头时 EOF，静默忽略
         } catch (e: Exception) {
-            listener.onStatus("接收失败: ${e.message}")
+            listener.onStatus("接收失败: ${e.message ?: "未知错误"}")
         } finally {
             if (wantAck) {
                 try {

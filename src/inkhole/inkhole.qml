@@ -342,7 +342,7 @@ Window {
                         bridge.dropFile(drop.urls[i].toString());
                     win.playAbsorb(drop.x, drop.y);
                 } else {
-                    win.hint = "右键选择目标设备"
+                    win.hint = "未选择目标设备"
                 }
             }
             if (win.edge >= 0) autoHide.restart()
