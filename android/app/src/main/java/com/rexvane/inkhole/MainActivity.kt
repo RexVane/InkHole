@@ -327,6 +327,11 @@ class MainActivity : ComponentActivity() {
                 },
                 confirmButton = {
                     TextButton(onClick = {
+                        // 只有设置真正变化时才重建节点(改名/改口令需重新注册 mDNS)；
+                        // 没变就不动，避免已连接的设备无谓断开、要重新点连接。
+                        val changed = nameInput != peerName.value ||
+                            secretInput != secret.value ||
+                            trustedInput != trustedOnly.value
                         peerName.value = nameInput
                         secret.value = secretInput
                         trustedOnly.value = trustedInput
@@ -337,10 +342,14 @@ class MainActivity : ComponentActivity() {
                             .putBoolean("trusted_only", trustedInput)
                             .apply()
                         showSettings.value = false
-                        // 重启前台服务里的节点即可，Activity 不用 recreate
-                        selectedPeer.value = null
-                        peers.clear()
-                        InkHoleService.restart(this@MainActivity)
+                        if (changed) {
+                            // 重启前记住当前选中目标，重建后由智能保留自动选回
+                            InkHoleBus.pendingSelectedService =
+                                InkHoleBus.node?.getSelectedServiceName()
+                            selectedPeer.value = null
+                            peers.clear()
+                            InkHoleService.restart(this@MainActivity)
+                        }
                     }) { Text("保存") }
                 },
                 dismissButton = {

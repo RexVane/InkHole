@@ -399,9 +399,18 @@ class InkHoleNode(
 
     fun getSelectedPeer(): String? = selectedPeer
 
+    /** 当前选中目标的 serviceName（用于节点重建后恢复选中）。 */
+    fun getSelectedServiceName(): String? = lastSelectedService
+
+    /** 预设"上次选中的 serviceName"：设置变更重建节点时，让智能保留在对端
+     *  重新被发现时自动恢复选中，避免用户重新点连接。 */
+    fun restoreSelectedService(serviceName: String?) {
+        lastSelectedService = serviceName
+    }
+
     private fun addPeer(serviceName: String, displayName: String, host: String, port: Int) {
         var added = false
-        var finalName = displayName
+        var finalName: String
         synchronized(peersLock) {
             val existing = peers[serviceName]
             if (existing != null) {

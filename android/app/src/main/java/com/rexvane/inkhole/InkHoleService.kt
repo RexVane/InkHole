@@ -80,6 +80,11 @@ class InkHoleService : Service() {
         val inbox = File(getExternalFilesDir(null), "收件箱")
 
         val node = InkHoleNode(this, name, inbox, secret, trustedOnly, listener = forwarder)
+        // 设置变更重建时恢复选中目标：对端被重新发现后智能保留会自动选回
+        InkHoleBus.pendingSelectedService?.let {
+            node.restoreSelectedService(it)
+            InkHoleBus.pendingSelectedService = null
+        }
         InkHoleBus.node = node
         node.start()
     }

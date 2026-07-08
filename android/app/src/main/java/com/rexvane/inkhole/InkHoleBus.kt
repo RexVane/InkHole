@@ -32,6 +32,8 @@ object InkHoleBus {
     // 最近状态缓存：Activity 重建时恢复 UI 用
     @Volatile var lastPeers: List<Peer> = emptyList()
     @Volatile var lastStatus: String = "正在启动…"
+    // 设置变更重建节点时暂存选中目标的 serviceName，新节点起来后自动恢复选中
+    @Volatile var pendingSelectedService: String? = null
     val receivedFiles = CopyOnWriteArrayList<ReceivedFile>()   // 最新的在最前
 
     private const val HISTORY_KEY = "history"
