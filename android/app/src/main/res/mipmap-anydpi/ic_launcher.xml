@@ -11,15 +11,15 @@
         android:pathData="M0,0 h48 v48 h-48 z"
         android:fillColor="#000000"/>
 
-    <!-- 黑洞径向渐变 -->
+    <!-- 黑洞径向渐变（半径 16，与自适应图标同比例缩小） -->
     <path
-        android:pathData="M24,24 m-20,0 a20,20 0,1 1,40 0 a20,20 0,1 1,-40 0">
+        android:pathData="M24,24 m-16,0 a16,16 0,1 1,32 0 a16,16 0,1 1,-32 0">
         <aapt:attr name="android:fillColor">
             <gradient
                 android:type="radial"
                 android:centerX="24"
                 android:centerY="24"
-                android:gradientRadius="20">
+                android:gradientRadius="16">
                 <item android:offset="0.00" android:color="#FF000000"/>
                 <item android:offset="0.42" android:color="#FF030308"/>
                 <item android:offset="0.60" android:color="#FF484456"/>
