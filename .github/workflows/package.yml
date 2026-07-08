@@ -34,7 +34,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install PySide6 zeroconf cryptography pyinstaller
+          pip install PySide6 zeroconf cryptography psutil pyinstaller
           pip install pyobjc-framework-Cocoa || true
 
       - name: Build

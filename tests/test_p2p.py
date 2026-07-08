@@ -813,6 +813,91 @@ def test_persistent_instance_id():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试 20: 过滤虚拟网卡地址 ----------
+def test_virtual_adapter_filtered():
+    """mDNS 注册地址应过滤 VMware/VirtualBox 等虚拟网卡与 169.254 APIPA。
+
+    Android NSD 的 host 只返回一个 IP，若拿到虚拟网卡地址(如 192.168.190.1)
+    会连接失败——手机连不到电脑的真实局域网地址。
+    """
+    print("\n=== 测试 20: 过滤虚拟网卡地址 ===")
+    import types
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    node = None
+    try:
+        node = make_node(tmpdir, "Alice")
+
+        # 构造假的 psutil.net_if_addrs()：WiFi + VMware + APIPA 混合
+        class FakeAddr:
+            def __init__(self, family, address):
+                self.family = family
+                self.address = address
+
+        fake_ifaces = {
+            "WLAN": [FakeAddr(socket.AF_INET, "192.168.5.7")],
+            "VMware Network Adapter VMnet1": [FakeAddr(socket.AF_INET, "192.168.190.1")],
+            "VMware Network Adapter VMnet8": [FakeAddr(socket.AF_INET, "192.168.110.1")],
+            "以太网 2": [FakeAddr(socket.AF_INET, "169.254.215.246")],  # APIPA
+        }
+        fake_psutil = types.SimpleNamespace(net_if_addrs=lambda: fake_ifaces)
+
+        # 注入假 psutil，强制默认路由 IP 为 WiFi 地址
+        import sys as _sys
+        orig_psutil = _sys.modules.get("psutil")
+        _sys.modules["psutil"] = fake_psutil
+        node._get_local_ip = lambda: "192.168.5.7"
+        try:
+            ips = node._get_local_ips()
+        finally:
+            if orig_psutil is not None:
+                _sys.modules["psutil"] = orig_psutil
+            else:
+                _sys.modules.pop("psutil", None)
+
+        check("保留真实 WiFi 地址", "192.168.5.7" in ips)
+        check("过滤 VMware VMnet1", "192.168.190.1" not in ips)
+        check("过滤 VMware VMnet8", "192.168.110.1" not in ips)
+        check("过滤 169.254 APIPA 地址", "169.254.215.246" not in ips)
+        check("默认路由地址排最前", ips[0] == "192.168.5.7")
+    finally:
+        if node:
+            node.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------- 测试 21: 智能保留选中目标 ----------
+def test_smart_keep_selection():
+    """选中目标离线后重新上线(service_name 匹配)应自动恢复选中。"""
+    print("\n=== 测试 21: 智能保留选中目标 ===")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    node = None
+    try:
+        node = make_node(tmpdir, "Alice")
+        svc = "Bob-abc123._inkhole._tcp.local."
+        node._on_peer_added("Bob", "127.0.0.1", 5000, service_name=svc)
+        node.select_peer("Bob")
+        check("初始选中 Bob", node.selected_peer() == "Bob")
+
+        # Bob 离线：当前选择清空，但记住 service_name
+        node._on_peer_removed("Bob")
+        check("离线后当前选择清空", node.selected_peer() is None)
+        check("记住离线前 service_name", node._last_selected_service == svc)
+
+        # Bob 重新上线(同 service_name，IP/端口变了)：自动恢复选中
+        node._on_peer_added("Bob", "127.0.0.1", 5001, service_name=svc)
+        check("重新上线自动恢复选中", node.selected_peer() == "Bob")
+
+        # 另一台设备上线不应误恢复
+        node.select_peer(None)
+        node._on_peer_added("Carol", "127.0.0.1", 5002,
+                            service_name="Carol-xyz._inkhole._tcp.local.")
+        check("不同设备上线不误恢复", node.selected_peer() is None)
+    finally:
+        if node:
+            node.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -835,6 +920,8 @@ if __name__ == "__main__":
         test_multi_host_fallback,
         test_ghost_peer_eviction,
         test_persistent_instance_id,
+        test_virtual_adapter_filtered,
+        test_smart_keep_selection,
     ]
     for _t in _tests:
         try:

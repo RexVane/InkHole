@@ -12,7 +12,7 @@
 
 ```bash
 # 1. 装依赖
-pip install PySide6 zeroconf cryptography
+pip install PySide6 zeroconf cryptography psutil
 
 # 2. 两台电脑各跑一个
 PYTHONPATH=src python -m inkhole.pet
@@ -31,7 +31,7 @@ PYTHONPATH=src python -m inkhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkH
 
 ## Features
 
-- **mDNS 自动发现**：注册 `_inkhole._tcp.local.` 服务，局域网内自动发现其他墨洞设备；服务名带唯一实例 ID，两台同名设备不冲突；宣告全部本机地址，开 VPN/多网卡也能连上
+- **mDNS 自动发现**：注册 `_inkhole._tcp.local.` 服务，局域网内自动发现其他墨洞设备；服务名带唯一实例 ID，两台同名设备不冲突；宣告本机物理网卡地址（自动过滤 VMware/VirtualBox/Hyper-V 等虚拟网卡与 169.254 链路本地地址），开 VPN/多网卡也能连上
 - **TCP 直连传输**：WHPP 协议（magic + JSON 头 + 文件数据 + 1 字节回执），不经过任何中转服务器
 - **传输回执（ACK）**：接收方落盘成功才算发送成功——对端解密失败、磁盘满、被拒收，发送方都能感知
 - **传输进度**：桌宠外圈亮起青色进度环，Android 端墨洞进度环同步
@@ -125,7 +125,7 @@ xattr -cr /Applications/InkHolePet.app
 make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可）
 ```
 
-覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线、回调触发、多文件连续发送、路径穿越防御、半截文件不落盘、恶意 size 拒收、同名设备共存与精确离线、口令不一致 ACK 失败、传输进度回调、分块加密往返、分块流篡改/重排检测、发送队列、仅接收目标设备、多地址回退、幽灵设备探测剔除。18 组 70 项全通过（也兼容 `pytest`）。
+覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线、回调触发、多文件连续发送、路径穿越防御、半截文件不落盘、恶意 size 拒收、同名设备共存与精确离线、口令不一致 ACK 失败、传输进度回调、分块加密往返、分块流篡改/重排检测、发送队列、仅接收目标设备、多地址回退、幽灵设备探测剔除、持久化实例 ID、虚拟网卡过滤、智能保留选中目标。21 组 85 项全通过（也兼容 `pytest`）。
 
 同名文件：桌面端直接覆盖（新版本替掉旧版本）；Android 端进系统下载目录，同名自动加 " (1)" 后缀（系统行为）。传输中断的半截文件不会落盘、不会覆盖已有文件。
 
@@ -141,7 +141,7 @@ make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可
 │   ├── pet.py                 # 桌宠挂件(PySide6+QML) + 设置持久化 + 发送队列
 │   └── inkhole.qml           # 墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
 ├── tests/
-│   └── test_p2p.py            # P2P 端到端测试(18 组 70 项)
+│   └── test_p2p.py            # P2P 端到端测试(21 组 85 项)
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)
 ├── android/                   # Android 客户端(Kotlin + Compose + 前台服务)
 ├── docs/                      # 使用与实现文档

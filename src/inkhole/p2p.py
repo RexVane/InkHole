@@ -714,13 +714,36 @@ class P2PNode:
             s.close()
 
     def _get_local_ips(self) -> list[str]:
-        """本机全部非环回 IPv4，默认路由地址排最前。"""
+        """本机全部非环回 IPv4，默认路由地址排最前，过滤虚拟网卡。
+
+        排除 VMware/VirtualBox/Hyper-V 等虚拟网卡，避免 mDNS 广播不可达地址。
+        Android NSD API 的 host 字段只返回一个 IP，若拿到虚拟网卡地址会连接失败。
+        """
         ips = [self._get_local_ip()]
         try:
+            # 优先用 psutil 获取网卡详细信息，按名称过滤虚拟网卡
+            import psutil
+            virtual_keywords = ("vmware", "virtualbox", "vbox", "hyper-v", "vethernet",
+                                "docker", "vmmem", "wsl")
+            for iface, addrs in psutil.net_if_addrs().items():
+                if any(kw in iface.lower() for kw in virtual_keywords):
+                    continue  # 跳过虚拟网卡
+                for addr in addrs:
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        # 排除环回、APIPA 链路本地地址(169.254.x.x 通常不可路由)
+                        if (ip not in ips and not ip.startswith("127.")
+                                and not ip.startswith("169.254.")):
+                            ips.append(ip)
+        except ImportError:
+            # psutil 未安装，回退到基础过滤：排除 169.254.x.x (APIPA) 和常见虚拟网段
             for _fam, _t, _p, _c, sockaddr in socket.getaddrinfo(
                     socket.gethostname(), None, socket.AF_INET):
                 ip = sockaddr[0]
-                if ip not in ips and not ip.startswith("127."):
+                if (ip not in ips and not ip.startswith("127.")
+                        and not ip.startswith("169.254.")  # Windows APIPA 自动分配
+                        and not ip.startswith("192.168.56.")  # VirtualBox 默认
+                        and not ip.startswith("192.168.99.")):  # Docker Machine
                     ips.append(ip)
         except (socket.gaierror, OSError):
             pass
