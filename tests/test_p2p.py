@@ -781,6 +781,38 @@ def test_ghost_peer_eviction():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试 19: 持久化 instance_id 稳定服务名(幽灵根治) ----------
+def test_persistent_instance_id():
+    """同一 instance_id 重建节点应产生同一服务名；不给才随机。
+
+    幽灵设备根因：每次启动随机 instance_id → 新服务名 → 旧记录残留。
+    持久化后同一设备重启用同一 ID，去重走原地更新而非新增。
+    """
+    print("\n=== 测试 19: 持久化 instance_id 稳定服务名 ===")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        # 不给 instance_id：P2PConfig 自动生成、两次不同
+        c1 = P2PConfig(inbox=tmpdir, peer_name="X", enable_mdns=False)
+        c2 = P2PConfig(inbox=tmpdir, peer_name="X", enable_mdns=False)
+        check("未指定时自动生成 instance_id", bool(c1.instance_id))
+        check("两次自动生成互不相同", c1.instance_id != c2.instance_id)
+
+        # 指定 instance_id：原样保留
+        fixed = "abcd1234"
+        c3 = P2PConfig(inbox=tmpdir, peer_name="X", instance_id=fixed,
+                       enable_mdns=False)
+        check("指定的 instance_id 原样保留", c3.instance_id == fixed)
+
+        # 节点用 cfg 的 id；同一 id 重建 → 同一服务名(去重能命中)
+        n1 = P2PNode(c3)
+        n2 = P2PNode(P2PConfig(inbox=tmpdir, peer_name="X",
+                               instance_id=fixed, enable_mdns=False))
+        check("节点采用 cfg.instance_id", n1._instance_id == fixed)
+        check("同一 id 重建服务名不变", n1._instance_id == n2._instance_id)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -802,6 +834,7 @@ if __name__ == "__main__":
         test_trusted_only,
         test_multi_host_fallback,
         test_ghost_peer_eviction,
+        test_persistent_instance_id,
     ]
     for _t in _tests:
         try:

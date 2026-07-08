@@ -5,6 +5,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import kotlinx.coroutines.*
 import java.io.*
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -56,7 +57,17 @@ class InkHoleNode(
     private var nsdManager: NsdManager? = null
     private var serverSocket: ServerSocket? = null
     private var actualPort = 0
-    private val instanceId = UUID.randomUUID().toString().replace("-", "").take(8)
+    // 唯一实例 ID 持久化到 SharedPreferences：同一台设备无论 App/前台服务重启
+    // 多少次都用同一个服务名，避免旧注册变成永不消失的"幽灵设备"。
+    private val instanceId = loadOrCreateInstanceId(context)
+
+    private fun loadOrCreateInstanceId(ctx: Context): String {
+        val prefs = ctx.getSharedPreferences("inkhole", Context.MODE_PRIVATE)
+        prefs.getString("instance_id", null)?.takeIf { it.isNotEmpty() }?.let { return it }
+        val id = UUID.randomUUID().toString().replace("-", "").take(8)
+        prefs.edit().putString("instance_id", id).apply()
+        return id
+    }
 
     // serviceName(唯一) -> Peer
     private val peers = LinkedHashMap<String, Peer>()
@@ -488,7 +499,22 @@ class InkHoleNode(
         if (txtInstanceId == instanceId) return
         val displayName = attrs["peer_name"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
             ?: discoveryName
+        // 兜底自我过滤：同名 + 地址是本机 IP，判定为自己的历史注册(旧 instanceId、
+        // goodbye 丢包残留)，丢弃不显示。
+        if (displayName == peerName && host in localIps()) return
         addPeer(discoveryName, displayName, host, info.port)
+    }
+
+    private fun localIps(): Set<String> {
+        val ips = mutableSetOf("127.0.0.1")
+        try {
+            for (nif in NetworkInterface.getNetworkInterfaces()) {
+                for (addr in nif.inetAddresses) {
+                    if (!addr.isLoopbackAddress) addr.hostAddress?.let { ips.add(it) }
+                }
+            }
+        } catch (_: Exception) {}
+        return ips
     }
 
     private fun discoverNsd() {

@@ -63,10 +63,13 @@ class P2PConfig:
     secret: str = ""               # 端到端加密口令(两台电脑必须一致；空=不加密)
     enable_mdns: bool = True       # False = 只起 TCP 不碰 mDNS(测试用，手动注册对端)
     trusted_only: bool = False     # True = 只接受当前选中目标设备的连接，其余拒收
+    instance_id: str = ""          # 本机唯一实例 ID；持久化后同一设备重启不换服务名(见 P2PNode)
 
     def __post_init__(self):
         if not self.peer_name:
             self.peer_name = socket.gethostname()
+        if not self.instance_id:
+            self.instance_id = uuid.uuid4().hex[:8]
 
 
 class PeerInfo:
@@ -134,8 +137,10 @@ class P2PNode:
         self.on_progress = on_progress   # (kind:"send"/"recv", 文件名, 已传字节, 总字节)
 
         # 本节点唯一实例 ID：进服务名保证唯一(两台设备同名不再冲突)，
-        # 进 TXT 属性用于"不发现自己"(比按显示名过滤可靠)
-        self._instance_id = uuid.uuid4().hex[:8]
+        # 进 TXT 属性用于"不发现自己"(比按显示名过滤可靠)。
+        # 从 cfg 取(桌宠会持久化到 config.json)——同一设备重启用同一 ID，
+        # 服务名不变，避免旧记录变成永不消失的"幽灵设备"。
+        self._instance_id = cfg.instance_id or uuid.uuid4().hex[:8]
 
         self._peers: dict[str, PeerInfo] = {}   # 显示名 -> PeerInfo
         self._lock = threading.Lock()
@@ -741,6 +746,13 @@ class _InkHoleListener:
         addresses = info.parsed_addresses()
         if not addresses:
             return
+
+        # 兜底自我过滤：同名 + 地址全落在本机 IP 上，判定为自己的历史注册
+        # (进程曾用旧 instance_id 注册、goodbye 丢包残留)，丢弃不显示。
+        if peer_name == self._node.cfg.peer_name:
+            local_ips = set(self._node._get_local_ips()) | {"127.0.0.1"}
+            if all(a in local_ips for a in addresses):
+                return
 
         self._node._on_peer_added(peer_name, addresses[0], info.port,
                                   service_name=name, hosts=list(addresses))

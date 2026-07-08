@@ -120,7 +120,8 @@ def _save_config(cfg: P2PConfig) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"name": cfg.peer_name, "secret": cfg.secret,
                        "inbox": cfg.inbox, "port": cfg.listen_port,
-                       "trusted_only": cfg.trusted_only},
+                       "trusted_only": cfg.trusted_only,
+                       "instance_id": cfg.instance_id},
                       f, ensure_ascii=False, indent=2)
     except OSError:
         pass
@@ -194,9 +195,13 @@ def _build_config(argv=None):
     name = args.name if args.name is not None else str(saved.get("name") or "")
     secret = args.secret if args.secret is not None else str(saved.get("secret") or "")
     trusted_only = bool(saved.get("trusted_only", False))
+    instance_id = str(saved.get("instance_id") or "")   # 空则 P2PConfig 自动生成
 
     cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret,
-                    trusted_only=trusted_only)
+                    trusted_only=trusted_only, instance_id=instance_id)
+    # 首次运行(配置里还没有 instance_id)时生成一个并落盘，之后重启复用同一 ID
+    if not saved.get("instance_id"):
+        _save_config(cfg)
     if any(a is not None for a in (args.inbox, args.port, args.name, args.secret)):
         _save_config(cfg)   # 显式 CLI 参数视为用户意图，记住
     return cfg, args.size
