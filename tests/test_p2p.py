@@ -31,6 +31,7 @@ import json
 import socket
 import tempfile
 import threading
+import uuid
 
 # 把 src 加入 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -898,6 +899,63 @@ def test_smart_keep_selection():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试 22: 待机唤醒/换网后 mDNS 重建 ----------
+def test_mdns_rebuild():
+    """待机唤醒/换网后 _rebuild_mdns 应重建 mDNS 层：换全新 Zeroconf 实例、
+    重新注册服务，且不动 TCP 监听端口。enable_mdns=False 时应为空操作。"""
+    print("\n=== 测试 22: 待机唤醒/换网后 mDNS 重建 ===")
+    try:
+        import zeroconf  # noqa: F401
+    except ImportError:
+        print("  [SKIP] 未安装 zeroconf，跳过重建测试")
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    node = None
+    try:
+        # 真实 mDNS 节点(唯一名字，避免与局域网其他墨洞混淆)
+        inbox = os.path.join(tmpdir, "rebuild_inbox")
+        cfg = P2PConfig(inbox=inbox, listen_port=0,
+                        peer_name="RebuildTest-" + uuid.uuid4().hex[:6],
+                        enable_mdns=True)
+        node = P2PNode(cfg)
+        node.start()
+        time.sleep(0.5)
+
+        zc1 = node._zc
+        port1 = node._actual_port
+        check("启动后 Zeroconf 实例已建", zc1 is not None)
+        check("启动后已注册服务", node._service_info is not None)
+        check("启动后记录了本机 IP", len(node._last_local_ips) > 0)
+        check("TCP 监听端口已分配", port1 > 0)
+
+        # 模拟唤醒/换网触发重建
+        node._rebuild_mdns("测试唤醒")
+        time.sleep(0.5)
+
+        check("重建后换了全新 Zeroconf 实例", node._zc is not None and node._zc is not zc1)
+        check("重建后服务重新注册", node._service_info is not None)
+        check("重建不动 TCP 监听端口", node._actual_port == port1)
+        check("重建后仍记录本机 IP", len(node._last_local_ips) > 0)
+    finally:
+        if node:
+            node.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # enable_mdns=False 时重建应为空操作(守卫生效，不误建 Zeroconf)
+    tmpdir2 = tempfile.mkdtemp(prefix="inkhole_test_")
+    node2 = None
+    try:
+        node2 = make_node(tmpdir2, "NoMdns")   # make_node 内 enable_mdns=False
+        node2.start()
+        node2._rebuild_mdns("测试")
+        check("enable_mdns=False 时重建不建 Zeroconf", node2._zc is None)
+    finally:
+        if node2:
+            node2.stop()
+        shutil.rmtree(tmpdir2, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -922,6 +980,7 @@ if __name__ == "__main__":
         test_persistent_instance_id,
         test_virtual_adapter_filtered,
         test_smart_keep_selection,
+        test_mdns_rebuild,
     ]
     for _t in _tests:
         try:

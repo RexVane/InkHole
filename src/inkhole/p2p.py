@@ -52,6 +52,8 @@ _DRAIN_CAP = 8 * 1024 * 1024       # 拒收时最多帮对端消化这么多字�
 _PROBE_INTERVAL = 10.0             # 对端存活探测间隔(秒)
 _PROBE_TIMEOUT = 1.5               # 探测单个地址的 TCP 连接超时(秒)
 _PROBE_STRIKES = 2                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
+_NET_CHECK_INTERVAL = 5.0          # 网络监控轮询间隔(秒)
+_NET_WAKE_GAP = 20.0               # 单轮 sleep 实际耗时超过此值判定为睡眠唤醒，触发 mDNS 重建
 
 
 # ---------- 配置 ----------
@@ -168,6 +170,9 @@ class P2PNode:
         self._listener = None        # _InkHoleListener
         self._service_info = None    # 自己注册的 ServiceInfo
         self._actual_port = 0        # 实际监听端口
+        # 网络监控：待机唤醒/换网后 mDNS 组播 socket 会失效，需重建(见 _net_monitor_loop)
+        self._last_local_ips: list[str] = []   # 上次建 mDNS 时的本机 IP，用于检测变化
+        self._net_monitor_thread: threading.Thread | None = None
 
         # TCP 服务器
         self._server_sock: socket.socket | None = None
@@ -206,12 +211,29 @@ class P2PNode:
             self._status(f"墨洞已开启(无 mDNS) · {self.cfg.peer_name} @ 127.0.0.1:{self._actual_port}")
             return
 
+        self._setup_mdns()
+
+        # 4. 网络监控线程：待机唤醒/换网后重建 mDNS(见 _net_monitor_loop)
+        self._net_monitor_thread = threading.Thread(target=self._net_monitor_loop, daemon=True)
+        self._net_monitor_thread.start()
+
+        local_ips = self._last_local_ips or ["127.0.0.1"]
+        self._status(f"墨洞已开启 · {self.cfg.peer_name} @ {local_ips[0]}:{self._actual_port}")
+
+    def _setup_mdns(self) -> None:
+        """创建 Zeroconf 实例、注册本机服务、启动发现浏览器。
+
+        抽成独立方法是为了待机唤醒/换网后能整段拆掉重建——
+        zeroconf 的组播 socket 绑在建实例时存在的网卡上，网卡被拆再挂
+        (睡眠唤醒、切 WiFi、DHCP 换租)后旧 socket 变死连接，必须重建。
+        """
         try:
             from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
         except ImportError:
             raise SystemExit("P2P 模式需要 zeroconf 库：pip install zeroconf")
 
         local_ips = self._get_local_ips()
+        self._last_local_ips = local_ips
         self._zc = Zeroconf()
         self._service_info = ServiceInfo(
             type_=_SERVICE_TYPE,
@@ -228,15 +250,12 @@ class P2PNode:
         # 服务名已带唯一后缀，理论上不会撞名；万一撞了让 zeroconf 自动改名而不是崩溃
         self._zc.register_service(self._service_info, allow_name_change=True)
 
-        # 4. 开始发现其他节点
+        # 开始发现其他节点
         self._listener = _InkHoleListener(self)
         self._browser = ServiceBrowser(self._zc, _SERVICE_TYPE, self._listener)
 
-        self._status(f"墨洞已开启 · {self.cfg.peer_name} @ {local_ips[0]}:{self._actual_port}")
-
-    def stop(self) -> None:
-        """停止：注销 mDNS + 关闭 TCP 监听。"""
-        self._running = False
+    def _teardown_mdns(self) -> None:
+        """注销并关闭当前 mDNS 层(浏览器 + 服务 + Zeroconf 实例)。"""
         if self._browser:
             try:
                 self._browser.cancel()
@@ -254,6 +273,13 @@ class P2PNode:
             except Exception:
                 pass
             self._zc = None
+        self._service_info = None
+        self._listener = None
+
+    def stop(self) -> None:
+        """停止：注销 mDNS + 关闭 TCP 监听。"""
+        self._running = False
+        self._teardown_mdns()
         if self._server_sock:
             try:
                 self._server_sock.close()
@@ -706,6 +732,60 @@ class P2PNode:
             for k in list(strikes):
                 if k not in seen:
                     del strikes[k]
+
+    # ---------- 网络变化监控 ----------
+    def _net_monitor_loop(self) -> None:
+        """待机唤醒 / 换网后重建 mDNS 层。
+
+        zeroconf 的组播 socket 绑在建实例时的网卡上。Windows 睡眠会拆掉
+        网卡、唤醒后重挂(DHCP 还可能换 IP)，旧 socket 变成死连接：既发现
+        不了新设备，自己也广播不出去，表现为"待机后搜不到设备"。TCP 监听层
+        不受影响，所以只重建 mDNS，不动 TCP。
+
+        两种触发：
+          1. 睡眠唤醒——本线程随进程一起被挂起，唤醒后这一轮 sleep 的实际
+             耗时会远超 _NET_CHECK_INTERVAL，据此判定。
+          2. 本机 IP 变化——切 WiFi/插网线/DHCP 换租，即使没睡眠也要重建。
+        """
+        last_tick = time.monotonic()
+        while self._running:
+            time.sleep(_NET_CHECK_INTERVAL)
+            if not self._running:
+                break
+            now = time.monotonic()
+            gap = now - last_tick
+            last_tick = now
+
+            woke = gap > _NET_WAKE_GAP
+            ips_now = self._get_local_ips()
+            ip_changed = ips_now != self._last_local_ips
+
+            if woke or ip_changed:
+                reason = "睡眠唤醒" if woke else "网络变化"
+                self._rebuild_mdns(reason)
+                # 重建自身耗时可能不短，重置基准避免把它误判成又一次唤醒
+                last_tick = time.monotonic()
+
+    def _rebuild_mdns(self, reason: str) -> None:
+        """拆掉并重新创建整个 mDNS 层(唤醒/换网后自愈)。
+
+        对端表保留：浏览器重建后会重新收到在线设备的通告刷新地址，
+        探测线程会清理掉真正够不着的旧设备，不必在这里清空(清空会让
+        菜单瞬间空掉、还丢掉当前选中)。
+        """
+        if not self._running or not self.cfg.enable_mdns:
+            return
+        self._status(f"检测到{reason}，正在重建设备发现…")
+        try:
+            self._teardown_mdns()
+        except Exception:
+            pass
+        try:
+            self._setup_mdns()
+            ip = (self._last_local_ips or ["?"])[0]
+            self._status(f"设备发现已重建 · {ip}:{self._actual_port}")
+        except Exception as e:
+            self._status("设备发现重建失败", str(e))
 
     # ---------- 工具 ----------
     def _status(self, msg: str, detail: str = "") -> None:
