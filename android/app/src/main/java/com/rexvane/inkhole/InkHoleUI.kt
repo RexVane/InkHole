@@ -377,9 +377,12 @@ private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
-            // 显示 instance_id 后4位（唯一标识，避免重名混淆）
+            // 显示完整 instance_id（8位唯一标识）
+            // service_name 格式: "guicaifeilupu-038551df._inkhole._tcp.local."
             val instanceId = peer.serviceName.takeIf { it.contains("-") }
-                ?.substringAfterLast("-")?.takeLast(4) ?: ""
+                ?.substringAfterLast("-")  // "038551df._inkhole._tcp.local."
+                ?.substringBefore(".")     // "038551df"
+                ?: ""
             if (instanceId.isNotEmpty()) {
                 Text(instanceId, color = TextDim, fontSize = 10.sp, maxLines = 1)
             }

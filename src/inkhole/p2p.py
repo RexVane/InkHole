@@ -101,9 +101,15 @@ class PeerInfo:
     @property
     def instance_id(self) -> str:
         """从 service_name 提取 instance_id（最后 8 位十六进制）。
-        service_name 格式：{label}-{instance_id}，无 service_name 返回空。"""
+        service_name 格式：{label}-{instance_id}._inkhole._tcp.local.，无 service_name 返回空。"""
         if self.service_name and "-" in self.service_name:
-            return self.service_name.rsplit("-", 1)[-1]
+            # service_name 格式: "V2419A-8980894b._inkhole._tcp.local."
+            # 提取 "-" 后面到 "." 之前的部分
+            part = self.service_name.rsplit("-", 1)[-1]
+            # 去掉 "._inkhole._tcp.local." 后缀，只保留 instance_id
+            if "." in part:
+                return part.split(".", 1)[0]
+            return part
         return ""
 
 

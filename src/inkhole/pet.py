@@ -264,7 +264,10 @@ def _install_crash_log(inbox: str) -> str:
 
 
 # ---------- 开机自启 ----------
-_APP_NAME = "InkHolePet"
+# 注意:名字不能用 "InkHolePet"/"WormholePet" —— 这两个已被联想电脑管家
+# 记入启动项黑名单(搬进 Run\LenovoDisabled 并加 rem| 前缀禁用)。
+# 换成管家未收录的名字才能稳定保留在 Run 键。
+_APP_NAME = "InkHole"
 
 
 def _src_dir() -> str:
@@ -288,7 +291,8 @@ def is_autostart_enabled() -> bool:
         try:
             import winreg
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                 r"Software\Microsoft\Windows\CurrentVersion\Run")
+                                 r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                 0, winreg.KEY_READ)
             winreg.QueryValueEx(key, _APP_NAME)
             winreg.CloseKey(key)
             return True
@@ -311,32 +315,40 @@ def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
         frozen = getattr(sys, "frozen", False)
 
         if sys.platform == "win32":
-            if frozen:
-                # 打包 exe：注册表直接指向 exe
-                cmd = f'"{python}"'
-            else:
-                # 源码运行：生成 .bat 脚本
-                content = "\r\n".join([
-                    "@echo off",
-                    f'cd /d "{proj}"',
-                    f'set "PYTHONPATH={src}"',
-                    f'"{python}" -m inkhole.pet',
-                ])
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                cmd = f'"{path}"'
-            # 写注册表
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                 r"Software\Microsoft\Windows\CurrentVersion\Run",
-                                 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, cmd)
-            winreg.CloseKey(key)
+            try:
+                if frozen:
+                    # 打包 exe：注册表直接指向 exe
+                    cmd = f'"{python}"'
+                else:
+                    # 源码运行：生成 .bat 脚本
+                    content = "\r\n".join([
+                        "@echo off",
+                        f'cd /d "{proj}"',
+                        f'set "PYTHONPATH={src}"',
+                        f'"{python}" -m inkhole.pet',
+                    ])
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    cmd = f'"{path}"'
+
+                # 写注册表
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                     r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                     0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, cmd)
+                winreg.CloseKey(key)
+            except Exception as e:
+                print(f"[ERROR] 设置开机自启失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
 
         elif sys.platform == "darwin":
-            if frozen:
-                exec_path = sys.executable  # .app 内的可执行文件
-                content = f"""<?xml version="1.0" encoding="UTF-8"?>
+            try:
+                if frozen:
+                    exec_path = sys.executable  # .app 内的可执行文件
+                    content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -348,8 +360,8 @@ def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
     <key>RunAtLoad</key><true/>
 </dict>
 </plist>"""
-            else:
-                content = f"""<?xml version="1.0" encoding="UTF-8"?>
+                else:
+                    content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -368,25 +380,36 @@ def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
     </dict>
 </dict>
 </plist>"""
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception as e:
+                print(f"[ERROR] 设置开机自启失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
 
         else:
             # Linux: .desktop
-            if frozen:
-                exec_line = f'"{python}"'
-            else:
-                exec_line = f'sh -c \'cd "{proj}" && PYTHONPATH="{src}" "{python}" -m inkhole.pet\''
-            content = f"""[Desktop Entry]
+            try:
+                if frozen:
+                    exec_line = f'"{python}"'
+                else:
+                    exec_line = f'sh -c \'cd "{proj}" && PYTHONPATH="{src}" "{python}" -m inkhole.pet\''
+                content = f"""[Desktop Entry]
 Type=Application
 Name=墨洞桌宠
 Exec={exec_line}
 Terminal=false
 X-GNOME-Autostart-enabled=true"""
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception as e:
+                print(f"[ERROR] 设置开机自启失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
 
     else:
         # 取消自启
@@ -398,15 +421,17 @@ X-GNOME-Autostart-enabled=true"""
                                      0, winreg.KEY_SET_VALUE)
                 winreg.DeleteValue(key, _APP_NAME)
                 winreg.CloseKey(key)
-            except (FileNotFoundError, OSError):
-                pass
+            except (FileNotFoundError, OSError) as e:
+                print(f"[INFO] 注册表项不存在或删除失败: {e}")
         if os.path.exists(path):
             try:
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"[ERROR] 删除启动脚本失败: {e}")
 
-    return is_autostart_enabled()
+    result = is_autostart_enabled()
+    print(f"[INFO] 开机自启设置{'成功' if result == enabled else '失败'}: enabled={enabled}, result={result}")
+    return result
 
 
 def main(argv=None) -> None:
@@ -487,95 +512,100 @@ def main(argv=None) -> None:
 
         # ---- 静态部分(每次弹出重建,因为目标子菜单要刷新) ----
         def _rebuild_menu():
-            menu.clear()
+            try:
+                menu.clear()
 
-            # 发送目标子菜单
-            peers = bridge.node.peers()
-            peer_menu = menu.addMenu("发送目标")
-            if not peers:
-                act = peer_menu.addAction("（等待发现设备…）")
-                act.setEnabled(False)
-            else:
-                selected = bridge.node.selected_peer()
-                for peer in peers:
-                    # 显示设备名 + instance_id 后4位，避免重名混淆
-                    marker = "●" if peer.name == selected else "○"
-                    suffix = f" ({peer.instance_id[-4:]})" if peer.instance_id else ""
-                    label = f"{marker} {peer.name}{suffix}"
-                    act = peer_menu.addAction(label)
-                    act.setCheckable(True)
-                    act.setChecked(peer.name == selected)
-                    # lambda 默认绑定技巧:用 name=peer.name 固定当前值
-                    _act = act  # 持引用
-                    act.triggered.connect(
-                        lambda checked=False, name=peer.name: bridge._select_peer(name))
-                peer_menu.addSeparator()
-                act_none = peer_menu.addAction("○ 不选目标")
-                act_none.setCheckable(True)
-                act_none.setChecked(selected is None)
-                act_none.triggered.connect(
-                    lambda checked=False: bridge._select_peer(None))
+                # 发送目标子菜单
+                peers = bridge.node.peers()
+                peer_menu = menu.addMenu("发送目标")
+                if not peers:
+                    act = peer_menu.addAction("（等待发现设备…）")
+                    act.setEnabled(False)
+                else:
+                    selected = bridge.node.selected_peer()
+                    for peer in peers:
+                        # 显示设备名-完整instance_id，确保唯一标识
+                        marker = "●" if peer.name == selected else "○"
+                        suffix = f"-{peer.instance_id}" if peer.instance_id else ""
+                        label = f"{marker} {peer.name}{suffix}"
+                        act = peer_menu.addAction(label)
+                        act.setCheckable(True)
+                        act.setChecked(peer.name == selected)
+                        # lambda 默认绑定技巧:用 name=peer.name 固定当前值
+                        _act = act  # 持引用
+                        act.triggered.connect(
+                            lambda checked=False, name=peer.name: bridge._select_peer(name))
+                    peer_menu.addSeparator()
+                    act_none = peer_menu.addAction("○ 不选目标")
+                    act_none.setCheckable(True)
+                    act_none.setChecked(selected is None)
+                    act_none.triggered.connect(
+                        lambda checked=False: bridge._select_peer(None))
 
-            menu.addSeparator()
+                menu.addSeparator()
 
-            act_open = menu.addAction("打开收件箱")
-            act_open.triggered.connect(bridge.openInbox)
+                act_open = menu.addAction("打开收件箱")
+                act_open.triggered.connect(bridge.openInbox)
 
-            # 最近接收子菜单：点一下直接打开文件
-            recents = bridge.recentFiles()
-            recent_menu = menu.addMenu("最近接收")
-            if not recents:
-                act_none = recent_menu.addAction("（暂无）")
-                act_none.setEnabled(False)
-            else:
-                for rp in recents:
-                    act_r = recent_menu.addAction(os.path.basename(rp))
-                    act_r.triggered.connect(
-                        lambda checked=False, p=rp: bridge.openPath(p))
+                # 最近接收子菜单：点一下直接打开文件
+                recents = bridge.recentFiles()
+                recent_menu = menu.addMenu("最近接收")
+                if not recents:
+                    act_none = recent_menu.addAction("（暂无）")
+                    act_none.setEnabled(False)
+                else:
+                    for rp in recents:
+                        act_r = recent_menu.addAction(os.path.basename(rp))
+                        act_r.triggered.connect(
+                            lambda checked=False, p=rp: bridge.openPath(p))
 
-            act_inbox = menu.addAction("更换收件箱...")
-            act_inbox.triggered.connect(bridge.chooseInbox)
+                act_inbox = menu.addAction("更换收件箱...")
+                act_inbox.triggered.connect(bridge.chooseInbox)
 
-            act_name = menu.addAction("设备名称...")
-            act_name.triggered.connect(bridge.renameDevice)
+                act_name = menu.addAction("设备名称...")
+                act_name.triggered.connect(bridge.renameDevice)
 
-            secret_on = bool(bridge.node.cfg.secret)
-            act_secret = menu.addAction("加密口令..." + ("　🔒" if secret_on else ""))
-            act_secret.triggered.connect(bridge.changeSecret)
+                secret_on = bool(bridge.node.cfg.secret)
+                act_secret = menu.addAction("加密口令..." + ("　🔒" if secret_on else ""))
+                act_secret.triggered.connect(bridge.changeSecret)
 
-            # 仅接收目标设备（可勾选）：拦掉陌生设备的投喂
-            act_trusted = menu.addAction("仅接收目标设备")
-            act_trusted.setCheckable(True)
-            act_trusted.setChecked(bridge.isTrustedOnly())
-            def _on_trusted():
-                on = bridge.toggleTrustedOnly()
-                act_trusted.setChecked(on)
-                bridge.status.emit("只收目标设备的文件" if on else "接收所有设备的文件")
-            act_trusted.triggered.connect(_on_trusted)
+                # 仅接收目标设备（可勾选）：拦掉陌生设备的投喂
+                act_trusted = menu.addAction("仅接收目标设备")
+                act_trusted.setCheckable(True)
+                act_trusted.setChecked(bridge.isTrustedOnly())
+                def _on_trusted():
+                    on = bridge.toggleTrustedOnly()
+                    act_trusted.setChecked(on)
+                    bridge.status.emit("只收目标设备的文件" if on else "接收所有设备的文件")
+                act_trusted.triggered.connect(_on_trusted)
 
-            # 开机自启（可勾选）
-            act_autostart = menu.addAction("开机自启")
-            act_autostart.setCheckable(True)
-            act_autostart.setChecked(bridge.isAutoStart())
-            def _on_autostart():
-                ok = bridge.toggleAutoStart()
-                act_autostart.setChecked(ok)
-                bridge.status.emit("已开启开机自启" if ok else "已关闭开机自启")
-            act_autostart.triggered.connect(_on_autostart)
+                # 开机自启（可勾选）
+                act_autostart = menu.addAction("开机自启")
+                act_autostart.setCheckable(True)
+                act_autostart.setChecked(bridge.isAutoStart())
+                def _on_autostart():
+                    ok = bridge.toggleAutoStart()
+                    act_autostart.setChecked(ok)
+                    bridge.status.emit("已开启开机自启" if ok else "已关闭开机自启")
+                act_autostart.triggered.connect(_on_autostart)
 
-            menu.addSeparator()
-            # 本机信息：显示设备名-instance_id，方便与对端核对
-            local_info = f"本机：{bridge.node.peer_name}-{bridge.node._instance_id}"
-            act_local = menu.addAction(local_info)
-            act_local.setEnabled(False)  # 只读，不可点击
+                menu.addSeparator()
+                # 本机信息：显示设备名-instance_id，方便与对端核对
+                local_info = f"本机：{bridge.node.cfg.peer_name}-{bridge.node._instance_id}"
+                act_local = menu.addAction(local_info)
+                act_local.setEnabled(False)  # 只读，不可点击
 
-            menu.addSeparator()
-            act_status = menu.addAction("状态：" + bridge.connState())
-            act_status.setEnabled(False)
-            menu.addSeparator()
+                menu.addSeparator()
+                act_status = menu.addAction("状态：" + bridge.connState())
+                act_status.setEnabled(False)
+                menu.addSeparator()
 
-            act_quit = menu.addAction("退出")
-            act_quit.triggered.connect(bridge.quit)
+                act_quit = menu.addAction("退出")
+                act_quit.triggered.connect(bridge.quit)
+            except Exception as e:
+                print(f"[ERROR] 菜单构建失败: {e}")
+                import traceback
+                traceback.print_exc()
 
         menu.aboutToShow.connect(_rebuild_menu)
         bridge._tray_menu = menu
