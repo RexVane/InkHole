@@ -956,6 +956,51 @@ def test_mdns_rebuild():
         shutil.rmtree(tmpdir2, ignore_errors=True)
 
 
+# ---------- 测试: 同名文件不覆盖(加后缀) ----------
+def test_no_overwrite_adds_suffix():
+    print("\n=== 测试: 同名文件不覆盖，加 (2) 后缀 ===")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        node_a = make_node(tmpdir, "Alice")
+        node_b = make_node(tmpdir, "Bob")
+        node_a.start()
+        node_b.start()
+        time.sleep(0.3)
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        # 收件箱预置一个同名文件，模拟"已收到过"
+        os.makedirs(node_b.cfg.inbox, exist_ok=True)
+        existing = os.path.join(node_b.cfg.inbox, "dup.txt")
+        with open(existing, "w", encoding="utf-8") as f:
+            f.write("原有内容")
+
+        src = os.path.join(tmpdir, "dup.txt")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("新发来的内容")
+        check("发送成功", node_a.send_file(src))
+
+        got = wait_for_file(node_b.cfg.inbox, "dup (2).txt")
+        check("同名文件落为 dup (2).txt", got is not None)
+        with open(existing, encoding="utf-8") as f:
+            check("原有文件未被覆盖", f.read() == "原有内容")
+    finally:
+        node_a.stop(); node_b.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------- 测试: 非法文件名清洗 ----------
+def test_illegal_filename_sanitized():
+    print("\n=== 测试: 非法文件名清洗 ===")
+    from inkhole.p2p import _safe_filename
+    check("裁掉正斜杠路径", _safe_filename("a/b/c.txt") == "c.txt")
+    check("裁掉反斜杠路径", _safe_filename("a\\b\\c.txt") == "c.txt")
+    check("替换 NTFS 非法字符", _safe_filename('a:b*c?.txt') == "a_b_c_.txt")
+    check("去掉尾部点和空格", _safe_filename("name.  ") == "name")
+    check("纯路径穿越回退 unknown", _safe_filename("../..") == "unknown")
+    check("空名回退 unknown", _safe_filename("") == "unknown")
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -981,6 +1026,8 @@ if __name__ == "__main__":
         test_virtual_adapter_filtered,
         test_smart_keep_selection,
         test_mdns_rebuild,
+        test_no_overwrite_adds_suffix,
+        test_illegal_filename_sanitized,
     ]
     for _t in _tests:
         try:
