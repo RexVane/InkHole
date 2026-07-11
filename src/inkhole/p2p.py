@@ -969,11 +969,16 @@ def _zip_dir(src_dir: str) -> str:
     tmp_root = tempfile.mkdtemp(prefix="inkhole_zip_")
     zip_path = os.path.join(tmp_root, base + ".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, _dirs, files in os.walk(src_dir):
+        for root, dirs, files in os.walk(src_dir):
             for fn in files:
                 full = os.path.join(root, fn)
                 arc = os.path.relpath(full, src_dir)
                 z.write(full, arc)
+            # 显式写目录条目（含空子目录），保持完整目录结构
+            for d in dirs:
+                full_d = os.path.join(root, d)
+                arc_d = os.path.relpath(full_d, src_dir).replace("\\", "/") + "/"
+                z.writestr(zipfile.ZipInfo(arc_d), "")
     return zip_path
 
 

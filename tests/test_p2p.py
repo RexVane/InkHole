@@ -1052,6 +1052,27 @@ def test_zip_dir_empty():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试: 打包保留空子目录 ----------
+def test_zip_dir_preserves_empty_subdir():
+    print("\n=== 测试: 打包保留空子目录 ===")
+    import zipfile
+    from inkhole.p2p import _zip_dir
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        src = os.path.join(tmpdir, "带空目录")
+        os.makedirs(os.path.join(src, "空子目录"))
+        with open(os.path.join(src, "有内容.txt"), "w", encoding="utf-8") as f:
+            f.write("x")
+        zip_path = _zip_dir(src)
+        out = os.path.join(tmpdir, "out")
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(out)
+        check("空子目录被保留", os.path.isdir(os.path.join(out, "空子目录")))
+        check("有内容文件保留", os.path.isfile(os.path.join(out, "有内容.txt")))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -1081,6 +1102,7 @@ if __name__ == "__main__":
         test_illegal_filename_sanitized,
         test_zip_dir_roundtrip,
         test_zip_dir_empty,
+        test_zip_dir_preserves_empty_subdir,
     ]
     for _t in _tests:
         try:
