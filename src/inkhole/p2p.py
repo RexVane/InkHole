@@ -43,6 +43,9 @@ _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
 _BUFFER = 65536           # 64KB 传输块
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
 _MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
+_MAX_WHE1_SIZE = 256 * 1024 * 1024 # WHE1 整块解密需全量进内存，超过此值拒收(防内存耗尽)
+_RECV_IDLE_TIMEOUT = 300           # 接收 socket 空闲超时(秒)，防半开连接永久占住线程
+_SEND_IO_TIMEOUT = 60              # 发送数据阶段单次 IO 超时(秒)
 _DISK_MARGIN = 256 * 1024 * 1024   # 收完文件后磁盘至少还要剩这么多才接收
 _ACK_OK = b"\x01"                  # 接收方回执：成功落盘
 _ACK_FAIL = b"\x00"                # 接收方回执：失败(中断/解密失败/写盘失败)
@@ -326,6 +329,8 @@ class P2PNode:
         want_ack = False
         ok = False
         try:
+            # 空闲超时：对端发一半停住不能永久占住线程和 .part 文件
+            conn.settimeout(_RECV_IDLE_TIMEOUT)
             # 仅接收目标设备：来源 IP 不是当前选中设备的地址就直接拒
             if self.cfg.trusted_only:
                 with self._lock:
@@ -357,7 +362,7 @@ class P2PNode:
                 return
             header = json.loads(hdr_bytes.decode("utf-8"))
 
-            filename = os.path.basename(str(header.get("filename", ""))) or "unknown"  # 防 ../ 路径穿越
+            filename = _safe_filename(str(header.get("filename", "")))  # 防 ../ 路径穿越 + 非法字符
             size = header.get("size", 0)
             encrypted = bool(header.get("encrypted", False))
             enc_mode = str(header.get("enc_mode", ""))
@@ -380,9 +385,15 @@ class P2PNode:
                 self._status(f"拒收 {filename}：对方启用了加密，本机未设口令")
                 _drain(conn, min(size, _DRAIN_CAP))
                 return
+            # WHE1 整块解密需把密文全量读进内存，超大声明是内存耗尽攻击
+            if encrypted and enc_mode != "chunked" and size > _MAX_WHE1_SIZE:
+                self._status(f"拒收 {filename}：整块加密文件过大")
+                _drain(conn, _DRAIN_CAP)
+                return
 
-            dst = os.path.join(self.cfg.inbox, filename)
-            part_path = dst + ".part"
+            # 落盘绝不覆盖已有文件；.part 带随机后缀，并发收同名文件互不干扰
+            dst = _unique_path(self.cfg.inbox, filename)
+            part_path = dst + f".{uuid.uuid4().hex[:8]}.part"
             progress = _Progress(self.on_progress, "recv", filename, size)
 
             if encrypted and enc_mode == "chunked":
@@ -448,7 +459,10 @@ class P2PNode:
                     with open(part_path, "wb") as f:
                         f.write(plain)
 
-            os.replace(part_path, dst)
+            # 落盘时在锁内再取一次唯一名：并发收同名文件时先落盘的不被后来的覆盖
+            with self._lock:
+                dst = _unique_path(self.cfg.inbox, filename)
+                os.replace(part_path, dst)
             part_path = None
             ok = True
 
@@ -534,6 +548,9 @@ class P2PNode:
                 raise last_err if last_err else OSError("无可用地址")
 
             try:
+                # create_connection 的 10s 连接超时会留在 socket 上，数据阶段
+                # 放宽到 60s——接收方磁盘偶发卡顿不该被误判成发送失败
+                sock.settimeout(_SEND_IO_TIMEOUT)
                 sock.sendall(_MAGIC)
                 sock.sendall(struct.pack("!I", len(header)))
                 sock.sendall(header)
@@ -903,6 +920,39 @@ class _InkHoleListener:
     def update_service(self, zc, type_: str, name: str) -> None:
         # 对端 IP/端口变化(DHCP 换租、重启换端口)时刷新，否则发送会连旧地址
         self._upsert(zc, type_, name)
+
+
+# ---------- 文件名安全 ----------
+def _safe_filename(raw: str) -> str:
+    """把来自网络的文件名清洗成能安全落盘的名字。
+
+    - basename 双向裁剪(/ 和 \\ 都算分隔符，Linux 收 Windows 发的名字也不穿越)
+    - 替换 Windows 非法字符(其中 ":" 在 NTFS 上会写进备用数据流)
+    - 去掉尾部点/空格(Windows 不允许)，空名回退 unknown
+    """
+    name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join("_" if c in '<>:"|?*' or ord(c) < 32 else c for c in name)
+    name = name.rstrip(". ")
+    if name in ("", ".", ".."):
+        return "unknown"
+    return name
+
+
+def _unique_path(directory: str, filename: str) -> str:
+    """收件箱内不重名的目标路径：已存在则加 " (2)"、" (3)"… 后缀。
+
+    收到的文件绝不覆盖已有文件——否则局域网内任何设备都能用同名文件
+    静默替换你已收到的内容。"""
+    dst = os.path.join(directory, filename)
+    if not os.path.exists(dst):
+        return dst
+    stem, ext = os.path.splitext(filename)
+    n = 2
+    while True:
+        dst = os.path.join(directory, f"{stem} ({n}){ext}")
+        if not os.path.exists(dst):
+            return dst
+        n += 1
 
 
 # ---------- 网络工具 ----------
