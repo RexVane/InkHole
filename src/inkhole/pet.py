@@ -113,16 +113,19 @@ def _load_saved_config() -> dict:
         return {}
 
 
-def _save_config(cfg: P2PConfig) -> None:
+def _save_config(cfg: P2PConfig, **extra) -> None:
+    """写回配置。读改写合并：不丢掉 P2PConfig 之外的界面项(如 show_pet)。"""
     path = _config_path()
     try:
+        data = _load_saved_config()
+        data.update({"name": cfg.peer_name, "secret": cfg.secret,
+                     "inbox": cfg.inbox, "port": cfg.listen_port,
+                     "trusted_only": cfg.trusted_only,
+                     "instance_id": cfg.instance_id})
+        data.update(extra)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"name": cfg.peer_name, "secret": cfg.secret,
-                       "inbox": cfg.inbox, "port": cfg.listen_port,
-                       "trusted_only": cfg.trusted_only,
-                       "instance_id": cfg.instance_id},
-                      f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 
@@ -510,7 +513,8 @@ def main(argv=None) -> None:
             return None
         menu = QMenu()
 
-        # ---- 静态部分(每次弹出重建,因为目标子菜单要刷新) ----
+        # ---- 每次弹出重建(目标子菜单要随设备上下线刷新) ----
+        # 只保留高频必需项；设备名/口令/收件箱/自启等设置都搬进了主界面
         def _rebuild_menu():
             try:
                 menu.clear()
@@ -532,7 +536,6 @@ def main(argv=None) -> None:
                         act.setCheckable(True)
                         act.setChecked(peer.name == selected)
                         # lambda 默认绑定技巧:用 name=peer.name 固定当前值
-                        _act = act  # 持引用
                         act.triggered.connect(
                             lambda checked=False, name=peer.name: bridge._select_peer(name))
                     peer_menu.addSeparator()
@@ -544,60 +547,12 @@ def main(argv=None) -> None:
 
                 menu.addSeparator()
 
+                act_main = menu.addAction("打开主界面")
+                act_main.triggered.connect(bridge.showMain)
+
                 act_open = menu.addAction("打开收件箱")
                 act_open.triggered.connect(bridge.openInbox)
 
-                # 最近接收子菜单：点一下直接打开文件
-                recents = bridge.recentFiles()
-                recent_menu = menu.addMenu("最近接收")
-                if not recents:
-                    act_none = recent_menu.addAction("（暂无）")
-                    act_none.setEnabled(False)
-                else:
-                    for rp in recents:
-                        act_r = recent_menu.addAction(os.path.basename(rp))
-                        act_r.triggered.connect(
-                            lambda checked=False, p=rp: bridge.openPath(p))
-
-                act_inbox = menu.addAction("更换收件箱...")
-                act_inbox.triggered.connect(bridge.chooseInbox)
-
-                act_name = menu.addAction("设备名称...")
-                act_name.triggered.connect(bridge.renameDevice)
-
-                secret_on = bool(bridge.node.cfg.secret)
-                act_secret = menu.addAction("加密口令..." + ("　🔒" if secret_on else ""))
-                act_secret.triggered.connect(bridge.changeSecret)
-
-                # 仅接收目标设备（可勾选）：拦掉陌生设备的投喂
-                act_trusted = menu.addAction("仅接收目标设备")
-                act_trusted.setCheckable(True)
-                act_trusted.setChecked(bridge.isTrustedOnly())
-                def _on_trusted():
-                    on = bridge.toggleTrustedOnly()
-                    act_trusted.setChecked(on)
-                    bridge.status.emit("只收目标设备的文件" if on else "接收所有设备的文件")
-                act_trusted.triggered.connect(_on_trusted)
-
-                # 开机自启（可勾选）
-                act_autostart = menu.addAction("开机自启")
-                act_autostart.setCheckable(True)
-                act_autostart.setChecked(bridge.isAutoStart())
-                def _on_autostart():
-                    ok = bridge.toggleAutoStart()
-                    act_autostart.setChecked(ok)
-                    bridge.status.emit("已开启开机自启" if ok else "已关闭开机自启")
-                act_autostart.triggered.connect(_on_autostart)
-
-                menu.addSeparator()
-                # 本机信息：显示设备名-instance_id，方便与对端核对
-                local_info = f"本机：{bridge.node.cfg.peer_name}-{bridge.node._instance_id}"
-                act_local = menu.addAction(local_info)
-                act_local.setEnabled(False)  # 只读，不可点击
-
-                menu.addSeparator()
-                act_status = menu.addAction("状态：" + bridge.connState())
-                act_status.setEnabled(False)
                 menu.addSeparator()
 
                 act_quit = menu.addAction("退出")
@@ -617,7 +572,7 @@ def main(argv=None) -> None:
         tray.setToolTip("墨洞")
         tray.setContextMenu(menu)
         tray.activated.connect(
-            lambda reason: bridge.openInbox()
+            lambda reason: bridge.showMain()
             if reason == QSystemTrayIcon.Trigger else None)
         tray.show()
         return tray
@@ -634,6 +589,7 @@ def main(argv=None) -> None:
         def __init__(self, cfg: P2PConfig):
             super().__init__()
             self._tray_menu = None        # 由 _setup_tray 注入:桌宠右键时弹出
+            self._main_window = None      # 由 main() 注入:主界面窗口
             self._recent: deque[str] = deque(maxlen=8)   # 最近收到的文件(路径)
             self.node = self._make_node(cfg)
             self.node.start()
@@ -667,14 +623,17 @@ def main(argv=None) -> None:
             self.status.emit(f"{arrow} {name} {pct}%")
 
         def _apply_settings(self, peer_name: str | None = None,
-                            secret: str | None = None) -> None:
-            """改名/改口令：写回配置并重启 P2P 节点(mDNS 需重新注册)。"""
+                            secret: str | None = None,
+                            port: int | None = None) -> None:
+            """改名/改口令/改端口：写回配置并重启 P2P 节点(mDNS 需重新注册)。"""
             cfg = self.node.cfg
             self.node.stop()
             if peer_name is not None:
                 cfg.peer_name = peer_name
             if secret is not None:
                 cfg.secret = secret
+            if port is not None:
+                cfg.listen_port = port
             _save_config(cfg)
             try:
                 self.node = self._make_node(cfg)
@@ -838,13 +797,22 @@ def main(argv=None) -> None:
             return f"🔍 {len(peers)}台设备"
 
         @Slot()
+        def showMain(self):
+            """显示并激活主窗口(托盘单击/右键菜单"打开主界面")。"""
+            w = getattr(self, "_main_window", None)
+            if w is not None:
+                w.show()
+                w.raise_()
+                w.activateWindow()
+
+        @Slot()
         def showMenu(self):
             """桌宠被右键时,在鼠标位置弹出菜单。"""
             if self._tray_menu is not None:
                 from PySide6.QtGui import QCursor
                 self._tray_menu.popup(QCursor.pos())
             else:
-                self.openInbox()
+                self.showMain()
 
         @Slot()
         def quit(self):
@@ -864,6 +832,35 @@ def main(argv=None) -> None:
     if not engine.rootObjects():
         sys.stderr.write("QML 加载失败\n")
         raise SystemExit(1)
+
+    # 桌宠 = 主界面里可开关的选项(show_pet)，默认开启
+    pet_root = engine.rootObjects()[0]
+    show_pet = bool(_load_saved_config().get("show_pet", True))
+    pet_root.setVisible(show_pet)
+
+    def _set_pet_visible(on: bool) -> None:
+        pet_root.setVisible(bool(on))
+        _save_config(bridge.node.cfg, show_pet=bool(on))
+
+    def _apply_identity(name: str, secret: str, port: int) -> None:
+        c = bridge.node.cfg
+        if (name, secret, port) == (c.peer_name, c.secret, c.listen_port):
+            return   # 没变就不重启节点
+        bridge._apply_settings(peer_name=name, secret=secret, port=port)
+
+    # 主界面窗口(需要 QtWidgets；不可用时退回纯桌宠模式)
+    main_win = None
+    if _HAS_WIDGETS:
+        from .mainwindow import MainWindow
+        main_win = MainWindow(bridge, {
+            "pet_visible": lambda: pet_root.isVisible(),
+            "set_pet_visible": _set_pet_visible,
+            "is_autostart": is_autostart_enabled,
+            "set_autostart": lambda on: set_autostart(on, bridge.node.cfg),
+            "apply_settings": _apply_identity,
+        }, icon=_make_app_icon())
+        bridge._main_window = main_win
+        main_win.show()
 
     # 系统托盘(Windows 右下托盘 / macOS 顶部菜单栏,Qt 跨平台一套代码)
     _tray = _setup_tray(app, bridge)   # 返回托盘对象(需持引用防被回收),失败返回 None
