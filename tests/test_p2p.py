@@ -1104,6 +1104,83 @@ def test_folder_send_end_to_end():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试: 发送队列 per-item 清理(连拖文件夹无竞态) ----------
+def test_send_queue_per_item_cleanup():
+    """临时 zip 改为「按文件发送完成即清理」——回归防线(评审 Important)。
+
+    旧实现用共享 _pending_zip_dirs 列表 + 批次末无差别 rmtree,连拖多个文件夹
+    时存在竞态:worker 发完第一批触发清理的瞬间,可能把第二个文件夹刚入队、
+    尚未发送的 zip 提前删掉(静默不送达),或因 append/重绑并发导致临时目录
+    永不清理(磁盘泄漏)。
+
+    新语义:清理精确绑定单个文件——SendQueue.put(path, on_done=cb),worker
+    每发完一个文件即调 cb(path, ok),由回调删除该文件自己的临时目录。无跨批次
+    耦合、无共享可变列表。
+
+    本测试构造真实 SendQueue(不依赖 Qt/GUI),用 3 个真实临时目录(镜像
+    _zip_dir 的 inkhole_zip_xxx/<name>.zip 结构),每个 zip 各带自己的 on_done
+    清理闭包,断言:
+      - 3 个 zip 发送函数都被调用(都送达/都尝试,无提前删除导致的漏发);
+      - 发送时每个 zip 都还在磁盘上(证明没被别的批次提前 rmtree);
+      - 3 个临时目录最终都不存在(各清各的,无泄漏);
+      - 其中一个发送失败的文件夹,其临时目录同样被清理(失败不泄漏)。
+    """
+    print("\n=== 测试: 发送队列 per-item 清理(连拖文件夹无竞态) ===")
+    from inkhole.pet import SendQueue
+
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        # 造 3 个独立临时目录,各放一个假 zip(镜像 _zip_dir 输出结构)
+        temp_dirs, zips = [], []
+        for i in range(3):
+            d = os.path.join(tmpdir, f"zipdir_{i}")
+            os.makedirs(d)
+            z = os.path.join(d, f"folder_{i}.zip")
+            with open(z, "wb") as f:
+                f.write(b"PK\x03\x04fake")
+            temp_dirs.append(d)
+            zips.append(z)
+
+        sent = []
+        existed_at_send = {}
+        lock = threading.Lock()
+        done = threading.Event()
+        remaining = {"n": len(zips)}
+        fail_zip = zips[2]        # folder_2 发送失败:验证失败也清理(不泄漏)
+
+        def fake_send(path):
+            # 发送时文件必须还在——若已被别的批次提前 rmtree,这里会记 False
+            existed_at_send[path] = os.path.isfile(path)
+            sent.append(path)
+            time.sleep(0.02)
+            return path != fail_zip
+
+        def make_on_done(temp_dir):
+            def _cb(path, ok):
+                shutil.rmtree(temp_dir, ignore_errors=True)   # 各清各的
+                with lock:
+                    remaining["n"] -= 1
+                    if remaining["n"] == 0:
+                        done.set()
+            return _cb
+
+        q = SendQueue(fake_send)
+        for z, d in zip(zips, temp_dirs):
+            q.put(z, on_done=make_on_done(d))
+
+        check("所有文件夹都处理完(per-item 回调触发)", done.wait(timeout=5))
+        check("发送函数对 3 个 zip 都被调用(无提前删除致漏发)",
+              sorted(sent) == sorted(zips))
+        check("发送时每个 zip 都还在磁盘(无提前删除)",
+              all(existed_at_send.get(z) for z in zips))
+        for i, d in enumerate(temp_dirs):
+            check(f"临时目录 {i} 已清理(无泄漏)", not os.path.exists(d))
+        check("发送失败的文件夹临时目录也被清理(失败不泄漏)",
+              not os.path.exists(temp_dirs[2]))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -1135,6 +1212,7 @@ if __name__ == "__main__":
         test_zip_dir_empty,
         test_zip_dir_preserves_empty_subdir,
         test_folder_send_end_to_end,
+        test_send_queue_per_item_cleanup,
     ]
     for _t in _tests:
         try:
