@@ -1001,6 +1001,57 @@ def test_illegal_filename_sanitized():
     check("空名回退 unknown", _safe_filename("") == "unknown")
 
 
+# ---------- 测试: 目录打包成 zip ----------
+def test_zip_dir_roundtrip():
+    print("\n=== 测试: 目录打包 zip 往返 ===")
+    import zipfile
+    from inkhole.p2p import _zip_dir
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        # 造一个带子目录、中文名、空文件的源目录
+        src = os.path.join(tmpdir, "我的资料")
+        os.makedirs(os.path.join(src, "子目录"))
+        with open(os.path.join(src, "a.txt"), "w", encoding="utf-8") as f:
+            f.write("内容A")
+        with open(os.path.join(src, "子目录", "b.txt"), "w", encoding="utf-8") as f:
+            f.write("内容B")
+        open(os.path.join(src, "空.dat"), "w").close()
+
+        zip_path = _zip_dir(src)
+        check("返回的是 .zip 路径", zip_path.endswith(".zip"))
+        check("zip 文件名是目录名", os.path.basename(zip_path) == "我的资料.zip")
+        check("zip 文件已生成", os.path.isfile(zip_path))
+
+        # 解压回来逐一核对
+        out = os.path.join(tmpdir, "out")
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(out)
+        with open(os.path.join(out, "a.txt"), encoding="utf-8") as f:
+            check("a.txt 内容一致", f.read() == "内容A")
+        with open(os.path.join(out, "子目录", "b.txt"), encoding="utf-8") as f:
+            check("子目录/b.txt 内容一致", f.read() == "内容B")
+        check("空文件保留", os.path.isfile(os.path.join(out, "空.dat")))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------- 测试: 空目录打包不报错 ----------
+def test_zip_dir_empty():
+    print("\n=== 测试: 空目录打包 ===")
+    import zipfile
+    from inkhole.p2p import _zip_dir
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        src = os.path.join(tmpdir, "空目录")
+        os.makedirs(src)
+        zip_path = _zip_dir(src)
+        check("空目录也生成合法 zip", os.path.isfile(zip_path))
+        with zipfile.ZipFile(zip_path) as z:
+            check("zip 内无文件条目", len([n for n in z.namelist() if not n.endswith("/")]) == 0)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -1028,6 +1079,8 @@ if __name__ == "__main__":
         test_mdns_rebuild,
         test_no_overwrite_adds_suffix,
         test_illegal_filename_sanitized,
+        test_zip_dir_roundtrip,
+        test_zip_dir_empty,
     ]
     for _t in _tests:
         try:

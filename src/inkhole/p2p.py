@@ -28,6 +28,7 @@ import json
 import shutil
 import socket
 import struct
+import tempfile
 import threading
 import time
 import uuid
@@ -953,6 +954,27 @@ def _unique_path(directory: str, filename: str) -> str:
         if not os.path.exists(dst):
             return dst
         n += 1
+
+
+def _zip_dir(src_dir: str) -> str:
+    """把目录递归打包成一个临时 zip，返回临时 zip 绝对路径。
+
+    zip 名为 <目录basename>.zip，落在独立临时目录里（调用方发送后应删除
+    整个临时目录）。arcname 用相对 src_dir 的路径，保持目录结构；空目录
+    也生成合法（空）zip。用 ZIP_DEFLATED 压缩。
+    """
+    import zipfile
+    src_dir = os.path.abspath(src_dir)
+    base = os.path.basename(src_dir.rstrip("/\\")) or "folder"
+    tmp_root = tempfile.mkdtemp(prefix="inkhole_zip_")
+    zip_path = os.path.join(tmp_root, base + ".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _dirs, files in os.walk(src_dir):
+            for fn in files:
+                full = os.path.join(root, fn)
+                arc = os.path.relpath(full, src_dir)
+                z.write(full, arc)
+    return zip_path
 
 
 # ---------- 网络工具 ----------
