@@ -1073,6 +1073,37 @@ def test_zip_dir_preserves_empty_subdir():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------- 测试: 文件夹发送端到端(打包 zip 送达) ----------
+def test_folder_send_end_to_end():
+    print("\n=== 测试: 文件夹发送端到端 ===")
+    import zipfile
+    from inkhole.p2p import _zip_dir
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        node_a = make_node(tmpdir, "Alice")
+        node_b = make_node(tmpdir, "Bob")
+        node_a.start(); node_b.start()
+        time.sleep(0.3)
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        src = os.path.join(tmpdir, "项目")
+        os.makedirs(src)
+        with open(os.path.join(src, "readme.txt"), "w", encoding="utf-8") as f:
+            f.write("hello folder")
+
+        zip_path = _zip_dir(src)
+        check("发送临时 zip 成功", node_a.send_file(zip_path))
+
+        got = wait_for_file(node_b.cfg.inbox, "项目.zip")
+        check("对端收到 项目.zip", got is not None)
+        with zipfile.ZipFile(got) as z:
+            check("zip 内含 readme.txt", "readme.txt" in z.namelist())
+    finally:
+        node_a.stop(); node_b.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------- 主入口 ----------
 if __name__ == "__main__":
     _tests = [
@@ -1103,6 +1134,7 @@ if __name__ == "__main__":
         test_zip_dir_roundtrip,
         test_zip_dir_empty,
         test_zip_dir_preserves_empty_subdir,
+        test_folder_send_end_to_end,
     ]
     for _t in _tests:
         try:

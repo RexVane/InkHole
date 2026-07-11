@@ -591,13 +591,13 @@ def main(argv=None) -> None:
             self._tray_menu = None        # 由 _setup_tray 注入:桌宠右键时弹出
             self._main_window = None      # 由 main() 注入:主界面窗口
             self._recent: deque[str] = deque(maxlen=8)   # 最近收到的文件(路径)
+            self._pending_zip_dirs: list[str] = []   # 待清理的临时打包目录
             self.node = self._make_node(cfg)
             self.node.start()
             # 串行发送队列：拖一堆文件不再开一堆并发连接
             self._sendq = SendQueue(
                 lambda p: self.node.send_file(p),
-                on_batch_done=lambda ok, total: (
-                    self.status.emit(f"已吞入 {ok}/{total} 个文件") if total > 1 else None),
+                on_batch_done=lambda ok, total: self._on_batch_done(ok, total),
             )
 
         def _make_node(self, cfg: P2PConfig) -> P2PNode:
@@ -665,14 +665,40 @@ def main(argv=None) -> None:
 
         @Slot(str)
         def dropFile(self, url: str):
-            """QML DropArea 收到桌面拖来的文件 url，转本地路径后入发送队列。
-            队列单线程串行发送：一次拖 N 个文件不会开 N 个并发连接。"""
+            """QML DropArea / 主窗口拖入的 url：文件直接入队，目录先打包成 zip。
+            队列单线程串行发送：一次拖 N 项不会开 N 个并发连接。"""
             path = QUrl(url).toLocalFile() if url.startswith("file:") else url
-            if path and os.path.isfile(path):
-                if not self.node.selected_peer():
-                    self.status.emit("右键选择目标设备")
-                    return
+            if not path:
+                return
+            if not self.node.selected_peer():
+                self.status.emit("右键选择目标设备")
+                return
+            self._enqueue_path(path)
+
+        def _enqueue_path(self, path: str):
+            """文件直接入队；目录打包成临时 zip 再入队,发送完成后清理临时目录。"""
+            if os.path.isfile(path):
                 self._sendq.put(path)
+                return
+            if os.path.isdir(path):
+                from .p2p import _zip_dir
+                try:
+                    self.status.emit("正在打包文件夹…")
+                    zip_path = _zip_dir(path)
+                except Exception as e:
+                    self.status.emit(f"打包失败：{e}")
+                    return
+                self._pending_zip_dirs.append(os.path.dirname(zip_path))
+                self._sendq.put(zip_path)
+
+        def _on_batch_done(self, ok: int, total: int):
+            """一批发送结束：清理临时打包目录 + 多文件时聚合提示。"""
+            import shutil as _sh
+            for d in self._pending_zip_dirs:
+                _sh.rmtree(d, ignore_errors=True)
+            self._pending_zip_dirs = []
+            if total > 1:
+                self.status.emit(f"已吞入 {ok}/{total} 个")
 
         @Slot(result=bool)
         def hasTarget(self) -> bool:
