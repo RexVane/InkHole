@@ -50,7 +50,11 @@ jobs:
       - name: Rename APK
         run: |
           REF="${GITHUB_REF##*/}"
-          case "$REF" in v*) VER="$REF" ;; *) VER="2.0.0" ;; esac
+          case "$REF" in
+            v*) VER="$REF" ;;
+            *) VER="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)" ;;
+          esac
+          test -n "$VER"
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk "dist/InkHole-${VER}.apk"
 

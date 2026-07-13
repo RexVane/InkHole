@@ -4,7 +4,7 @@
 [![Android APK](https://github.com/RexVane/InkHole/actions/workflows/android.yml/badge.svg)](https://github.com/RexVane/InkHole/actions/workflows/android.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 局域网 P2P 文件传输：把文件拖进桌面上的墨洞桌宠（或手机端墨洞），文件直接出现在另一台设备上。无需服务器。
+> 局域网 P2P 文件传输：在桌面主窗口、墨洞桌宠或手机端选择设备并发送，文件直接出现在另一台设备上。无需服务器。
 
 两台设备连同一个 WiFi，各开一个墨洞，mDNS 自动发现彼此，拖文件进去就 TCP 直连传过去。支持端到端加密（大文件分块流式）、传输回执与进度、手动选目标设备、开机自启。Windows / macOS / Android 三平台互通。
 
@@ -18,7 +18,7 @@ pip install PySide6 zeroconf cryptography psutil
 PYTHONPATH=src python -m inkhole.pet
 PYTHONPATH=src python -m inkhole.pet --name 我的Mac
 
-# 3. 右键桌宠选目标设备 → 拖文件进去 → 传过去
+# 3. 在主窗口选择目标设备 → 点击选择文件或直接拖入 → 传过去
 ```
 
 也可以直接 `python -m inkhole`（等价于启动桌宠）。
@@ -29,13 +29,21 @@ PYTHONPATH=src python -m inkhole.pet --name 我的Mac
 PYTHONPATH=src python -m inkhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkHole/发件箱
 ```
 
+## Windows 桌面端
+
+![InkHole Windows desktop UI](docs/assets/inkhole-windows.png)
+
+Windows 主窗口采用双栏工作台布局：左侧固定为发送目标、墨洞动画、文件选择和状态反馈，右侧集中显示附近设备与最近接收。设置页继续在同一窗口内切换，不弹出额外对话框。
+
+默认窗口为 `960×640`，最小支持 `800×580`；长设备名、文件名和状态文本会自动省略。墨洞动画使用时间驱动的 60fps 刷新，窗口隐藏或切到设置页时自动停表；设备卡片、页面切换、拖拽状态、布尔开关和传输进度均有短时缓动。
+
 ## Features
 
 - **mDNS 自动发现**：注册 `_inkhole._tcp.local.` 服务，局域网内自动发现其他墨洞设备；服务名带唯一实例 ID，两台同名设备不冲突；宣告本机物理网卡地址（自动过滤 VMware/VirtualBox/Hyper-V 等虚拟网卡与 169.254 链路本地地址），开 VPN/多网卡也能连上
-- **应用内主界面**：玻璃拟态主窗口——设备列表、点击/拖拽发送、应用内设置页、最近接收；设备名/口令/收件箱/自启等设置从右键菜单迁入；桌宠挂件保留为可开关选项
+- **应用内主界面**：深色双栏工作台——稳定的发送区、附近设备、最近接收、应用内设置页和自适应长文本；设备名/口令/收件箱/自启等设置集中管理，桌宠挂件保留为可开关选项
 - **TCP 直连传输**：WHPP 协议（magic + JSON 头 + 文件数据 + 1 字节回执），不经过任何中转服务器
 - **传输回执（ACK）**：接收方落盘成功才算发送成功——对端解密失败、磁盘满、被拒收，发送方都能感知
-- **传输进度**：桌宠外圈亮起青色进度环，Android 端墨洞进度环同步
+- **传输进度**：主窗口、桌宠和 Android 端均显示墨洞进度环；发送使用青绿色，主窗口接收使用暖金色
 - **端到端加密**：AES-256-GCM；超过 32MB 的文件自动切换 4MB 分块流式加密（WHE2），内存峰值恒定，块序号防篡改/防重排
 - **发送队列**：一次拖一堆文件按序排队发送，完成后聚合报告"已吞入 k/N 个"
 - **文件夹传输**：桌面端拖入文件夹自动递归打包成 `<文件夹名>.zip` 发送（保留完整目录结构），对端收到即一个 zip 文件（不自动解压，规避路径穿越）；Android 端可正常接收
@@ -44,21 +52,21 @@ PYTHONPATH=src python -m inkhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkH
 - **墨洞桌宠**：PySide6 + QML——墨黑核心、青色吸积弧缓慢旋转、呼吸光晕；拖入碎裂吞入动画 / 收到拼合吐出动画；贴边自动收起
 - **Android 前台服务**：锁屏/切后台持续接收；收到的文件进系统 `Download/InkHole`（文件管理器可见）并发通知，点击直接打开；接收历史持久化
 - **系统分享入口**：手机上任意 App 分享 → 墨洞，选中设备即发送，支持多选
-- **开机自启**：右键菜单可勾选，Windows 注册表 / macOS LaunchAgent / Linux .desktop（不含明文口令）
+- **开机自启**：在应用内设置页切换，Windows 注册表 / macOS LaunchAgent / Linux .desktop（不含明文口令）
 - **接收防御**：文件名 basename 裁剪防 `../` 穿越；size 合法性校验 + 磁盘余量检查；半截文件绝不落盘
 
 ## 安全模型（请阅读）
 
 墨洞面向**可信局域网**（家里/自己的路由器）设计：
 
-- **默认接收无发送方认证**：同一网络里任何运行墨洞协议的人都可以向你的收件箱发送文件（同名文件自动加后缀不覆盖）。公共 WiFi 建议开启右键菜单的**「仅接收目标设备」**，或设置加密口令。
+- **默认接收无发送方认证**：同一网络里任何运行墨洞协议的人都可以向你的收件箱发送文件。公共 WiFi 建议在设置页开启**「仅接收目标设备」**，或设置加密口令。
 - **口令的双重作用**：`--secret` 保证文件内容端到端加密；口令不一致的文件会被拒收并回执失败——同时起到"只接收知道口令的设备"的准认证作用。
 - **口令明文存储在本机配置**（桌面 `config.json` / Android `SharedPreferences`），与浏览器记住密码同级别；它不会进开机自启脚本或注册表。
 - 传输不经过任何服务器，文件不出局域网。
 
 ## 启动参数
 
-参数改一次就会记住（写入配置文件），下次双击直接生效；也可以全部通过右键菜单修改。
+参数改一次就会记住（写入配置文件），下次双击直接生效；桌面端也可以在应用内设置页修改。
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
@@ -82,7 +90,7 @@ PYTHONPATH=src python -m inkhole.p2p --inbox ~/InkHole/收件箱 --outbox ~/InkH
 
 ```bash
 # Windows
-cd packaging && build-windows.bat        # 产物:packaging\dist\InkHolePet.exe
+cd packaging && build-windows.bat        # 产物:packaging\dist\InkHolePet\
 
 # macOS
 cd packaging && bash build-mac.sh         # 产物:packaging/dist/InkHolePet.app
@@ -119,7 +127,7 @@ xattr -cr /Applications/InkHolePet.app
 
 ### 问题反馈
 
-提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.0.1）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
+提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.1.0）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
 
 ## Tests
 
@@ -129,7 +137,7 @@ make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可
 
 覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线、回调触发、多文件连续发送、路径穿越防御、半截文件不落盘、恶意 size 拒收、同名设备共存与精确离线、口令不一致 ACK 失败、传输进度回调、分块加密往返、分块流篡改/重排检测、发送队列、仅接收目标设备、多地址回退、幽灵设备探测剔除、持久化实例 ID、虚拟网卡过滤、智能保留选中目标、同名不覆盖、非法文件名清洗、目录打包往返、文件夹发送、队列按文件清理。29 组 123 项全通过（也兼容 `pytest`）。
 
-同名文件：收件箱已有同名文件时自动加 " (2)" 后缀，绝不覆盖已有文件（桌面端与 Android 端一致）。传输中断的半截文件不会落盘、不会覆盖已有文件。
+桌面端同名文件：收件箱已有同名文件时自动加 " (2)" 后缀，绝不覆盖已有文件；传输中断的半截文件不会落盘。该自动加后缀保证当前由 Python 桌面端测试覆盖，Android 导出到系统下载目录时遵循 Android/MediaStore 的同名项处理方式。
 
 ## Project Structure
 
@@ -140,7 +148,8 @@ make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可
 │   ├── __main__.py            # 入口(python -m inkhole 启动桌宠)
 │   ├── p2p.py                 # P2P 引擎(mDNS 发现 + TCP 直连 + ACK/进度 + 加密)
 │   ├── crypto.py              # 端到端加密(AES-256-GCM，WHE1 整块 / WHE2 分块流)
-│   ├── pet.py                 # 桌宠挂件(PySide6+QML) + 设置持久化 + 发送队列
+│   ├── pet.py                 # 应用生命周期、桌宠、配置持久化与发送队列
+│   ├── mainwindow.py          # QtWidgets 桌面主窗口、设置页与交互动效
 │   └── inkhole.qml           # 墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
 ├── tests/
 │   └── test_p2p.py            # P2P 端到端测试(29 组 123 项)
