@@ -946,7 +946,7 @@ class MainWindow(QWidget):
 
         connection = QVBoxLayout()
         connection.setSpacing(13)
-        connection.addWidget(_section_label("连接与身份"))
+        connection.addWidget(_section_label("局域网配置"))
 
         fields = QGridLayout()
         fields.setHorizontalSpacing(14)
@@ -1002,9 +1002,11 @@ class MainWindow(QWidget):
         fields.addWidget(_field("收件箱", inbox_row), 2, 0, 1, 2)
         connection.addLayout(fields)
 
-        # ---- 手动添加设备(自动发现不可用时的直连入口) ----
-        connection.addSpacing(8)
-        connection.addWidget(_section_label("手动添加设备"))
+        # ---- 跨网络配置(自动发现不可用时的直连入口) ----
+        connection.addSpacing(10)
+        connection.addWidget(_divider())
+        connection.addSpacing(6)
+        connection.addWidget(_section_label("跨网络配置（手动添加设备）"))
         manual_hint = QLabel("自动发现找不到对方时，填对方 IP 与墨洞监听端口直连"
                              "（对方需在设置里固定监听端口）。跨网络传输：两台电脑"
                              "安装 Tailscale 并登录同一账号，填对方的 Tailscale IP 即可。")

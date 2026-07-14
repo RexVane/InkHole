@@ -334,6 +334,9 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
+                        Text("局域网配置", fontSize = 14.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+                        Spacer(Modifier.height(6.dp))
                         OutlinedTextField(
                             value = nameInput,
                             onValueChange = { nameInput = it },
@@ -370,9 +373,10 @@ class MainActivity : ComponentActivity() {
                                 onCheckedChange = { trustedInput = it })
                         }
 
-                        // ---- 手动添加设备(跨网直连,如 Tailscale) ----
+                        // ---- 跨网络配置(手动添加设备,如 Tailscale) ----
                         Spacer(Modifier.height(14.dp))
-                        Text("手动添加设备", fontSize = 14.sp)
+                        Text("跨网络配置（手动添加设备）", fontSize = 14.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                         Text("自动发现不可用时(如 Tailscale 跨网)填对方 IP 与监听端口",
                             fontSize = 11.sp,
                             color = androidx.compose.ui.graphics.Color.Gray)
