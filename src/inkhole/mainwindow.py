@@ -754,6 +754,7 @@ class MainWindow(QWidget):
         bridge.status.connect(self._on_status)
         bridge.errorState.connect(self._on_error)
         bridge.emit_out.connect(lambda _n: self._refresh_recent())
+        bridge.updateCheckFinished.connect(self._on_update_check)
         if hasattr(bridge, "progress"):
             bridge.progress.connect(self._hole.set_transfer_progress)
         self._refresh_peers()
@@ -1109,6 +1110,11 @@ class MainWindow(QWidget):
         self._local_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
         btns.addWidget(self._local_lbl)
         btns.addStretch(1)
+        self._update_btn = QPushButton("检查更新")
+        self._update_btn.setObjectName("QuietAction")
+        self._update_btn.setCursor(Qt.PointingHandCursor)
+        self._update_btn.clicked.connect(self._check_update)
+        btns.addWidget(self._update_btn)
         b_save = QPushButton("保存")
         b_save.setObjectName("Primary")
         b_save.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
@@ -1159,10 +1165,52 @@ class MainWindow(QWidget):
         self._cb_auto.setChecked(bool(self._ctl["is_autostart"]()))
         ips = " / ".join(self._bridge.localAddresses()) or "?"
         self._local_lbl.set_full_text(
-            f"本机：{cfg.peer_name}-{cfg.instance_id} · 端口 {cfg.listen_port or '自动'}"
+            f"v{self._bridge.appVersion()} · 本机：{cfg.peer_name}-{cfg.instance_id}"
+            f" · 端口 {cfg.listen_port or '自动'}"
             f" · IP {ips}（对方手动添加本机时填这里的 IP 和端口）")
         self._refresh_manual_list()
         self._show_page(1)
+
+    def _check_update(self):
+        self._update_btn.setEnabled(False)
+        self._update_btn.setText("检查中…")
+        self._bridge.checkUpdate()
+
+    @Slot(bool, str, str, str)
+    def _on_update_check(self, has_new: bool, latest: str, notes: str,
+                         asset_url: str):
+        self._update_btn.setEnabled(True)
+        self._update_btn.setText("检查更新")
+        if not latest:
+            QMessageBox.warning(self, "检查更新",
+                                f"{notes}\n\n可到发布页手动查看：\n"
+                                f"{self._bridge.releasesPage()}")
+            return
+        if not has_new:
+            self._on_status(f"已是最新版本 v{self._bridge.appVersion()}")
+            return
+        import sys as _sys
+        packaged = bool(getattr(_sys, "frozen", False)) and _sys.platform == "win32"
+        summary = (notes or "").strip()
+        if len(summary) > 260:
+            summary = summary[:260] + "…"
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setText(f"最新版本 {latest}（当前 v{self._bridge.appVersion()}）")
+        box.setInformativeText(summary or "查看发布页了解更新内容。")
+        if packaged and asset_url:
+            b_auto = box.addButton("立即更新", QMessageBox.AcceptRole)
+        else:
+            b_auto = None
+        b_page = box.addButton("打开下载页", QMessageBox.ActionRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if b_auto is not None and clicked is b_auto:
+            self._on_status("开始自动更新，完成后将自动重启…")
+            self._bridge.performUpdate(asset_url)
+        elif clicked is b_page:
+            self._bridge.openPath(self._bridge.releasesPage())
 
     # ---- 手动设备(Tailscale/固定 IP 直连) ----
     def _refresh_manual_list(self):

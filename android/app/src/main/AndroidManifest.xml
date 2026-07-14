@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- WifiLock:息屏后保持 WiFi 联通,对端不再把本机判离线 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 应用内更新:下载新版 APK 后拉起系统安装器 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 前台服务：锁屏/切后台也能持续接收 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />

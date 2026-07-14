@@ -31,6 +31,26 @@ import threading
 from collections import deque
 
 from .p2p import P2PNode, P2PConfig
+from . import __version__ as _APP_VERSION
+
+
+def _version_newer(remote: str, local: str) -> bool:
+    """语义化比较:remote 是否比 local 新。容忍 v 前缀与位数不齐。"""
+    def parts(v: str) -> tuple:
+        v = v.strip().lstrip("vV")
+        out = []
+        for seg in v.split("."):
+            digits = "".join(ch for ch in seg if ch.isdigit())
+            out.append(int(digits) if digits else 0)
+        return tuple(out + [0] * (4 - len(out)))
+    try:
+        return parts(remote) > parts(local)
+    except Exception:
+        return False
+
+
+_RELEASES_PAGE = "https://github.com/RexVane/InkHole/releases/latest"
+_RELEASES_API = "https://api.github.com/repos/RexVane/InkHole/releases/latest"
 
 def _qml_path() -> str:
     """定位 inkhole.qml。
@@ -604,6 +624,8 @@ def main(argv=None) -> None:
         errorState = Signal(str)      # 错误信息(持续显示，非空=有错误，空=清除)
         progress = Signal(str, int)   # 传输进度(kind "send"/"recv", 百分比 0-100)
         transferStateChanged = Signal(bool)
+        # 检查更新结果: has_new, 最新版本号, 更新说明摘要, 资产下载 url(空=无对应平台包)
+        updateCheckFinished = Signal(bool, str, str, str)
 
         def __init__(self, cfg: P2PConfig):
             super().__init__()
@@ -1008,6 +1030,108 @@ def main(argv=None) -> None:
             if hide is not None:
                 hide()
                 self.status.emit("桌宠已关闭，可在主界面设置中重新开启")
+
+        # ---- 版本与更新 ----
+        @Slot(result=str)
+        def appVersion(self) -> str:
+            return _APP_VERSION
+
+        @Slot(result=str)
+        def releasesPage(self) -> str:
+            return _RELEASES_PAGE
+
+        @Slot()
+        def checkUpdate(self) -> None:
+            """查 GitHub 最新 Release 并与当前版本比较(后台线程)。
+
+            走系统代理(urllib 自动读 Windows 注册表代理设置,Clash 系统代理
+            开着就能通);超时/不可达按"检查失败"报告,引导手动去下载页。
+            """
+            def worker():
+                try:
+                    import json as _json
+                    import urllib.request
+                    req = urllib.request.Request(
+                        _RELEASES_API,
+                        headers={"User-Agent": "InkHole-Updater",
+                                 "Accept": "application/vnd.github+json"})
+                    with urllib.request.urlopen(req, timeout=12) as resp:
+                        data = _json.loads(resp.read().decode("utf-8"))
+                    latest = str(data.get("tag_name", "")).strip()
+                    notes = str(data.get("body", "") or "")[:400]
+                    asset_url = ""
+                    want = ("InkHolePet-windows.zip" if sys.platform == "win32"
+                            else "InkHolePet-macos.zip")
+                    for asset in data.get("assets", []):
+                        if asset.get("name") == want:
+                            asset_url = str(asset.get("browser_download_url", ""))
+                            break
+                    has_new = _version_newer(latest, _APP_VERSION)
+                    self.updateCheckFinished.emit(has_new, latest, notes, asset_url)
+                except Exception as exc:
+                    self.updateCheckFinished.emit(
+                        False, "", f"检查失败：{exc}", "")
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        @Slot(str)
+        def performUpdate(self, asset_url: str) -> None:
+            """Windows 打包版自动更新:下载 zip → 写替换脚本 → 退出交棒。
+
+            运行中的 exe 无法覆盖自己,由 bat 在进程退出后解压覆盖并重启。
+            仅 frozen(打包)且 Windows 下可用;其他环境走浏览器下载页。
+            """
+            if not (getattr(sys, "frozen", False) and sys.platform == "win32"
+                    and asset_url):
+                self.openPath(_RELEASES_PAGE)
+                return
+
+            def worker():
+                try:
+                    import tempfile
+                    import urllib.request
+                    self.status.emit("正在下载新版本…")
+                    workdir = tempfile.mkdtemp(prefix="inkhole_update_")
+                    zip_path = os.path.join(workdir, "InkHolePet-windows.zip")
+                    req = urllib.request.Request(
+                        asset_url, headers={"User-Agent": "InkHole-Updater"})
+                    with urllib.request.urlopen(req, timeout=30) as resp, \
+                            open(zip_path, "wb") as out:
+                        total = int(resp.headers.get("Content-Length") or 0)
+                        done = 0
+                        while True:
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            done += len(chunk)
+                            if total:
+                                self.status.emit(
+                                    f"正在下载新版本… {done * 100 // total}%")
+                    app_dir = os.path.dirname(sys.executable)
+                    bat = os.path.join(workdir, "update.bat")
+                    with open(bat, "w", encoding="gbk", errors="ignore") as f:
+                        f.write("\r\n".join([
+                            "@echo off",
+                            "timeout /t 2 /nobreak >nul",
+                            f'powershell -NoProfile -Command "Expand-Archive -Force '
+                            f"'{zip_path}' '{workdir}\\unzip'\"",
+                            f'robocopy "{workdir}\\unzip\\InkHolePet" "{app_dir}" /E /IS /IT >nul',
+                            f'start "" "{app_dir}\\InkHolePet.exe"',
+                            f'rd /s /q "{workdir}\\unzip"',
+                            f'del "{zip_path}"',
+                        ]))
+                    self.status.emit("下载完成，正在重启应用…")
+                    import subprocess
+                    subprocess.Popen(
+                        ["cmd", "/c", bat],
+                        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                        close_fds=True)
+                    self.quit()   # quit 内部会停节点并退出事件循环(线程安全)
+                except Exception as exc:
+                    self.status.emit(f"自动更新失败：{exc}，请到下载页手动更新")
+
+            threading.Thread(target=worker, daemon=True).start()
 
         @Slot()
         def showMenu(self):

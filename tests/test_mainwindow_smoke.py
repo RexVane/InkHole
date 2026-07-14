@@ -55,6 +55,7 @@ class FakeBridge(QObject):
     errorState = Signal(str)
     emit_out = Signal(str)
     progress = Signal(str, int)
+    updateCheckFinished = Signal(bool, str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -85,6 +86,21 @@ class FakeBridge(QObject):
         pass
 
     def clearRecent(self):
+        pass
+
+    def appVersion(self):
+        return "0.0.0"
+
+    def releasesPage(self):
+        return "https://example.com"
+
+    def checkUpdate(self):
+        pass
+
+    def performUpdate(self, url):
+        pass
+
+    def openPath(self, path):
         pass
 
     # ---- 手动设备 ----
@@ -216,3 +232,14 @@ def test_mask_manual_host_typing():
     assert mask("100.127.46.2611") == "100.127.46.261"
     # 主机名不做掩码
     assert mask("my-pc") == "my-pc"
+
+
+def test_version_newer():
+    """更新检查的版本比较:语义化、容 v 前缀、位数不齐。"""
+    from inkhole.pet import _version_newer as newer
+    assert newer("v1.3.7", "1.3.6")
+    assert newer("1.10.0", "1.9.9")
+    assert not newer("1.3.6", "1.3.6")
+    assert not newer("v1.3.5", "1.3.6")
+    assert newer("2.0", "1.9.9.9")
+    assert not newer("", "1.0.0")

@@ -61,6 +61,83 @@ class MainActivity : ComponentActivity() {
     private val trustedOnly = mutableStateOf(false)
     private var showSettings = mutableStateOf(false)
 
+    // 应用内更新
+    private val updateInfo = mutableStateOf<Updater.Info?>(null)
+    private val checkingUpdate = mutableStateOf(false)
+
+    private fun currentVersion(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    } catch (_: Exception) { "?" }
+
+    private fun checkUpdate() {
+        if (checkingUpdate.value) return
+        checkingUpdate.value = true
+        Thread {
+            try {
+                val info = Updater.fetchLatest()
+                runOnUiThread {
+                    checkingUpdate.value = false
+                    if (Updater.versionNewer(info.version, currentVersion())) {
+                        updateInfo.value = info
+                    } else {
+                        statusMsg.value = "已是最新版本 v${currentVersion()}"
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    checkingUpdate.value = false
+                    statusMsg.value = "检查更新失败: ${e.message}"
+                }
+            }
+        }.start()
+    }
+
+    private fun downloadAndInstall(info: Updater.Info) {
+        Thread {
+            try {
+                runOnUiThread { statusMsg.value = "正在下载新版本…" }
+                val apk = Updater.downloadApk(this, info.apkUrl) { p ->
+                    runOnUiThread { statusMsg.value = "正在下载新版本… $p%" }
+                }
+                runOnUiThread {
+                    statusMsg.value = "下载完成，请在安装器中确认"
+                    Updater.installApk(this, apk)
+                }
+            } catch (e: Exception) {
+                runOnUiThread { statusMsg.value = "更新下载失败: ${e.message}" }
+            }
+        }.start()
+    }
+
+    @androidx.compose.runtime.Composable
+    private fun UpdateDialog() {
+        val info = updateInfo.value ?: return
+        AlertDialog(
+            onDismissRequest = { updateInfo.value = null },
+            title = { Text("发现新版本 ${info.version}") },
+            text = {
+                Column {
+                    Text("当前版本 v${currentVersion()}", fontSize = 12.sp,
+                        color = androidx.compose.ui.graphics.Color.Gray)
+                    Spacer(Modifier.height(6.dp))
+                    Text(info.notes.ifEmpty { "新版本可用" }, fontSize = 12.sp)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val i = info
+                    updateInfo.value = null
+                    if (i.apkUrl.isNotEmpty()) downloadAndInstall(i)
+                    else startActivity(Intent(Intent.ACTION_VIEW,
+                        Uri.parse(Updater.RELEASES_PAGE)))
+                }) { Text("立即更新") }
+            },
+            dismissButton = {
+                TextButton(onClick = { updateInfo.value = null }) { Text("取消") }
+            },
+        )
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()) { /* 拒绝也能用，只是没通知/旧机型不导出 */ }
 
@@ -145,6 +222,7 @@ class MainActivity : ComponentActivity() {
                     onSettingsClick = { showSettings.value = true },
                 )
                 SettingsDialog()
+                UpdateDialog()
             }
         }
     }
@@ -329,7 +407,7 @@ class MainActivity : ComponentActivity() {
                         androidx.compose.foundation.text.selection.SelectionContainer {
                             Column {
                                 Text(
-                                    text = "本机：${peerName.value}-$instanceId",
+                                    text = "本机：${peerName.value}-$instanceId · v${currentVersion()}",
                                     fontSize = 12.sp,
                                     color = androidx.compose.ui.graphics.Color.Gray,
                                 )
@@ -498,7 +576,12 @@ class MainActivity : ComponentActivity() {
                     }) { Text("保存") }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showSettings.value = false }) { Text("取消") }
+                    Row {
+                        TextButton(onClick = { checkUpdate() }) {
+                            Text(if (checkingUpdate.value) "检查中…" else "检查更新")
+                        }
+                        TextButton(onClick = { showSettings.value = false }) { Text("取消") }
+                    }
                 },
             )
         }
