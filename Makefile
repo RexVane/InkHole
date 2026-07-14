@@ -4,9 +4,9 @@
 PYTHON ?= $(shell command -v python3 2>/dev/null || echo python)
 PYTHONPATH := src
 
-# P2P 端到端测试
+# 全量测试(P2P 引擎 + 手动设备 + 主窗口离屏冒烟)
 test:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) tests/test_p2p.py
+	PYTHONPATH=$(PYTHONPATH) QT_QPA_PLATFORM=offscreen $(PYTHON) -m pytest tests/ -q
 
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +

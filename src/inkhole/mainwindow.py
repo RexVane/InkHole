@@ -917,7 +917,8 @@ class MainWindow(QWidget):
         connection.addSpacing(8)
         connection.addWidget(_section_label("手动添加设备"))
         manual_hint = QLabel("自动发现找不到对方时，填对方 IP 与墨洞监听端口直连"
-                             "（对方需在设置里固定监听端口）。跨网络传输将在后续版本内置。")
+                             "（对方需在设置里固定监听端口）。跨网络传输：两台电脑"
+                             "安装 Tailscale 并登录同一账号，填对方的 Tailscale IP 即可。")
         manual_hint.setWordWrap(True)
         manual_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
         connection.addWidget(manual_hint)
