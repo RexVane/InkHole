@@ -150,15 +150,23 @@ class InkHoleNode(
 
     // ---- TCP 服务器 ----
 
+    /** 绑定监听端口。必须开 SO_REUSEADDR:设置保存会重启节点,旧连接的
+     *  TIME_WAIT 会让立刻重绑同端口失败——不开的话固定端口会"莫名变随机"。 */
+    private fun bindServer(port: Int): ServerSocket =
+        ServerSocket().apply {
+            reuseAddress = true
+            bind(java.net.InetSocketAddress(port.coerceIn(0, 65535)))
+        }
+
     private fun startTcpServer() {
         val server = try {
-            // 固定端口被占用时回退自动分配,保证应用总能启动
             try {
-                ServerSocket(listenPort.coerceIn(0, 65535))
+                bindServer(listenPort)
             } catch (e: IOException) {
                 if (listenPort != 0) {
+                    // 真被其他应用占用才回退自动分配(REUSEADDR 已排除自身重启的假占用)
                     listener.onStatus("端口 $listenPort 被占用,已改用自动分配")
-                    ServerSocket(0)
+                    bindServer(0)
                 } else throw e
             }.also { actualPort = it.localPort }
         } catch (e: IOException) {
