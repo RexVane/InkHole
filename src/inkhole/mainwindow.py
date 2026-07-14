@@ -17,6 +17,7 @@ import os
 import sys
 import math
 import random
+import time
 
 from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, Slot, Signal,
                             QElapsedTimer, QVariantAnimation,
@@ -28,7 +29,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QGridLayout, QLineEdit, QSpinBox, QCheckBox,
                                QMessageBox, QSizePolicy, QStackedWidget,
                                QSizeGrip, QToolButton, QStyle,
-                               QGraphicsOpacityEffect)
+                               QGraphicsOpacityEffect,
+                               QApplication)
 
 # ---------- 设计令牌 ----------
 _TEAL = "#5AD8C0"
@@ -80,6 +82,13 @@ QPushButton#QuietAction {{ background: rgba(255,255,255,9); border-color: transp
                            min-height: 20px; padding: 4px 10px; font-size: 12px; }}
 QPushButton#QuietAction:hover {{ background: rgba(255,255,255,18);
                                 border-color: {_EDGE}; color: {_TEAL_BRIGHT}; }}
+QFrame#ModeSegment {{ background: rgba(5,8,9,170); border: 1px solid {_EDGE};
+                      border-radius: 7px; }}
+QPushButton#ModeOption {{ border: none; border-radius: 5px; background: transparent;
+                          min-height: 20px; padding: 5px 14px; font-size: 11px; }}
+QPushButton#ModeOption:checked {{ background: rgba(90,216,192,35);
+                                  color: {_TEAL_BRIGHT}; }}
+QPushButton#ModeOption:disabled {{ color: rgba(178,191,188,75); }}
 
 QFrame#TransferPane {{ background: rgba(19,24,25,225); border: 1px solid {_EDGE};
                        border-radius: 8px; }}
@@ -108,11 +117,11 @@ QScrollBar::handle:hover {{ background: rgba(90,216,192,90); }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
-QLineEdit, QSpinBox {{ background: rgba(8,11,12,185); border: 1px solid {_EDGE};
+QLineEdit, QSpinBox, QPlainTextEdit {{ background: rgba(8,11,12,185); border: 1px solid {_EDGE};
                        border-radius: 7px; padding: 9px 11px; color: {_TEXT};
                        min-height: 22px;
                        selection-background-color: {_TEAL_DIM}; }}
-QLineEdit:focus, QSpinBox:focus {{ border-color: {_EDGE_HOVER};
+QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {{ border-color: {_EDGE_HOVER};
                                    background: rgba(6,9,10,225); }}
 QSpinBox::up-button, QSpinBox::down-button {{ width: 0; }}
 
@@ -574,8 +583,9 @@ class TitleBar(QWidget):
         brand.addWidget(t2)
         lay.addLayout(brand)
         lay.addSpacing(10)
-        self._device_badge = QLabel("正在发现")
+        self._device_badge = QLabel()
         self._device_badge.setObjectName("MetaBadge")
+        self._device_badge.hide()
         lay.addWidget(self._device_badge)
         lay.addStretch(1)
 
@@ -604,7 +614,9 @@ class TitleBar(QWidget):
             lay.addWidget(b)
 
     def set_device_count(self, count: int):
-        self._device_badge.setText(f"{count} 台设备" if count else "正在发现")
+        self._device_badge.setVisible(count > 0)
+        if count:
+            self._device_badge.setText(f"{count} 台设备")
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -648,7 +660,7 @@ class MainWindow(QWidget):
         outer.addWidget(self._titlebar)
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_home_page())      # 0
-        self._stack.addWidget(self._build_settings_page())  # 1
+        self._stack.addWidget(self._build_settings_page())  # 1: 设置
         outer.addWidget(self._stack, 1)
         self._grip = QSizeGrip(self)
         self._grip.setFixedSize(16, 16)
@@ -764,7 +776,8 @@ class MainWindow(QWidget):
         right.setSpacing(12)
 
         device_bar = QHBoxLayout()
-        device_bar.addWidget(_section_label("附近设备"))
+        self._device_section = _section_label("设备")
+        device_bar.addWidget(self._device_section)
         device_bar.addStretch(1)
         self._peer_count_lbl = QLabel("0")
         self._peer_count_lbl.setObjectName("CountBadge")
@@ -811,12 +824,7 @@ class MainWindow(QWidget):
         return page
 
     # ================= 设置页 =================
-    def _build_settings_page(self) -> QWidget:
-        page = QWidget()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(30, 10, 30, 24)
-        outer.setSpacing(14)
-
+    def _build_settings_header(self) -> QHBoxLayout:
         top = QHBoxLayout()
         back = QPushButton("返回")
         back.setObjectName("Link")
@@ -829,7 +837,14 @@ class MainWindow(QWidget):
         top.addSpacing(10)
         top.addWidget(title)
         top.addStretch(1)
-        outer.addLayout(top)
+        return top
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(30, 10, 30, 24)
+        outer.setSpacing(14)
+        outer.addLayout(self._build_settings_header())
 
         panel = QFrame()
         panel.setObjectName("SettingsSurface")
@@ -897,6 +912,40 @@ class MainWindow(QWidget):
         inbox_lay.addWidget(b_browse)
         fields.addWidget(_field("收件箱", inbox_row), 2, 0, 1, 2)
         connection.addLayout(fields)
+
+        # ---- 手动添加设备(自动发现不可用时的直连入口) ----
+        connection.addSpacing(8)
+        connection.addWidget(_section_label("手动添加设备"))
+        manual_hint = QLabel("自动发现找不到对方时，填对方 IP 与墨洞监听端口直连"
+                             "（对方需在设置里固定监听端口）。跨网络传输将在后续版本内置。")
+        manual_hint.setWordWrap(True)
+        manual_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        connection.addWidget(manual_hint)
+
+        manual_row = QWidget()
+        manual_lay = QHBoxLayout(manual_row)
+        manual_lay.setContentsMargins(0, 2, 0, 0)
+        manual_lay.setSpacing(8)
+        self._manual_host = QLineEdit()
+        self._manual_host.setPlaceholderText("对方 IP，如 192.168.1.23")
+        self._manual_port = QSpinBox()
+        self._manual_port.setRange(1, 65535)
+        self._manual_port.setValue(52130)
+        self._manual_port.setFixedWidth(86)
+        b_manual_add = QPushButton("添加")
+        b_manual_add.setCursor(Qt.PointingHandCursor)
+        b_manual_add.clicked.connect(self._add_manual_peer)
+        manual_lay.addWidget(self._manual_host, 1)
+        manual_lay.addWidget(self._manual_port)
+        manual_lay.addWidget(b_manual_add)
+        connection.addWidget(manual_row)
+
+        manual_box = QWidget()
+        self._manual_list_lay = QVBoxLayout(manual_box)
+        self._manual_list_lay.setContentsMargins(0, 4, 0, 0)
+        self._manual_list_lay.setSpacing(4)
+        connection.addWidget(manual_box)
+
         connection.addStretch(1)
         columns.addLayout(connection, 3)
         columns.addWidget(_divider(vertical=True))
@@ -963,7 +1012,12 @@ class MainWindow(QWidget):
             return
         if self._page_animation is not None:
             self._page_animation.stop()
+        # 上一次动画若被打断,旧页面会残留半透明 effect,这里先清掉
+        previous = getattr(self, "_animated_page", None)
+        if previous is not None and previous.graphicsEffect() is not None:
+            previous.setGraphicsEffect(None)
         page = self._stack.widget(index)
+        self._animated_page = page
         self._stack.setCurrentIndex(index)
         effect = QGraphicsOpacityEffect(page)
         page.setGraphicsEffect(effect)
@@ -979,7 +1033,9 @@ class MainWindow(QWidget):
         animation.start()
 
     def _open_settings(self):
-        cfg = self._bridge.node.cfg
+        if self._stack.currentIndex() == 1:
+            return   # 已在本页:不重填表单,避免吃掉未保存的编辑
+        cfg = self._bridge.lanConfig()
         self._ed_name.setText(cfg.peer_name)
         self._ed_secret.setText(cfg.secret)
         self._sp_port.setValue(cfg.listen_port)
@@ -988,9 +1044,50 @@ class MainWindow(QWidget):
         self._cb_pet.setChecked(bool(self._ctl["pet_visible"]()))
         self._cb_auto.setChecked(bool(self._ctl["is_autostart"]()))
         self._local_lbl.set_full_text(
-            f"本机：{cfg.peer_name}-{self._bridge.node._instance_id}"
-            f" · 端口 {self._bridge.node.actual_port}")
+            f"本机：{cfg.peer_name}-{cfg.instance_id} · 局域网监听端口 {cfg.listen_port or '自动'}")
+        self._refresh_manual_list()
         self._show_page(1)
+
+    # ---- 手动设备(Tailscale/固定 IP 直连) ----
+    def _refresh_manual_list(self):
+        while self._manual_list_lay.count():
+            it = self._manual_list_lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        for entry in self._bridge.manualPeers():
+            host, port = str(entry.get("host")), int(entry.get("port"))
+            name = str(entry.get("name") or "")
+            row = QWidget()
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(2, 0, 0, 0)
+            row_lay.setSpacing(8)
+            text = f"{name}  ·  {host}:{port}" if name else f"{host}:{port}"
+            lbl = ElidedLabel(text, Qt.ElideMiddle)
+            lbl.setStyleSheet(f"color:{_TEXT_SECOND}; font-size:11.5px;")
+            b_del = QPushButton("移除")
+            b_del.setObjectName("Link")
+            b_del.setCursor(Qt.PointingHandCursor)
+            b_del.clicked.connect(
+                lambda checked=False, h=host, p=port: self._remove_manual_peer(h, p))
+            row_lay.addWidget(lbl, 1)
+            row_lay.addWidget(b_del)
+            self._manual_list_lay.addWidget(row)
+
+    def _add_manual_peer(self):
+        host = self._manual_host.text().strip()
+        if not host:
+            return
+        if self._bridge.addManualPeer("", host, self._manual_port.value()):
+            self._manual_host.clear()
+            self._refresh_manual_list()
+            self._refresh_peers()
+        else:
+            QMessageBox.warning(self, "手动设备", "地址无效，请检查 IP 与端口")
+
+    def _remove_manual_peer(self, host: str, port: int):
+        self._bridge.removeManualPeer(host, port)
+        self._refresh_manual_list()
+        self._refresh_peers()
 
     def _choose_inbox(self):
         d = QFileDialog.getExistingDirectory(self, "选择收件箱目录",
@@ -1003,12 +1100,10 @@ class MainWindow(QWidget):
         if not name:
             QMessageBox.warning(self, "墨洞", "设备名称不能为空")
             return
-        node = self._bridge.node
         inbox = self._ed_inbox.text()
-        if inbox and os.path.abspath(inbox) != os.path.abspath(node.cfg.inbox):
-            node.cfg.inbox = inbox
-            os.makedirs(inbox, exist_ok=True)
-        if self._cb_trusted.isChecked() != node.cfg.trusted_only:
+        if inbox:
+            self._bridge.setInbox(inbox)   # 单独持久化:即使名字/端口没变也要落盘
+        if self._cb_trusted.isChecked() != self._bridge.lanConfig().trusted_only:
             self._bridge.toggleTrustedOnly()
         self._ctl["set_pet_visible"](self._cb_pet.isChecked())
         if self._cb_auto.isChecked() != bool(self._ctl["is_autostart"]()):
@@ -1032,8 +1127,9 @@ class MainWindow(QWidget):
         self._titlebar.set_device_count(len(peers))
 
         if not peers:
-            empty = QLabel("正在发现局域网设备")
+            empty = QLabel("正在发现设备 · 跨网设备可在设置中手动添加")
             empty.setAlignment(Qt.AlignCenter)
+            empty.setWordWrap(True)
             empty.setStyleSheet(
                 f"color:{_TEXT_DIM}; padding: 22px 4px; font-size:12px;")
             self._chip_lay.addWidget(empty)

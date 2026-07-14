@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install zeroconf cryptography
+        run: pip install -e ".[test]" zeroconf cryptography
 
-      - name: Run P2P tests
-        run: make test
+      - name: Run Python tests
+        run: pytest -q

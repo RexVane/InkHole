@@ -29,6 +29,9 @@ import sys
 PROJ = os.path.abspath(os.path.join(SPECPATH, ".."))
 SRC = os.path.join(PROJ, "src")
 QML = os.path.join(SRC, "inkhole", "inkhole.qml")
+ICON_ICO = os.path.join(PROJ, "assets", "inkhole.ico")
+ICON_ICNS = os.path.join(PROJ, "assets", "inkhole.icns")
+APP_ICON = ICON_ICNS if sys.platform == "darwin" else ICON_ICO
 
 datas = [(QML, "inkhole")]
 
@@ -48,7 +51,10 @@ a = Analysis(
     pathex=[SRC],
     binaries=[],
     datas=datas,
-    hiddenimports=["inkhole.p2p", "zeroconf", "psutil"],
+    hiddenimports=[
+        "inkhole.p2p", "inkhole.branding",
+        "zeroconf", "psutil",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -73,6 +79,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=APP_ICON,
 )
 
 # Windows: onedir 模式——产物是文件夹，不解压到 %TEMP%，绕开 Defender 拦截
@@ -94,9 +101,10 @@ if sys.platform == "darwin":
             target_arch=None,
             codesign_identity=None,
             entitlements_file=None,
+            icon=ICON_ICNS,
         ),
         name="InkHolePet.app",
-        icon=None,
+        icon=ICON_ICNS,
         bundle_identifier="com.rexvane.inkhole-pet",
         info_plist={
             "CFBundleName": "墨洞桌宠",

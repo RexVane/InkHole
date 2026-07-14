@@ -32,7 +32,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
@@ -70,6 +70,9 @@ class P2PConfig:
     enable_mdns: bool = True       # False = 只起 TCP 不碰 mDNS(测试用，手动注册对端)
     trusted_only: bool = False     # True = 只接受当前选中目标设备的连接，其余拒收
     instance_id: str = ""          # 本机唯一实例 ID；持久化后同一设备重启不换服务名(见 P2PNode)
+    # 手动添加的设备(Tailscale/固定 IP 直连用)：mDNS 组播不穿虚拟网卡,
+    # 这些设备靠探测线程维持在线状态。元素: {"name": str, "host": str, "port": int}
+    manual_peers: list = field(default_factory=list)
 
     def __post_init__(self):
         if not self.peer_name:
@@ -174,6 +177,10 @@ class P2PNode:
         self._listener = None        # _InkHoleListener
         self._service_info = None    # 自己注册的 ServiceInfo
         self._actual_port = 0        # 实际监听端口
+        # mDNS 生命周期锁：_rebuild_mdns(网络监控线程)与 stop()(主/切换线程)
+        # 可能并发执行；不加锁时 stop 刚拆完、rebuild 又建一个新 Zeroconf——
+        # 节点已停止却还在局域网宣告，变成幽灵设备且实例泄漏。
+        self._mdns_lock = threading.Lock()
         # 网络监控：待机唤醒/换网后 mDNS 组播 socket 会失效，需重建(见 _net_monitor_loop)
         self._last_local_ips: list[str] = []   # 上次建 mDNS 时的本机 IP，用于检测变化
         self._net_monitor_thread: threading.Thread | None = None
@@ -206,6 +213,11 @@ class P2PNode:
         # 1. 启动 TCP 监听
         self._start_tcp_server()
 
+        # 1.5 注册手动添加的设备(乐观加入;真离线的话探测线程 ~10s 内剔除,
+        #     回线后探测线程又会自动加回来——见 _probe_loop 末尾的兜底段)
+        for entry in list(self.cfg.manual_peers or []):
+            self._register_manual(entry)
+
         # 2. 对端存活探测线程(mDNS goodbye 丢包/对端崩溃的兜底，见 _probe_loop)
         self._probe_thread = threading.Thread(target=self._probe_loop, daemon=True)
         self._probe_thread.start()
@@ -215,7 +227,8 @@ class P2PNode:
             self._status(f"墨洞已开启(无 mDNS) · {self.cfg.peer_name} @ 127.0.0.1:{self._actual_port}")
             return
 
-        self._setup_mdns()
+        with self._mdns_lock:
+            self._setup_mdns()
 
         # 4. 网络监控线程：待机唤醒/换网后重建 mDNS(见 _net_monitor_loop)
         self._net_monitor_thread = threading.Thread(target=self._net_monitor_loop, daemon=True)
@@ -283,7 +296,8 @@ class P2PNode:
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
         self._running = False
-        self._teardown_mdns()
+        with self._mdns_lock:
+            self._teardown_mdns()
         if self._server_sock:
             try:
                 self._server_sock.close()
@@ -709,6 +723,44 @@ class P2PNode:
                 else service_name.split(".")[0]
         self._on_peer_removed(display)
 
+    # ---------- 手动设备(Tailscale/固定 IP 直连) ----------
+    @staticmethod
+    def _manual_key(entry: dict) -> str:
+        """手动设备的稳定标识,顶替 mDNS service_name 参与增删/探测去重。"""
+        return f"manual|{entry['host']}|{int(entry['port'])}"
+
+    def _register_manual(self, entry: dict) -> None:
+        self._on_peer_added(str(entry.get("name") or entry["host"]),
+                            str(entry["host"]), int(entry["port"]),
+                            service_name=self._manual_key(entry))
+
+    def add_manual_peer(self, name: str, host: str, port: int) -> None:
+        """新增(或更新)一台手动设备并立即注册。调用方负责持久化配置。"""
+        port = int(port)
+        entry = {"name": name, "host": host, "port": port}
+        self.cfg.manual_peers = [
+            m for m in (self.cfg.manual_peers or [])
+            if not (m["host"] == host and int(m["port"]) == port)]
+        self.cfg.manual_peers.append(entry)
+        if self._running:
+            self._register_manual(entry)
+
+    def remove_manual_peer(self, host: str, port: int) -> None:
+        """删除手动设备:同时移出配置与在线列表。调用方负责持久化配置。"""
+        port = int(port)
+        self.cfg.manual_peers = [
+            m for m in (self.cfg.manual_peers or [])
+            if not (m["host"] == host and int(m["port"]) == port)]
+        key = f"manual|{host}|{port}"
+        display = None
+        with self._lock:
+            for n, p in self._peers.items():
+                if p.service_name == key:
+                    display = n
+                    break
+        if display is not None:
+            self._on_peer_removed(display)
+
     # ---------- 对端存活探测 ----------
     def _probe_loop(self) -> None:
         """幽灵设备兜底：定期 TCP 探测已发现的对端，连不上的剔除。
@@ -751,6 +803,24 @@ class P2PNode:
                 if k not in seen:
                     del strikes[k]
 
+            # 手动设备兜底:被判离线后不会有 mDNS 通告拉它回来,
+            # 每轮探测不在表里的手动设备,连得上就重新加入。
+            with self._lock:
+                known = {p.service_name for p in self._peers.values()}
+            for entry in list(self.cfg.manual_peers or []):
+                if not self._running:
+                    break
+                key = self._manual_key(entry)
+                if key in known:
+                    continue
+                try:
+                    socket.create_connection(
+                        (entry["host"], int(entry["port"])),
+                        timeout=self._probe_timeout).close()
+                except OSError:
+                    continue
+                self._register_manual(entry)
+
     # ---------- 网络变化监控 ----------
     def _net_monitor_loop(self) -> None:
         """待机唤醒 / 换网后重建 mDNS 层。
@@ -790,20 +860,27 @@ class P2PNode:
         对端表保留：浏览器重建后会重新收到在线设备的通告刷新地址，
         探测线程会清理掉真正够不着的旧设备，不必在这里清空(清空会让
         菜单瞬间空掉、还丢掉当前选中)。
+
+        与 stop() 竞争 _mdns_lock；拿到锁后必须复查 _running——
+        stop 可能刚在锁内拆完，这里再重建就泄漏了。
         """
         if not self._running or not self.cfg.enable_mdns:
             return
         self._status(f"检测到{reason}，正在重建设备发现…")
-        try:
-            self._teardown_mdns()
-        except Exception:
-            pass
-        try:
-            self._setup_mdns()
-            ip = (self._last_local_ips or ["?"])[0]
-            self._status(f"设备发现已重建 · {ip}:{self._actual_port}")
-        except Exception as e:
-            self._status("设备发现重建失败", str(e))
+        with self._mdns_lock:
+            if not self._running:
+                return   # stop() 抢先完成:保持拆除状态,绝不再注册
+            try:
+                self._teardown_mdns()
+            except Exception:
+                pass
+            try:
+                self._setup_mdns()
+            except Exception as e:
+                self._status("设备发现重建失败", str(e))
+                return
+        ip = (self._last_local_ips or ["?"])[0]
+        self._status(f"设备发现已重建 · {ip}:{self._actual_port}")
 
     # ---------- 工具 ----------
     def _status(self, msg: str, detail: str = "") -> None:

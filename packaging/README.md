@@ -9,6 +9,7 @@ Windows 产出 **onedir 目录**（压成 zip 发布，就地运行不写临时�
 |---|---|
 | `inkhole-pet.spec` | PyInstaller 打包规格（Windows onedir 与 macOS .app 共用） |
 | `pet_entry.py` | 打包入口脚本（处理 `pet.py` 相对导入） |
+| `generate-icons.py` | 从共享品牌绘制代码生成 PNG/ICO/ICNS |
 | `build-windows.bat` | Windows 一键构建 |
 | `build-mac.sh` | macOS 一键构建 |
 
@@ -28,7 +29,9 @@ bash build-mac.sh
 # 产物:packaging/dist/InkHolePet.app
 ```
 
-依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`（可选）。
+依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。生成品牌图标时另需 `Pillow`；macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`（可选）。
+
+桌面任务栏、托盘、Windows 可执行文件和 macOS app bundle 使用同一双弧墨洞图标。修改 `src/inkhole/branding.py` 后安装 Pillow，并运行 `python packaging/generate-icons.py`，再提交 `assets/inkhole.png`、`.ico` 和 `.icns`。
 
 ## 运行
 
@@ -47,7 +50,7 @@ InkHolePet --name 我的电脑 \
 - `--size N`：挂件边长像素（0 = 随屏幕自适应）
 - 收到的文件落在收件箱目录
 
-> 直接双击会打开 `960×640` 桌面主窗口；设备名、口令、收件箱、桌宠显示和开机自启可在设置页管理。P2P 模式无需指定服务器地址，mDNS 会自动发现局域网内的其他墨洞设备。
+> 直接双击会打开 `960×640` 桌面主窗口；设备名、口令、收件箱、桌宠显示和开机自启可在设置页管理。设备通过 mDNS 自动发现；自动发现不可用时可在设置里手动添加对方 IP 与端口直连。
 
 ## 体积说明
 

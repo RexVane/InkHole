@@ -118,14 +118,22 @@ def _save_config(cfg: P2PConfig, **extra) -> None:
     path = _config_path()
     try:
         data = _load_saved_config()
+        # SSH 中转方案已移除:清掉历史遗留的相关键,避免污染配置
+        for stale in ("ssh_relay", "relay", "transport_mode"):
+            data.pop(stale, None)
         data.update({"name": cfg.peer_name, "secret": cfg.secret,
                      "inbox": cfg.inbox, "port": cfg.listen_port,
                      "trusted_only": cfg.trusted_only,
-                     "instance_id": cfg.instance_id})
+                     "instance_id": cfg.instance_id,
+                     "manual_peers": list(cfg.manual_peers or [])})
         data.update(extra)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
     except OSError:
         pass
 
@@ -140,14 +148,16 @@ class SendQueue:
     不依赖 Qt，可单测。
     """
 
-    def __init__(self, send_fn, on_batch_done=None):
+    def __init__(self, send_fn, on_batch_done=None, on_busy_changed=None):
         self._send = send_fn
         self._on_batch_done = on_batch_done
+        self._on_busy_changed = on_busy_changed
         # 队列元素是 (path, on_done)：on_done 可为 None
         self._q: queue.Queue[tuple[str, object]] = queue.Queue()
         self._lock = threading.Lock()
         self._batch_total = 0
         self._batch_ok = 0
+        self._working = False
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
 
@@ -157,13 +167,24 @@ class SendQueue:
         on_done(path, ok)：该文件发送结束后在工作线程内回调一次(无论成败)，
         用于「发完即清理」它自己的临时资源(如目录打包产生的临时 zip 目录)。
         """
+        notify = False
         with self._lock:
+            if self._batch_total == 0 and not self._working:
+                notify = True
             self._batch_total += 1
-        self._q.put((path, on_done))
+            self._q.put((path, on_done))
+        if notify and self._on_busy_changed:
+            self._on_busy_changed(True)
+
+    def busy(self) -> bool:
+        with self._lock:
+            return self._working or self._batch_total > 0
 
     def _loop(self) -> None:
         while True:
             path, on_done = self._q.get()
+            with self._lock:
+                self._working = True
             ok = False
             try:
                 ok = bool(self._send(path))
@@ -184,9 +205,15 @@ class SendQueue:
                     batch_done = (self._batch_ok, self._batch_total)
                     self._batch_ok = 0
                     self._batch_total = 0
+                    self._working = False
             if batch_done and self._on_batch_done:
                 try:
                     self._on_batch_done(*batch_done)
+                except Exception:
+                    pass
+            if batch_done and self._on_busy_changed:
+                try:
+                    self._on_busy_changed(False)
                 except Exception:
                     pass
 
@@ -215,9 +242,21 @@ def _build_config(argv=None):
     secret = args.secret if args.secret is not None else str(saved.get("secret") or "")
     trusted_only = bool(saved.get("trusted_only", False))
     instance_id = str(saved.get("instance_id") or "")   # 空则 P2PConfig 自动生成
+    manual_peers = []
+    for m in (saved.get("manual_peers") or []):
+        try:
+            m_host = str(m.get("host", "")).strip()
+            m_port = int(m.get("port", 0))
+            m_name = str(m.get("name", "")).strip()
+            if m_host and 1 <= m_port <= 65535:
+                manual_peers.append({"name": m_name, "host": m_host,
+                                     "port": m_port})
+        except (TypeError, ValueError, AttributeError):
+            continue   # 配置文件被手改坏的条目直接丢弃
 
     cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret,
-                    trusted_only=trusted_only, instance_id=instance_id)
+                    trusted_only=trusted_only, instance_id=instance_id,
+                    manual_peers=manual_peers)
     # 首次运行(配置里还没有 instance_id)时生成一个并落盘，之后重启复用同一 ID
     if not saved.get("instance_id"):
         _save_config(cfg)
@@ -457,10 +496,10 @@ def main(argv=None) -> None:
     cfg, size_override = _build_config(argv)
     _install_crash_log(cfg.inbox)   # 尽早安装:之后任何崩溃/print 都安全且留痕
     try:
-        from PySide6.QtCore import QObject, Signal, Slot, QUrl, Qt, QPointF
-        from PySide6.QtGui import (QGuiApplication, QIcon, QPixmap, QPainter,
-                                   QColor, QRadialGradient)
+        from PySide6.QtCore import QObject, Signal, Slot, QUrl, Qt
+        from PySide6.QtGui import QGuiApplication
         from PySide6.QtQml import QQmlApplicationEngine
+        from .branding import make_app_icon as _make_app_icon
         # 托盘菜单需要 QtWidgets(QApplication/QSystemTrayIcon/QMenu);
         # 不可用时降级:仍能跑桌宠,只是没有系统托盘(见 _setup_tray 的容错)
         try:
@@ -473,41 +512,6 @@ def main(argv=None) -> None:
             "未安装 PySide6。请先运行：pip install PySide6 --break-system-packages\n"
             "(P2P 引擎本身无需 GUI，可用 python -m inkhole.p2p 跑命令行版)\n")
         raise SystemExit(1)
-
-    def _draw_icon_pixmap(size: int) -> QPixmap:
-        """画单一尺寸的图标位图：圆角黑底 + 居中墨洞(青色视界环)。"""
-        from PySide6.QtGui import QPainterPath
-        from PySide6.QtCore import QRectF
-        pm = QPixmap(size, size)
-        pm.fill(Qt.transparent)                   # 圆角外保持透明
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        radius = size * 0.22                      # macOS 风格圆角(边长 22%)
-        clip = QPainterPath()
-        clip.addRoundedRect(QRectF(0, 0, size, size), radius, radius)
-        p.setClipPath(clip)
-        p.fillPath(clip, QColor(5, 7, 10))        # 圆角墨黑底
-        cx = cy = size / 2
-        R = size * 0.42
-        g = QRadialGradient(cx, cy, R)            # 墨黑核心 -> 青色视界环 -> 融回黑底
-        g.setColorAt(0.00, QColor(0, 0, 0, 255))
-        g.setColorAt(0.45, QColor(2, 8, 7, 255))
-        g.setColorAt(0.62, QColor(14, 58, 50, 255))
-        g.setColorAt(0.76, QColor(88, 230, 200, 255))   # 亮青视界环
-        g.setColorAt(0.86, QColor(20, 64, 56, 255))
-        g.setColorAt(1.00, QColor(5, 7, 10, 255))
-        p.setBrush(g)
-        p.setPen(Qt.NoPen)
-        p.drawEllipse(QPointF(cx, cy), R, R)
-        p.end()
-        return pm
-
-    def _make_app_icon() -> QIcon:
-        """多分辨率自适应图标：装入多个尺寸，系统按 Dock/任务栏/高分屏自动选最合适的。"""
-        icon = QIcon()
-        for s in (16, 32, 64, 128, 256, 512, 1024):
-            icon.addPixmap(_draw_icon_pixmap(s))
-        return icon
 
     def _setup_tray(app, bridge):
         """构建右键菜单 +(可用时)系统托盘图标。
@@ -601,22 +605,33 @@ def main(argv=None) -> None:
         peersChanged = Signal()       # 设备列表变化(刷新菜单)
         errorState = Signal(str)      # 错误信息(持续显示，非空=有错误，空=清除)
         progress = Signal(str, int)   # 传输进度(kind "send"/"recv", 百分比 0-100)
+        transferStateChanged = Signal(bool)
 
         def __init__(self, cfg: P2PConfig):
             super().__init__()
             self._tray_menu = None        # 由 _setup_tray 注入:桌宠右键时弹出
             self._main_window = None      # 由 main() 注入:主界面窗口
             self._recent: deque[str] = deque(maxlen=8)   # 最近收到的文件(路径)
+            self._engine_lock = threading.RLock()
+            self._progress_lock = threading.Lock()
+            self._progress_generation = 0
+            self._progress_active = False
+            self._lan_cfg = cfg
+            # 设置保存会后台重启节点(mDNS 重新注册,阻塞数秒不能占 UI 线程);
+            # _restart_gate 保证同一时刻只有一次重启,_restarting 供发送路径守卫。
+            self._restart_gate = threading.Lock()
+            self._restarting = False
             self.node = self._make_node(cfg)
-            self.node.start()
             # 串行发送队列：拖一堆文件不再开一堆并发连接
             self._sendq = SendQueue(
                 lambda p: self.node.send_file(p),
                 on_batch_done=lambda ok, total: self._on_batch_done(ok, total),
+                on_busy_changed=lambda _busy: self.transferStateChanged.emit(
+                    self._transfer_active()),
             )
+            self.node.start()
 
-        def _make_node(self, cfg: P2PConfig) -> P2PNode:
-            """用统一的回调钩子构造 P2P 节点(初始启动与改设置重启共用)。"""
+        def _make_node(self, cfg):
             return P2PNode(
                 cfg,
                 on_sent=lambda n: self.absorb.emit(n),
@@ -627,11 +642,37 @@ def main(argv=None) -> None:
                     kind, name, done, total),
             )
 
+        @Slot(result=bool)
+        def isTransferActive(self) -> bool:
+            return self._transfer_active()
+
+        def _transfer_active(self) -> bool:
+            with self._progress_lock:
+                progress_active = self._progress_active
+            return self._sendq.busy() or progress_active
+
+        def lanConfig(self) -> P2PConfig:
+            return self._lan_cfg
+
         def _on_received_file(self, path: str) -> None:
             self._recent.appendleft(path)
             self.emit_out.emit(os.path.basename(path))
 
         def _on_progress(self, kind: str, name: str, done: int, total: int) -> None:
+            with self._progress_lock:
+                self._progress_generation += 1
+                generation = self._progress_generation
+                self._progress_active = True
+            self.transferStateChanged.emit(True)
+
+            def settle():
+                with self._progress_lock:
+                    if generation != self._progress_generation:
+                        return
+                    self._progress_active = False
+                self.transferStateChanged.emit(self._transfer_active())
+
+            threading.Timer(1.25, settle).start()
             pct = done * 100 // total if total else 100
             self.progress.emit(kind, pct)
             arrow = "↑" if kind == "send" else "↓"
@@ -640,25 +681,41 @@ def main(argv=None) -> None:
         def _apply_settings(self, peer_name: str | None = None,
                             secret: str | None = None,
                             port: int | None = None) -> None:
-            """改名/改口令/改端口：写回配置并重启 P2P 节点(mDNS 需重新注册)。"""
-            cfg = self.node.cfg
-            self.node.stop()
-            if peer_name is not None:
-                cfg.peer_name = peer_name
-            if secret is not None:
-                cfg.secret = secret
-            if port is not None:
-                cfg.listen_port = port
-            _save_config(cfg)
-            try:
-                self.node = self._make_node(cfg)
-            except SystemExit:
-                # 设了口令但没装 cryptography：退回不加密，保持能用
-                cfg.secret = ""
+            """改名/改口令/改端口:写回配置并重启 P2P 节点(mDNS 需重新注册)。
+
+            节点重启会阻塞数秒,放到后台线程;_restart_gate 串行化多次保存。
+            """
+            def worker():
+                self._restart_gate.acquire()
+                self._restarting = True
+                try:
+                    self._apply_settings_blocking(peer_name, secret, port)
+                finally:
+                    self._restarting = False
+                    self._restart_gate.release()
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _apply_settings_blocking(self, peer_name, secret, port) -> None:
+            cfg = self._lan_cfg
+            with self._engine_lock:
+                self.node.stop()
+                if peer_name is not None:
+                    cfg.peer_name = peer_name
+                if secret is not None:
+                    cfg.secret = secret
+                if port is not None:
+                    cfg.listen_port = port
                 _save_config(cfg)
-                self.node = self._make_node(cfg)
-                self.status.emit("缺少 cryptography 库，加密未开启")
-            self.node.start()
+                try:
+                    self.node = self._make_node(cfg)
+                except SystemExit:
+                    # 设了口令但没装 cryptography：退回不加密，保持能用
+                    cfg.secret = ""
+                    _save_config(cfg)
+                    self.node = self._make_node(cfg)
+                    self.status.emit("缺少 cryptography 库，加密未开启")
+                self.node.start()
             self.peersChanged.emit()
 
         def _route_status(self, msg: str) -> None:
@@ -682,6 +739,9 @@ def main(argv=None) -> None:
         def dropFile(self, url: str):
             """QML DropArea / 主窗口拖入的 url：文件直接入队，目录先打包成 zip。
             队列单线程串行发送：一次拖 N 项不会开 N 个并发连接。"""
+            if self._restarting:
+                self.status.emit("正在应用新设置，请稍候再发送")
+                return
             path = QUrl(url).toLocalFile() if url.startswith("file:") else url
             if not path:
                 return
@@ -733,14 +793,14 @@ def main(argv=None) -> None:
 
         @Slot(result=bool)
         def isTrustedOnly(self) -> bool:
-            return self.node.cfg.trusted_only
+            return self._lan_cfg.trusted_only
 
         @Slot(result=bool)
         def toggleTrustedOnly(self) -> bool:
             """切换「仅接收目标设备」：拦掉局域网里陌生设备的投喂。"""
-            self.node.cfg.trusted_only = not self.node.cfg.trusted_only
-            _save_config(self.node.cfg)
-            return self.node.cfg.trusted_only
+            self._lan_cfg.trusted_only = not self._lan_cfg.trusted_only
+            _save_config(self._lan_cfg)
+            return self._lan_cfg.trusted_only
 
         @Slot(result="QVariantList")
         def recentFiles(self) -> list:
@@ -762,12 +822,12 @@ def main(argv=None) -> None:
 
         @Slot(result=str)
         def inboxPath(self) -> str:
-            return os.path.abspath(self.node.cfg.inbox)
+            return os.path.abspath(self._lan_cfg.inbox)
 
         @Slot()
         def openInbox(self):
             """在系统文件管理器中打开收件箱目录(跨平台)。"""
-            path = os.path.abspath(self.node.cfg.inbox)
+            path = os.path.abspath(self._lan_cfg.inbox)
             os.makedirs(path, exist_ok=True)
             try:
                 if sys.platform == "win32":
@@ -788,12 +848,69 @@ def main(argv=None) -> None:
                 return
             from PySide6.QtWidgets import QFileDialog
             directory = QFileDialog.getExistingDirectory(
-                None, "选择收件箱目录", self.node.cfg.inbox)
+                None, "选择收件箱目录", self._lan_cfg.inbox)
             if directory:
-                self.node.cfg.inbox = directory
+                self._lan_cfg.inbox = directory
                 os.makedirs(directory, exist_ok=True)
-                _save_config(self.node.cfg)   # 记住，重启后仍生效
+                _save_config(self._lan_cfg)   # 记住，重启后仍生效
                 self.status.emit(f"收件箱: {os.path.basename(directory)}")
+
+        @Slot(str)
+        def setInbox(self, directory: str) -> None:
+            """设置收件箱路径并持久化(主界面「保存」用)。
+
+            与 chooseInbox 的差别:直接收路径,无对话框。即使其他设置项没变,
+            也保证收件箱改动落盘——修复"只改收件箱、重启后回退"的问题。
+            """
+            directory = (directory or "").strip()
+            if not directory:
+                return
+            if os.path.abspath(directory) == os.path.abspath(self._lan_cfg.inbox):
+                return   # 没变,不必写盘
+            self._lan_cfg.inbox = directory
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError:
+                pass
+            _save_config(self._lan_cfg)
+
+        # ---- 手动设备(Tailscale/固定 IP 直连) ----
+        @Slot(result="QVariantList")
+        def manualPeers(self) -> list:
+            return [dict(m) for m in (self._lan_cfg.manual_peers or [])]
+
+        @Slot(str, str, int, result=bool)
+        def addManualPeer(self, name: str, host: str, port: int) -> bool:
+            """添加手动设备并持久化。局域网模式下立即出现在设备列表。"""
+            host = (host or "").strip()
+            name = (name or "").strip()
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                return False
+            if not host or " " in host or not 1 <= port <= 65535:
+                return False
+            if isinstance(self.node, P2PNode):
+                self.node.add_manual_peer(name, host, port)   # 就地注册(共享 cfg)
+            else:
+                # 远程模式:只更新配置,切回局域网时 start() 会注册
+                self._lan_cfg.manual_peers = [
+                    m for m in (self._lan_cfg.manual_peers or [])
+                    if not (m["host"] == host and int(m["port"]) == port)]
+                self._lan_cfg.manual_peers.append(
+                    {"name": name, "host": host, "port": port})
+            _save_config(self._lan_cfg)
+            return True
+
+        @Slot(str, int)
+        def removeManualPeer(self, host: str, port: int) -> None:
+            if isinstance(self.node, P2PNode):
+                self.node.remove_manual_peer(host, int(port))
+            else:
+                self._lan_cfg.manual_peers = [
+                    m for m in (self._lan_cfg.manual_peers or [])
+                    if not (m["host"] == host and int(m["port"]) == int(port))]
+            _save_config(self._lan_cfg)
 
         @Slot()
         def renameDevice(self):
@@ -804,10 +921,10 @@ def main(argv=None) -> None:
             from PySide6.QtWidgets import QInputDialog
             name, ok = QInputDialog.getText(
                 None, "设备名称", "对端设备看到的名字：",
-                text=self.node.cfg.peer_name)
+                text=self._lan_cfg.peer_name)
             if ok:
                 name = name.strip()
-                if name and name != self.node.cfg.peer_name:
+                if name and name != self._lan_cfg.peer_name:
                     self._apply_settings(peer_name=name)
                     self.status.emit(f"设备名: {name}")
 
@@ -821,8 +938,8 @@ def main(argv=None) -> None:
             secret, ok = QInputDialog.getText(
                 None, "端到端加密口令",
                 "两台设备口令必须一致；留空关闭加密：",
-                QLineEdit.Normal, self.node.cfg.secret)
-            if ok and secret != self.node.cfg.secret:
+                QLineEdit.Normal, self._lan_cfg.secret)
+            if ok and secret != self._lan_cfg.secret:
                 self._apply_settings(secret=secret)
                 self.status.emit("已开启端到端加密" if secret else "已关闭加密")
 
@@ -835,7 +952,7 @@ def main(argv=None) -> None:
         def toggleAutoStart(self) -> bool:
             """切换开机自启，返回切换后的状态。"""
             enabled = not is_autostart_enabled()
-            return set_autostart(enabled, self.node.cfg)
+            return set_autostart(enabled, self._lan_cfg)
 
         @Slot(result=str)
         def connState(self) -> str:
@@ -868,7 +985,10 @@ def main(argv=None) -> None:
 
         @Slot()
         def quit(self):
-            self.node.stop()
+            """退出:节点停止放后台并限时等待,不让 mDNS 注销卡住退出。"""
+            closer = threading.Thread(target=self.node.stop, daemon=True)
+            closer.start()
+            closer.join(2.0)   # 给 mDNS goodbye 留 2 秒,超时直接退
             QGuiApplication.quit()
 
     # 有 QtWidgets 用 QApplication(支持托盘菜单),否则退回 QGuiApplication
@@ -892,10 +1012,10 @@ def main(argv=None) -> None:
 
     def _set_pet_visible(on: bool) -> None:
         pet_root.setVisible(bool(on))
-        _save_config(bridge.node.cfg, show_pet=bool(on))
+        _save_config(bridge._lan_cfg, show_pet=bool(on))
 
     def _apply_identity(name: str, secret: str, port: int) -> None:
-        c = bridge.node.cfg
+        c = bridge._lan_cfg
         if (name, secret, port) == (c.peer_name, c.secret, c.listen_port):
             return   # 没变就不重启节点
         bridge._apply_settings(peer_name=name, secret=secret, port=port)
@@ -908,7 +1028,7 @@ def main(argv=None) -> None:
             "pet_visible": lambda: pet_root.isVisible(),
             "set_pet_visible": _set_pet_visible,
             "is_autostart": is_autostart_enabled,
-            "set_autostart": lambda on: set_autostart(on, bridge.node.cfg),
+            "set_autostart": lambda on: set_autostart(on, bridge._lan_cfg),
             "apply_settings": _apply_identity,
         }, icon=_make_app_icon())
         bridge._main_window = main_win

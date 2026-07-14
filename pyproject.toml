@@ -1,11 +1,12 @@
 [project]
 name = "inkhole"
-version = "1.1.0"
-description = "P2P LAN file transfer: drag files into a black-hole desktop pet, they appear on the other machine. mDNS auto-discovery, TCP direct, no server needed."
+version = "1.2.0"
+description = "Cross-platform file transfer over LAN auto-discovery and direct IP connections."
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
 gui = ["PySide6", "zeroconf", "cryptography", "psutil"]
+test = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
