@@ -1,31 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="48dp"
     android:height="48dp"
     android:viewportWidth="48"
     android:viewportHeight="48">
 
-    <!-- 黑底 -->
     <path
-        android:pathData="M0,0 h48 v48 h-48 z"
-        android:fillColor="#000000"/>
-
-    <!-- 黑洞径向渐变（半径 16，与自适应图标同比例缩小） -->
+        android:pathData="M10,2 H38 Q46,2 46,10 V38 Q46,46 38,46 H10 Q2,46 2,38 V10 Q2,2 10,2 Z"
+        android:fillColor="#FF0B1011" />
     <path
-        android:pathData="M24,24 m-16,0 a16,16 0,1 1,32 0 a16,16 0,1 1,-32 0">
-        <aapt:attr name="android:fillColor">
-            <gradient
-                android:type="radial"
-                android:centerX="24"
-                android:centerY="24"
-                android:gradientRadius="16">
-                <item android:offset="0.00" android:color="#FF000000"/>
-                <item android:offset="0.42" android:color="#FF030308"/>
-                <item android:offset="0.60" android:color="#FF484456"/>
-                <item android:offset="0.78" android:color="#FFEEECF4"/>
-                <item android:offset="1.00" android:color="#FF000000"/>
-            </gradient>
-        </aapt:attr>
-    </path>
+        android:pathData="M24,24 m-12,0 a12,12 0,1 1,24,0 a12,12 0,1 1,-24,0"
+        android:fillColor="#FF020506" />
+    <path
+        android:pathData="M37.42,16.25 A15.5,15.5 0,1 0 15.11,36.7"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FF5AD8C0"
+        android:strokeWidth="3.1"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M14.74,30.48 A11.3,11.3 0,0 0 30.48,33.26"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFE9BD72"
+        android:strokeWidth="2.3"
+        android:strokeLineCap="round" />
 </vector>

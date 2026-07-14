@@ -204,6 +204,11 @@ fun MainScreen(
     transferPct: Float,
     transferKind: String,
     pendingCount: Int,
+    transportMode: String,
+    modeSwitchEnabled: Boolean,
+    relayConfigured: Boolean,
+    onModeChange: (String) -> Unit,
+    onRelaySetup: () -> Unit,
     onDeviceClick: (Peer) -> Unit,
     onSendClick: () -> Unit,
     onOpenInbox: () -> Unit,
@@ -249,7 +254,8 @@ fun MainScreen(
                     pendingCount > 0 && selectedPeer == null -> "有 $pendingCount 个待发文件 · 点选下方设备立刻发出"
                     selectedPeer != null -> "轻点墨洞选择文件 → 吞入即发送"
                     peers.isNotEmpty() -> "点选下方设备作为目标"
-                    else -> "等待附近的墨洞上线…"
+                    else -> if (transportMode == "remote")
+                        "等待中继内其他设备上线…" else "等待附近的墨洞上线…"
                 },
                 color = TextDim,
                 fontSize = 11.sp,
@@ -257,6 +263,20 @@ fun MainScreen(
             )
 
             Spacer(Modifier.height(14.dp))
+
+            TransportModeControl(
+                mode = transportMode,
+                enabled = modeSwitchEnabled,
+                onModeChange = onModeChange,
+            )
+            Spacer(Modifier.height(12.dp))
+
+            if (transportMode == "remote" && !relayConfigured) {
+                OutlinedButton(onClick = onRelaySetup, enabled = modeSwitchEnabled) {
+                    Text("部署或加入远程中继")
+                }
+                Spacer(Modifier.height(12.dp))
+            }
 
             // 设备横排
             if (peers.isNotEmpty()) {
@@ -313,6 +333,47 @@ fun MainScreen(
                     }
                     item { Spacer(Modifier.height(12.dp)) }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TransportModeControl(
+    mode: String,
+    enabled: Boolean,
+    onModeChange: (String) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .width(220.dp)
+            .height(40.dp)
+            .clip(RoundedCornerShape(7.dp))
+            .background(Color(0xFF080D0E))
+            .border(1.dp, BorderColor, RoundedCornerShape(7.dp))
+            .padding(3.dp),
+    ) {
+        listOf("local" to "局域网", "remote" to "远程").forEach { (value, label) ->
+            val selected = mode == value
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(if (selected) Teal.copy(alpha = 0.16f) else Color.Transparent)
+                    .clickable(enabled = enabled && !selected) { onModeChange(value) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    label,
+                    color = when {
+                        !enabled -> TextDim
+                        selected -> TealSoft
+                        else -> TextSecondary
+                    },
+                    fontSize = 12.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                )
             }
         }
     }
@@ -489,6 +550,8 @@ fun PreviewMainScreen() {
             transferPct = 63f,
             transferKind = "recv",
             pendingCount = 0,
+            transportMode = "local", modeSwitchEnabled = true,
+            relayConfigured = false, onModeChange = {}, onRelaySetup = {},
             onDeviceClick = {}, onSendClick = {}, onOpenInbox = {},
             onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},
         )
@@ -507,6 +570,8 @@ fun PreviewEmptyState() {
             transferPct = -1f,
             transferKind = "",
             pendingCount = 0,
+            transportMode = "remote", modeSwitchEnabled = true,
+            relayConfigured = false, onModeChange = {}, onRelaySetup = {},
             onDeviceClick = {}, onSendClick = {}, onOpenInbox = {},
             onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},
         )

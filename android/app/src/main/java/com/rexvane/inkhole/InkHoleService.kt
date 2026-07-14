@@ -19,6 +19,9 @@ import androidx.core.content.FileProvider
 import com.rexvane.inkhole.p2p.Peer
 import com.rexvane.inkhole.p2p.InkHoleListener
 import com.rexvane.inkhole.p2p.InkHoleNode
+import com.rexvane.inkhole.p2p.TransportNode
+import com.rexvane.inkhole.relay.RelayNode
+import com.rexvane.inkhole.relay.RelaySettings
 import java.io.File
 
 /**
@@ -79,7 +82,19 @@ class InkHoleService : Service() {
         val trustedOnly = prefs.getBoolean("trusted_only", false)
         val inbox = File(getExternalFilesDir(null), "收件箱")
 
-        val node = InkHoleNode(this, name, inbox, secret, trustedOnly, listener = forwarder)
+        val mode = prefs.getString("transport_mode", "local") ?: "local"
+        val node: TransportNode = if (mode == "remote") {
+            val relay = RelaySettings.load(this)
+            if (relay == null) {
+                InkHoleBus.lastStatus = "远程模式尚未配置"
+                InkHoleBus.uiListener?.onStatus(InkHoleBus.lastStatus)
+                updateStatusNotification(InkHoleBus.lastStatus)
+                return
+            }
+            RelayNode(this, name, inbox, relay, listener = forwarder)
+        } else {
+            InkHoleNode(this, name, inbox, secret, trustedOnly, listener = forwarder)
+        }
         // 设置变更重建时恢复选中目标：对端被重新发现后智能保留会自动选回
         InkHoleBus.pendingSelectedService?.let {
             node.restoreSelectedService(it)
@@ -108,6 +123,7 @@ class InkHoleService : Service() {
         }
 
         override fun onFileReceived(filename: String, path: String) {
+            InkHoleBus.transferActive = false
             val record = exportToDownloads(File(path))
             InkHoleBus.receivedFiles.add(0, record)
             InkHoleBus.saveHistory(this@InkHoleService)
@@ -121,6 +137,7 @@ class InkHoleService : Service() {
         }
 
         override fun onProgress(kind: String, filename: String, done: Long, total: Long) {
+            InkHoleBus.transferActive = total <= 0 || done < total
             InkHoleBus.uiListener?.onProgress(kind, filename, done, total)
         }
     }
@@ -192,7 +209,7 @@ class InkHoleService : Service() {
         val builder = if (Build.VERSION.SDK_INT >= 26)
             Notification.Builder(this, CHANNEL_STATUS) else Notification.Builder(this)
         return builder
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("墨洞")
             .setContentText(text)
             .setContentIntent(openApp)
@@ -215,7 +232,7 @@ class InkHoleService : Service() {
 
         val builder = if (Build.VERSION.SDK_INT >= 26)
             Notification.Builder(this, CHANNEL_FILES) else Notification.Builder(this)
-        builder.setSmallIcon(android.R.drawable.stat_sys_download_done)
+        builder.setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("墨洞吐出文件")
             .setContentText(record.name)
             .setAutoCancel(true)

@@ -41,8 +41,8 @@ jobs:
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
-      - name: Build APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Test and build APK
+        run: gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace
 
       # Use an ASCII name (InkHole-<ver>.apk): Release assets do not support
       # non-ASCII filenames. On tag push use the tag, otherwise the versionName.

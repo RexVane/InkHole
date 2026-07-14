@@ -44,7 +44,7 @@ class InkHoleNode(
     private val secret: String = "",
     private val trustedOnly: Boolean = false,   // true = 只接受当前选中目标设备的连接
     private val listener: InkHoleListener,
-) {
+) : TransportNode {
     companion object {
         private const val SERVICE_TYPE = "_inkhole._tcp."
         private const val DISK_MARGIN = 256L * 1024 * 1024   // 收完至少还要剩这么多
@@ -86,7 +86,7 @@ class InkHoleNode(
 
     // ---- 生命周期 ----
 
-    fun start() {
+    override fun start() {
         if (running) return
         running = true
         inboxDir.mkdirs()
@@ -96,7 +96,7 @@ class InkHoleNode(
         listener.onStatus("墨洞已开启 · $peerName")
     }
 
-    fun stop() {
+    override fun stop() {
         running = false
         // 注册/发现可能从未成功，注销时系统会抛 IllegalArgumentException——不能让退出流程崩掉
         nsdManager?.let { nsd ->
@@ -297,7 +297,7 @@ class InkHoleNode(
 
     // ---- 发送文件 ----
 
-    fun sendFile(filePath: String): Boolean {
+    override fun sendFile(filePath: String): Boolean {
         val file = File(filePath)
         if (!file.isFile) {
             listener.onStatus("文件不存在")
@@ -394,9 +394,9 @@ class InkHoleNode(
 
     // ---- 对端管理 ----
 
-    fun getPeers(): List<Peer> = synchronized(peersLock) { peers.values.toList().sortedBy { it.name } }
+    override fun getPeers(): List<Peer> = synchronized(peersLock) { peers.values.toList().sortedBy { it.name } }
 
-    fun selectPeer(name: String?) {
+    override fun selectPeer(name: String?) {
         selectedPeer = name
         // 智能保留：记住 serviceName，离线后重新上线能自动恢复选中
         lastSelectedService = if (name != null) {
@@ -405,14 +405,14 @@ class InkHoleNode(
         listener.onStatus(if (name != null) "目标: $name" else "未选择目标")
     }
 
-    fun getSelectedPeer(): String? = selectedPeer
+    override fun getSelectedPeer(): String? = selectedPeer
 
     /** 当前选中目标的 serviceName（用于节点重建后恢复选中）。 */
-    fun getSelectedServiceName(): String? = lastSelectedService
+    override fun getSelectedServiceName(): String? = lastSelectedService
 
     /** 预设"上次选中的 serviceName"：设置变更重建节点时，让智能保留在对端
      *  重新被发现时自动恢复选中，避免用户重新点连接。 */
-    fun restoreSelectedService(serviceName: String?) {
+    override fun restoreSelectedService(serviceName: String?) {
         lastSelectedService = serviceName
     }
 

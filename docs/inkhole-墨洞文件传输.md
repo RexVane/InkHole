@@ -1,10 +1,13 @@
 # 墨洞文件传输（InkHole）
 
-> 局域网点对点文件传输：在桌面主窗口、墨洞桌宠或 Android 端选择设备发送，文件直接出现在另一台设备上。无需服务器。
+> 局域网点对点或 SSH 跨网络通道：桌面、桌宠和 Android 使用同一设备选择与发送体验。
 
 ## 这是什么
 
-一个面向可信局域网的文件互传通道。两台设备连同一个 WiFi/路由器，各自启动墨洞后，mDNS 自动发现对端，文件通过 TCP 直连传输——不经过任何中转服务器。
+局域网模式面向可信网络，两台设备通过 mDNS 自动发现并 TCP 直连。远程模式让两端登录同一台 OpenSSH 服务器，通过回环反向端口转发互通；服务器无需安装墨洞且不保存文件。
+
+设备栏顶部的“局域网 / 远程”分段控制严格二选一。传输过程中不可切换，切换后旧引擎停止、目标清空并启动新引擎。服务器配置与协议细节见
+[SSH 远程模式](remote-relay.md) 和 [SSH 远程协议 v1](relay-protocol.md)。
 
 桌面端体验：**在主窗口选择目标 → 点击选择文件或拖入窗口 → 墨洞显示传输进度 → 对端文件落入收件箱**。桌宠仍可作为常驻桌面的快捷拖放入口。
 
@@ -20,7 +23,7 @@
 
 ## 原理与架构
 
-墨洞分为两层：底层是 P2P 引擎（mDNS 发现 + TCP 直连），上层是桌面主窗口/桌宠与 Android UI。界面只通过 Bridge 信号和回调使用引擎，传输逻辑不依赖 GUI。
+墨洞底层有两个互斥传输引擎：局域网引擎使用 mDNS + TCP 直连，远程引擎使用 SSH 登记 + 回环反向端口转发。上层桌面主窗口、桌宠与 Android UI 只通过公共传输接口使用当前引擎。
 
 ```
    电脑A                                      电脑B
@@ -45,17 +48,24 @@
 ```
 src/inkhole/
 ├── p2p.py        P2P 引擎(mDNS 发现 + TCP 直连 + WHE2 分块加密)——纯后台, 已自动化测试
+├── ssh_relay.py  SSH 设备登记、反向端口转发与远程 WHPP/ACK
+├── relay_crypto.py P-256 ECDH、HKDF 与 AES-GCM 严格序号帧
+├── transport.py 局域网与远程引擎公共接口
 ├── crypto.py     端到端加密(AES-256-GCM，WHE1 整块 / WHE2 分块流)
+├── branding.py   标题栏、任务栏、托盘与桌面打包共用的品牌图标绘制
 ├── pet.py        应用生命周期、桌宠挂件、配置持久化与发送队列
 ├── mainwindow.py QtWidgets 桌面主窗口、设置页、进度与交互动效
 ├── inkhole.qml   墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
 ├── __init__.py
 └── __main__.py   入口(python -m inkhole 启动桌宠)
-tests/test_p2p.py       P2P 引擎端到端测试(29 组 123 项)
+tests/test_p2p.py       P2P 引擎端到端测试(29 项)
 android/app/src/main/java/com/rexvane/inkhole/
 ├── p2p/InkHoleNode.kt  Android P2P 引擎(NSD + TCP)
 ├── p2p/Crypto.kt       加密(与桌面版逐字节兼容)
 ├── p2p/WHPP.kt         协议常量与读写
+├── relay/RelayNode.kt  Android SSH 反向通道与 WHPP 流
+├── relay/RelayCrypto.kt P-256/HKDF/AES-GCM 共享帧协议
+├── relay/AndroidSshConnector.kt SSHJ 鉴权、主机密钥与转发检查
 ├── InkHoleService.kt   前台服务(P2P 节点生命周期)
 ├── MainActivity.kt     主 UI(Jetpack Compose)
 └── InkHoleUI.kt        Compose UI 组件
@@ -68,7 +78,7 @@ android/app/src/main/java/com/rexvane/inkhole/
 装依赖（只需一次）：
 
 ```bash
-pip install PySide6 zeroconf cryptography psutil
+pip install PySide6 zeroconf cryptography psutil paramiko
 # macOS 另需（挂件常驻所有桌面，可选）：
 pip install pyobjc-framework-Cocoa
 ```

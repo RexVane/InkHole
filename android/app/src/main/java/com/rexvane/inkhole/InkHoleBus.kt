@@ -4,7 +4,7 @@ import android.content.Context
 import android.net.Uri
 import com.rexvane.inkhole.p2p.Peer
 import com.rexvane.inkhole.p2p.InkHoleListener
-import com.rexvane.inkhole.p2p.InkHoleNode
+import com.rexvane.inkhole.p2p.TransportNode
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
@@ -26,12 +26,13 @@ data class ReceivedFile(
  * 接收历史持久化到 SharedPreferences(最近 50 条)，重启 App 不丢。
  */
 object InkHoleBus {
-    @Volatile var node: InkHoleNode? = null
+    @Volatile var node: TransportNode? = null
     @Volatile var uiListener: InkHoleListener? = null
 
     // 最近状态缓存：Activity 重建时恢复 UI 用
     @Volatile var lastPeers: List<Peer> = emptyList()
     @Volatile var lastStatus: String = "正在启动…"
+    @Volatile var transferActive: Boolean = false
     // 设置变更重建节点时暂存选中目标的 serviceName，新节点起来后自动恢复选中
     @Volatile var pendingSelectedService: String? = null
     val receivedFiles = CopyOnWriteArrayList<ReceivedFile>()   // 最新的在最前

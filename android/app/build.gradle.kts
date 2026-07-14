@@ -34,6 +34,18 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.12"
     }
+    sourceSets.getByName("test").resources.srcDir("../../tests/vectors")
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+                "META-INF/INDEX.LIST",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+            )
+        }
+    }
 }
 
 dependencies {
@@ -47,5 +59,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+    implementation("com.hierynomus:sshj:0.39.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

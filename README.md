@@ -4,15 +4,15 @@
 [![Android APK](https://github.com/RexVane/InkHole/actions/workflows/android.yml/badge.svg)](https://github.com/RexVane/InkHole/actions/workflows/android.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 局域网 P2P 文件传输：在桌面主窗口、墨洞桌宠或手机端选择设备并发送，文件直接出现在另一台设备上。无需服务器。
+> 局域网直连或 SSH 跨网络传输：桌面与 Android 选择设备发送，文件直接出现在对端。
 
-两台设备连同一个 WiFi，各开一个墨洞，mDNS 自动发现彼此，拖文件进去就 TCP 直连传过去。支持端到端加密（大文件分块流式）、传输回执与进度、手动选目标设备、开机自启。Windows / macOS / Android 三平台互通。
+局域网模式使用 mDNS + TCP 直连。远程模式让设备登录用户自己的 OpenSSH 服务器，通过回环反向端口转发互通。服务器无需安装墨洞，两种模式严格二选一，Windows / macOS / Android 三平台互通。
 
 ## Quick Start
 
 ```bash
 # 1. 装依赖
-pip install PySide6 zeroconf cryptography psutil
+pip install PySide6 zeroconf cryptography psutil paramiko
 
 # 2. 两台电脑各跑一个
 PYTHONPATH=src python -m inkhole.pet
@@ -22,6 +22,17 @@ PYTHONPATH=src python -m inkhole.pet --name 我的Mac
 ```
 
 也可以直接 `python -m inkhole`（等价于启动桌宠）。
+
+## SSH 远程模式
+
+在设备栏切换到“远程”，填写云服务器地址和 SSH 私钥即可。服务器只需启用
+OpenSSH、公钥登录、SFTP 和 `AllowTcpForwarding yes`，不需要 `root`、Docker、
+Web 服务或数据库，安全组也只需开放 SSH 端口。
+
+所有需要互相发现的设备必须使用同一服务器、同一 SSH 账户和同一份私钥文本。
+首次连接必须核对 SSH 主机密钥指纹；私钥与口令不写入应用配置。完整 WHPP 流
+（包括文件名与 ACK）强制使用 P-256 ECDH + HKDF-SHA256 + AES-256-GCM 端到端
+加密。详见 [服务器配置](docs/remote-relay.md) 与 [SSH 远程协议](docs/relay-protocol.md)。
 
 无图形界面时用命令行版：
 
@@ -40,7 +51,11 @@ Windows 主窗口采用双栏工作台布局：左侧固定为发送目标、墨
 ## Features
 
 - **mDNS 自动发现**：注册 `_inkhole._tcp.local.` 服务，局域网内自动发现其他墨洞设备；服务名带唯一实例 ID，两台同名设备不冲突；宣告本机物理网卡地址（自动过滤 VMware/VirtualBox/Hyper-V 等虚拟网卡与 169.254 链路本地地址），开 VPN/多网卡也能连上
+- **局域网 / 远程二选一**：上次模式持久化，切换会停止旧引擎并清空目标；传输期间禁止切换
+- **SSH 跨网络通道**：只依赖标准 OpenSSH、SFTP 与回环反向端口转发，不安装服务端程序，不公开随机转发端口
+- **远程强制端到端加密**：每次传输使用独立 ECDH/HKDF 密钥和 64 KiB AES-GCM 严格序号帧；服务器不保存文件
 - **应用内主界面**：深色双栏工作台——稳定的发送区、附近设备、最近接收、应用内设置页和自适应长文本；设备名/口令/收件箱/自启等设置集中管理，桌宠挂件保留为可开关选项
+- **统一应用图标**：标题栏双弧墨洞标记同时用于桌面任务栏/托盘、Windows 可执行文件、macOS app、Android 自适应/主题图标和通知图标
 - **TCP 直连传输**：WHPP 协议（magic + JSON 头 + 文件数据 + 1 字节回执），不经过任何中转服务器
 - **传输回执（ACK）**：接收方落盘成功才算发送成功——对端解密失败、磁盘满、被拒收，发送方都能感知
 - **传输进度**：主窗口、桌宠和 Android 端均显示墨洞进度环；发送使用青绿色，主窗口接收使用暖金色
@@ -57,12 +72,13 @@ Windows 主窗口采用双栏工作台布局：左侧固定为发送目标、墨
 
 ## 安全模型（请阅读）
 
-墨洞面向**可信局域网**（家里/自己的路由器）设计：
+局域网模式面向**可信局域网**（家里/自己的路由器）设计：
 
 - **默认接收无发送方认证**：同一网络里任何运行墨洞协议的人都可以向你的收件箱发送文件。公共 WiFi 建议在设置页开启**「仅接收目标设备」**，或设置加密口令。
 - **口令的双重作用**：`--secret` 保证文件内容端到端加密；口令不一致的文件会被拒收并回执失败——同时起到"只接收知道口令的设备"的准认证作用。
 - **口令明文存储在本机配置**（桌面 `config.json` / Android `SharedPreferences`），与浏览器记住密码同级别；它不会进开机自启脚本或注册表。
-- 传输不经过任何服务器，文件不出局域网。
+- 局域网传输不经过服务器。远程模式经过用户指定的 SSH 服务器，但完整 WHPP 字节流强制端到端加密。
+- 远程设备登记以共享私钥派生的 HMAC 认证；设备 E2E 私钥只保存在客户端。SSH 私钥和口令只存在当前应用进程内存中。
 
 ## 启动参数
 
@@ -125,6 +141,11 @@ xattr -cr /Applications/InkHolePet.app
 3. 避开访客网络/企业网络——它们常开 AP 隔离，设备间互相不可见
 4. 开着 VPN 时若发现异常，先断开 VPN 再试
 
+### 远程模式看不到设备
+
+确认两端都选择“远程”，并使用同一服务器、同一 SSH 用户名和同一份私钥文本。
+服务器需要启用 SFTP 与 `AllowTcpForwarding yes`；云安全组只需开放 SSH 端口。
+
 ### 问题反馈
 
 提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.1.0）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
@@ -132,10 +153,11 @@ xattr -cr /Applications/InkHolePet.app
 ## Tests
 
 ```bash
-make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可）
+pytest -q        # 局域网、SSH 远程协议与文件往返测试
+cd android && ./gradlew testDebugUnitTest
 ```
 
-覆盖：TCP 直连传输、端到端加密、设备选择切换、对端离线、回调触发、多文件连续发送、路径穿越防御、半截文件不落盘、恶意 size 拒收、同名设备共存与精确离线、口令不一致 ACK 失败、传输进度回调、分块加密往返、分块流篡改/重排检测、发送队列、仅接收目标设备、多地址回退、幽灵设备探测剔除、持久化实例 ID、虚拟网卡过滤、智能保留选中目标、同名不覆盖、非法文件名清洗、目录打包往返、文件夹发送、队列按文件清理。29 组 123 项全通过（也兼容 `pytest`）。
+覆盖：TCP 直连、SSH 反向通道契约、跨端 P-256/HKDF/AES-GCM 固定向量、登记与握手认证、文件往返与 ACK、设备选择、离线处理、路径穿越防御、半截文件清理、恶意 size、分块加密、发送队列、同名不覆盖、目录打包和文件夹发送。
 
 桌面端同名文件：收件箱已有同名文件时自动加 " (2)" 后缀，绝不覆盖已有文件；传输中断的半截文件不会落盘。该自动加后缀保证当前由 Python 桌面端测试覆盖，Android 导出到系统下载目录时遵循 Android/MediaStore 的同名项处理方式。
 
@@ -148,12 +170,16 @@ make test        # P2P 端到端测试（Windows Git Bash / macOS / Linux 均可
 │   ├── __main__.py            # 入口(python -m inkhole 启动桌宠)
 │   ├── p2p.py                 # P2P 引擎(mDNS 发现 + TCP 直连 + ACK/进度 + 加密)
 │   ├── crypto.py              # 端到端加密(AES-256-GCM，WHE1 整块 / WHE2 分块流)
+│   ├── ssh_relay.py           # SSH 发现、反向端口转发与远程 WHPP/ACK
+│   ├── relay_crypto.py        # P-256/HKDF/AES-GCM 严格序号帧
+│   ├── transport.py           # 局域网与远程引擎的公共接口
+│   ├── branding.py            # 统一品牌标记与桌面多尺寸应用图标
 │   ├── pet.py                 # 应用生命周期、桌宠、配置持久化与发送队列
 │   ├── mainwindow.py          # QtWidgets 桌面主窗口、设置页与交互动效
 │   └── inkhole.qml           # 墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
-├── tests/
-│   └── test_p2p.py            # P2P 端到端测试(29 组 123 项)
+├── tests/                     # 局域网、SSH 远程与共享跨端密码学向量
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)
+├── assets/                    # Windows/macOS 打包图标(PNG/ICO/ICNS)
 ├── android/                   # Android 客户端(Kotlin + Compose + 前台服务)
 ├── docs/                      # 使用与实现文档
 ├── .github/workflows/         # CI

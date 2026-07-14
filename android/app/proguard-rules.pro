@@ -1,1 +1,15 @@
 -keep class com.rexvane.inkhole.** { *; }
+-keep class net.schmizz.sshj.** { *; }
+-keep class net.i2p.crypto.eddsa.** { *; }
+-keep class org.bouncycastle.** { *; }
+-dontwarn org.bouncycastle.**
+-dontwarn org.slf4j.**
+-dontwarn javax.security.auth.login.LoginContext
+-dontwarn org.ietf.jgss.GSSContext
+-dontwarn org.ietf.jgss.GSSCredential
+-dontwarn org.ietf.jgss.GSSException
+-dontwarn org.ietf.jgss.GSSManager
+-dontwarn org.ietf.jgss.GSSName
+-dontwarn org.ietf.jgss.MessageProp
+-dontwarn org.ietf.jgss.Oid
+-dontwarn sun.security.x509.X509Key
