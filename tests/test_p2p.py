@@ -710,6 +710,14 @@ def test_trusted_only():
 # ---------- 测试 17: 多地址回退连接 ----------
 def test_multi_host_fallback():
     print("\n=== 测试 17: 多地址回退 ===")
+    # 环境守卫:Clash/TUN 全局代理会把保留测试网段 203.0.113.x 也"接管连通",
+    # 使"不可达的第一地址"假设失效——此时跳过而不是误报回归
+    try:
+        socket.create_connection(("203.0.113.1", 9), timeout=0.8).close()
+        print("  [SKIP] 代理/TUN 接管了保留测试网段,本测试在此环境无意义")
+        return
+    except OSError:
+        pass
     import inkhole.p2p as p2p_mod
     tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     saved_timeout = p2p_mod._CONNECT_TIMEOUT

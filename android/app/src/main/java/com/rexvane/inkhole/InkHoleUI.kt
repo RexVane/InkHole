@@ -382,14 +382,17 @@ private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
-            // 显示完整 instance_id（8位唯一标识）
-            // service_name 格式: "guicaifeilupu-038551df._inkhole._tcp.local."
-            val instanceId = peer.serviceName.takeIf { it.contains("-") }
-                ?.substringAfterLast("-")  // "038551df._inkhole._tcp.local."
-                ?.substringBefore(".")     // "038551df"
-                ?: ""
-            if (instanceId.isNotEmpty()) {
-                Text(instanceId, color = TextDim, fontSize = 10.sp, maxLines = 1)
+            // 第二行:手动设备显示 IP(备注在上、IP 在下);自动发现设备显示实例 ID
+            val subline = if (peer.serviceName.startsWith("manual|")) {
+                "${peer.host}:${peer.port}"
+            } else {
+                peer.serviceName.takeIf { it.contains("-") }
+                    ?.substringAfterLast("-")
+                    ?.substringBefore(".")
+                    ?: ""
+            }
+            if (subline.isNotEmpty()) {
+                Text(subline, color = TextDim, fontSize = 10.sp, maxLines = 1)
             }
         }
         if (selected) {

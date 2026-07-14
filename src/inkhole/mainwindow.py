@@ -671,11 +671,6 @@ class TitleBar(QWidget):
         brand.addWidget(t1)
         brand.addWidget(t2)
         lay.addLayout(brand)
-        lay.addSpacing(10)
-        self._device_badge = QLabel()
-        self._device_badge.setObjectName("MetaBadge")
-        self._device_badge.hide()
-        lay.addWidget(self._device_badge)
         lay.addStretch(1)
 
         b_settings = QPushButton("设置")
@@ -703,9 +698,7 @@ class TitleBar(QWidget):
             lay.addWidget(b)
 
     def set_device_count(self, count: int):
-        self._device_badge.setVisible(count > 0)
-        if count:
-            self._device_badge.setText(f"{count} 台设备")
+        pass   # 标题栏不再显示设备数(右侧设备栏有计数)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -895,9 +888,14 @@ class MainWindow(QWidget):
         rec_bar = QHBoxLayout()
         rec_bar.addWidget(_section_label("最近接收"))
         rec_bar.addStretch(1)
-        self._recent_count_lbl = QLabel("0")
-        self._recent_count_lbl.setObjectName("CountBadge")
-        rec_bar.addWidget(self._recent_count_lbl)
+        b_clear = QToolButton()
+        b_clear.setObjectName("Win")
+        b_clear.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        b_clear.setFixedSize(30, 28)
+        b_clear.setToolTip("清空接收记录（不删除文件）")
+        b_clear.setCursor(Qt.PointingHandCursor)
+        b_clear.clicked.connect(self._bridge.clearRecent)
+        rec_bar.addWidget(b_clear)
         b_inbox = QToolButton()
         b_inbox.setObjectName("Win")
         b_inbox.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
@@ -906,6 +904,9 @@ class MainWindow(QWidget):
         b_inbox.setCursor(Qt.PointingHandCursor)
         b_inbox.clicked.connect(self._bridge.openInbox)
         rec_bar.addWidget(b_inbox)
+        self._recent_count_lbl = QLabel("0")
+        self._recent_count_lbl.setObjectName("CountBadge")
+        rec_bar.addWidget(self._recent_count_lbl)
         right.addLayout(rec_bar)
 
         self._recent_area = QScrollArea()
@@ -1014,7 +1015,7 @@ class MainWindow(QWidget):
         connection.addSpacing(10)
         connection.addWidget(_divider())
         connection.addSpacing(6)
-        connection.addWidget(_section_label("跨网络配置（手动添加设备）"))
+        connection.addWidget(_section_label("跨网络配置"))
         manual_hint = QLabel("自动发现找不到对方时，填对方 IP 与墨洞监听端口直连"
                              "（对方需在设置里固定监听端口）。跨网络传输：两台电脑"
                              "安装 Tailscale 并登录同一账号，填对方的 Tailscale IP 即可。")
@@ -1026,6 +1027,9 @@ class MainWindow(QWidget):
         manual_lay = QHBoxLayout(manual_row)
         manual_lay.setContentsMargins(0, 2, 0, 0)
         manual_lay.setSpacing(8)
+        self._manual_name = QLineEdit()
+        self._manual_name.setPlaceholderText("备注，如 我的手机")
+        self._manual_name.setFixedWidth(118)
         self._manual_host = QLineEdit()
         self._manual_host.setPlaceholderText("对方 IP，如 192.168.1.23")
         self._manual_host.textEdited.connect(self._mask_manual_host)
@@ -1036,6 +1040,7 @@ class MainWindow(QWidget):
         b_manual_add = QPushButton("添加")
         b_manual_add.setCursor(Qt.PointingHandCursor)
         b_manual_add.clicked.connect(self._add_manual_peer)
+        manual_lay.addWidget(self._manual_name)
         manual_lay.addWidget(self._manual_host, 1)
         manual_lay.addWidget(self._manual_port)
         manual_lay.addWidget(b_manual_add)
@@ -1163,8 +1168,10 @@ class MainWindow(QWidget):
     def _refresh_manual_list(self):
         while self._manual_list_lay.count():
             it = self._manual_list_lay.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
         for entry in self._bridge.manualPeers():
             host, port = str(entry.get("host")), int(entry.get("port"))
             name = str(entry.get("name") or "")
@@ -1175,14 +1182,31 @@ class MainWindow(QWidget):
             text = f"{name}  ·  {host}:{port}" if name else f"{host}:{port}"
             lbl = ElidedLabel(text, Qt.ElideMiddle)
             lbl.setStyleSheet(f"color:{_TEXT_SECOND}; font-size:11.5px;")
+            b_edit = QPushButton("编辑")
+            b_edit.setObjectName("Link")
+            b_edit.setCursor(Qt.PointingHandCursor)
+            b_edit.clicked.connect(
+                lambda checked=False, n=name, h=host, p=port:
+                self._edit_manual_peer(n, h, p))
             b_del = QPushButton("移除")
             b_del.setObjectName("Link")
             b_del.setCursor(Qt.PointingHandCursor)
             b_del.clicked.connect(
                 lambda checked=False, h=host, p=port: self._remove_manual_peer(h, p))
             row_lay.addWidget(lbl, 1)
+            row_lay.addWidget(b_edit)
             row_lay.addWidget(b_del)
             self._manual_list_lay.addWidget(row)
+
+    def _edit_manual_peer(self, name: str, host: str, port: int):
+        """编辑 = 回填到输入框并移除原条目,改完点「添加」保存。"""
+        self._manual_name.setText(name)
+        self._manual_host.setText(host)
+        self._manual_port.setValue(port)
+        self._bridge.removeManualPeer(host, port)
+        self._refresh_manual_list()
+        self._refresh_peers()
+        self._manual_host.setFocus()
 
     def _mask_manual_host(self, text: str):
         """输入时实时分段(仅光标在末尾时,不打扰中间修改)。"""
@@ -1205,7 +1229,9 @@ class MainWindow(QWidget):
         if host != raw.strip():
             self._manual_host.setText(host)   # 回显修正结果,用户可见实际用的地址
             self._on_status(f"已自动修正为 {host}")
-        if self._bridge.addManualPeer("", host, self._manual_port.value()):
+        if self._bridge.addManualPeer(self._manual_name.text().strip(),
+                                      host, self._manual_port.value()):
+            self._manual_name.clear()
             self._manual_host.clear()
             self._refresh_manual_list()
             self._refresh_peers()

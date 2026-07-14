@@ -307,7 +307,12 @@ class MainActivity : ComponentActivity() {
             val manualList = remember {
                 mutableStateListOf<ManualPeer>().apply { addAll(ManualPeers.load(prefs)) }
             }
-            var manualHost by remember { mutableStateOf("") }
+            var manualName by remember { mutableStateOf("") }
+            // 用 TextFieldValue 而非 String:自动补点改写文本后必须显式把光标放到
+            // 末尾,否则 Compose 会把光标留在旧 offset(点号前),后续输入全插错位
+            var manualHost by remember {
+                mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(""))
+            }
             var manualPort by remember { mutableStateOf("52130") }
             var manualError by remember { mutableStateOf("") }
             AlertDialog(
@@ -377,9 +382,9 @@ class MainActivity : ComponentActivity() {
                                 onCheckedChange = { trustedInput = it })
                         }
 
-                        // ---- 跨网络配置(手动添加设备,如 Tailscale) ----
+                        // ---- 跨网络配置(手动直连,如 Tailscale) ----
                         Spacer(Modifier.height(14.dp))
-                        Text("跨网络配置（手动添加设备）", fontSize = 14.sp,
+                        Text("跨网络配置", fontSize = 14.sp,
                             fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                         Text("自动发现不可用时(如 Tailscale 跨网)填对方 IP 与监听端口",
                             fontSize = 11.sp,
@@ -389,15 +394,45 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Text("${m.host}:${m.port}",
-                                    fontSize = 13.sp, modifier = Modifier.weight(1f))
+                                Column(Modifier.weight(1f)) {
+                                    if (m.name.isNotEmpty()) {
+                                        Text(m.name, fontSize = 13.sp)
+                                    }
+                                    Text("${m.host}:${m.port}", fontSize = 12.sp,
+                                        color = androidx.compose.ui.graphics.Color.Gray)
+                                }
+                                TextButton(onClick = {
+                                    // 编辑 = 回填输入框并移除原条目,改完点「添加设备」保存
+                                    manualName = m.name
+                                    manualHost = androidx.compose.ui.text.input.TextFieldValue(
+                                        m.host,
+                                        selection = androidx.compose.ui.text.TextRange(m.host.length))
+                                    manualPort = m.port.toString()
+                                    manualList.remove(m)
+                                }) { Text("编辑") }
                                 TextButton(onClick = { manualList.remove(m) }) { Text("删除") }
                             }
                         }
+                        OutlinedTextField(
+                            value = manualName,
+                            onValueChange = { manualName = it },
+                            label = { Text("备注（如 我的电脑，可选）") },
+                            singleLine = true,
+                        )
+                        Spacer(Modifier.height(6.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedTextField(
                                 value = manualHost,
-                                onValueChange = { manualHost = ManualPeers.maskTyping(it) },
+                                onValueChange = { tfv ->
+                                    // 光标在末尾才自动补点(不打扰中间编辑),并把光标固定回末尾——
+                                    // 否则 Compose 会把光标留在旧 offset,后续输入全插错位
+                                    manualHost = if (tfv.selection.end == tfv.text.length) {
+                                        val masked = ManualPeers.maskTyping(tfv.text)
+                                        androidx.compose.ui.text.input.TextFieldValue(
+                                            masked,
+                                            selection = androidx.compose.ui.text.TextRange(masked.length))
+                                    } else tfv
+                                },
                                 label = { Text("对方 IP") },
                                 singleLine = true,
                                 modifier = Modifier.weight(1f),
@@ -405,7 +440,7 @@ class MainActivity : ComponentActivity() {
                             Spacer(Modifier.width(6.dp))
                             OutlinedTextField(
                                 value = manualPort,
-                                onValueChange = { manualPort = it.filter { c -> c.isDigit() } },
+                                onValueChange = { manualPort = it.filter { c -> c.isDigit() }.take(5) },
                                 label = { Text("端口") },
                                 singleLine = true,
                                 modifier = Modifier.width(92.dp),
@@ -416,15 +451,16 @@ class MainActivity : ComponentActivity() {
                                 color = androidx.compose.ui.graphics.Color(0xFFF08A7C))
                         }
                         TextButton(onClick = {
-                            val fixed = ManualPeers.normalizeHost(manualHost)
+                            val fixed = ManualPeers.normalizeHost(manualHost.text)
                             val port = manualPort.toIntOrNull()
                             if (fixed == null || port == null || port !in 1..65535) {
                                 manualError = "IP 无效或有歧义，请检查（端口 1-65535）"
                             } else {
                                 manualError = ""
                                 manualList.removeAll { it.host == fixed && it.port == port }
-                                manualList.add(ManualPeer("", fixed, port))
-                                manualHost = ""
+                                manualList.add(ManualPeer(manualName.trim(), fixed, port))
+                                manualName = ""
+                                manualHost = androidx.compose.ui.text.input.TextFieldValue("")
                             }
                         }) { Text("添加设备") }
                     }

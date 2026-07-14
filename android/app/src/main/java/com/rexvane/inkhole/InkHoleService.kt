@@ -53,11 +53,27 @@ class InkHoleService : Service() {
     }
 
     private var fileNotifId = 100
+    // 息屏后 vivo/各厂商会让 WiFi 休眠,TCP 监听对外不可达,对端把本机判离线。
+    // 前台服务期间持有高性能 WifiLock,保持 WiFi 常联通(亮屏恢复即自愈的
+    // "设备消失又回来"就是它治的)。
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
         createChannels()
         startForeground(NOTIF_STATUS_ID, buildStatusNotification("正在启动…"))
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE)
+                as android.net.wifi.WifiManager
+            @Suppress("DEPRECATION")
+            val mode = if (Build.VERSION.SDK_INT >= 29)
+                android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            else android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifiLock = wm.createWifiLock(mode, "inkhole:wifi").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (_: Exception) {}
         InkHoleBus.loadHistory(this)
         startNode()
     }
@@ -92,6 +108,8 @@ class InkHoleService : Service() {
     }
 
     override fun onDestroy() {
+        try { wifiLock?.release() } catch (_: Exception) {}
+        wifiLock = null
         InkHoleBus.node?.stop()
         InkHoleBus.node = null
         super.onDestroy()
@@ -195,6 +213,9 @@ class InkHoleService : Service() {
             Notification.Builder(this, CHANNEL_STATUS) else Notification.Builder(this)
         return builder
             .setSmallIcon(R.drawable.ic_notification)
+            .setColor(0xFF58E6C8.toInt())
+            .setLargeIcon(android.graphics.drawable.Icon.createWithResource(
+                this, R.mipmap.ic_launcher))
             .setContentTitle("墨洞")
             .setContentText(text)
             .setContentIntent(openApp)
@@ -218,6 +239,9 @@ class InkHoleService : Service() {
         val builder = if (Build.VERSION.SDK_INT >= 26)
             Notification.Builder(this, CHANNEL_FILES) else Notification.Builder(this)
         builder.setSmallIcon(R.drawable.ic_notification)
+            .setColor(0xFF58E6C8.toInt())
+            .setLargeIcon(android.graphics.drawable.Icon.createWithResource(
+                this, R.mipmap.ic_launcher))
             .setContentTitle("墨洞吐出文件")
             .setContentText(record.name)
             .setAutoCancel(true)

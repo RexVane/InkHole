@@ -824,6 +824,12 @@ def main(argv=None) -> None:
             """最近收到的文件路径列表(新的在前)。"""
             return [p for p in self._recent if os.path.exists(p)]
 
+        @Slot()
+        def clearRecent(self) -> None:
+            """清空最近接收列表(只清记录,不动磁盘上的文件)。"""
+            self._recent.clear()
+            self.emit_out.emit("")   # 复用信号触发界面刷新列表
+
         @Slot(str)
         def openPath(self, path: str):
             """用系统默认程序打开一个文件(最近接收菜单用)。"""

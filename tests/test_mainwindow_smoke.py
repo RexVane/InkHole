@@ -84,6 +84,9 @@ class FakeBridge(QObject):
     def refreshDiscovery(self):
         pass
 
+    def clearRecent(self):
+        pass
+
     # ---- 手动设备 ----
     def manualPeers(self):
         return [dict(m) for m in self._manual]

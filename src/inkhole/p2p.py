@@ -798,7 +798,12 @@ class P2PNode:
                         continue
                 if alive:
                     strikes.pop(key, None)
-                elif strikes.get(key, 0) + 1 >= self._probe_strikes:
+                    continue
+                # 手动设备用双倍容忍:手机息屏时厂商省电会让 WiFi 短暂休眠,
+                # 探活偶发失败;阈值太急会造成"息屏就消失、亮屏又回来"的抖动
+                threshold = (self._probe_strikes * 2
+                             if key.startswith("manual|") else self._probe_strikes)
+                if strikes.get(key, 0) + 1 >= threshold:
                     strikes.pop(key, None)
                     self._on_peer_removed(display)
                 else:
