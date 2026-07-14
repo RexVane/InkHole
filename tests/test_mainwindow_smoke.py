@@ -81,6 +81,9 @@ class FakeBridge(QObject):
     def localAddresses(self):
         return ["192.168.1.10", "100.64.0.9"]
 
+    def refreshDiscovery(self):
+        pass
+
     # ---- 手动设备 ----
     def manualPeers(self):
         return [dict(m) for m in self._manual]

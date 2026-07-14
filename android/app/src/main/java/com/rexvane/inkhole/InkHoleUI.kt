@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Computer
@@ -209,10 +210,11 @@ fun MainScreen(
     onOpenInbox: () -> Unit,
     onOpenFile: (ReceivedFile) -> Unit,
     onClearHistory: () -> Unit,
+    onRefreshClick: () -> Unit = {},
     onSettingsClick: () -> Unit,
 ) {
     Scaffold(
-        topBar = { InkTopBar(onSettingsClick) },
+        topBar = { InkTopBar(onRefreshClick, onSettingsClick) },
         containerColor = BgDark,
     ) { padding ->
         Column(
@@ -321,7 +323,7 @@ fun MainScreen(
 // ==================== 子组件 ====================
 
 @Composable
-private fun InkTopBar(onSettingsClick: () -> Unit) {
+private fun InkTopBar(onRefreshClick: () -> Unit, onSettingsClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -332,6 +334,9 @@ private fun InkTopBar(onSettingsClick: () -> Unit) {
         Spacer(Modifier.width(8.dp))
         Text("InkHole", color = TextDim, fontSize = 12.sp)
         Spacer(Modifier.weight(1f))
+        IconButton(onClick = onRefreshClick) {
+            Icon(Icons.Default.Refresh, contentDescription = "重新搜索设备", tint = TextSecondary)
+        }
         IconButton(onClick = onSettingsClick) {
             Icon(Icons.Default.Settings, contentDescription = "设置", tint = TextSecondary)
         }

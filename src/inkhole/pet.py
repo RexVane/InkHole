@@ -724,6 +724,16 @@ def main(argv=None) -> None:
                 self.errorState.emit("")  # 清除之前的错误
                 self.status.emit(msg)
 
+        @Slot()
+        def refreshDiscovery(self) -> None:
+            """手动重启设备发现(主界面刷新按钮)。mDNS 层偶发卡死的自救手段。"""
+            node = self.node
+            if isinstance(node, P2PNode):
+                self.status.emit("正在重新搜索设备…")
+                threading.Thread(
+                    target=lambda: node._rebuild_mdns("手动刷新"),
+                    daemon=True).start()
+
         @Slot(result="QVariantList")
         def localAddresses(self) -> list:
             """本机全部非环回 IPv4(含 Tailscale 100.x)。设置页展示用。"""

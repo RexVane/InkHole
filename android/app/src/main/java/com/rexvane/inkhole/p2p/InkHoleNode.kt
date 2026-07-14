@@ -104,7 +104,26 @@ class InkHoleNode(
         // 手动设备:乐观注册(真离线的话探活循环 ~10s 内剔除,回线自动加回)
         manualPeers.forEach { registerManual(it) }
         if (manualPeers.isNotEmpty()) startManualProbeLoop()
+        // 发现自愈:NSD 发现流偶尔"卡死"(WiFi 省电丢组播/系统服务抽风),
+        // 表现为对端明明在线列表却空着。列表持续为空时周期性重启发现。
+        scope.launch {
+            while (running) {
+                delay(30_000)
+                val empty = synchronized(peersLock) { peers.isEmpty() }
+                if (empty && running) restartDiscovery()
+            }
+        }
         listener.onStatus("墨洞已开启 · $peerName")
+    }
+
+    /** 重启 NSD 发现(手动刷新按钮/自愈循环用)。stop 是异步的,稍等再启。 */
+    fun restartDiscovery() {
+        val nsd = nsdManager ?: return
+        try { discoveryListener?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
+        scope.launch {
+            delay(400)
+            if (running) try { discoverNsd() } catch (_: Exception) {}
+        }
     }
 
     private fun registerManual(m: ManualPeer) {

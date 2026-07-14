@@ -138,6 +138,10 @@ class MainActivity : ComponentActivity() {
                         InkHoleBus.clearHistory(this)
                         refreshReceived()
                     },
+                    onRefreshClick = {
+                        statusMsg.value = "正在重新搜索设备…"
+                        InkHoleBus.node?.restartDiscovery()
+                    },
                     onSettingsClick = { showSettings.value = true },
                 )
                 SettingsDialog()
