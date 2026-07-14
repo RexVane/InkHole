@@ -967,7 +967,7 @@ class MainWindow(QWidget):
         self._sp_port.setToolTip("0 = 系统自动分配")
         self._ed_inbox = QLineEdit()
         self._ed_inbox.setReadOnly(True)
-        b_browse = QPushButton("浏览")
+        b_browse = QPushButton("更换目录")
         b_browse.setCursor(Qt.PointingHandCursor)
         b_browse.clicked.connect(self._choose_inbox)
 
