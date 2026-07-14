@@ -46,6 +46,7 @@ class InkHoleNode(
     private val inboxDir: File,
     private val secret: String = "",
     private val trustedOnly: Boolean = false,   // true = 只接受当前选中目标设备的连接
+    private val listenPort: Int = 0,            // 固定监听端口;0 = 系统自动分配(跨网手动直连需固定)
     private val listener: InkHoleListener,
 ) {
     companion object {
@@ -151,7 +152,15 @@ class InkHoleNode(
 
     private fun startTcpServer() {
         val server = try {
-            ServerSocket(0).also { actualPort = it.localPort } // OS 自动分配端口
+            // 固定端口被占用时回退自动分配,保证应用总能启动
+            try {
+                ServerSocket(listenPort.coerceIn(0, 65535))
+            } catch (e: IOException) {
+                if (listenPort != 0) {
+                    listener.onStatus("端口 $listenPort 被占用,已改用自动分配")
+                    ServerSocket(0)
+                } else throw e
+            }.also { actualPort = it.localPort }
         } catch (e: IOException) {
             listener.onStatus("TCP 启动失败: ${e.message}")
             return
@@ -435,6 +444,13 @@ class InkHoleNode(
     // ---- 对端管理 ----
 
     fun getPeers(): List<Peer> = synchronized(peersLock) { peers.values.toList().sortedBy { it.name } }
+
+    /** 实际监听端口(0=尚未启动)。设置页展示"本机"信息用。 */
+    fun getActualPort(): Int = actualPort
+
+    /** 本机全部非环回 IPv4(含 Tailscale 100.x)。设置页展示,方便对端照着手动添加。 */
+    fun getLocalAddresses(): List<String> =
+        localIps().filter { it.contains('.') && it != "127.0.0.1" }.sorted()
 
     fun selectPeer(name: String?) {
         selectedPeer = name

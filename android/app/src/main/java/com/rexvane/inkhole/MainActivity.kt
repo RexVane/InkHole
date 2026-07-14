@@ -296,6 +296,10 @@ class MainActivity : ComponentActivity() {
             var nameInput by remember { mutableStateOf(peerName.value) }
             var secretInput by remember { mutableStateOf(secret.value) }
             var trustedInput by remember { mutableStateOf(trustedOnly.value) }
+            val originalPort = remember { prefs.getInt("listen_port", 0) }
+            var portInput by remember {
+                mutableStateOf(if (originalPort == 0) "" else originalPort.toString())
+            }
             val manualList = remember {
                 mutableStateListOf<ManualPeer>().apply { addAll(ManualPeers.load(prefs)) }
             }
@@ -309,18 +313,38 @@ class MainActivity : ComponentActivity() {
                     Column(
                         modifier = Modifier.verticalScroll(rememberScrollState()),
                     ) {
-                        // 本机信息提示：对端看到的设备名-instance_id
+                        // 本机信息:对端手动添加本机时,照这里的 IP+端口填
                         val instanceId = prefs.getString("instance_id", "") ?: ""
-                        Text(
-                            text = "本机：${peerName.value}-$instanceId",
-                            fontSize = 12.sp,
-                            color = androidx.compose.ui.graphics.Color.Gray,
-                            modifier = Modifier.padding(bottom = 12.dp)
-                        )
+                        val localAddrs = InkHoleBus.node?.getLocalAddresses().orEmpty()
+                        val actualPort = InkHoleBus.node?.getActualPort() ?: 0
+                        androidx.compose.foundation.text.selection.SelectionContainer {
+                            Column {
+                                Text(
+                                    text = "本机：${peerName.value}-$instanceId",
+                                    fontSize = 12.sp,
+                                    color = androidx.compose.ui.graphics.Color.Gray,
+                                )
+                                Text(
+                                    text = "IP ${localAddrs.joinToString(" / ").ifEmpty { "?" }}" +
+                                        " · 端口 ${if (actualPort > 0) actualPort else "未启动"}" +
+                                        "（对方手动添加本机时填这两项）",
+                                    fontSize = 11.sp,
+                                    color = androidx.compose.ui.graphics.Color.Gray,
+                                    modifier = Modifier.padding(bottom = 12.dp)
+                                )
+                            }
+                        }
                         OutlinedTextField(
                             value = nameInput,
                             onValueChange = { nameInput = it },
                             label = { Text("设备名称") },
+                            singleLine = true,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = portInput,
+                            onValueChange = { portInput = it.filter { c -> c.isDigit() }.take(5) },
+                            label = { Text("监听端口（留空=自动；跨网直连需固定，如 52130）") },
                             singleLine = true,
                         )
                         Spacer(Modifier.height(8.dp))
@@ -399,12 +423,14 @@ class MainActivity : ComponentActivity() {
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        // 只有设置真正变化时才重建节点(改名/改口令/手动设备需生效)；
+                        // 只有设置真正变化时才重建节点(改名/口令/端口/手动设备需生效)；
                         // 没变就不动，避免已连接的设备无谓断开、要重新点连接。
+                        val portVal = portInput.toIntOrNull()?.takeIf { it in 1..65535 } ?: 0
                         val manualChanged = ManualPeers.load(prefs) != manualList.toList()
                         val changed = nameInput != peerName.value ||
                             secretInput != secret.value ||
                             trustedInput != trustedOnly.value ||
+                            portVal != originalPort ||
                             manualChanged
                         peerName.value = nameInput
                         secret.value = secretInput
@@ -413,6 +439,7 @@ class MainActivity : ComponentActivity() {
                             .putString("peer_name", nameInput)
                             .putString("secret", secretInput)
                             .putBoolean("trusted_only", trustedInput)
+                            .putInt("listen_port", portVal)
                             .apply()
                         ManualPeers.save(prefs, manualList.toList())
                         showSettings.value = false

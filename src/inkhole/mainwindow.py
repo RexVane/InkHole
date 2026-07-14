@@ -1078,7 +1078,15 @@ class MainWindow(QWidget):
                 behavior.addWidget(_divider())
         behavior.addStretch(1)
         columns.addLayout(behavior, 2)
-        lay.addLayout(columns, 1)
+        # 内容装进滚动区:窗口高度不足时出滚动条,而不是把输入框压扁裁切
+        content = QWidget()
+        content.setLayout(columns)
+        content_scroll = QScrollArea()
+        content_scroll.setWidgetResizable(True)
+        content_scroll.setFrameShape(QFrame.NoFrame)
+        content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content_scroll.setWidget(content)
+        lay.addWidget(content_scroll, 1)
         lay.addWidget(_divider())
 
         btns = QHBoxLayout()
@@ -1134,8 +1142,10 @@ class MainWindow(QWidget):
         self._cb_trusted.setChecked(cfg.trusted_only)
         self._cb_pet.setChecked(bool(self._ctl["pet_visible"]()))
         self._cb_auto.setChecked(bool(self._ctl["is_autostart"]()))
+        ips = " / ".join(self._bridge.localAddresses()) or "?"
         self._local_lbl.set_full_text(
-            f"本机：{cfg.peer_name}-{cfg.instance_id} · 局域网监听端口 {cfg.listen_port or '自动'}")
+            f"本机：{cfg.peer_name}-{cfg.instance_id} · 端口 {cfg.listen_port or '自动'}"
+            f" · IP {ips}（对方手动添加本机时填这里的 IP 和端口）")
         self._refresh_manual_list()
         self._show_page(1)
 

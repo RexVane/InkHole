@@ -77,9 +77,11 @@ class InkHoleService : Service() {
         val name = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         val secret = prefs.getString("secret", "") ?: ""
         val trustedOnly = prefs.getBoolean("trusted_only", false)
+        val listenPort = prefs.getInt("listen_port", 0)
         val inbox = File(getExternalFilesDir(null), "收件箱")
 
-        val node = InkHoleNode(this, name, inbox, secret, trustedOnly, listener = forwarder)
+        val node = InkHoleNode(this, name, inbox, secret, trustedOnly, listenPort,
+                               listener = forwarder)
         // 设置变更重建时恢复选中目标：对端被重新发现后智能保留会自动选回
         InkHoleBus.pendingSelectedService?.let {
             node.restoreSelectedService(it)

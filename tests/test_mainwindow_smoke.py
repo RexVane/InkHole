@@ -78,6 +78,9 @@ class FakeBridge(QObject):
     def openInbox(self):
         pass
 
+    def localAddresses(self):
+        return ["192.168.1.10", "100.64.0.9"]
+
     # ---- 手动设备 ----
     def manualPeers(self):
         return [dict(m) for m in self._manual]

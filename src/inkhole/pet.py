@@ -724,6 +724,15 @@ def main(argv=None) -> None:
                 self.errorState.emit("")  # 清除之前的错误
                 self.status.emit(msg)
 
+        @Slot(result="QVariantList")
+        def localAddresses(self) -> list:
+            """本机全部非环回 IPv4(含 Tailscale 100.x)。设置页展示用。"""
+            try:
+                return [ip for ip in self.node._get_local_ips()
+                        if ip != "127.0.0.1"]
+            except Exception:
+                return []
+
         @Slot(result=str)
         def peerStatus(self) -> str:
             """持续状态：始终返回空(桌宠不显示持续文字，只有出错时才显示)。"""
