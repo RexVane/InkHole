@@ -365,7 +365,7 @@ class MainActivity : ComponentActivity() {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedTextField(
                                 value = manualHost,
-                                onValueChange = { manualHost = it },
+                                onValueChange = { manualHost = ManualPeers.maskTyping(it) },
                                 label = { Text("对方 IP") },
                                 singleLine = true,
                                 modifier = Modifier.weight(1f),

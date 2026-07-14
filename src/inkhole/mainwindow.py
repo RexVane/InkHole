@@ -195,6 +195,30 @@ def _divider(vertical: bool = False) -> QFrame:
     return line
 
 
+def mask_manual_host_typing(text: str) -> str:
+    """IP 输入的实时分段:边打边自动落点,四段封顶(经典 IP 输入框行为)。
+
+    规则:纯数字/分隔符时生效(主机名不动);全角句号/逗号/空格即落点;
+    当前段已 3 位、或再接一位就超过 255 时,自动补点开新段——
+    连续输入 1001274626 会实时变成 100.127.46.26。
+    """
+    if any(c.isalpha() for c in text):
+        return text   # 主机名(如 MagicDNS)不做掩码
+    parts: list[str] = [""]
+    for ch in text:
+        if ch in ".。，, ":
+            if parts[-1] and len(parts) < 4:
+                parts.append("")
+        elif ch.isdigit():
+            candidate = parts[-1] + ch
+            if (len(candidate) > 3 or int(candidate) > 255) and len(parts) < 4:
+                parts.append(ch)          # 当前段容不下:落点,新段从这一位开始
+            elif len(candidate) <= 3:
+                parts[-1] = candidate
+            # 第四段已满 3 位后的多余数字直接丢弃(非法输入,添加时还有校验兜底)
+    return ".".join(parts)
+
+
 def normalize_manual_host(raw: str) -> str | None:
     """手动添加设备的地址自动纠正。返回修正后的地址;非法/有歧义返回 None。
 
@@ -994,6 +1018,7 @@ class MainWindow(QWidget):
         manual_lay.setSpacing(8)
         self._manual_host = QLineEdit()
         self._manual_host.setPlaceholderText("对方 IP，如 192.168.1.23")
+        self._manual_host.textEdited.connect(self._mask_manual_host)
         self._manual_port = QSpinBox()
         self._manual_port.setRange(1, 65535)
         self._manual_port.setValue(52130)
@@ -1138,6 +1163,15 @@ class MainWindow(QWidget):
             row_lay.addWidget(lbl, 1)
             row_lay.addWidget(b_del)
             self._manual_list_lay.addWidget(row)
+
+    def _mask_manual_host(self, text: str):
+        """输入时实时分段(仅光标在末尾时,不打扰中间修改)。"""
+        if self._manual_host.cursorPosition() != len(text):
+            return
+        masked = mask_manual_host_typing(text)
+        if masked != text:
+            self._manual_host.setText(masked)     # textEdited 不会因 setText 重入
+            self._manual_host.setCursorPosition(len(masked))
 
     def _add_manual_peer(self):
         raw = self._manual_host.text()

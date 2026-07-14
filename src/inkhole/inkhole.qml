@@ -12,9 +12,9 @@ Window {
     visible: true
     color: "transparent"
     flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.NoDropShadowWindowHint
-    // 初始位置：屏幕右上角偏下一点,贴右边缘
-    x: Screen.width - win.petSize
-    y: Math.round(win.petSize * 0.8)
+    // 初始位置：屏幕右上角偏下一点,贴右边缘(virtualX = 所在屏在虚拟桌面的原点)
+    x: Screen.virtualX + Screen.width - win.petSize
+    y: Screen.virtualY + Math.round(win.petSize * 0.8)
 
     property real scaleF: 1.0          // 整体缩放(吸入/喷出时放大)
     property string hint: ""           // 临时提示文字(2.2s 后消失)
@@ -35,33 +35,38 @@ Window {
     Behavior on x { enabled: !win.dragging; NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
     Behavior on y { enabled: !win.dragging; NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
 
-    // 松手时判断是否靠近某条屏幕边缘；是则记下该边并收起,否则恢复自由浮动
+    // 松手时判断是否靠近某条屏幕边缘；是则记下该边并收起,否则恢复自由浮动。
+    // 多屏关键:win.x/y 是全部屏幕拼成的虚拟桌面全局坐标,而 Screen.width/height
+    // 只是"当前所在屏"的尺寸——必须先减 Screen.virtualX/virtualY 换算成屏内
+    // 坐标再算边距,否则副屏上贴边判定/收起位置全部错乱(桌宠飞走/消失)。
+    // Screen 附加属性随窗口移动自动切换为所在屏:拖到哪块屏就贴哪块屏的边。
     function decideSnap() {
-        var dl = win.x, dr = Screen.width - (win.x + win.petSize);
-        var dt = win.y, db = Screen.height - (win.y + win.petSize);
+        var sx = win.x - Screen.virtualX, sy = win.y - Screen.virtualY;
+        var dl = sx, dr = Screen.width - (sx + win.petSize);
+        var dt = sy, db = Screen.height - (sy + win.petSize);
         var m = Math.min(dl, dr, dt, db);
         if (m > win.snapThreshold) { win.edge = -1; win.collapsed = false; return; }
         if (m === dl) win.edge = 0; else if (m === dr) win.edge = 1;
         else if (m === dt) win.edge = 2; else win.edge = 3;
         win.collapse();
     }
-    // 收起：沿贴边方向滑出屏幕,只在边缘留 peek 宽度
+    // 收起：沿贴边方向滑出屏幕,只在边缘留 peek 宽度(所在屏的边)
     function collapse() {
         if (win.edge < 0) return;
         win.collapsed = true;
-        if (win.edge === 0) win.x = -(win.petSize - win.peek);
-        else if (win.edge === 1) win.x = Screen.width - win.peek;
-        else if (win.edge === 2) win.y = -(win.petSize - win.peek);
-        else if (win.edge === 3) win.y = Screen.height - win.peek;
+        if (win.edge === 0) win.x = Screen.virtualX - (win.petSize - win.peek);
+        else if (win.edge === 1) win.x = Screen.virtualX + Screen.width - win.peek;
+        else if (win.edge === 2) win.y = Screen.virtualY - (win.petSize - win.peek);
+        else if (win.edge === 3) win.y = Screen.virtualY + Screen.height - win.peek;
     }
     // 探出：滑回贴边处完整显示(收文件 / 重新拖动用)
     function expand() {
         if (win.edge < 0) return;
         win.collapsed = false;
-        if (win.edge === 0) win.x = 0;
-        else if (win.edge === 1) win.x = Screen.width - win.petSize;
-        else if (win.edge === 2) win.y = 0;
-        else if (win.edge === 3) win.y = Screen.height - win.petSize;
+        if (win.edge === 0) win.x = Screen.virtualX;
+        else if (win.edge === 1) win.x = Screen.virtualX + Screen.width - win.petSize;
+        else if (win.edge === 2) win.y = Screen.virtualY;
+        else if (win.edge === 3) win.y = Screen.virtualY + Screen.height - win.petSize;
     }
     // 探出后无人理睬则自动收回(鼠标不在其上、且未在拖动、且没在传文件)
     Timer {

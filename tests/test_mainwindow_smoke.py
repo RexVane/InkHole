@@ -184,3 +184,26 @@ def test_normalize_manual_host():
     # 主机名放行(Tailscale MagicDNS)
     assert fix("my-pc") == "my-pc"
     assert fix("my pc") == "mypc"
+
+
+def test_mask_manual_host_typing():
+    """边打边分段:段满 3 位或再加一位超 255 自动落点(经典 IP 输入框)。"""
+    from inkhole.mainwindow import mask_manual_host_typing as mask
+    # 连续输入自动分段(用户诉求场景)
+    assert mask("1001274626") == "100.127.46.26"
+    assert mask("100127") == "100.127"
+    # 全角句号/逗号即落点
+    assert mask("100。127") == "100.127"
+    assert mask("100，127") == "100.127"
+    # 段没满不越权补点(46 之后等用户自己点或数字溢出)
+    assert mask("100.127.46") == "100.127.46"
+    # 段溢出自动断段:192.168.1 后打 5 并入(合法),打 999 会断
+    assert mask("19216815") == "192.168.15"
+    assert mask("192168999") == "192.168.99.9"
+    # 尾部点保留(正在输入下一段)
+    assert mask("100.") == "100."
+    # 第四段允许打满 3 位(超 255 由添加时校验拦),第 4 位起丢弃
+    assert mask("100.127.46.261") == "100.127.46.261"
+    assert mask("100.127.46.2611") == "100.127.46.261"
+    # 主机名不做掩码
+    assert mask("my-pc") == "my-pc"

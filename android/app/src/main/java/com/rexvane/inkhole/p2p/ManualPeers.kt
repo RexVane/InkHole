@@ -39,6 +39,34 @@ object ManualPeers {
     }
 
     /**
+     * 输入时实时分段（经典 IP 输入框行为）：段满 3 位、或再接一位就超过 255
+     * 时自动落点开新段——连续输入 1001274626 实时变成 100.127.46.26。
+     * 含字母(主机名)不做掩码；四段封顶，第四段满后的多余数字丢弃。
+     */
+    fun maskTyping(text: String): String {
+        if (text.any { it.isLetter() }) return text
+        val parts = mutableListOf(StringBuilder())
+        for (ch in text) {
+            when {
+                ch == '.' || ch == '。' || ch == '，' || ch == ',' || ch == ' ' ->
+                    if (parts.last().isNotEmpty() && parts.size < 4) parts.add(StringBuilder())
+                ch.isDigit() -> {
+                    val cand = parts.last().toString() + ch
+                    when {
+                        (cand.length > 3 || cand.toInt() > 255) && parts.size < 4 ->
+                            parts.add(StringBuilder().append(ch))
+                        cand.length <= 3 -> {
+                            parts.last().clear()
+                            parts.last().append(cand)
+                        }
+                    }
+                }
+            }
+        }
+        return parts.joinToString(".") { it.toString() }
+    }
+
+    /**
      * IP 输入自动纠正。与桌面端同一套规则：
      *  - 全角句号/逗号/空格视为分隔符（输入法常见误输）；
      *  - 含字母则按主机名原样放行（如 Tailscale MagicDNS 名）；

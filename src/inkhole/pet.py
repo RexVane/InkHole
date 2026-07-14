@@ -516,26 +516,16 @@ def main(argv=None) -> None:
     def _setup_tray(app, bridge):
         """构建右键菜单 +(可用时)系统托盘图标。
 
-        菜单结构：
-          发送目标 ▸  (动态子菜单，列出已发现的设备，可单选)
-          ─────────
-          打开收件箱
-          ☑/☐ 开机自启  (可勾选，切换开机自动启动)
-          ─────────
-          状态：…
-          ─────────
-          退出
-
-        关键修复:把"菜单的构建"与"系统托盘是否可用"解耦(见原版注释)。
-        新增:发送目标子菜单在 aboutToShow 时动态重建——对端随时上下线。
+        托盘与桌宠各有一份菜单,尾部动作语义不同(用户明确要求):
+          桌宠右键 → 「关闭桌宠」= 只收起挂件(等于设置里关掉开关),程序继续跑;
+                     另保留「退出程序」。
+          托盘     → 「退出」= 退出整个应用。
+        发送目标子菜单在 aboutToShow 时动态重建——对端随时上下线。
         """
         if not _HAS_WIDGETS:
             return None
-        menu = QMenu()
 
-        # ---- 每次弹出重建(目标子菜单要随设备上下线刷新) ----
-        # 只保留高频必需项；设备名/口令/收件箱/自启等设置都搬进了主界面
-        def _rebuild_menu():
+        def _fill_menu(menu, from_pet):
             try:
                 menu.clear()
 
@@ -575,22 +565,30 @@ def main(argv=None) -> None:
 
                 menu.addSeparator()
 
-                act_quit = menu.addAction("退出")
+                if from_pet:
+                    act_hide = menu.addAction("关闭桌宠")
+                    act_hide.triggered.connect(bridge.hidePet)
+                    act_quit = menu.addAction("退出程序")
+                else:
+                    act_quit = menu.addAction("退出")
                 act_quit.triggered.connect(bridge.quit)
             except Exception as e:
                 print(f"[ERROR] 菜单构建失败: {e}")
                 import traceback
                 traceback.print_exc()
 
-        menu.aboutToShow.connect(_rebuild_menu)
-        bridge._tray_menu = menu
+        tray_menu = QMenu()
+        tray_menu.aboutToShow.connect(lambda: _fill_menu(tray_menu, False))
+        pet_menu = QMenu()
+        pet_menu.aboutToShow.connect(lambda: _fill_menu(pet_menu, True))
+        bridge._tray_menu = pet_menu   # 桌宠右键弹出的是桌宠版菜单
 
         # 仅当系统托盘可用时才创建并显示托盘图标;不可用也不影响右键菜单
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return None
         tray = QSystemTrayIcon(_make_app_icon(), app)
         tray.setToolTip("墨洞")
-        tray.setContextMenu(menu)
+        tray.setContextMenu(tray_menu)
         tray.activated.connect(
             lambda reason: bridge.showMain()
             if reason == QSystemTrayIcon.Trigger else None)
@@ -975,6 +973,18 @@ def main(argv=None) -> None:
                 w.activateWindow()
 
         @Slot()
+        def hidePet(self):
+            """关闭桌宠挂件(桌宠右键菜单"关闭桌宠")。
+
+            等价于主界面设置里关掉「桌宠挂件」开关:只收起挂件并记住,
+            程序与传输继续运行;重新开启走主界面设置。
+            """
+            hide = getattr(self, "_hide_pet", None)
+            if hide is not None:
+                hide()
+                self.status.emit("桌宠已关闭，可在主界面设置中重新开启")
+
+        @Slot()
         def showMenu(self):
             """桌宠被右键时,在鼠标位置弹出菜单。"""
             if self._tray_menu is not None:
@@ -1013,6 +1023,9 @@ def main(argv=None) -> None:
     def _set_pet_visible(on: bool) -> None:
         pet_root.setVisible(bool(on))
         _save_config(bridge._lan_cfg, show_pet=bool(on))
+
+    # 桌宠右键"关闭桌宠"走这里:与设置页开关同一持久化路径
+    bridge._hide_pet = lambda: _set_pet_visible(False)
 
     def _apply_identity(name: str, secret: str, port: int) -> None:
         c = bridge._lan_cfg
