@@ -27,6 +27,9 @@ data class Peer(
     val host: String,
     val port: Int,
     val serviceName: String = "",  // NSD 服务实例名(唯一，用于离线精确匹配)
+    // 对端全部已知地址：桌面多网卡/VPN 场景发出连接的源 IP 可能不是解析到的
+    // 那一个,「仅接收目标设备」按整个列表放行(来自 TXT ips / API34 hostAddresses)
+    val hosts: List<String> = listOf(host),
 )
 
 /**
@@ -84,6 +87,10 @@ class InkHoleNode(
     /** 系统实际注册下来的服务名(冲突时可能被系统改名)，用于"不发现自己"。 */
     @Volatile private var registeredName: String? = null
 
+    // 手动添加的设备(跨网/固定 IP 直连):没有 NSD 通告,靠探活循环维持状态
+    private val manualPeers: List<ManualPeer> =
+        ManualPeers.load(context.getSharedPreferences("inkhole", Context.MODE_PRIVATE))
+
     // ---- 生命周期 ----
 
     fun start() {
@@ -93,7 +100,38 @@ class InkHoleNode(
         startTcpServer()
         registerNsd()
         discoverNsd()
+        // 手动设备:乐观注册(真离线的话探活循环 ~10s 内剔除,回线自动加回)
+        manualPeers.forEach { registerManual(it) }
+        if (manualPeers.isNotEmpty()) startManualProbeLoop()
         listener.onStatus("墨洞已开启 · $peerName")
+    }
+
+    private fun registerManual(m: ManualPeer) {
+        addPeer(m.key, m.name.ifEmpty { m.host }, m.host, m.port)
+    }
+
+    /** 手动设备探活:离线连续 2 轮剔除;不在列表且连得上就加回(无 NSD 通告可依赖)。 */
+    private fun startManualProbeLoop() {
+        scope.launch {
+            val strikes = HashMap<String, Int>()
+            while (running) {
+                delay(5_000)
+                for (m in manualPeers) {
+                    if (!running) break
+                    val present = synchronized(peersLock) { peers.containsKey(m.key) }
+                    val alive = probeAlive(m.host, m.port)
+                    when {
+                        present && !alive -> {
+                            val s = (strikes[m.key] ?: 0) + 1
+                            if (s >= 2) { strikes.remove(m.key); removePeer(m.key) }
+                            else strikes[m.key] = s
+                        }
+                        !present && alive -> { strikes.remove(m.key); registerManual(m) }
+                        else -> strikes.remove(m.key)
+                    }
+                }
+            }
+        }
     }
 
     fun stop() {
@@ -137,25 +175,27 @@ class InkHoleNode(
         var wantAck = false
         var ok = false
         try {
-            // 仅接收目标设备：来源 IP 不是当前选中设备就直接拒
+            val input = BufferedInputStream(conn.getInputStream())
+            // 先读协议头再做 trusted 判断:存活探测的空连接(连上即断)在
+            // readHeader 处 EOF 静默结束,不会被当成陌生传输拒收刷屏
+            val header = WHPP.readHeader(input)
+            wantAck = header.wantAck
+
+            // 仅接收目标设备：来源 IP 不在选中设备的地址列表就拒收。
+            // 必须按完整列表匹配——桌面多网卡/VPN 时连接源 IP 常不是
+            // NSD 解析到的那一个,只比对单个 host 会把自己人误拒
+            // (对端还会把 ACK_FAIL 显示成"口令不一致",极难排查)。
             if (trustedOnly) {
                 val src = conn.inetAddress?.hostAddress
                 val sel = selectedPeer?.let { s ->
                     synchronized(peersLock) { peers.values.find { it.name == s } }
                 }
-                if (sel == null || src != sel.host) {
-                    listener.onStatus("已拒收 ${src ?: "?"} 的连接（仅接收目标设备）")
-                    try {
-                        conn.getOutputStream().apply { write(WHPP.ACK_FAIL); flush() }
-                    } catch (_: IOException) {}
-                    drain(conn.getInputStream(), DRAIN_CAP)
-                    return
+                if (sel == null || src == null || src !in sel.hosts) {
+                    listener.onStatus("已拒收 ${src ?: "?"} 的传输（仅接收目标设备）")
+                    drain(input, minOf(header.size, DRAIN_CAP))
+                    return   // finally 统一回 ACK_FAIL
                 }
             }
-
-            val input = BufferedInputStream(conn.getInputStream())
-            val header = WHPP.readHeader(input)
-            wantAck = header.wantAck
 
             // basename 防路径穿越
             val safeName = File(header.filename).name.ifEmpty { "unknown" }
@@ -416,14 +456,15 @@ class InkHoleNode(
         lastSelectedService = serviceName
     }
 
-    private fun addPeer(serviceName: String, displayName: String, host: String, port: Int) {
+    private fun addPeer(serviceName: String, displayName: String, host: String, port: Int,
+                        hosts: List<String> = listOf(host)) {
         var added = false
         var finalName: String
         synchronized(peersLock) {
             val existing = peers[serviceName]
             if (existing != null) {
                 // 同一服务重新解析(IP 变化)：原地更新
-                peers[serviceName] = existing.copy(host = host, port = port)
+                peers[serviceName] = existing.copy(host = host, port = port, hosts = hosts)
                 finalName = existing.name
             } else {
                 // 不同设备撞了显示名：给后来者加 " (2)" 后缀
@@ -432,7 +473,7 @@ class InkHoleNode(
                 while (peers.values.any { it.name == name }) {
                     name = "$displayName (${n++})"
                 }
-                peers[serviceName] = Peer(name, host, port, serviceName)
+                peers[serviceName] = Peer(name, host, port, serviceName, hosts)
                 finalName = name
                 added = true
             }
@@ -559,7 +600,17 @@ class InkHoleNode(
         // 兜底自我过滤：同名 + 地址是本机 IP，判定为自己的历史注册(旧 instanceId、
         // goodbye 丢包残留)，丢弃不显示。
         if (displayName == peerName && host in localIps()) return
-        addPeer(discoveryName, displayName, host, info.port)
+        // 对端全部地址：TXT ips(桌面端宣告,多网卡/VPN 全覆盖) + API34 hostAddresses
+        val hosts = LinkedHashSet<String>()
+        hosts.add(host)
+        attrs["ips"]?.toString(Charsets.UTF_8)?.split(",")
+            ?.map { it.trim() }?.filter { it.isNotEmpty() }?.let { hosts.addAll(it) }
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            try {
+                info.hostAddresses.forEach { a -> a.hostAddress?.let { hosts.add(it) } }
+            } catch (_: Exception) {}
+        }
+        addPeer(discoveryName, displayName, host, info.port, hosts.toList())
     }
 
     private fun localIps(): Set<String> {

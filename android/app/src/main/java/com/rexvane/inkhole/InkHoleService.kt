@@ -192,7 +192,7 @@ class InkHoleService : Service() {
         val builder = if (Build.VERSION.SDK_INT >= 26)
             Notification.Builder(this, CHANNEL_STATUS) else Notification.Builder(this)
         return builder
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("墨洞")
             .setContentText(text)
             .setContentIntent(openApp)
@@ -215,7 +215,7 @@ class InkHoleService : Service() {
 
         val builder = if (Build.VERSION.SDK_INT >= 26)
             Notification.Builder(this, CHANNEL_FILES) else Notification.Builder(this)
-        builder.setSmallIcon(android.R.drawable.stat_sys_download_done)
+        builder.setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("墨洞吐出文件")
             .setContentText(record.name)
             .setAutoCancel(true)

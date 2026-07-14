@@ -262,6 +262,10 @@ class P2PNode:
             properties={
                 b"peer_name": self.cfg.peer_name.encode("utf-8"),
                 b"instance_id": self._instance_id.encode("ascii"),
+                # 全部本机 IPv4:Android NSD 只解析出一个地址,而本机发出
+                # 连接的源 IP 可能是另一块网卡(VPN/TUN/多网卡)——对端的
+                # "仅接收目标设备"需要完整列表才能正确放行
+                b"ips": ",".join(local_ips).encode("ascii"),
             },
         )
         # 服务名已带唯一后缀，理论上不会撞名；万一撞了让 zeroconf 自动改名而不是崩溃
@@ -346,24 +350,25 @@ class P2PNode:
         try:
             # 空闲超时：对端发一半停住不能永久占住线程和 .part 文件
             conn.settimeout(_RECV_IDLE_TIMEOUT)
-            # 仅接收目标设备：来源 IP 不是当前选中设备的地址就直接拒
+            # 读 magic。放在 trusted_only 之前:存活探测的空连接(连上即断)
+            # 在这里静默结束,不会被当成陌生传输拒收刷屏
+            magic = _recv_exact(conn, 4)
+            if magic != _MAGIC:
+                return
+
+            # 仅接收目标设备：来源 IP 不是当前选中设备的地址就拒收
             if self.cfg.trusted_only:
                 with self._lock:
                     sel = self._peers.get(self._selected_peer) if self._selected_peer else None
                     allowed = set(sel.hosts) if sel else set()
                 if addr[0] not in allowed:
-                    self._status(f"已拒收 {addr[0]} 的连接（仅接收目标设备）")
+                    self._status(f"已拒收 {addr[0]} 的传输（仅接收目标设备）")
                     try:
                         conn.sendall(_ACK_FAIL)
                     except OSError:
                         pass
                     _drain(conn, _DRAIN_CAP)
                     return
-
-            # 读 magic
-            magic = _recv_exact(conn, 4)
-            if magic != _MAGIC:
-                return
 
             # 读 header 长度 + header JSON
             hdr_len_bytes = _recv_exact(conn, 4)

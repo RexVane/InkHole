@@ -18,6 +18,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
@@ -30,6 +32,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.rexvane.inkhole.p2p.Peer
 import com.rexvane.inkhole.p2p.InkHoleListener
+import com.rexvane.inkhole.p2p.ManualPeer
+import com.rexvane.inkhole.p2p.ManualPeers
 import java.io.File
 
 /**
@@ -288,17 +292,25 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun SettingsDialog() {
         if (showSettings.value) {
+            val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
             var nameInput by remember { mutableStateOf(peerName.value) }
             var secretInput by remember { mutableStateOf(secret.value) }
             var trustedInput by remember { mutableStateOf(trustedOnly.value) }
+            val manualList = remember {
+                mutableStateListOf<ManualPeer>().apply { addAll(ManualPeers.load(prefs)) }
+            }
+            var manualHost by remember { mutableStateOf("") }
+            var manualPort by remember { mutableStateOf("52130") }
+            var manualError by remember { mutableStateOf("") }
             AlertDialog(
                 onDismissRequest = { showSettings.value = false },
                 title = { Text("设置") },
                 text = {
-                    Column {
+                    Column(
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                    ) {
                         // 本机信息提示：对端看到的设备名-instance_id
-                        val instanceId = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-                            .getString("instance_id", "") ?: ""
+                        val instanceId = prefs.getString("instance_id", "") ?: ""
                         Text(
                             text = "本机：${peerName.value}-$instanceId",
                             fontSize = 12.sp,
@@ -333,24 +345,76 @@ class MainActivity : ComponentActivity() {
                             Switch(checked = trustedInput,
                                 onCheckedChange = { trustedInput = it })
                         }
+
+                        // ---- 手动添加设备(跨网直连,如 Tailscale) ----
+                        Spacer(Modifier.height(14.dp))
+                        Text("手动添加设备", fontSize = 14.sp)
+                        Text("自动发现不可用时(如 Tailscale 跨网)填对方 IP 与监听端口",
+                            fontSize = 11.sp,
+                            color = androidx.compose.ui.graphics.Color.Gray)
+                        manualList.forEach { m ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("${m.host}:${m.port}",
+                                    fontSize = 13.sp, modifier = Modifier.weight(1f))
+                                TextButton(onClick = { manualList.remove(m) }) { Text("删除") }
+                            }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = manualHost,
+                                onValueChange = { manualHost = it },
+                                label = { Text("对方 IP") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            OutlinedTextField(
+                                value = manualPort,
+                                onValueChange = { manualPort = it.filter { c -> c.isDigit() } },
+                                label = { Text("端口") },
+                                singleLine = true,
+                                modifier = Modifier.width(92.dp),
+                            )
+                        }
+                        if (manualError.isNotEmpty()) {
+                            Text(manualError, fontSize = 11.sp,
+                                color = androidx.compose.ui.graphics.Color(0xFFF08A7C))
+                        }
+                        TextButton(onClick = {
+                            val fixed = ManualPeers.normalizeHost(manualHost)
+                            val port = manualPort.toIntOrNull()
+                            if (fixed == null || port == null || port !in 1..65535) {
+                                manualError = "IP 无效或有歧义，请检查（端口 1-65535）"
+                            } else {
+                                manualError = ""
+                                manualList.removeAll { it.host == fixed && it.port == port }
+                                manualList.add(ManualPeer("", fixed, port))
+                                manualHost = ""
+                            }
+                        }) { Text("添加设备") }
                     }
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        // 只有设置真正变化时才重建节点(改名/改口令需重新注册 mDNS)；
+                        // 只有设置真正变化时才重建节点(改名/改口令/手动设备需生效)；
                         // 没变就不动，避免已连接的设备无谓断开、要重新点连接。
+                        val manualChanged = ManualPeers.load(prefs) != manualList.toList()
                         val changed = nameInput != peerName.value ||
                             secretInput != secret.value ||
-                            trustedInput != trustedOnly.value
+                            trustedInput != trustedOnly.value ||
+                            manualChanged
                         peerName.value = nameInput
                         secret.value = secretInput
                         trustedOnly.value = trustedInput
-                        getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-                            .edit()
+                        prefs.edit()
                             .putString("peer_name", nameInput)
                             .putString("secret", secretInput)
                             .putBoolean("trusted_only", trustedInput)
                             .apply()
+                        ManualPeers.save(prefs, manualList.toList())
                         showSettings.value = false
                         if (changed) {
                             // 重启前记住当前选中目标，重建后由智能保留自动选回

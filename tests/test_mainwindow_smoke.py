@@ -138,14 +138,14 @@ def test_manual_peer_add_and_remove(app):
 
 
 def test_manual_peer_rejects_bad_input(app, monkeypatch):
-    """Invalid host must be rejected with a warning, not stored."""
+    """Ambiguous/invalid host must be rejected with a warning, not stored."""
     from PySide6.QtWidgets import QMessageBox
     warned = []
     monkeypatch.setattr(QMessageBox, "warning",
                         staticmethod(lambda *a, **k: warned.append(a)))
     window, bridge = _make_window(app)
     window._open_settings()
-    window._manual_host.setText("bad host with spaces")
+    window._manual_host.setText("11111")   # 多种拆分方式,有歧义必须拒绝
     window._add_manual_peer()
     assert bridge.manualPeers() == []
     assert warned
@@ -159,3 +159,28 @@ def test_peer_and_transfer_signals_drive_window(app):
     bridge.errorState.emit("boom")
     bridge.errorState.emit("")
     assert window._state_lbl._full_text == "正在发现设备"
+
+
+def test_normalize_manual_host():
+    """IP 输入自动纠正:补点/清理标点/歧义拒绝/主机名放行。"""
+    from inkhole.mainwindow import normalize_manual_host as fix
+    # 正常输入原样通过
+    assert fix("100.127.46.26") == "100.127.46.26"
+    assert fix(" 192.168.1.5 ") == "192.168.1.5"
+    # 用户案例:缺一个点,唯一合法拆分
+    assert fix("100127.46.26") == "100.127.46.26"
+    assert fix("192168.1.5") == "192.168.1.5"
+    # 全角句号/逗号当分隔符
+    assert fix("100。127。46。26") == "100.127.46.26"
+    assert fix("100,127,46,26") == "100.127.46.26"
+    # 全无分隔符但唯一可拆
+    assert fix("1.2.3.4") == "1.2.3.4"
+    # 歧义必须拒绝(11111 有多种拆法)
+    assert fix("11111") is None
+    # 非法值拒绝
+    assert fix("300.1.1.1") is None
+    assert fix("1.2.3") is None      # 三段且无法拆分,补不成四段
+    assert fix("") is None
+    # 主机名放行(Tailscale MagicDNS)
+    assert fix("my-pc") == "my-pc"
+    assert fix("my pc") == "mypc"

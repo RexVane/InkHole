@@ -14,16 +14,16 @@ mainwindow.py
 
 from __future__ import annotations
 import os
+import re
 import sys
 import math
-import random
 import time
 
 from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, Slot, Signal,
                             QElapsedTimer, QVariantAnimation,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
-                           QPen, QConicalGradient, QFont)
+                           QPen, QFont)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
                                QGridLayout, QLineEdit, QSpinBox, QCheckBox,
@@ -193,6 +193,67 @@ def _divider(vertical: bool = False) -> QFrame:
     else:
         line.setFixedHeight(1)
     return line
+
+
+def normalize_manual_host(raw: str) -> str | None:
+    """手动添加设备的地址自动纠正。返回修正后的地址;非法/有歧义返回 None。
+
+    - 含字母按主机名放行(如 Tailscale MagicDNS 名),只去空白;
+    - 全角句号/逗号/空格当作分隔符(输入法常见误输);
+    - 缺分隔符的数字段尝试拆分:100127.46.26 -> 100.127.46.26。
+      只有全局唯一合法拆分才接受——有歧义宁可报错,绝不猜错 IP。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if any(c.isalpha() for c in s):
+        host = s.replace(" ", "")
+        return host or None
+    for sep in ("。", "，", ",", " "):
+        s = s.replace(sep, ".")
+    s = re.sub(r"\.+", ".", s).strip(".")
+    if not s or not re.fullmatch(r"[0-9.]+", s):
+        return None
+    segments = s.split(".")
+    if len(segments) > 4:
+        return None
+
+    solutions: list[list[str]] = []
+
+    def piece_ok(piece: str) -> bool:
+        if len(piece) > 1 and piece[0] == "0":
+            return False   # 前导零(易歧义,真实 IP 不这么写)
+        return int(piece) <= 255
+
+    def search(seg_index: int, acc: list[str]):
+        if len(solutions) > 1:
+            return   # 已确认多解,提前停
+        if seg_index == len(segments):
+            if len(acc) == 4:
+                solutions.append(acc)
+            return
+        seg = segments[seg_index]
+
+        def cut(pos: int, parts: list[str]):
+            if len(solutions) > 1:
+                return
+            if pos == len(seg):
+                search(seg_index + 1, acc + parts)
+                return
+            for length in (1, 2, 3):
+                if pos + length > len(seg):
+                    break
+                piece = seg[pos:pos + length]
+                if not piece_ok(piece):
+                    continue
+                if len(acc) + len(parts) + 1 > 4:
+                    continue
+                cut(pos + length, parts + [piece])
+
+        cut(0, [])
+
+    search(0, [])
+    return ".".join(solutions[0]) if len(solutions) == 1 else None
 
 
 class ElidedLabel(QLabel):
@@ -418,30 +479,26 @@ class DeviceGlyph(QWidget):
 
 # ---------- 中央墨洞动画 ----------
 class HoleWidget(QWidget):
-    """深黑核心 + 呼吸光晕 + 三条旋转弧线 + 吸积微粒。
+    """与 Android 端 InkHoleHero 同一套视觉:墨黑核心径向渐变 + 双层反向
+    旋转吸积弧 + 呼吸 + 无设备时雷达波纹 + 传输进度环。
 
-    鼠标悬停整体提速加亮；点击 = 选文件发送。
+    参数(转速/半径/透明度/线宽)逐项对齐 InkHoleUI.kt,尺寸沿用桌面布局。
+    点击 = 选文件发送。
     """
 
     def __init__(self, on_click, parent=None):
         super().__init__(parent)
         self._on_click = on_click
         self._t = 0.0
-        self._hover = 0.0
+        self._searching = True        # 无设备时播放雷达波纹(由主窗口刷新)
         self._progress = 0.0
         self._progress_target = 0.0
         self._progress_kind = "send"
         self._progress_generation = 0
-        self._a = [0.0, 120.0, 245.0]
-        rnd = random.Random(42)
-        self._parts = [(rnd.uniform(0, 360), rnd.uniform(0.55, 1.15),
-                        rnd.uniform(0.4, 1.2), rnd.uniform(1.2, 2.6))
-                       for _ in range(18)]
         self.setMinimumSize(270, 270)
         self.setMaximumSize(310, 310)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.PointingHandCursor)
-        self.setMouseTracking(True)
         self._clock = QElapsedTimer()
         self._clock.start()
         timer = QTimer(self)
@@ -452,15 +509,15 @@ class HoleWidget(QWidget):
 
     def _tick(self):
         dt = min(0.05, max(0.001, self._clock.restart() / 1000.0))
-        speed = 1.0 + self._hover * 0.9
-        self._t += dt * speed
-        self._a[0] = (self._a[0] + 10.0 * dt * speed) % 360
-        self._a[1] = (self._a[1] - 6.3 * dt * speed) % 360
-        self._a[2] = (self._a[2] + 3.7 * dt * speed) % 360
-        target = 1.0 if self.underMouse() else 0.0
-        self._hover += (target - self._hover) * min(1.0, dt * 9.5)
+        self._t += dt
         self._progress += (self._progress_target - self._progress) * min(1.0, dt * 10.0)
         self.update()
+
+    @Slot(bool)
+    def set_searching(self, searching: bool):
+        if self._searching != searching:
+            self._searching = searching
+            self.update()
 
     @Slot(str, int)
     def set_transfer_progress(self, kind: str, percent: int):
@@ -490,74 +547,82 @@ class HoleWidget(QWidget):
             self._on_click()
         super().mouseReleaseEvent(e)
 
+    # Android InkHoleHero 的角度体系是顺时针(y 向下),Qt drawArc 是逆时针:
+    # Qt 角 = -Compose 角,扫角同理取负。
     def paintEvent(self, _e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         w, h = self.width(), self.height()
-        cx, cy = w / 2, h / 2
-        R = min(w, h) * 0.285
-        breath = 0.92 + 0.08 * math.sin(self._t * 2.4)
-        lum = breath * (1.0 + 0.35 * self._hover)
+        cx, cy = w / 2.0, h / 2.0
+        r = min(w, h) / 2.0
+        t = self._t
 
-        # 紧凑实体光晕 + 深黑核心
-        g = QRadialGradient(cx, cy, R * 1.55)
-        g.setColorAt(0.00, QColor(1, 3, 4))
-        g.setColorAt(0.48, QColor(3, 8, 8))
-        g.setColorAt(0.64, QColor(14, 53, 47, min(255, int(225 * lum))))
-        g.setColorAt(0.78, QColor(53, 139, 122, min(255, int(105 * lum))))
-        g.setColorAt(1.00, QColor(6, 10, 12, 0))
-        p.setBrush(g)
-        p.setPen(Qt.NoPen)
-        p.drawEllipse(QPointF(cx, cy), R * 1.55, R * 1.55)
+        teal = QColor(0x58, 0xE6, 0xC8)
+        teal_soft = QColor(0x7F, 0xEF, 0xD8)
+        teal_dim = QColor(0x1E, 0x4A, 0x42)
 
-        # 外部进度轨道：只在传输期间出现
-        if self._progress > 0.003:
-            pr = R * 1.47
-            progress_rect = QRectF(cx - pr, cy - pr, pr * 2, pr * 2)
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(255, 255, 255, 20), 4.0,
-                          Qt.SolidLine, Qt.RoundCap))
-            p.drawArc(progress_rect, 90 * 16, -360 * 16)
-            progress_color = QColor(233, 189, 114) \
-                if self._progress_kind == "recv" else QColor(90, 216, 192)
-            p.setPen(QPen(progress_color, 4.0, Qt.SolidLine, Qt.RoundCap))
-            p.drawArc(progress_rect, 90 * 16,
-                      int(-360 * 16 * self._progress))
+        # 呼吸 0.55..1.0,周期 5.2s(Compose 2.6s tween 往返)
+        breath = 0.775 + 0.225 * math.sin(2 * math.pi * t / 5.2)
+        # 双层反向旋转:内层顺时针 360°/46s,外层逆时针 360°/71s
+        spin1 = (t * 360.0 / 46.0) % 360.0
+        spin2 = -(t * 360.0 / 71.0) % 360.0
 
-        # 三条有厚度的旋转弧线
-        for (radius, angle, span, alpha, width) in (
-                (R * 1.05, self._a[0], 152, 215, 3.4),
-                (R * 0.86, self._a[1], 112, 135, 2.2),
-                (R * 1.22, self._a[2], 78, 95, 1.8)):
-            cg = QConicalGradient(cx, cy, -angle)
-            c0 = QColor(90, 216, 192, 0)
-            c1 = QColor(90, 216, 192, min(255, int(alpha * lum)))
-            cg.setColorAt(0.0, c0)
-            cg.setColorAt(span / 720, c1)
-            cg.setColorAt(span / 360, c0)
-            pen = QPen(cg, width)
+        def arc(radius: float, start_deg: float, sweep_deg: float,
+                color: QColor, width: float):
+            pen = QPen(color, width)
             pen.setCapStyle(Qt.RoundCap)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
             rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
-            p.drawArc(rect, int(angle * 16), int(span * 16))
+            p.drawArc(rect, int(-start_deg * 16), int(-sweep_deg * 16))
 
-        # 吸积微粒；少量暖色打破单一青色
+        def alpha(base: QColor, a: float) -> QColor:
+            c = QColor(base)
+            c.setAlphaF(max(0.0, min(1.0, a)))
+            return c
+
+        # 雷达波纹:无设备时从洞口向外扩散(2.4s 循环)
+        if self._searching:
+            k = (t % 2.4) / 2.4
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(alpha(teal, (1 - k) * 0.28), r * 2 / 115.0))
+            rr = r * (0.62 + 0.36 * k)
+            p.drawEllipse(QPointF(cx, cy), rr, rr)
+
+        # 墨洞主体:墨黑核心 -> 暗青过渡 -> 青色光晕 -> 透明
+        g = QRadialGradient(cx, cy, r * 0.94)
+        g.setColorAt(0.00, QColor(0, 0, 0))
+        g.setColorAt(0.42, QColor(0x02, 0x08, 0x07))
+        g.setColorAt(0.60, alpha(QColor(0x0A, 0x2A, 0x25), 0.9))
+        g.setColorAt(0.76, alpha(teal, 0.40 * breath))
+        g.setColorAt(0.90, alpha(QColor(0x1E, 0x50, 0x46), 0.15))
+        g.setColorAt(1.00, QColor(0, 0, 0, 0))
         p.setPen(Qt.NoPen)
-        for idx, (a0, r0, spd, size) in enumerate(self._parts):
-            k = ((self._t * spd * 0.11) + a0 / 360.0) % 1.0
-            rr = R * (1.35 - 0.73 * k) * r0
-            ang = math.radians(a0 + self._t * spd * 60.0 + k * 240.0)
-            x = cx + rr * math.cos(ang)
-            y = cy + rr * math.sin(ang) * 0.96
-            fade = math.sin(k * math.pi)
-            alpha = int(175 * fade * lum)
-            if alpha > 4:
-                if idx % 6 == 0:
-                    p.setBrush(QColor(233, 189, 114, min(210, alpha)))
-                else:
-                    p.setBrush(QColor(131, 232, 211, min(255, alpha)))
-                p.drawEllipse(QPointF(x, y), size, size)
+        p.setBrush(g)
+        p.drawEllipse(QPointF(cx, cy), r * 0.94, r * 0.94)
+
+        # 吸积弧·内层(顺时针)——不对称弧才看得出旋转
+        inner_r = r * 0.66
+        arc(inner_r, 15 + spin1, 105,
+            alpha(teal_soft, 0.30 * breath), r * 4 / 115.0)
+        arc(inner_r * 0.86, 195 + spin1, 70,
+            alpha(teal_soft, 0.15 * breath), r * 2.5 / 115.0)
+        # 吸积弧·外层(逆时针,更淡更慢)
+        arc(r * 0.84, 60 + spin2, 140,
+            alpha(teal_soft, 0.12), r * 2 / 115.0)
+
+        # 传输进度环(与安卓一致:青色,-90° 起,轨道半透明)
+        if self._progress > 0.003:
+            ring_r = r * 0.97
+            ring_w = r * 5 / 115.0
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(alpha(teal_dim, 0.5), ring_w))
+            p.drawEllipse(QPointF(cx, cy), ring_r, ring_r)
+            pen = QPen(teal, ring_w)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            rect = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
+            p.drawArc(rect, 90 * 16, int(-360 * 16 * self._progress))
 
 
 # ---------- 自绘标题栏 ----------
@@ -1075,9 +1140,17 @@ class MainWindow(QWidget):
             self._manual_list_lay.addWidget(row)
 
     def _add_manual_peer(self):
-        host = self._manual_host.text().strip()
-        if not host:
+        raw = self._manual_host.text()
+        if not raw.strip():
             return
+        host = normalize_manual_host(raw)
+        if host is None:
+            QMessageBox.warning(self, "手动设备",
+                                "IP 无效或有歧义，请检查后重新输入")
+            return
+        if host != raw.strip():
+            self._manual_host.setText(host)   # 回显修正结果,用户可见实际用的地址
+            self._on_status(f"已自动修正为 {host}")
         if self._bridge.addManualPeer("", host, self._manual_port.value()):
             self._manual_host.clear()
             self._refresh_manual_list()
@@ -1126,6 +1199,7 @@ class MainWindow(QWidget):
         selected = node.selected_peer()
         self._peer_count_lbl.setText(str(len(peers)))
         self._titlebar.set_device_count(len(peers))
+        self._hole.set_searching(len(peers) == 0)   # 无设备时墨洞播放雷达波纹
 
         if not peers:
             empty = QLabel("正在发现设备 · 跨网设备可在设置中手动添加")

@@ -1,14 +1,16 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.2.0`），与 Windows/macOS 桌面端在同一局域网内互传文件。
+墨洞 Android 客户端（当前版本 `1.3.0`），与 Windows/macOS 桌面端在同一局域网内互传文件。
 
 ## 功能
 
 - 使用 Android NSD 发现 `_inkhole._tcp` 服务并手动选择发送目标。
+- **手动添加设备**（设置内填 IP+端口）：跨网络（如 Tailscale）直连，离线自动剔除、回线自动恢复。
 - Jetpack Compose 主界面、系统文件选择器和最近接收历史。
 - 前台服务维持 P2P 节点，锁屏或切到后台后仍可接收。
 - 支持系统 `ACTION_SEND` / `ACTION_SEND_MULTIPLE` 分享入口。
 - 接收文件导出到系统 `Download/InkHole`，并发送可点击通知。
+- 与桌面端同款品牌图标（自适应 + Android 13 单色图标 + 通知小图标）。
 - 兼容桌面端明文、WHE1 整块加密、WHE2 分块加密和 ACK 回执；桌面端发送的文件夹以 zip 文件接收。
 
 ## 构建
