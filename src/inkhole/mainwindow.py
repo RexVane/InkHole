@@ -23,7 +23,7 @@ from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, Slot, Signal,
                             QElapsedTimer, QVariantAnimation,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
-                           QPen, QFont)
+                           QPen, QFont, QIcon, QPixmap)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
                                QGridLayout, QLineEdit, QSpinBox, QCheckBox,
@@ -193,6 +193,30 @@ def _divider(vertical: bool = False) -> QFrame:
     else:
         line.setFixedHeight(1)
     return line
+
+
+def _eye_icon(crossed: bool) -> QIcon:
+    """自绘眼睛图标(口令可见性切换)。crossed=True 画斜线(当前为明文,点击遮蔽)。"""
+    pm = QPixmap(20, 20)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(178, 191, 188), 1.5)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    # 杏仁形眼眶:上下两条圆弧
+    p.drawArc(QRectF(2.5, 4.0, 15.0, 12.0), 25 * 16, 130 * 16)
+    p.drawArc(QRectF(2.5, 4.0, 15.0, 12.0), -155 * 16, 130 * 16)
+    # 瞳孔
+    p.setBrush(QColor(178, 191, 188))
+    p.drawEllipse(QPointF(10, 10), 2.4, 2.4)
+    if crossed:
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(178, 191, 188), 1.6, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(4.5, 16.0), QPointF(15.5, 4.0))
+    p.end()
+    return QIcon(pm)
 
 
 def mask_manual_host_typing(text: str) -> str:
@@ -969,9 +993,20 @@ class MainWindow(QWidget):
         self._ed_secret = QLineEdit()
         self._ed_secret.setEchoMode(QLineEdit.Password)
         self._ed_secret.setPlaceholderText("留空时不加密")
-        cb_show = QCheckBox("显示")
-        cb_show.toggled.connect(lambda on: self._ed_secret.setEchoMode(
-            QLineEdit.Normal if on else QLineEdit.Password))
+        b_eye = QToolButton()
+        b_eye.setObjectName("Win")
+        b_eye.setCheckable(True)
+        b_eye.setIcon(_eye_icon(crossed=False))
+        b_eye.setFixedSize(30, 28)
+        b_eye.setToolTip("显示/隐藏口令")
+        b_eye.setCursor(Qt.PointingHandCursor)
+
+        def _toggle_secret(visible: bool):
+            self._ed_secret.setEchoMode(
+                QLineEdit.Normal if visible else QLineEdit.Password)
+            b_eye.setIcon(_eye_icon(crossed=visible))
+
+        b_eye.toggled.connect(_toggle_secret)
         self._sp_port = QSpinBox()
         self._sp_port.setRange(0, 65535)
         self._sp_port.setToolTip("0 = 系统自动分配")
@@ -1000,7 +1035,7 @@ class MainWindow(QWidget):
         secret_lay.setContentsMargins(0, 0, 0, 0)
         secret_lay.setSpacing(10)
         secret_lay.addWidget(self._ed_secret, 1)
-        secret_lay.addWidget(cb_show)
+        secret_lay.addWidget(b_eye)
         fields.addWidget(_field("加密口令", secret_row), 1, 0, 1, 2)
 
         inbox_row = QWidget()
@@ -1088,10 +1123,30 @@ class MainWindow(QWidget):
             "桌宠挂件", "在桌面保留可拖放的墨洞挂件")
         auto_row, self._cb_auto = _toggle_row(
             "开机自启", "登录 Windows 后自动启动墨洞")
-        for index, row in enumerate((trusted_row, pet_row, auto_row)):
+        for row in (trusted_row, pet_row, auto_row):
             behavior.addWidget(row)
-            if index < 2:
-                behavior.addWidget(_divider())
+            behavior.addWidget(_divider())
+
+        # 检查更新:放在应用行为组里(左侧标题+当前版本,右侧按钮)
+        update_row = QWidget()
+        update_lay = QHBoxLayout(update_row)
+        update_lay.setContentsMargins(0, 8, 0, 8)
+        update_lay.setSpacing(12)
+        update_copy = QVBoxLayout()
+        update_copy.setSpacing(2)
+        update_title = QLabel("检查更新")
+        update_title.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
+        self._version_lbl = QLabel(f"当前版本 v{self._bridge.appVersion()}")
+        self._version_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        update_copy.addWidget(update_title)
+        update_copy.addWidget(self._version_lbl)
+        self._update_btn = QPushButton("检查更新")
+        self._update_btn.setObjectName("QuietAction")
+        self._update_btn.setCursor(Qt.PointingHandCursor)
+        self._update_btn.clicked.connect(self._check_update)
+        update_lay.addLayout(update_copy, 1)
+        update_lay.addWidget(self._update_btn, 0, Qt.AlignVCenter)
+        behavior.addWidget(update_row)
         behavior.addStretch(1)
         columns.addLayout(behavior, 2)
         # 内容装进滚动区:窗口高度不足时出滚动条,而不是把输入框压扁裁切
@@ -1110,11 +1165,6 @@ class MainWindow(QWidget):
         self._local_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
         btns.addWidget(self._local_lbl)
         btns.addStretch(1)
-        self._update_btn = QPushButton("检查更新")
-        self._update_btn.setObjectName("QuietAction")
-        self._update_btn.setCursor(Qt.PointingHandCursor)
-        self._update_btn.clicked.connect(self._check_update)
-        btns.addWidget(self._update_btn)
         b_save = QPushButton("保存")
         b_save.setObjectName("Primary")
         b_save.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))

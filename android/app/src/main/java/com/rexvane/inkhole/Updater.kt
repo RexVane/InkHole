@@ -31,8 +31,25 @@ object Updater {
         return false
     }
 
-    /** 拉取最新 Release(阻塞,调用方放线程)。失败抛异常。 */
+    /** 拉取最新 Release(阻塞,调用方放线程)。失败抛异常。
+     *
+     * GitHub API 匿名限流按出口 IP 计,挂代理极易 403;API 失败后回退
+     * 读 releases/latest 的重定向 Location 解析 tag(网页端无限流),
+     * APK 地址按 CI 命名规则 InkHole-<tag>.apk 直接构造,更新说明为空。
+     */
     fun fetchLatest(): Info {
+        return try {
+            fetchLatestFromApi()
+        } catch (apiExc: Exception) {
+            try {
+                fetchLatestFromRedirect()
+            } catch (_: Exception) {
+                throw apiExc
+            }
+        }
+    }
+
+    private fun fetchLatestFromApi(): Info {
         val conn = URL(API).openConnection() as HttpURLConnection
         conn.connectTimeout = 10_000
         conn.readTimeout = 15_000
@@ -55,6 +72,20 @@ object Updater {
             }
             return Info(tag, apk, notes)
         }
+    }
+
+    private fun fetchLatestFromRedirect(): Info {
+        val conn = URL(RELEASES_PAGE).openConnection() as HttpURLConnection
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 15_000
+        conn.instanceFollowRedirects = false
+        conn.setRequestProperty("User-Agent", "InkHole-Updater")
+        val location = conn.getHeaderField("Location").orEmpty()
+        conn.disconnect()
+        val tag = location.trimEnd('/').substringAfterLast("/tag/", "")
+        require(tag.isNotEmpty() && "/" !in tag) { "无法解析最新版本号" }
+        val apk = "https://github.com/RexVane/InkHole/releases/download/$tag/InkHole-$tag.apk"
+        return Info(tag, apk, "")
     }
 
     /** 下载 APK 到应用缓存(阻塞,调用方放线程)。返回文件。 */

@@ -1046,11 +1046,18 @@ def main(argv=None) -> None:
 
             走系统代理(urllib 自动读 Windows 注册表代理设置,Clash 系统代理
             开着就能通);超时/不可达按"检查失败"报告,引导手动去下载页。
+
+            GitHub API 匿名限流每小时 60 次且按出口 IP 计(挂代理时出口
+            IP 共享,极易 403),API 失败后回退解析 releases/latest 的
+            重定向拿 tag——网页端无此限流,只是拿不到更新说明。
             """
             def worker():
+                import urllib.request
+                want = ("InkHolePet-windows.zip" if sys.platform == "win32"
+                        else "InkHolePet-macos.zip")
+                latest, notes, asset_url = "", "", ""
                 try:
                     import json as _json
-                    import urllib.request
                     req = urllib.request.Request(
                         _RELEASES_API,
                         headers={"User-Agent": "InkHole-Updater",
@@ -1059,18 +1066,32 @@ def main(argv=None) -> None:
                         data = _json.loads(resp.read().decode("utf-8"))
                     latest = str(data.get("tag_name", "")).strip()
                     notes = str(data.get("body", "") or "")[:400]
-                    asset_url = ""
-                    want = ("InkHolePet-windows.zip" if sys.platform == "win32"
-                            else "InkHolePet-macos.zip")
                     for asset in data.get("assets", []):
                         if asset.get("name") == want:
                             asset_url = str(asset.get("browser_download_url", ""))
                             break
-                    has_new = _version_newer(latest, _APP_VERSION)
-                    self.updateCheckFinished.emit(has_new, latest, notes, asset_url)
-                except Exception as exc:
+                except Exception as api_exc:
+                    try:
+                        req = urllib.request.Request(
+                            _RELEASES_PAGE,
+                            headers={"User-Agent": "InkHole-Updater"})
+                        with urllib.request.urlopen(req, timeout=12) as resp:
+                            final_url = resp.geturl()
+                        if "/tag/" in final_url:
+                            latest = final_url.rstrip("/").rsplit("/tag/", 1)[-1]
+                            asset_url = (
+                                "https://github.com/RexVane/InkHole/releases"
+                                f"/download/{latest}/{want}")
+                    except Exception:
+                        self.updateCheckFinished.emit(
+                            False, "", f"检查失败：{api_exc}", "")
+                        return
+                if not latest:
                     self.updateCheckFinished.emit(
-                        False, "", f"检查失败：{exc}", "")
+                        False, "", "检查失败：无法解析最新版本号", "")
+                    return
+                has_new = _version_newer(latest, _APP_VERSION)
+                self.updateCheckFinished.emit(has_new, latest, notes, asset_url)
 
             threading.Thread(target=worker, daemon=True).start()
 

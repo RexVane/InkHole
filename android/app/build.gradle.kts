@@ -11,8 +11,8 @@ android {
         applicationId = "com.rexvane.inkhole"
         minSdk = 24
         targetSdk = 34
-        versionCode = 23
-        versionName = "1.3.7"
+        versionCode = 24
+        versionName = "1.3.8"
     }
 
     buildTypes {
