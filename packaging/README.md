@@ -54,7 +54,9 @@ InkHolePet --name 我的电脑 \
 
 ## 体积说明
 
-包含整个 Qt Quick 运行时：Windows zip 约 170MB（解压后约 425MB）、macOS zip 约 150MB，属于 PySide6 应用的正常范围。spec 已排除 WebEngine、Multimedia、3D、Charts 等未使用的重型模块。
+包含整个 Qt Quick 运行时，属于 PySide6 应用的正常范围。`inkhole-pet.spec` 在收集清单上过滤掉 WebEngine、Multimedia、3D、Charts、Quick3D、Pdf 等界面用不到的重型 Qt 模块（PyInstaller 的 `excludes` 只挡 Python 绑定，挡不住这些按目录整体收进来的 Qt DLL，故改为在 `binaries`/`datas` 上按名称过滤）。优化后 Windows 解压后约 **164MB**（压 zip 发布约 70MB），macOS zip 约 150MB。
+
+> 单个 `Qt6WebEngineCore.dll`（浏览器内核）就有 195MB 且本应用完全不用——这是过滤的主要收益来源。若要进一步做到几 MB 级别，需改用 Tauri/C++ 等原生技术栈重写整个桌面端（后端 P2P 引擎也要用 Rust 重写才能保持体积优势），代价是全部功能推倒重做与重新验证，不建议。
 
 ## 原理要点
 

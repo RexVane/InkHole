@@ -64,6 +64,35 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# PyInstaller 的 excludes 只挡 Python 模块绑定(.pyd),挡不住 PySide6 钩子
+# 按目录整体收进来的 Qt DLL / QML 插件——WebEngineCore.dll 一个就 195MB。
+# 这里在收集清单(binaries/datas)上做名称过滤,把界面用不到的重型 Qt 组件
+# 直接剔除。本应用 UI = QtWidgets + QtQuick(仅 QtQuick/QtQuick.Window)+
+# QtQml + QtNetwork/QtGui/QtCore,其余全部可删。
+_DROP_TOKENS = (
+    "webengine", "webenginecore", "webenginequick", "webchannel", "websockets",
+    "qt63d", "quick3d", "3danimation", "3dcore", "3drender", "3dinput",
+    "3dlogic", "3dextras", "3dquick",
+    "charts", "datavisualization", "graphs",
+    "multimedia", "spatialaudio",
+    "pdf", "location", "positioning", "sensors", "serialport", "nfc",
+    "bluetooth", "remoteobjects", "scxml", "sql", "designer", "help",
+    "quicktest", "qttest", "virtualkeyboard",
+    "opengl32sw",           # 软件 OpenGL 兜底,19.7MB,有独显/集显都用不到
+    "d3dcompiler",          # ANGLE 的 HLSL 编译器,墨洞 UI 不需要
+)
+
+
+def _keep(dest_name: str) -> bool:
+    low = dest_name.replace("\\", "/").lower()
+    base = low.rsplit("/", 1)[-1]
+    return not any(tok in base for tok in _DROP_TOKENS)
+
+
+a.binaries = TOC([e for e in a.binaries if _keep(e[0])])
+a.datas = TOC([e for e in a.datas if _keep(e[0])])
+
+
 exe = EXE(
     pyz,
     a.scripts,
