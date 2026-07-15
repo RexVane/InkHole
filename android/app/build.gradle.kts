@@ -11,14 +11,35 @@ android {
         applicationId = "com.rexvane.inkhole"
         minSdk = 24
         targetSdk = 34
-        versionCode = 24
-        versionName = "1.3.8"
+        versionCode = 25
+        versionName = "1.3.9"
+    }
+
+    // 固定发布签名:CI 从 secrets 解出 keystore 时启用,让每次构建的 APK
+    // 签名一致,用户才能覆盖安装(debug 签名每台机器随机 -> 安装冲突)。
+    // 本地无 keystore 时回退空,assembleDebug 仍走默认 debug 签名照常构建。
+    val ksPath = System.getenv("ANDROID_KEYSTORE_PATH")
+    val hasReleaseKeystore = ksPath != null && file(ksPath).exists()
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = file(ksPath!!)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = true
+            // 不开混淆:此前一直发 debug 包(从未过 R8),保持行为一致,
+            // 本次改动只为固定签名,避免 R8 裁掉 Compose/反射引发新问题。
+            isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {

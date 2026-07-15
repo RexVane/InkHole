@@ -41,12 +41,36 @@ jobs:
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
+      # 有发布签名 secret 时解出 keystore,构建固定签名的 release APK;
+      # 否则(如 fork 无 secret)回退 debug 包,保证 CI 仍能跑通。
+      - name: Decode release keystore
+        id: keystore
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/inkhole-release.jks"
+            echo "path=$RUNNER_TEMP/inkhole-release.jks" >> "$GITHUB_OUTPUT"
+            echo "signed=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=no" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ "${{ steps.keystore.outputs.signed }}" = "yes" ]; then
+            gradle assembleRelease --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
 
       # Use an ASCII name (InkHole-<ver>.apk): Release assets do not support
       # non-ASCII filenames. On tag push use the tag, otherwise the versionName.
-      # gradle's default output is app-debug.apk.
       - name: Rename APK
         run: |
           REF="${GITHUB_REF##*/}"
@@ -56,7 +80,12 @@ jobs:
           esac
           test -n "$VER"
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/InkHole-${VER}.apk"
+          if [ "${{ steps.keystore.outputs.signed }}" = "yes" ]; then
+            SRC="app/build/outputs/apk/release/app-release.apk"
+          else
+            SRC="app/build/outputs/apk/debug/app-debug.apk"
+          fi
+          cp "$SRC" "dist/InkHole-${VER}.apk"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

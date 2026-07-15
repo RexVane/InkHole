@@ -1237,7 +1237,9 @@ class MainWindow(QWidget):
                                 f"{self._bridge.releasesPage()}")
             return
         if not has_new:
-            self._on_status(f"已是最新版本 v{self._bridge.appVersion()}")
+            QMessageBox.information(
+                self, "检查更新",
+                f"当前已是最新版本 v{self._bridge.appVersion()}。")
             return
         import sys as _sys
         packaged = bool(getattr(_sys, "frozen", False)) and _sys.platform == "win32"

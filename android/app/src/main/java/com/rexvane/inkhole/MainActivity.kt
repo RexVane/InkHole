@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -80,13 +81,18 @@ class MainActivity : ComponentActivity() {
                     if (Updater.versionNewer(info.version, currentVersion())) {
                         updateInfo.value = info
                     } else {
-                        statusMsg.value = "已是最新版本 v${currentVersion()}"
+                        // 检查更新是在设置对话框里点的,statusMsg(主页状态栏)被
+                        // 对话框盖住看不到 -> 用 Toast 明确回馈"已是最新版"。
+                        Toast.makeText(this,
+                            "已是最新版本 v${currentVersion()}",
+                            Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
                     checkingUpdate.value = false
-                    statusMsg.value = "检查更新失败: ${e.message}"
+                    Toast.makeText(this,
+                        "检查更新失败: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }.start()

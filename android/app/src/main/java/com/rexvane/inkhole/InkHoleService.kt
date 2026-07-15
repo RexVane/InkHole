@@ -214,8 +214,6 @@ class InkHoleService : Service() {
         return builder
             .setSmallIcon(R.drawable.ic_notification)
             .setColor(0xFF58E6C8.toInt())
-            .setLargeIcon(android.graphics.drawable.Icon.createWithResource(
-                this, R.mipmap.ic_launcher))
             .setContentTitle("墨洞")
             .setContentText(text)
             .setContentIntent(openApp)
@@ -240,8 +238,6 @@ class InkHoleService : Service() {
             Notification.Builder(this, CHANNEL_FILES) else Notification.Builder(this)
         builder.setSmallIcon(R.drawable.ic_notification)
             .setColor(0xFF58E6C8.toInt())
-            .setLargeIcon(android.graphics.drawable.Icon.createWithResource(
-                this, R.mipmap.ic_launcher))
             .setContentTitle("墨洞吐出文件")
             .setContentText(record.name)
             .setAutoCancel(true)
