@@ -243,3 +243,22 @@ def test_version_newer():
     assert not newer("v1.3.5", "1.3.6")
     assert newer("2.0", "1.9.9.9")
     assert not newer("", "1.0.0")
+
+
+def test_summarize_release_notes():
+    """更新说明摘要:清洗 Markdown 为干净要点,遇安装/下载段停止,与安卓一致。"""
+    from inkhole.pet import _summarize_release_notes as summarize
+    raw = """
+## Changes
+- First feature change
+- Second bug fix
+## Download
+- Windows installer
+- macOS dmg
+"""
+    result = summarize(raw)
+    assert "• First feature change" in result
+    assert "• Second bug fix" in result
+    assert "Windows installer" not in result  # 遇 Download 段停止
+    assert "macOS dmg" not in result
+

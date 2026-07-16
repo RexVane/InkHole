@@ -23,6 +23,7 @@ pet.py
 
 from __future__ import annotations
 import os
+import re
 import sys
 import json
 import queue
@@ -47,6 +48,42 @@ def _version_newer(remote: str, local: str) -> bool:
         return parts(remote) > parts(local)
     except Exception:
         return False
+
+
+def _summarize_release_notes(raw: str, max_items: int = 4) -> str:
+    """把 GitHub Release 的 Markdown 压缩成更新弹窗里的简短要点。
+
+    与安卓端 Updater.summarizeReleaseNotes 行为一致:去图片/链接语法、列表前缀、
+    强调标记与反引号;遇到「安装/下载/校验」等标题段落即停止;裸 URL 行丢弃;
+    单条超 90 字截断。每条前缀「• 」,最多 max_items 条。
+    """
+    items: list[str] = []
+    stop_sections = ("安装", "下载", "校验", "install", "download", "verify", "checksum")
+    for raw_line in raw.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            heading = line.lstrip("#").strip().lower()
+            if items and any(s in heading for s in stop_sections):
+                break
+            continue
+        if line.startswith(">"):
+            continue
+
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"^[-*+]\s+", "", text)
+        text = re.sub(r"^\d+[.)]\s+", "", text)
+        text = text.replace("**", "").replace("__", "").replace("`", "").strip()
+        if not text or text.startswith("http://") or text.startswith("https://"):
+            continue
+        if len(text) > 90:
+            text = text[:89].rstrip() + "…"
+        items.append(f"• {text}")
+        if len(items) >= max_items:
+            break
+    return "\n".join(items)
 
 
 _RELEASES_PAGE = "https://github.com/RexVane/InkHole/releases/latest"
@@ -1065,7 +1102,7 @@ def main(argv=None) -> None:
                     with urllib.request.urlopen(req, timeout=12) as resp:
                         data = _json.loads(resp.read().decode("utf-8"))
                     latest = str(data.get("tag_name", "")).strip()
-                    notes = str(data.get("body", "") or "")[:400]
+                    notes = _summarize_release_notes(str(data.get("body", "") or ""))
                     for asset in data.get("assets", []):
                         if asset.get("name") == want:
                             asset_url = str(asset.get("browser_download_url", ""))
@@ -1216,6 +1253,10 @@ def main(argv=None) -> None:
         }, icon=_make_app_icon())
         bridge._main_window = main_win
         main_win.show()
+        # 首次启动自动弹一次使用说明,看过即记住(与 show_pet 同一持久化路径)
+        if not _load_saved_config().get("usage_guide_seen", False):
+            main_win._show_usage_guide()
+            _save_config(bridge._lan_cfg, usage_guide_seen=True)
 
     # 系统托盘(Windows 右下托盘 / macOS 顶部菜单栏,Qt 跨平台一套代码)
     _tray = _setup_tray(app, bridge)   # 返回托盘对象(需持引用防被回收),失败返回 None

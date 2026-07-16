@@ -978,38 +978,39 @@ class MainWindow(QWidget):
         columns = QHBoxLayout()
         columns.setSpacing(26)
 
-        connection = QVBoxLayout()
-        connection.setSpacing(13)
-        connection.addWidget(_section_label("局域网配置"))
+        # ========== 左列:设备设置 + 传输安全 + 跨网络配置 ==========
+        left_col = QVBoxLayout()
+        left_col.setSpacing(13)
 
-        fields = QGridLayout()
-        fields.setHorizontalSpacing(14)
-        fields.setVerticalSpacing(12)
-        fields.setColumnStretch(0, 3)
-        fields.setColumnStretch(1, 2)
+        # ---- 本机信息(可选中复制) ----
+        cfg = self._bridge.lanConfig()
+        info_box = QWidget()
+        info_lay = QVBoxLayout(info_box)
+        info_lay.setContentsMargins(0, 0, 0, 8)
+        info_lay.setSpacing(3)
 
+        def _info_line(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11.5px;")
+            return lbl
+
+        self._local_info_lbl = _info_line(f"本机：{cfg.peer_name}-{cfg.instance_id}")
+        info_lay.addWidget(self._local_info_lbl)
+        info_lay.addWidget(_info_line(f"版本：v{self._bridge.appVersion()}"))
+        # 实际端口需要从节点获取(启动后才有),设置页打开时节点已运行
+        actual_port = cfg.listen_port or "自动"
+        info_lay.addWidget(_info_line(f"端口：{actual_port}（建议自定义固定端口）"))
+        left_col.addWidget(info_box)
+
+        # ---- 1. 设备设置 ----
+        left_col.addWidget(_section_label("设备设置"))
         self._ed_name = QLineEdit()
         self._ed_name.setPlaceholderText("设备名称")
-        self._ed_secret = QLineEdit()
-        self._ed_secret.setEchoMode(QLineEdit.Password)
-        self._ed_secret.setPlaceholderText("留空时不加密")
-        b_eye = QToolButton()
-        b_eye.setObjectName("Win")
-        b_eye.setCheckable(True)
-        b_eye.setIcon(_eye_icon(crossed=False))
-        b_eye.setFixedSize(30, 28)
-        b_eye.setToolTip("显示/隐藏口令")
-        b_eye.setCursor(Qt.PointingHandCursor)
-
-        def _toggle_secret(visible: bool):
-            self._ed_secret.setEchoMode(
-                QLineEdit.Normal if visible else QLineEdit.Password)
-            b_eye.setIcon(_eye_icon(crossed=visible))
-
-        b_eye.toggled.connect(_toggle_secret)
-        self._sp_port = QSpinBox()
-        self._sp_port.setRange(0, 65535)
-        self._sp_port.setToolTip("0 = 系统自动分配")
+        # 设备名输入框实时同步本机信息显示
+        self._ed_name.textChanged.connect(
+            lambda name: self._local_info_lbl.setText(f"本机：{name or cfg.peer_name}-{cfg.instance_id}")
+        )
         self._ed_inbox = QLineEdit()
         self._ed_inbox.setReadOnly(True)
         b_browse = QPushButton("更换目录")
@@ -1027,75 +1028,44 @@ class MainWindow(QWidget):
             box_lay.addWidget(control)
             return box
 
-        fields.addWidget(_field("设备名称", self._ed_name), 0, 0)
-        fields.addWidget(_field("监听端口", self._sp_port), 0, 1)
-
-        secret_row = QWidget()
-        secret_lay = QHBoxLayout(secret_row)
-        secret_lay.setContentsMargins(0, 0, 0, 0)
-        secret_lay.setSpacing(10)
-        secret_lay.addWidget(self._ed_secret, 1)
-        secret_lay.addWidget(b_eye)
-        fields.addWidget(_field("加密口令", secret_row), 1, 0, 1, 2)
-
+        left_col.addWidget(_field("设备名称", self._ed_name))
         inbox_row = QWidget()
         inbox_lay = QHBoxLayout(inbox_row)
         inbox_lay.setContentsMargins(0, 0, 0, 0)
         inbox_lay.setSpacing(8)
         inbox_lay.addWidget(self._ed_inbox, 1)
         inbox_lay.addWidget(b_browse)
-        fields.addWidget(_field("收件箱", inbox_row), 2, 0, 1, 2)
-        connection.addLayout(fields)
+        left_col.addWidget(_field("收件箱", inbox_row))
 
-        # ---- 跨网络配置(自动发现不可用时的直连入口) ----
-        connection.addSpacing(10)
-        connection.addWidget(_divider())
-        connection.addSpacing(6)
-        connection.addWidget(_section_label("跨网络配置"))
-        manual_hint = QLabel("自动发现找不到对方时，填对方 IP 与墨洞监听端口直连"
-                             "（对方需在设置里固定监听端口）。跨网络传输：两台电脑"
-                             "安装 Tailscale 并登录同一账号，填对方的 Tailscale IP 即可。")
-        manual_hint.setWordWrap(True)
-        manual_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
-        connection.addWidget(manual_hint)
+        # ---- 2. 传输安全 ----
+        left_col.addSpacing(10)
+        left_col.addWidget(_divider())
+        left_col.addSpacing(6)
+        left_col.addWidget(_section_label("传输安全"))
+        self._ed_secret = QLineEdit()
+        self._ed_secret.setEchoMode(QLineEdit.Password)
+        self._ed_secret.setPlaceholderText("留空时不加密")
+        b_eye = QToolButton()
+        b_eye.setObjectName("Win")
+        b_eye.setCheckable(True)
+        b_eye.setIcon(_eye_icon(crossed=False))
+        b_eye.setFixedSize(30, 28)
+        b_eye.setToolTip("显示/隐藏口令")
+        b_eye.setCursor(Qt.PointingHandCursor)
 
-        manual_row = QWidget()
-        manual_lay = QHBoxLayout(manual_row)
-        manual_lay.setContentsMargins(0, 2, 0, 0)
-        manual_lay.setSpacing(8)
-        self._manual_name = QLineEdit()
-        self._manual_name.setPlaceholderText("备注，如 我的手机")
-        self._manual_name.setFixedWidth(118)
-        self._manual_host = QLineEdit()
-        self._manual_host.setPlaceholderText("对方 IP，如 192.168.1.23")
-        self._manual_host.textEdited.connect(self._mask_manual_host)
-        self._manual_port = QSpinBox()
-        self._manual_port.setRange(1, 65535)
-        self._manual_port.setValue(52130)
-        self._manual_port.setFixedWidth(86)
-        b_manual_add = QPushButton("添加")
-        b_manual_add.setCursor(Qt.PointingHandCursor)
-        b_manual_add.clicked.connect(self._add_manual_peer)
-        manual_lay.addWidget(self._manual_name)
-        manual_lay.addWidget(self._manual_host, 1)
-        manual_lay.addWidget(self._manual_port)
-        manual_lay.addWidget(b_manual_add)
-        connection.addWidget(manual_row)
+        def _toggle_secret(visible: bool):
+            self._ed_secret.setEchoMode(
+                QLineEdit.Normal if visible else QLineEdit.Password)
+            b_eye.setIcon(_eye_icon(crossed=visible))
 
-        manual_box = QWidget()
-        self._manual_list_lay = QVBoxLayout(manual_box)
-        self._manual_list_lay.setContentsMargins(0, 4, 0, 0)
-        self._manual_list_lay.setSpacing(4)
-        connection.addWidget(manual_box)
-
-        connection.addStretch(1)
-        columns.addLayout(connection, 3)
-        columns.addWidget(_divider(vertical=True))
-
-        behavior = QVBoxLayout()
-        behavior.setSpacing(0)
-        behavior.addWidget(_section_label("应用行为"))
-        behavior.addSpacing(10)
+        b_eye.toggled.connect(_toggle_secret)
+        secret_row = QWidget()
+        secret_lay = QHBoxLayout(secret_row)
+        secret_lay.setContentsMargins(0, 0, 0, 0)
+        secret_lay.setSpacing(10)
+        secret_lay.addWidget(self._ed_secret, 1)
+        secret_lay.addWidget(b_eye)
+        left_col.addWidget(_field("加密口令", secret_row))
 
         def _toggle_row(title_text: str, detail: str):
             row = QWidget()
@@ -1119,15 +1089,99 @@ class MainWindow(QWidget):
 
         trusted_row, self._cb_trusted = _toggle_row(
             "仅接收目标设备", "拒绝其他局域网设备发送的文件")
-        pet_row, self._cb_pet = _toggle_row(
-            "桌宠挂件", "在桌面保留可拖放的墨洞挂件")
-        auto_row, self._cb_auto = _toggle_row(
-            "开机自启", "登录 Windows 后自动启动墨洞")
-        for row in (trusted_row, pet_row, auto_row):
-            behavior.addWidget(row)
-            behavior.addWidget(_divider())
+        left_col.addWidget(trusted_row)
 
-        # 检查更新:放在应用行为组里(左侧标题+当前版本,右侧按钮)
+        # ---- 3. 跨网络配置 ----
+        left_col.addSpacing(10)
+        left_col.addWidget(_divider())
+        left_col.addSpacing(6)
+        left_col.addWidget(_section_label("跨网络配置"))
+        self._sp_port = QSpinBox()
+        self._sp_port.setRange(0, 65535)
+        self._sp_port.setToolTip("0 = 系统自动分配")
+        left_col.addWidget(_field("本机监听端口", self._sp_port))
+
+        manual_row = QWidget()
+        manual_lay = QHBoxLayout(manual_row)
+        manual_lay.setContentsMargins(0, 0, 0, 0)
+        manual_lay.setSpacing(8)
+        self._manual_name = QLineEdit()
+        self._manual_name.setPlaceholderText("备注")
+        self._manual_name.setFixedWidth(100)
+        self._manual_host = QLineEdit()
+        self._manual_host.setPlaceholderText("对方 IP (如 100.127.46.26)")
+        self._manual_host.textChanged.connect(lambda t: self._manual_host.setText(
+            _mask_ip_input(t)))
+        self._manual_port = QSpinBox()
+        self._manual_port.setRange(1, 65535)
+        self._manual_port.setValue(8765)
+        self._manual_port.setFixedWidth(78)
+        b_manual_add = QPushButton("添加")
+        b_manual_add.setCursor(Qt.PointingHandCursor)
+        b_manual_add.clicked.connect(self._add_manual_peer)
+        manual_lay.addWidget(self._manual_name)
+        manual_lay.addWidget(self._manual_host, 1)
+        manual_lay.addWidget(self._manual_port)
+        manual_lay.addWidget(b_manual_add)
+        left_col.addWidget(manual_row)
+
+        manual_box = QWidget()
+        self._manual_list_lay = QVBoxLayout(manual_box)
+        self._manual_list_lay.setContentsMargins(0, 4, 0, 0)
+        self._manual_list_lay.setSpacing(4)
+        left_col.addWidget(manual_box)
+
+        left_col.addStretch(1)
+        columns.addLayout(left_col, 3)
+        columns.addWidget(_divider(vertical=True))
+
+        # ========== 右列:应用行为 + 帮助与更新 ==========
+        right_col = QVBoxLayout()
+        right_col.setSpacing(0)
+
+        # ---- 4. 应用行为 ----
+        right_col.addWidget(_section_label("应用行为"))
+        right_col.addSpacing(10)
+
+        pet_row, self._cb_pet = _toggle_row(
+            "桌面挂件", "可拖动的墨洞图标,拖文件到上面发送")
+        right_col.addWidget(pet_row)
+        right_col.addWidget(_divider())
+
+        autostart_row, self._cb_auto = _toggle_row(
+            "开机自启", "开机后自动启动墨洞(后台接收)")
+        right_col.addWidget(autostart_row)
+
+        # ---- 5. 帮助与更新 ----
+        right_col.addSpacing(10)
+        right_col.addWidget(_divider())
+        right_col.addSpacing(6)
+        right_col.addWidget(_section_label("帮助与更新"))
+        right_col.addSpacing(10)
+
+        # 使用说明
+        guide_row = QWidget()
+        guide_lay = QHBoxLayout(guide_row)
+        guide_lay.setContentsMargins(0, 8, 0, 8)
+        guide_lay.setSpacing(12)
+        guide_copy = QVBoxLayout()
+        guide_copy.setSpacing(2)
+        guide_title = QLabel("使用说明")
+        guide_title.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
+        guide_detail = QLabel("局域网 / 跨网络传输与文件位置")
+        guide_detail.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        guide_copy.addWidget(guide_title)
+        guide_copy.addWidget(guide_detail)
+        b_guide = QPushButton("查看说明")
+        b_guide.setObjectName("QuietAction")
+        b_guide.setCursor(Qt.PointingHandCursor)
+        b_guide.clicked.connect(self._show_usage_guide)
+        guide_lay.addLayout(guide_copy, 1)
+        guide_lay.addWidget(b_guide, 0, Qt.AlignVCenter)
+        right_col.addWidget(guide_row)
+        right_col.addWidget(_divider())
+
+        # 检查更新
         update_row = QWidget()
         update_lay = QHBoxLayout(update_row)
         update_lay.setContentsMargins(0, 8, 0, 8)
@@ -1146,9 +1200,9 @@ class MainWindow(QWidget):
         self._update_btn.clicked.connect(self._check_update)
         update_lay.addLayout(update_copy, 1)
         update_lay.addWidget(self._update_btn, 0, Qt.AlignVCenter)
-        behavior.addWidget(update_row)
-        behavior.addStretch(1)
-        columns.addLayout(behavior, 2)
+        right_col.addWidget(update_row)
+        right_col.addStretch(1)
+        columns.addLayout(right_col, 2)
         # 内容装进滚动区:窗口高度不足时出滚动条,而不是把输入框压扁裁切
         content = QWidget()
         content.setLayout(columns)
@@ -1220,6 +1274,29 @@ class MainWindow(QWidget):
             f" · IP {ips}（对方手动添加本机时填这里的 IP 和端口）")
         self._refresh_manual_list()
         self._show_page(1)
+
+    def _show_usage_guide(self):
+        """使用说明弹窗(首启自动弹一次 + 设置页入口)。富文本三段:
+        局域网 / 跨网络 / 文件位置,按桌面端工作流写。"""
+        html = (
+            "<p style='margin:0 0 4px 0;'><b>局域网</b></p>"
+            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备连接同一个 WiFi 并都打开"
+            "墨洞,右侧「设备」栏里会自动出现对方。点选对方设备后,把文件拖到窗口(或墨洞),"
+            "也可以点「选择文件」发送。</p>"
+            "<p style='margin:0 0 4px 0;'><b>跨网络</b></p>"
+            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备安装 Tailscale 并登录同一"
+            "账号。先在设置里固定本机监听端口,再到「跨网络配置」填对方的 Tailscale IP 与监听"
+            "端口添加设备。添加后,发送方式与局域网相同。</p>"
+            "<p style='margin:0 0 4px 0;'><b>文件位置</b></p>"
+            "<p style='margin:0; color:#B2BFBC;'>收到的文件保存在设置里的收件箱目录,可在"
+            "「最近接收」中查看,或点其右上角的文件夹按钮直接打开目录。</p>"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("使用说明")
+        box.setTextFormat(Qt.RichText)
+        box.setText(html)
+        box.addButton("知道了", QMessageBox.AcceptRole)
+        box.exec()
 
     def _check_update(self):
         self._update_btn.setEnabled(False)
@@ -1409,10 +1486,17 @@ class MainWindow(QWidget):
         name.setStyleSheet(
             f"color:{_TEAL_BRIGHT if selected else _TEXT};"
             " font-size:13px; font-weight:650;")
-        host = QLabel(peer.host)
-        host.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
+        # 副行:局域网(自动发现)显示唯一标识,跨网络(手动)显示 IP:端口。
+        # 与安卓 DeviceChip 一致——第一行始终是显示名(手动设备即备注)。
+        if peer.service_name.startswith("manual|"):
+            subline = f"{peer.host}:{peer.port}"
+        else:
+            subline = peer.instance_id or ""
         col.addWidget(name)
-        col.addWidget(host)
+        if subline:
+            host = QLabel(subline)
+            host.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
+            col.addWidget(host)
         lay.addWidget(icon)
         lay.addLayout(col, 1)
         if selected:
