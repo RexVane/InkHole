@@ -120,13 +120,24 @@ class MainActivity : ComponentActivity() {
         val info = updateInfo.value ?: return
         AlertDialog(
             onDismissRequest = { updateInfo.value = null },
-            title = { Text("发现新版本 ${info.version}") },
+            title = { Text("发现新版本") },
             text = {
-                Column {
-                    Text("当前版本 v${currentVersion()}", fontSize = 12.sp,
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text("当前版本：v${currentVersion()}", fontSize = 12.sp,
                         color = androidx.compose.ui.graphics.Color.Gray)
-                    Spacer(Modifier.height(6.dp))
-                    Text(info.notes.ifEmpty { "新版本可用" }, fontSize = 12.sp)
+                    Text("最新版本：${info.version}", fontSize = 12.sp,
+                        color = androidx.compose.ui.graphics.Color.Gray)
+                    Text(
+                        text = if (info.apkUrl.isNotEmpty()) "更新状态：可直接更新"
+                            else "更新状态：可前往发布页下载",
+                        fontSize = 12.sp,
+                        color = androidx.compose.ui.graphics.Color(0xFF58CDB5),
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Text("本次更新", fontSize = 13.sp,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+                    Spacer(Modifier.height(4.dp))
+                    Text(info.notes.ifEmpty { "发布说明暂不可用" }, fontSize = 12.sp)
                 }
             },
             confirmButton = {
@@ -136,7 +147,7 @@ class MainActivity : ComponentActivity() {
                     if (i.apkUrl.isNotEmpty()) downloadAndInstall(i)
                     else startActivity(Intent(Intent.ACTION_VIEW,
                         Uri.parse(Updater.RELEASES_PAGE)))
-                }) { Text("立即更新") }
+                }) { Text(if (info.apkUrl.isNotEmpty()) "立即更新" else "查看发布页") }
             },
             dismissButton = {
                 TextButton(onClick = { updateInfo.value = null }) { Text("取消") }

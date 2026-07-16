@@ -16,6 +16,39 @@ object Updater {
 
     data class Info(val version: String, val apkUrl: String, val notes: String)
 
+    /** 把 GitHub Release Markdown 压缩为更新弹窗里的简短要点。 */
+    internal fun summarizeReleaseNotes(raw: String, maxItems: Int = 4): String {
+        val items = mutableListOf<String>()
+        val stopSections = listOf("安装", "下载", "校验", "checksum")
+        for (rawLine in raw.replace("\r\n", "\n").lines()) {
+            val line = rawLine.trim()
+            if (line.isEmpty()) continue
+            if (line.startsWith("#")) {
+                val heading = line.trimStart('#').trim().lowercase()
+                if (items.isNotEmpty() && stopSections.any { it in heading }) break
+                continue
+            }
+            if (line.startsWith(">")) continue
+
+            var text = line
+                .replace(Regex("!\\[[^]]*]\\([^)]*\\)"), "")
+                .replace(Regex("\\[([^]]+)]\\([^)]*\\)"), "$1")
+                .replace(Regex("^[-*+]\\s+"), "")
+                .replace(Regex("^\\d+[.)]\\s+"), "")
+                .replace("**", "")
+                .replace("__", "")
+                .replace("`", "")
+                .trim()
+            if (text.isEmpty() || text.startsWith("http://") || text.startsWith("https://")) {
+                continue
+            }
+            if (text.length > 90) text = text.take(89).trimEnd() + "…"
+            items.add("• $text")
+            if (items.size >= maxItems) break
+        }
+        return items.joinToString("\n")
+    }
+
     /** remote 是否比 local 新(容忍 v 前缀/位数不齐)。 */
     fun versionNewer(remote: String, local: String): Boolean {
         fun parts(v: String): List<Int> {
@@ -58,7 +91,7 @@ object Updater {
         conn.inputStream.use { input ->
             val data = JSONObject(input.bufferedReader().readText())
             val tag = data.optString("tag_name").trim()
-            val notes = data.optString("body").take(400)
+            val notes = summarizeReleaseNotes(data.optString("body"))
             var apk = ""
             val assets = data.optJSONArray("assets")
             if (assets != null) {
