@@ -406,28 +406,30 @@ class MainActivity : ComponentActivity() {
                     Column(
                         modifier = Modifier.verticalScroll(rememberScrollState()),
                     ) {
-                        // 本机信息:对端手动添加本机时,照这里的 IP+端口填
+                        // 本机信息
                         val instanceId = prefs.getString("instance_id", "") ?: ""
-                        val localAddrs = InkHoleBus.node?.getLocalAddresses().orEmpty()
                         val actualPort = InkHoleBus.node?.getActualPort() ?: 0
                         androidx.compose.foundation.text.selection.SelectionContainer {
                             Column {
                                 Text(
-                                    text = "本机：${peerName.value}-$instanceId · v${currentVersion()}",
+                                    text = "本机：${peerName.value}-$instanceId",
                                     fontSize = 12.sp,
                                     color = androidx.compose.ui.graphics.Color.Gray,
                                 )
                                 Text(
-                                    text = "IP ${localAddrs.joinToString(" / ").ifEmpty { "?" }}" +
-                                        " · 端口 ${if (actualPort > 0) actualPort else "未启动"}" +
-                                        "（对方手动添加本机时填这两项）",
-                                    fontSize = 11.sp,
+                                    text = "版本：v${currentVersion()}",
+                                    fontSize = 12.sp,
+                                    color = androidx.compose.ui.graphics.Color.Gray,
+                                )
+                                Text(
+                                    text = "端口：${if (actualPort > 0) actualPort else "未启动"}",
+                                    fontSize = 12.sp,
                                     color = androidx.compose.ui.graphics.Color.Gray,
                                     modifier = Modifier.padding(bottom = 12.dp)
                                 )
                             }
                         }
-                        Text("局域网配置", fontSize = 14.sp,
+                        Text("设备设置", fontSize = 14.sp,
                             fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                         Spacer(Modifier.height(6.dp))
                         OutlinedTextField(
@@ -436,14 +438,11 @@ class MainActivity : ComponentActivity() {
                             label = { Text("设备名称") },
                             singleLine = true,
                         )
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = portInput,
-                            onValueChange = { portInput = it.filter { c -> c.isDigit() }.take(5) },
-                            label = { Text("监听端口（留空=自动；跨网直连需固定，如 52130）") },
-                            singleLine = true,
-                        )
-                        Spacer(Modifier.height(8.dp))
+
+                        Spacer(Modifier.height(14.dp))
+                        Text("传输安全", fontSize = 14.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+                        Spacer(Modifier.height(6.dp))
                         OutlinedTextField(
                             value = secretInput,
                             onValueChange = { secretInput = it },
@@ -457,7 +456,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text("仅接收目标设备", fontSize = 14.sp)
-                                Text("拦掉局域网里陌生设备发来的文件",
+                                Text("只允许当前选中的设备向本机发送文件",
                                     fontSize = 11.sp,
                                     color = androidx.compose.ui.graphics.Color.Gray)
                             }
@@ -470,9 +469,17 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(14.dp))
                         Text("跨网络配置", fontSize = 14.sp,
                             fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                        Text("自动发现不可用时(如 Tailscale 跨网)填对方 IP 与监听端口",
+                        Text("跨网直连时固定本机监听端口，并填写对方 IP 与端口",
                             fontSize = 11.sp,
                             color = androidx.compose.ui.graphics.Color.Gray)
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = portInput,
+                            onValueChange = { portInput = it.filter { c -> c.isDigit() }.take(5) },
+                            label = { Text("本机监听端口（留空=自动，如 52130）") },
+                            singleLine = true,
+                        )
+                        Spacer(Modifier.height(8.dp))
                         manualList.forEach { m ->
                             Row(
                                 modifier = Modifier.fillMaxWidth(),

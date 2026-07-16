@@ -475,10 +475,6 @@ class InkHoleNode(
     /** 实际监听端口(0=尚未启动)。设置页展示"本机"信息用。 */
     fun getActualPort(): Int = actualPort
 
-    /** 本机全部非环回 IPv4(含 Tailscale 100.x)。设置页展示,方便对端照着手动添加。 */
-    fun getLocalAddresses(): List<String> =
-        localIps().filter { it.contains('.') && it != "127.0.0.1" }.sorted()
-
     fun selectPeer(name: String?) {
         selectedPeer = name
         // 智能保留：记住 serviceName，离线后重新上线能自动恢复选中
