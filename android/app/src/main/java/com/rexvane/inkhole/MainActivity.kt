@@ -481,7 +481,7 @@ class MainActivity : ComponentActivity() {
             var manualHost by remember {
                 mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(""))
             }
-            var manualPort by remember { mutableStateOf("52130") }
+            var manualPort by remember { mutableStateOf("") }
             var manualError by remember { mutableStateOf("") }
             var settingsError by remember { mutableStateOf("") }
             var editingPeer by remember { mutableStateOf<ManualPeer?>(null) }
@@ -650,7 +650,12 @@ class MainActivity : ComponentActivity() {
                                 }) { Text("编辑") }
                                 TextButton(onClick = {
                                     manualList.remove(m)
-                                    if (editingPeer == m) editingPeer = null
+                                    if (editingPeer == m) {
+                                        editingPeer = null
+                                        manualName = ""
+                                        manualHost = androidx.compose.ui.text.input.TextFieldValue("")
+                                        manualPort = ""
+                                    }
                                 }) { Text("删除") }
                             }
                         }

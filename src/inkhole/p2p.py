@@ -211,7 +211,19 @@ class P2PNode:
         self._running = True
 
         # 1. 启动 TCP 监听
-        self._start_tcp_server()
+        try:
+            self._start_tcp_server()
+        except OSError:
+            self._running = False
+            if self._server_sock:
+                try:
+                    self._server_sock.close()
+                except OSError:
+                    pass
+                self._server_sock = None
+            self._actual_port = 0
+            self._status("墨洞未开启：监听端口启动失败")
+            return
 
         # 1.5 注册手动添加的设备(乐观加入;真离线的话探测线程 ~10s 内剔除,
         #     回线后探测线程又会自动加回来——见 _probe_loop 末尾的兜底段)
@@ -224,7 +236,7 @@ class P2PNode:
 
         # 3. 注册 mDNS 服务(测试模式跳过：只测 TCP 层，不受局域网环境干扰)
         if not self.cfg.enable_mdns:
-            self._status(f"墨洞已开启(无 mDNS) · {self.cfg.peer_name} @ 127.0.0.1:{self._actual_port}")
+            self._report_started()
             return
 
         with self._mdns_lock:
@@ -234,8 +246,14 @@ class P2PNode:
         self._net_monitor_thread = threading.Thread(target=self._net_monitor_loop, daemon=True)
         self._net_monitor_thread.start()
 
-        local_ips = self._last_local_ips or ["127.0.0.1"]
-        self._status(f"墨洞已开启 · {self.cfg.peer_name} @ {local_ips[0]}:{self._actual_port}")
+        self._report_started()
+
+    def _report_started(self) -> None:
+        if self.cfg.listen_port and self._actual_port != self.cfg.listen_port:
+            self._status(
+                f"墨洞已开启 · 端口 {self.cfg.listen_port} 被占用，当前端口 {self._actual_port}")
+        else:
+            self._status(f"墨洞已开启 · {self.cfg.peer_name}")
 
     def _setup_mdns(self) -> None:
         """创建 Zeroconf 实例、注册本机服务、启动发现浏览器。
@@ -312,14 +330,25 @@ class P2PNode:
     # ---------- TCP 服务器 ----------
     def _start_tcp_server(self) -> None:
         """绑定 TCP 监听端口。listen_port=0 时由操作系统自动分配可用端口。"""
-        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        def make_socket() -> socket.socket:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return sock
+
+        self._server_sock = make_socket()
 
         port = self.cfg.listen_port
         # 统一交给 OS 分配(port=0)或绑定指定端口。不用手动扫端口范围——
         # Windows 上 SO_REUSEADDR 允许多 socket 绑同一端口,手动扫描会给两个节点
         # 分到同一个端口,导致只有一方能收到连接。
-        self._server_sock.bind(("", port))
+        try:
+            self._server_sock.bind(("", port))
+        except OSError:
+            if not port:
+                raise
+            self._server_sock.close()
+            self._server_sock = make_socket()
+            self._server_sock.bind(("", 0))
 
         self._server_sock.listen(8)
         self._actual_port = self._server_sock.getsockname()[1]
@@ -488,6 +517,7 @@ class P2PNode:
 
             if self.on_received:
                 self.on_received(dst)
+            self._status(f"已接收：{os.path.basename(dst)}")
         except Exception as e:
             self._status("接收失败", str(e))
         finally:
@@ -514,12 +544,14 @@ class P2PNode:
         发送方感知；老版接收方(v1.0.0)读完数据直接关连接，按成功处理。
         """
         if not os.path.isfile(local_path):
+            self._status("文件不存在")
             return False
 
         with self._lock:
-            peer = self._peers.get(self._selected_peer) if self._selected_peer else None
+            selected = self._selected_peer
+            peer = self._peers.get(selected) if selected else None
         if not peer:
-            self._status("请先右键选择目标设备")
+            self._status("目标设备已离线" if selected else "请先选择目标设备")
             return False
 
         name = os.path.basename(local_path)
@@ -608,12 +640,12 @@ class P2PNode:
                 except (socket.timeout, OSError):
                     resp = b""
                 if resp == _ACK_FAIL:
-                    self._status(f"{peer.name} 接收失败（口令不一致、被拒收或磁盘问题）")
+                    self._status(f"{peer.name} 接收失败（口令不一致、被拒收或存储问题）")
                     return False
             finally:
                 sock.close()
         except (ConnectionRefusedError, socket.timeout, OSError) as e:
-            self._status(f"无法连接 {peer.name}", str(e))
+            self._status("发送失败", str(e))
             return False
         except Exception as e:
             self._status("发送失败", str(e))
@@ -621,6 +653,7 @@ class P2PNode:
 
         if self.on_sent:
             self.on_sent(name)
+        self._status(f"已发送：{name}")
         return True
 
     # ---------- 对端管理 ----------
@@ -649,8 +682,7 @@ class P2PNode:
                 self._selected_peer = name
                 # 智能保留：记住 service_name，离线后重新上线能自动恢复选中
                 self._last_selected_service = self._peers[name].service_name
-        label = name if name else "未选择"
-        self._status(f"目标: {label}")
+        self._status(f"目标: {name}" if name else "未选择目标")
 
     def _on_peer_added(self, name: str, host: str, port: int, service_name: str = "",
                        hosts: list[str] | None = None) -> None:
@@ -687,7 +719,7 @@ class P2PNode:
                 self._status(f"目标设备 {display_name} 重新上线，已自动恢复选中")
 
         if not updated:
-            self._status(f"发现 {name}")
+            self._status(f"发现: {display_name}")
 
         if self.on_peers_changed:
             self.on_peers_changed()
@@ -785,6 +817,7 @@ class P2PNode:
                 targets = [(p.service_name or n, list(p.hosts), p.port, n)
                            for n, p in self._peers.items()]
             seen = set()
+            auto_removed = False
             for key, hosts, port, display in targets:
                 seen.add(key)
                 alive = False
@@ -806,12 +839,19 @@ class P2PNode:
                 if strikes.get(key, 0) + 1 >= threshold:
                     strikes.pop(key, None)
                     self._on_peer_removed(display)
+                    if not key.startswith("manual|"):
+                        auto_removed = True
                 else:
                     strikes[key] = strikes.get(key, 0) + 1
             # 已经不在对端表里的条目不再计数(正常离线/被 mDNS 先移除)
             for k in list(strikes):
                 if k not in seen:
                     del strikes[k]
+
+            if auto_removed and self.cfg.enable_mdns:
+                threading.Thread(
+                    target=lambda: self._rebuild_mdns("设备离线", announce=False),
+                    daemon=True).start()
 
             # 手动设备兜底:被判离线后不会有 mDNS 通告拉它回来,
             # 每轮探测不在表里的手动设备,连得上就重新加入。
@@ -864,7 +904,7 @@ class P2PNode:
                 # 重建自身耗时可能不短，重置基准避免把它误判成又一次唤醒
                 last_tick = time.monotonic()
 
-    def _rebuild_mdns(self, reason: str) -> None:
+    def _rebuild_mdns(self, reason: str, announce: bool = True) -> None:
         """拆掉并重新创建整个 mDNS 层(唤醒/换网后自愈)。
 
         对端表保留：浏览器重建后会重新收到在线设备的通告刷新地址，
@@ -876,7 +916,8 @@ class P2PNode:
         """
         if not self._running or not self.cfg.enable_mdns:
             return
-        self._status(f"检测到{reason}，正在重建设备发现…")
+        if announce:
+            self._status(f"检测到{reason}，正在重建设备发现…")
         with self._mdns_lock:
             if not self._running:
                 return   # stop() 抢先完成:保持拆除状态,绝不再注册
@@ -889,15 +930,15 @@ class P2PNode:
             except Exception as e:
                 self._status("设备发现重建失败", str(e))
                 return
-        ip = (self._last_local_ips or ["?"])[0]
-        self._status(f"设备发现已重建 · {ip}:{self._actual_port}")
+        if announce:
+            self._status("设备发现已重建")
 
     # ---------- 工具 ----------
     def _status(self, msg: str, detail: str = "") -> None:
         if detail:
             print(f"[P2P] {msg} | {detail}", flush=True)
         if self.on_status:
-            self.on_status(msg)
+            self.on_status(f"{msg}: {detail}" if detail else msg)
 
     # ---------- 工具 ----------
     @staticmethod
@@ -1142,8 +1183,8 @@ def _run_cli(argv=None) -> None:
                     peer_name=args.name, secret=args.secret)
     node = P2PNode(
         cfg,
-        on_sent=lambda n: print(f"[发送] {n} 已吸入墨洞"),
-        on_received=lambda p: print(f"[接收] 墨洞吐出 -> {p}"),
+        on_sent=lambda n: print(f"[发送] {n}"),
+        on_received=lambda p: print(f"[接收] {p}"),
         on_status=lambda s: print(f"[状态] {s}"),
         on_peers_changed=lambda: print(f"[设备] {', '.join(node.peer_names()) or '无'}"),
         on_progress=lambda kind, name, done, total: print(

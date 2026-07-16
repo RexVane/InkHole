@@ -54,6 +54,7 @@ class FakeBridge(QObject):
     status = Signal(str)
     errorState = Signal(str)
     emit_out = Signal(str)
+    recentChanged = Signal()
     progress = Signal(str, int)
     updateCheckFinished = Signal(bool, str, str, str)
 
@@ -61,6 +62,8 @@ class FakeBridge(QObject):
         super().__init__()
         self.node = _FakeNode()
         self._manual = []
+        self.opened_paths = []
+        self.applied_settings = None
 
     # ---- query surface used by the window ----
     def lanConfig(self):
@@ -82,6 +85,12 @@ class FakeBridge(QObject):
     def localAddresses(self):
         return ["192.168.1.10", "100.64.0.9"]
 
+    def actualPort(self):
+        return 43123
+
+    def lastStatus(self):
+        return "墨洞已开启 · SMOKE"
+
     def refreshDiscovery(self):
         pass
 
@@ -94,6 +103,9 @@ class FakeBridge(QObject):
     def releasesPage(self):
         return "https://example.com"
 
+    def repositoryPage(self):
+        return "https://example.com/repository"
+
     def checkUpdate(self):
         pass
 
@@ -101,11 +113,15 @@ class FakeBridge(QObject):
         pass
 
     def openPath(self, path):
-        pass
+        self.opened_paths.append(path)
 
     # ---- 手动设备 ----
     def manualPeers(self):
         return [dict(m) for m in self._manual]
+
+    def setManualPeers(self, peers):
+        self._manual = [dict(m) for m in peers]
+        return True
 
     def addManualPeer(self, name, host, port):
         if not host or " " in host or not 1 <= int(port) <= 65535:
@@ -123,14 +139,15 @@ class FakeBridge(QObject):
 def _make_window(app):
     from inkhole.mainwindow import MainWindow
 
+    bridge = FakeBridge()
     ctl = {
         "pet_visible": lambda: True,
         "set_pet_visible": lambda on: None,
         "is_autostart": lambda: False,
         "set_autostart": lambda on: None,
-        "apply_settings": lambda name, secret, port: None,
+        "apply_settings": lambda name, secret, port: setattr(
+            bridge, "applied_settings", (name, secret, port)),
     }
-    bridge = FakeBridge()
     return MainWindow(bridge, ctl), bridge
 
 
@@ -146,19 +163,67 @@ def test_settings_page_opens_and_populates(app):
     window._open_settings()
     assert window._stack.currentIndex() == 1
     assert window._ed_name.text() == "SMOKE"
+    assert window._sp_port.text() == ""
+    assert window._manual_name.text() == ""
+    assert window._manual_host.text() == ""
+    assert window._manual_port.text() == ""
+    assert window._local_info_lbl.text().startswith("本机：SMOKE-")
+    assert window._version_info_lbl.text() == "版本：v0.0.0"
+    assert window._port_info_lbl.text() == "端口：43123（建议自定义固定端口）"
+    assert "IP" not in window._local_info_lbl.text()
 
 
 def test_manual_peer_add_and_remove(app):
-    """Manual peer UI round-trips through the bridge and refreshes the list."""
+    """Manual peers stay as drafts until the settings page is saved."""
     window, bridge = _make_window(app)
     window._open_settings()
+    window._manual_name.setText("我的电脑")
     window._manual_host.setText("100.64.0.2")
-    window._manual_port.setValue(52130)
+    window._manual_port.setText("52130")
     window._add_manual_peer()
+    assert bridge.manualPeers() == []
+    assert window._manual_draft == [
+        {"name": "我的电脑", "host": "100.64.0.2", "port": 52130}]
+    assert window._manual_name.text() == ""
+    assert window._manual_host.text() == ""
+    assert window._manual_port.text() == ""
+    window._save_settings()
     assert bridge.manualPeers() == [
-        {"name": "", "host": "100.64.0.2", "port": 52130}]
-    assert window._manual_host.text() == ""     # 添加成功后清空输入
-    window._remove_manual_peer("100.64.0.2", 52130)
+        {"name": "我的电脑", "host": "100.64.0.2", "port": 52130}]
+
+
+def test_manual_peer_edit_and_cancel_are_non_destructive(app):
+    """Editing a draft must not touch live config until main Save."""
+    window, bridge = _make_window(app)
+    bridge._manual = [
+        {"name": "旧备注", "host": "100.64.0.3", "port": 52130}]
+    window._open_settings()
+    window._edit_manual_peer(0)
+    assert bridge.manualPeers()[0]["name"] == "旧备注"
+    assert window._manual_add_btn.text() == "保存设备"
+    window._manual_name.setText("新备注")
+    window._add_manual_peer()
+    assert bridge.manualPeers()[0]["name"] == "旧备注"
+    window._cancel_settings()
+    assert bridge.manualPeers()[0]["name"] == "旧备注"
+
+    window._open_settings()
+    window._edit_manual_peer(0)
+    window._manual_name.setText("新备注")
+    window._add_manual_peer()
+    window._save_settings()
+    assert bridge.manualPeers() == [
+        {"name": "新备注", "host": "100.64.0.3", "port": 52130}]
+
+
+def test_manual_peer_remove_is_draft_until_save(app):
+    window, bridge = _make_window(app)
+    bridge._manual = [
+        {"name": "目标", "host": "100.64.0.4", "port": 52130}]
+    window._open_settings()
+    window._remove_manual_peer(0)
+    assert bridge.manualPeers()
+    window._save_settings()
     assert bridge.manualPeers() == []
 
 
@@ -176,6 +241,21 @@ def test_manual_peer_rejects_bad_input(app, monkeypatch):
     assert warned
 
 
+def test_explicit_zero_listen_port_is_rejected(app, monkeypatch):
+    """Only a blank field means automatic; typed 0 is invalid like Android."""
+    from PySide6.QtWidgets import QMessageBox
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: warned.append(a)))
+    window, bridge = _make_window(app)
+    window._open_settings()
+    window._sp_port.setText("0")
+    window._save_settings()
+    assert warned
+    assert bridge.applied_settings is None
+    assert window._stack.currentIndex() == 1
+
+
 def test_peer_and_transfer_signals_drive_window(app):
     """peersChanged / progress / errorState flow through without raising."""
     window, bridge = _make_window(app)
@@ -183,7 +263,41 @@ def test_peer_and_transfer_signals_drive_window(app):
     bridge.progress.emit("send", 42)
     bridge.errorState.emit("boom")
     bridge.errorState.emit("")
-    assert window._state_lbl._full_text == "正在发现设备"
+    assert window._state_lbl._full_text == "等待附近的墨洞上线…"
+
+
+def test_repository_button_opens_github(app):
+    window, bridge = _make_window(app)
+    window._repository_btn.click()
+    assert bridge.opened_paths == ["https://example.com/repository"]
+
+
+def test_update_dialog_matches_android_summary(app, monkeypatch):
+    """Available-update dialog exposes versions, availability and changes."""
+    from PySide6.QtWidgets import QMessageBox
+
+    captured = {}
+    original_text = QMessageBox.setText
+    original_info = QMessageBox.setInformativeText
+
+    def capture_text(box, value):
+        captured["text"] = value
+        original_text(box, value)
+
+    def capture_info(box, value):
+        captured["info"] = value
+        original_info(box, value)
+
+    monkeypatch.setattr(QMessageBox, "setText", capture_text)
+    monkeypatch.setattr(QMessageBox, "setInformativeText", capture_info)
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+
+    window, _ = _make_window(app)
+    window._on_update_check(True, "v1.2.3", "• 修复设备发现", "")
+    assert "当前版本：v0.0.0" in captured["text"]
+    assert "最新版本：v1.2.3" in captured["text"]
+    assert "更新状态：可前往发布页下载" in captured["text"]
+    assert captured["info"] == "本次更新\n• 修复设备发现"
 
 
 def test_normalize_manual_host():
@@ -234,6 +348,19 @@ def test_mask_manual_host_typing():
     assert mask("my-pc") == "my-pc"
 
 
+def test_file_metadata_format_matches_android():
+    from inkhole.mainwindow import format_file_size, format_file_time
+
+    assert format_file_size(512) == "512B"
+    assert format_file_size(1536) == "2KB"
+    assert format_file_size(2_400_000) == "2.3MB"
+    now = 2_000_000.0
+    assert format_file_time(now - 20, now) == "刚刚"
+    assert format_file_time(now - 120, now) == "2 分钟前"
+    assert format_file_time(now - 7200, now) == "2 小时前"
+    assert format_file_time(now - 90000, now) == "昨天"
+
+
 def test_version_newer():
     """更新检查的版本比较:语义化、容 v 前缀、位数不齐。"""
     from inkhole.pet import _version_newer as newer
@@ -261,4 +388,3 @@ def test_summarize_release_notes():
     assert "• Second bug fix" in result
     assert "Windows installer" not in result  # 遇 Download 段停止
     assert "macOS dmg" not in result
-

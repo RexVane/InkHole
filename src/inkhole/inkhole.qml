@@ -16,13 +16,13 @@ Window {
     x: Screen.virtualX + Screen.width - win.petSize
     y: Screen.virtualY + Math.round(win.petSize * 0.8)
 
-    property real scaleF: 1.0          // 整体缩放(吸入/喷出时放大)
+    property real scaleF: 1.0          // 整体缩放(发送/接收时放大)
     property string hint: ""           // 临时提示文字(2.2s 后消失)
     property string persistentHint: "" // 持续状态(错误信息等，始终显示)
 
     // ---- 传输进度环 ----
     property real transferPct: -1      // -1=无传输; 0-100 显示进度环
-    property string transferKind: ""   // "send"=吞入 / "recv"=吐出
+    property string transferKind: ""   // "send"=发送 / "recv"=接收
 
     // ---- 边缘吸附(悬浮球)状态 ----
     property int edge: -1             // 贴的是哪条边：-1未贴 0左 1右 2上 3下
@@ -76,19 +76,19 @@ Window {
                          && win.transferPct < 0) win.collapse()
     }
 
-    // 吸入/喷出时的放大-回弹动画
+    // 发送/接收时的放大-回弹动画
     SequentialAnimation {
         id: pulse
         NumberAnimation { target: win; property: "scaleF"; to: 1.5; duration: 220; easing.type: Easing.OutQuad }
         NumberAnimation { target: win; property: "scaleF"; to: 1.0; duration: 360; easing.type: Easing.OutBack }
     }
 
-    // ===== 玻璃碎片系统:文件吸入时碎成青玻璃片卷入墨洞;吐出时碎片飞拢拼合 =====
+    // ===== 玻璃碎片系统:发送时碎成青玻璃片卷入墨洞;接收时碎片飞拢拼合 =====
     property int shardCols: 4
     property int shardRows: 4
     property real fileIconSize: Math.round(win.width * 0.30)   // 拼合后"文件"的边长
-    property real shardProgress: 0.0      // 0=完整拼合, 1=完全碎裂吸入(被动画驱动)
-    property bool shardEmit: false        // false=吸入方向, true=吐出方向
+    property real shardProgress: 0.0      // 0=完整拼合, 1=完全碎裂发送(被动画驱动)
+    property bool shardEmit: false        // false=发送方向, true=接收方向
 
     Item {
         id: shardField
@@ -132,14 +132,14 @@ Window {
         }
     }
 
-    // 吸入:碎裂 0 -> 1(完整文件被撕碎卷入墨洞)
+    // 发送:碎裂 0 -> 1(完整文件被撕碎卷入墨洞)
     SequentialAnimation {
         id: shatterAbsorb
         ScriptAction { script: { win.shardEmit = false; shardField.visible = true } }
         NumberAnimation { target: win; property: "shardProgress"; from: 0; to: 1; duration: 620; easing.type: Easing.InCubic }
         ScriptAction { script: shardField.visible = false }
     }
-    // 吐出:拼合 1 -> 0(碎片从墨洞飞回拼成完整文件),停顿后淡出
+    // 接收:拼合 1 -> 0(碎片从墨洞飞回拼成完整文件),停顿后淡出
     SequentialAnimation {
         id: shatterEmit
         ScriptAction { script: { win.shardEmit = true; win.shardProgress = 1; shardField.visible = true } }
@@ -160,7 +160,7 @@ Window {
         pulse.restart();
     }
 
-    // 收到对端文件时:若缩在边上,先探出,等滑回完整再播吐出动画(否则动画在屏幕外看不见)
+    // 收到对端文件时:若缩在边上,先探出,等滑回完整再播接收动画(否则动画在屏幕外看不见)
     Timer {
         id: emitDelay
         interval: 300
@@ -258,7 +258,7 @@ Window {
             NumberAnimation { target: disk1; property: "opacity"; from: 0.55; to: 1.0; duration: 2600; easing.type: Easing.InOutSine }
         }
 
-        // 传输进度环：青色圆弧，吞入顺时针填充、吐出同样从顶部起
+        // 传输进度环：青色圆弧，发送和接收都从顶部起
         Canvas {
             id: ring
             anchors.fill: parent
@@ -334,10 +334,10 @@ Window {
     }
 
 
-    // 接收桌面拖来的文件 -> 吸入动画 -> 入发送队列；拖文件靠近收起的窄条时自动探出
+    // 接收桌面拖来的文件 -> 发送动画 -> 入发送队列；拖文件靠近收起的窄条时自动探出
     DropArea {
         anchors.fill: parent
-        onEntered: { if (win.collapsed) win.expand(); win.hint = "松手吞入" }
+        onEntered: { if (win.collapsed) win.expand(); win.hint = "松手发送" }
         onExited: { win.hint = ""; if (win.edge >= 0 && !dragArea.containsMouse) autoHide.restart() }
         onDropped: function(drop) {
             win.hint = ""
@@ -347,7 +347,7 @@ Window {
                         bridge.dropFile(drop.urls[i].toString());
                     win.playAbsorb(drop.x, drop.y);
                 } else {
-                    win.hint = "未选择目标设备"
+                    win.hint = bridge.missingTargetMessage()
                 }
             }
             if (win.edge >= 0) autoHide.restart()
@@ -358,9 +358,9 @@ Window {
     // 来自 Python 的事件 -> 提示/动画
     Connections {
         target: bridge
-        function onAbsorb(name) { win.hint = "吞入 " + name }
+        function onAbsorb(name) { win.hint = "发送 " + name }
         function onEmit_out(name) {
-            win.hint = "吐出 " + name;
+            win.hint = "接收 " + name;
             win.emitWhenVisible();
         }
         function onStatus(s) { win.hint = s }

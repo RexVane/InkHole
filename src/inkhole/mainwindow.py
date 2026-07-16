@@ -23,10 +23,10 @@ from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, Slot, Signal,
                             QElapsedTimer, QVariantAnimation,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
-                           QPen, QFont, QIcon, QPixmap)
+                           QPen, QFont, QIcon, QPixmap, QIntValidator)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
-                               QGridLayout, QLineEdit, QSpinBox, QCheckBox,
+                               QLineEdit, QCheckBox,
                                QMessageBox, QSizePolicy, QStackedWidget,
                                QSizeGrip, QToolButton, QStyle,
                                QGraphicsOpacityEffect,
@@ -302,6 +302,35 @@ def normalize_manual_host(raw: str) -> str | None:
 
     search(0, [])
     return ".".join(solutions[0]) if len(solutions) == 1 else None
+
+
+def format_file_size(size: int) -> str:
+    if size <= 0:
+        return ""
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 ** 2:
+        return f"{size / 1024:.0f}KB"
+    if size < 1024 ** 3:
+        return f"{size / 1024 ** 2:.1f}MB"
+    return f"{size / 1024 ** 3:.2f}GB"
+
+
+def format_file_time(timestamp: float, now: float | None = None) -> str:
+    if timestamp <= 0:
+        return ""
+    now = time.time() if now is None else now
+    diff = max(0, now - timestamp)
+    if diff < 60:
+        return "刚刚"
+    if diff < 3600:
+        return f"{int(diff // 60)} 分钟前"
+    if diff < 86400:
+        return f"{int(diff // 3600)} 小时前"
+    if diff < 2 * 86400:
+        return "昨天"
+    value = time.localtime(timestamp)
+    return f"{value.tm_mon}月{value.tm_mday}日 {value.tm_hour:02d}:{value.tm_min:02d}"
 
 
 class ElidedLabel(QLabel):
@@ -753,6 +782,8 @@ class MainWindow(QWidget):
         self._backdrop_ok = False
         self._backdrop_tried = False
         self._page_animation = None
+        self._manual_draft: list[dict] = []
+        self._editing_manual_index: int | None = None
         self._drag_level = 0.0
         self._drag_animation = QVariantAnimation(self)
         self._drag_animation.setDuration(170)
@@ -777,12 +808,17 @@ class MainWindow(QWidget):
         bridge.peersChanged.connect(self._refresh_peers)
         bridge.status.connect(self._on_status)
         bridge.errorState.connect(self._on_error)
-        bridge.emit_out.connect(lambda _n: self._refresh_recent())
+        if hasattr(bridge, "recentChanged"):
+            bridge.recentChanged.connect(self._refresh_recent)
+        else:
+            bridge.emit_out.connect(lambda _n: self._refresh_recent())
         bridge.updateCheckFinished.connect(self._on_update_check)
         if hasattr(bridge, "progress"):
             bridge.progress.connect(self._hole.set_transfer_progress)
         self._refresh_peers()
         self._refresh_recent()
+        if hasattr(bridge, "lastStatus"):
+            self._on_status(bridge.lastStatus())
 
     # ---- 中性深色背景 + 轻微结构纹理 ----
     def paintEvent(self, _e):
@@ -828,7 +864,7 @@ class MainWindow(QWidget):
         left.setContentsMargins(24, 22, 24, 18)
         left.setSpacing(8)
         left.addWidget(_section_label("发送目标"))
-        self._state_lbl = ElidedLabel("正在发现设备")
+        self._state_lbl = ElidedLabel("等待附近的墨洞上线…")
         self._state_lbl.setFixedHeight(46)
         self._state_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._state_lbl.setStyleSheet(
@@ -911,16 +947,17 @@ class MainWindow(QWidget):
         right.addWidget(_divider())
 
         rec_bar = QHBoxLayout()
-        rec_bar.addWidget(_section_label("最近接收"))
+        rec_bar.addWidget(_section_label("已接收"))
         rec_bar.addStretch(1)
-        b_clear = QToolButton()
-        b_clear.setObjectName("Win")
-        b_clear.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
-        b_clear.setFixedSize(30, 28)
-        b_clear.setToolTip("清空接收记录（不删除文件）")
-        b_clear.setCursor(Qt.PointingHandCursor)
-        b_clear.clicked.connect(self._bridge.clearRecent)
-        rec_bar.addWidget(b_clear)
+        self._clear_recent_btn = QToolButton()
+        self._clear_recent_btn.setObjectName("Win")
+        self._clear_recent_btn.setIcon(
+            self.style().standardIcon(QStyle.SP_DialogResetButton))
+        self._clear_recent_btn.setFixedSize(30, 28)
+        self._clear_recent_btn.setToolTip("清空接收记录（不删除文件）")
+        self._clear_recent_btn.setCursor(Qt.PointingHandCursor)
+        self._clear_recent_btn.clicked.connect(self._bridge.clearRecent)
+        rec_bar.addWidget(self._clear_recent_btn)
         b_inbox = QToolButton()
         b_inbox.setObjectName("Win")
         b_inbox.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
@@ -953,7 +990,7 @@ class MainWindow(QWidget):
         back.setObjectName("Link")
         back.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
         back.setCursor(Qt.PointingHandCursor)
-        back.clicked.connect(lambda: self._show_page(0))
+        back.clicked.connect(self._cancel_settings)
         title = QLabel("设置")
         title.setStyleSheet(f"color:{_TEXT}; font-size:19px; font-weight:700;")
         top.addWidget(back)
@@ -977,6 +1014,7 @@ class MainWindow(QWidget):
 
         columns = QHBoxLayout()
         columns.setSpacing(26)
+        self._settings_columns = columns
 
         # ========== 左列:设备设置 + 传输安全 + 跨网络配置 ==========
         left_col = QVBoxLayout()
@@ -997,16 +1035,17 @@ class MainWindow(QWidget):
 
         self._local_info_lbl = _info_line(f"本机：{cfg.peer_name}-{cfg.instance_id}")
         info_lay.addWidget(self._local_info_lbl)
-        info_lay.addWidget(_info_line(f"版本：v{self._bridge.appVersion()}"))
-        # 实际端口需要从节点获取(启动后才有),设置页打开时节点已运行
-        actual_port = cfg.listen_port or "自动"
-        info_lay.addWidget(_info_line(f"端口：{actual_port}（建议自定义固定端口）"))
+        self._version_info_lbl = _info_line(f"版本：v{self._bridge.appVersion()}")
+        info_lay.addWidget(self._version_info_lbl)
+        self._port_info_lbl = _info_line("端口：未启动（建议自定义固定端口）")
+        info_lay.addWidget(self._port_info_lbl)
         left_col.addWidget(info_box)
 
         # ---- 1. 设备设置 ----
         left_col.addWidget(_section_label("设备设置"))
         self._ed_name = QLineEdit()
         self._ed_name.setPlaceholderText("设备名称")
+        self._ed_name.setMaxLength(40)
         # 设备名输入框实时同步本机信息显示
         self._ed_name.textChanged.connect(
             lambda name: self._local_info_lbl.setText(f"本机：{name or cfg.peer_name}-{cfg.instance_id}")
@@ -1065,7 +1104,7 @@ class MainWindow(QWidget):
         secret_lay.setSpacing(10)
         secret_lay.addWidget(self._ed_secret, 1)
         secret_lay.addWidget(b_eye)
-        left_col.addWidget(_field("加密口令", secret_row))
+        left_col.addWidget(_field("加密口令（可选，两端一致）", secret_row))
 
         def _toggle_row(title_text: str, detail: str):
             row = QWidget()
@@ -1088,7 +1127,7 @@ class MainWindow(QWidget):
             return row, checkbox
 
         trusted_row, self._cb_trusted = _toggle_row(
-            "仅接收目标设备", "拒绝其他局域网设备发送的文件")
+            "仅接收目标设备", "只允许当前选中的设备向本机发送文件")
         left_col.addWidget(trusted_row)
 
         # ---- 3. 跨网络配置 ----
@@ -1096,9 +1135,14 @@ class MainWindow(QWidget):
         left_col.addWidget(_divider())
         left_col.addSpacing(6)
         left_col.addWidget(_section_label("跨网络配置"))
-        self._sp_port = QSpinBox()
-        self._sp_port.setRange(0, 65535)
-        self._sp_port.setToolTip("0 = 系统自动分配")
+        network_hint = QLabel(
+            "跨网直连时固定本机监听端口，并填写对方 Tailscale IP 与监听端口")
+        network_hint.setWordWrap(True)
+        network_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        left_col.addWidget(network_hint)
+        self._sp_port = QLineEdit()
+        self._sp_port.setValidator(QIntValidator(1, 65535, self._sp_port))
+        self._sp_port.setPlaceholderText("留空=自动，如 52130")
         left_col.addWidget(_field("本机监听端口", self._sp_port))
 
         manual_row = QWidget()
@@ -1106,23 +1150,23 @@ class MainWindow(QWidget):
         manual_lay.setContentsMargins(0, 0, 0, 0)
         manual_lay.setSpacing(8)
         self._manual_name = QLineEdit()
-        self._manual_name.setPlaceholderText("备注")
-        self._manual_name.setFixedWidth(100)
+        self._manual_name.setPlaceholderText("备注（如 我的电脑，可选）")
+        self._manual_name.setMinimumWidth(70)
         self._manual_host = QLineEdit()
-        self._manual_host.setPlaceholderText("对方 IP (如 100.127.46.26)")
-        self._manual_host.textChanged.connect(lambda t: self._manual_host.setText(
-            _mask_ip_input(t)))
-        self._manual_port = QSpinBox()
-        self._manual_port.setRange(1, 65535)
-        self._manual_port.setValue(8765)
-        self._manual_port.setFixedWidth(78)
-        b_manual_add = QPushButton("添加")
-        b_manual_add.setCursor(Qt.PointingHandCursor)
-        b_manual_add.clicked.connect(self._add_manual_peer)
-        manual_lay.addWidget(self._manual_name)
-        manual_lay.addWidget(self._manual_host, 1)
-        manual_lay.addWidget(self._manual_port)
-        manual_lay.addWidget(b_manual_add)
+        self._manual_host.setPlaceholderText("对方 Tailscale IP")
+        self._manual_host.setMinimumWidth(90)
+        self._manual_host.textEdited.connect(self._mask_manual_host)
+        self._manual_port = QLineEdit()
+        self._manual_port.setValidator(QIntValidator(1, 65535, self._manual_port))
+        self._manual_port.setPlaceholderText("对方的监听端口")
+        self._manual_port.setMinimumWidth(80)
+        self._manual_add_btn = QPushButton("添加设备")
+        self._manual_add_btn.setCursor(Qt.PointingHandCursor)
+        self._manual_add_btn.clicked.connect(self._add_manual_peer)
+        manual_lay.addWidget(self._manual_name, 2)
+        manual_lay.addWidget(self._manual_host, 3)
+        manual_lay.addWidget(self._manual_port, 2)
+        manual_lay.addWidget(self._manual_add_btn)
         left_col.addWidget(manual_row)
 
         manual_box = QWidget()
@@ -1201,8 +1245,32 @@ class MainWindow(QWidget):
         update_lay.addLayout(update_copy, 1)
         update_lay.addWidget(self._update_btn, 0, Qt.AlignVCenter)
         right_col.addWidget(update_row)
+        right_col.addWidget(_divider())
+
+        repository_row = QWidget()
+        repository_lay = QHBoxLayout(repository_row)
+        repository_lay.setContentsMargins(0, 8, 0, 8)
+        repository_lay.setSpacing(12)
+        repository_copy = QVBoxLayout()
+        repository_copy.setSpacing(2)
+        repository_title = QLabel("GitHub 仓库")
+        repository_title.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
+        repository_detail = QLabel("查看源码、问题反馈与历史版本")
+        repository_detail.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        repository_copy.addWidget(repository_title)
+        repository_copy.addWidget(repository_detail)
+        self._repository_btn = QPushButton("打开仓库")
+        self._repository_btn.setObjectName("QuietAction")
+        self._repository_btn.setCursor(Qt.PointingHandCursor)
+        self._repository_btn.clicked.connect(
+            lambda: self._bridge.openPath(self._bridge.repositoryPage()))
+        repository_lay.addLayout(repository_copy, 1)
+        repository_lay.addWidget(self._repository_btn, 0, Qt.AlignVCenter)
+        right_col.addWidget(repository_row)
         right_col.addStretch(1)
         columns.addLayout(right_col, 2)
+        columns.setStretch(0, 3)
+        columns.setStretch(2, 2)
         # 内容装进滚动区:窗口高度不足时出滚动条,而不是把输入框压扁裁切
         content = QWidget()
         content.setLayout(columns)
@@ -1215,10 +1283,12 @@ class MainWindow(QWidget):
         lay.addWidget(_divider())
 
         btns = QHBoxLayout()
-        self._local_lbl = ElidedLabel(mode=Qt.ElideMiddle)
-        self._local_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
-        btns.addWidget(self._local_lbl)
         btns.addStretch(1)
+        b_cancel = QPushButton("取消")
+        b_cancel.setObjectName("QuietAction")
+        b_cancel.setCursor(Qt.PointingHandCursor)
+        b_cancel.clicked.connect(self._cancel_settings)
+        btns.addWidget(b_cancel)
         b_save = QPushButton("保存")
         b_save.setObjectName("Primary")
         b_save.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
@@ -1262,34 +1332,43 @@ class MainWindow(QWidget):
         cfg = self._bridge.lanConfig()
         self._ed_name.setText(cfg.peer_name)
         self._ed_secret.setText(cfg.secret)
-        self._sp_port.setValue(cfg.listen_port)
+        self._sp_port.setText(str(cfg.listen_port) if cfg.listen_port else "")
         self._ed_inbox.setText(os.path.abspath(cfg.inbox))
         self._cb_trusted.setChecked(cfg.trusted_only)
         self._cb_pet.setChecked(bool(self._ctl["pet_visible"]()))
         self._cb_auto.setChecked(bool(self._ctl["is_autostart"]()))
-        ips = " / ".join(self._bridge.localAddresses()) or "?"
-        self._local_lbl.set_full_text(
-            f"v{self._bridge.appVersion()} · 本机：{cfg.peer_name}-{cfg.instance_id}"
-            f" · 端口 {cfg.listen_port or '自动'}"
-            f" · IP {ips}（对方手动添加本机时填这里的 IP 和端口）")
+        actual_port = (self._bridge.actualPort()
+                       if hasattr(self._bridge, "actualPort") else cfg.listen_port)
+        self._local_info_lbl.setText(f"本机：{cfg.peer_name}-{cfg.instance_id}")
+        self._version_info_lbl.setText(f"版本：v{self._bridge.appVersion()}")
+        self._port_info_lbl.setText(
+            f"端口：{actual_port if actual_port else '未启动'}（建议自定义固定端口）")
+        self._manual_draft = [dict(entry) for entry in self._bridge.manualPeers()]
+        self._reset_manual_editor()
         self._refresh_manual_list()
         self._show_page(1)
+
+    def _cancel_settings(self):
+        """放弃设置页草稿；返回主页不触碰正在运行的节点。"""
+        self._manual_draft = []
+        self._reset_manual_editor()
+        self._show_page(0)
 
     def _show_usage_guide(self):
         """使用说明弹窗(首启自动弹一次 + 设置页入口)。富文本三段:
         局域网 / 跨网络 / 文件位置,按桌面端工作流写。"""
         html = (
             "<p style='margin:0 0 4px 0;'><b>局域网</b></p>"
-            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备连接同一个 WiFi 并都打开"
-            "墨洞,右侧「设备」栏里会自动出现对方。点选对方设备后,把文件拖到窗口(或墨洞),"
-            "也可以点「选择文件」发送。</p>"
+            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备连接同一个 WiFi，并同时打开"
+            "墨洞。发现设备后，点击对方设备，再点击墨洞图标选择文件发送；也可以把文件拖到"
+            "窗口或墨洞图标。</p>"
             "<p style='margin:0 0 4px 0;'><b>跨网络</b></p>"
-            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备安装 Tailscale 并登录同一"
-            "账号。先在设置里固定本机监听端口,再到「跨网络配置」填对方的 Tailscale IP 与监听"
-            "端口添加设备。添加后,发送方式与局域网相同。</p>"
+            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备登录同一个 Tailscale 网络。"
+            "在设置中配置固定监听端口，然后填写对方的 Tailscale IP 和监听端口添加设备。"
+            "添加后，发送方式与局域网相同。</p>"
             "<p style='margin:0 0 4px 0;'><b>文件位置</b></p>"
-            "<p style='margin:0; color:#B2BFBC;'>收到的文件保存在设置里的收件箱目录,可在"
-            "「最近接收」中查看,或点其右上角的文件夹按钮直接打开目录。</p>"
+            "<p style='margin:0; color:#B2BFBC;'>收到的文件保存在设置里的收件箱目录，也可以"
+            "在首页「已接收」中查看。</p>"
         )
         box = QMessageBox(self)
         box.setWindowTitle("使用说明")
@@ -1316,22 +1395,25 @@ class MainWindow(QWidget):
         if not has_new:
             QMessageBox.information(
                 self, "检查更新",
-                f"当前已是最新版本 v{self._bridge.appVersion()}。")
+                f"已是最新版本 v{self._bridge.appVersion()}")
             return
         import sys as _sys
         packaged = bool(getattr(_sys, "frozen", False)) and _sys.platform == "win32"
         summary = (notes or "").strip()
-        if len(summary) > 260:
-            summary = summary[:260] + "…"
+        can_direct = packaged and bool(asset_url)
         box = QMessageBox(self)
         box.setWindowTitle("发现新版本")
-        box.setText(f"最新版本 {latest}（当前 v{self._bridge.appVersion()}）")
-        box.setInformativeText(summary or "查看发布页了解更新内容。")
-        if packaged and asset_url:
+        box.setText(
+            f"当前版本：v{self._bridge.appVersion()}\n"
+            f"最新版本：{latest}\n"
+            f"更新状态：{'可直接更新' if can_direct else '可前往发布页下载'}")
+        box.setInformativeText(
+            f"本次更新\n{summary or '发布说明暂不可用'}")
+        if can_direct:
             b_auto = box.addButton("立即更新", QMessageBox.AcceptRole)
         else:
             b_auto = None
-        b_page = box.addButton("打开下载页", QMessageBox.ActionRole)
+        b_page = box.addButton("查看发布页", QMessageBox.ActionRole)
         box.addButton("取消", QMessageBox.RejectRole)
         box.exec()
         clicked = box.clickedButton()
@@ -1349,7 +1431,7 @@ class MainWindow(QWidget):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        for entry in self._bridge.manualPeers():
+        for index, entry in enumerate(self._manual_draft):
             host, port = str(entry.get("host")), int(entry.get("port"))
             name = str(entry.get("name") or "")
             row = QWidget()
@@ -1363,26 +1445,27 @@ class MainWindow(QWidget):
             b_edit.setObjectName("Link")
             b_edit.setCursor(Qt.PointingHandCursor)
             b_edit.clicked.connect(
-                lambda checked=False, n=name, h=host, p=port:
-                self._edit_manual_peer(n, h, p))
-            b_del = QPushButton("移除")
+                lambda checked=False, i=index: self._edit_manual_peer(i))
+            b_del = QPushButton("删除")
             b_del.setObjectName("Link")
             b_del.setCursor(Qt.PointingHandCursor)
             b_del.clicked.connect(
-                lambda checked=False, h=host, p=port: self._remove_manual_peer(h, p))
+                lambda checked=False, i=index: self._remove_manual_peer(i))
             row_lay.addWidget(lbl, 1)
             row_lay.addWidget(b_edit)
             row_lay.addWidget(b_del)
             self._manual_list_lay.addWidget(row)
 
-    def _edit_manual_peer(self, name: str, host: str, port: int):
-        """编辑 = 回填到输入框并移除原条目,改完点「添加」保存。"""
-        self._manual_name.setText(name)
-        self._manual_host.setText(host)
-        self._manual_port.setValue(port)
-        self._bridge.removeManualPeer(host, port)
-        self._refresh_manual_list()
-        self._refresh_peers()
+    def _edit_manual_peer(self, index: int):
+        """回填草稿；只有点「保存设备」后才替换原条目。"""
+        if not 0 <= index < len(self._manual_draft):
+            return
+        entry = self._manual_draft[index]
+        self._editing_manual_index = index
+        self._manual_name.setText(str(entry.get("name") or ""))
+        self._manual_host.setText(str(entry.get("host") or ""))
+        self._manual_port.setText(str(entry.get("port") or ""))
+        self._manual_add_btn.setText("保存设备")
         self._manual_host.setFocus()
 
     def _mask_manual_host(self, text: str):
@@ -1396,29 +1479,47 @@ class MainWindow(QWidget):
 
     def _add_manual_peer(self):
         raw = self._manual_host.text()
-        if not raw.strip():
-            return
+        try:
+            port = int(self._manual_port.text())
+        except (TypeError, ValueError):
+            port = 0
         host = normalize_manual_host(raw)
-        if host is None:
+        if host is None or not 1 <= port <= 65535:
             QMessageBox.warning(self, "手动设备",
-                                "IP 无效或有歧义，请检查后重新输入")
+                                "Tailscale IP 无效，或对方监听端口不在 1-65535 范围内")
             return
         if host != raw.strip():
             self._manual_host.setText(host)   # 回显修正结果,用户可见实际用的地址
             self._on_status(f"已自动修正为 {host}")
-        if self._bridge.addManualPeer(self._manual_name.text().strip(),
-                                      host, self._manual_port.value()):
-            self._manual_name.clear()
-            self._manual_host.clear()
-            self._refresh_manual_list()
-            self._refresh_peers()
-        else:
-            QMessageBox.warning(self, "手动设备", "地址无效，请检查 IP 与端口")
-
-    def _remove_manual_peer(self, host: str, port: int):
-        self._bridge.removeManualPeer(host, port)
+        editing = self._editing_manual_index
+        draft = [entry for index, entry in enumerate(self._manual_draft)
+                 if index != editing]
+        draft = [entry for entry in draft
+                 if not (str(entry.get("host")) == host
+                         and int(entry.get("port")) == port)]
+        draft.append({"name": self._manual_name.text().strip(),
+                      "host": host, "port": port})
+        self._manual_draft = draft
+        self._reset_manual_editor()
         self._refresh_manual_list()
-        self._refresh_peers()
+
+    def _remove_manual_peer(self, index: int):
+        if not 0 <= index < len(self._manual_draft):
+            return
+        self._manual_draft.pop(index)
+        if self._editing_manual_index == index:
+            self._reset_manual_editor()
+        elif (self._editing_manual_index is not None
+              and self._editing_manual_index > index):
+            self._editing_manual_index -= 1
+        self._refresh_manual_list()
+
+    def _reset_manual_editor(self):
+        self._editing_manual_index = None
+        self._manual_name.clear()
+        self._manual_host.clear()
+        self._manual_port.clear()
+        self._manual_add_btn.setText("添加设备")
 
     def _choose_inbox(self):
         d = QFileDialog.getExistingDirectory(self, "选择收件箱目录",
@@ -1431,6 +1532,15 @@ class MainWindow(QWidget):
         if not name:
             QMessageBox.warning(self, "墨洞", "设备名称不能为空")
             return
+        port_text = self._sp_port.text().strip()
+        try:
+            port = int(port_text) if port_text else 0
+        except ValueError:
+            port = -1
+        if port_text and not 1 <= port <= 65535:
+            QMessageBox.warning(
+                self, "墨洞", "本机监听端口必须在 1-65535 范围内")
+            return
         inbox = self._ed_inbox.text()
         if inbox:
             self._bridge.setInbox(inbox)   # 单独持久化:即使名字/端口没变也要落盘
@@ -1439,8 +1549,11 @@ class MainWindow(QWidget):
         self._ctl["set_pet_visible"](self._cb_pet.isChecked())
         if self._cb_auto.isChecked() != bool(self._ctl["is_autostart"]()):
             self._ctl["set_autostart"](self._cb_auto.isChecked())
+        self._bridge.setManualPeers(self._manual_draft)
         self._ctl["apply_settings"](name, self._ed_secret.text(),
-                                    self._sp_port.value())
+                                    port)
+        self._manual_draft = []
+        self._reset_manual_editor()
         self._show_page(0)
         self._refresh_peers()
 
@@ -1459,7 +1572,7 @@ class MainWindow(QWidget):
         self._hole.set_searching(len(peers) == 0)   # 无设备时墨洞播放雷达波纹
 
         if not peers:
-            empty = QLabel("正在发现设备 · 跨网设备可在设置中手动添加")
+            empty = QLabel("还没发现设备")
             empty.setAlignment(Qt.AlignCenter)
             empty.setWordWrap(True)
             empty.setStyleSheet(
@@ -1518,15 +1631,15 @@ class MainWindow(QWidget):
         if selected:
             self._state_lbl.setStyleSheet(
                 f"color:{_TEAL_BRIGHT}; font-size:18px; font-weight:650;")
-            self._state_lbl.set_full_text(f"发送至  {selected}")
+            self._state_lbl.set_full_text(f"目标：{selected}")
         elif n:
             self._state_lbl.setStyleSheet(
                 f"color:{_TEXT_SECOND}; font-size:18px; font-weight:650;")
-            self._state_lbl.set_full_text(f"{n} 台设备可用")
+            self._state_lbl.set_full_text("点选右侧设备作为目标")
         else:
             self._state_lbl.setStyleSheet(
                 f"color:{_TEXT_DIM}; font-size:18px; font-weight:650;")
-            self._state_lbl.set_full_text("正在发现设备")
+            self._state_lbl.set_full_text("等待附近的墨洞上线…")
 
     # ================= 最近接收 =================
     def _refresh_recent(self):
@@ -1536,8 +1649,9 @@ class MainWindow(QWidget):
                 it.widget().deleteLater()
         recents = self._bridge.recentFiles()
         self._recent_count_lbl.setText(str(len(recents)))
+        self._clear_recent_btn.setVisible(bool(recents))
         if not recents:
-            empty = QLabel("暂无接收记录")
+            empty = QLabel("还没有收到过文件")
             empty.setAlignment(Qt.AlignCenter)
             empty.setStyleSheet(
                 f"color:{_TEXT_DIM}; padding: 22px 4px; font-size:12px;")
@@ -1547,7 +1661,7 @@ class MainWindow(QWidget):
         self._recent_lay.addStretch(1)
 
     def _file_card(self, path: str) -> QFrame:
-        card = InteractiveCard(compact=True, clickable=False)
+        card = InteractiveCard(compact=True)
         card.setAccessibleName(f"打开文件 {os.path.basename(path)}")
         lay = QHBoxLayout(card)
         lay.setContentsMargins(11, 8, 10, 8)
@@ -1557,23 +1671,40 @@ class MainWindow(QWidget):
         icon.setObjectName("FileBadge")
         icon.setFixedSize(38, 36)
         icon.setAlignment(Qt.AlignCenter)
+        copy = QVBoxLayout()
+        copy.setSpacing(2)
         name = ElidedLabel(os.path.basename(path), Qt.ElideMiddle)
         name.setStyleSheet(f"color:{_TEXT}; font-size:12px;")
         name.setToolTip(path)
+        copy.addWidget(name)
+        try:
+            meta_text = " · ".join(filter(None, (
+                format_file_size(os.path.getsize(path)),
+                format_file_time(os.path.getmtime(path)),
+            )))
+        except OSError:
+            meta_text = ""
+        if meta_text:
+            meta = ElidedLabel(meta_text)
+            meta.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10px;")
+            copy.addWidget(meta)
         b_open = QPushButton("打开")
         b_open.setObjectName("QuietAction")
         b_open.setFixedWidth(52)
         b_open.setCursor(Qt.PointingHandCursor)
         b_open.clicked.connect(lambda checked=False, p=path: self._bridge.openPath(p))
+        card.clicked.connect(lambda p=path: self._bridge.openPath(p))
         lay.addWidget(icon)
-        lay.addWidget(name, 1)
+        lay.addLayout(copy, 1)
         lay.addWidget(b_open)
         return card
 
     # ================= 发送 / 状态 =================
     def _pick_and_send(self):
         if not self._bridge.node.selected_peer():
-            self._on_error("先在右侧点击卡片选择目标设备")
+            self._on_error(
+                "还没发现设备" if not self._bridge.node.peers()
+                else "先点选一台目标设备")
             return
         files, _ = QFileDialog.getOpenFileNames(self, "选择要发送的文件")
         for fp in files:
@@ -1631,6 +1762,11 @@ class MainWindow(QWidget):
     # ================= 磨砂 & 关闭 =================
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        columns = getattr(self, "_settings_columns", None)
+        if columns is not None:
+            narrow = self.width() < 880
+            columns.setStretch(0, 7 if narrow else 3)
+            columns.setStretch(2, 3 if narrow else 2)
         grip = getattr(self, "_grip", None)
         if grip is not None:
             grip.move(self.width() - grip.width() - 2,

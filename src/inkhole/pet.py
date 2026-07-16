@@ -7,8 +7,8 @@ pet.py
       桌面小图标大小，低调浮在角落，无边框、透明、置顶、可拖动。
 
 交互：
-  - 从桌面拖文件到挂件上 -> 黑洞放大"吸入"动画 -> P2P 直连发给目标设备。
-  - 收到对端文件(node.on_received 回调) -> 黑洞放大"喷出"动画(文件已落在收件箱)。
+  - 从桌面拖文件到挂件上 -> 黑洞播放发送动画 -> P2P 直连发给目标设备。
+  - 收到对端文件(node.on_received 回调) -> 黑洞播放接收动画(文件已落在收件箱)。
   - 右键菜单：发送目标 / 打开收件箱 / 更换收件箱 / 开机自启 / 状态 / 退出。
   - 鼠标拖动窗口可挪到桌面任意位置。
 
@@ -88,6 +88,7 @@ def _summarize_release_notes(raw: str, max_items: int = 4) -> str:
 
 _RELEASES_PAGE = "https://github.com/RexVane/InkHole/releases/latest"
 _RELEASES_API = "https://api.github.com/repos/RexVane/InkHole/releases/latest"
+_REPOSITORY_PAGE = "https://github.com/RexVane/InkHole"
 
 def _qml_path() -> str:
     """定位 inkhole.qml。
@@ -152,6 +153,8 @@ def _default_inbox() -> str:
 # 双击 exe 的用户没有命令行：名字/口令/收件箱改一次就记住。
 # 显式 CLI 参数 > 配置文件 > 默认值；显式参数会写回配置(下次不带参数也生效)。
 
+_CONFIG_LOCK = threading.RLock()
+
 def _config_path() -> str:
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -162,37 +165,39 @@ def _config_path() -> str:
 
 
 def _load_saved_config() -> dict:
-    try:
-        with open(_config_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    with _CONFIG_LOCK:
+        try:
+            with open(_config_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
 
 def _save_config(cfg: P2PConfig, **extra) -> None:
     """写回配置。读改写合并：不丢掉 P2PConfig 之外的界面项(如 show_pet)。"""
     path = _config_path()
-    try:
-        data = _load_saved_config()
-        # SSH 中转方案已移除:清掉历史遗留的相关键,避免污染配置
-        for stale in ("ssh_relay", "relay", "transport_mode"):
-            data.pop(stale, None)
-        data.update({"name": cfg.peer_name, "secret": cfg.secret,
-                     "inbox": cfg.inbox, "port": cfg.listen_port,
-                     "trusted_only": cfg.trusted_only,
-                     "instance_id": cfg.instance_id,
-                     "manual_peers": list(cfg.manual_peers or [])})
-        data.update(extra)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+    with _CONFIG_LOCK:
         try:
-            os.chmod(path, 0o600)
+            data = _load_saved_config()
+            # SSH 中转方案已移除:清掉历史遗留的相关键,避免污染配置
+            for stale in ("ssh_relay", "relay", "transport_mode"):
+                data.pop(stale, None)
+            data.update({"name": cfg.peer_name, "secret": cfg.secret,
+                         "inbox": cfg.inbox, "port": cfg.listen_port,
+                         "trusted_only": cfg.trusted_only,
+                         "instance_id": cfg.instance_id,
+                         "manual_peers": list(cfg.manual_peers or [])})
+            data.update(extra)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except OSError:
             pass
-    except OSError:
-        pass
 
 
 class SendQueue:
@@ -654,10 +659,11 @@ def main(argv=None) -> None:
 
     # ---- Python<->QML 桥：把 P2P 引擎的事件转成 QML 信号驱动动画 ----
     class Bridge(QObject):
-        absorb = Signal(str)          # 通知 QML 播放"吸入"动画(参数=文件名)
-        emit_out = Signal(str)        # 通知 QML 播放"喷出"动画(参数=文件名)
+        absorb = Signal(str)          # 通知 QML 播放发送动画(参数=文件名)
+        emit_out = Signal(str)        # 通知 QML 播放接收动画(参数=文件名)
         status = Signal(str)          # 临时状态文字(2.2s 后消失)
         peersChanged = Signal()       # 设备列表变化(刷新菜单)
+        recentChanged = Signal()      # 接收历史变化(不触发桌宠接收动画)
         errorState = Signal(str)      # 错误信息(持续显示，非空=有错误，空=清除)
         progress = Signal(str, int)   # 传输进度(kind "send"/"recv", 百分比 0-100)
         transferStateChanged = Signal(bool)
@@ -668,11 +674,18 @@ def main(argv=None) -> None:
             super().__init__()
             self._tray_menu = None        # 由 _setup_tray 注入:桌宠右键时弹出
             self._main_window = None      # 由 main() 注入:主界面窗口
-            self._recent: deque[str] = deque(maxlen=8)   # 最近收到的文件(路径)
+            saved_recent = _load_saved_config().get("recent_files", [])
+            if not isinstance(saved_recent, list):
+                saved_recent = []
+            self._recent: deque[str] = deque(
+                (str(path) for path in saved_recent[:50]
+                 if isinstance(path, str)),
+                maxlen=50)
             self._engine_lock = threading.RLock()
             self._progress_lock = threading.Lock()
             self._progress_generation = 0
             self._progress_active = False
+            self._last_status = "正在启动…"
             self._lan_cfg = cfg
             # 设置保存会后台重启节点(mDNS 重新注册,阻塞数秒不能占 UI 线程);
             # _restart_gate 保证同一时刻只有一次重启,_restarting 供发送路径守卫。
@@ -713,7 +726,12 @@ def main(argv=None) -> None:
 
         def _on_received_file(self, path: str) -> None:
             self._recent.appendleft(path)
+            self._save_recent()
+            self.recentChanged.emit()
             self.emit_out.emit(os.path.basename(path))
+
+        def _save_recent(self) -> None:
+            _save_config(self._lan_cfg, recent_files=list(self._recent))
 
         def _on_progress(self, kind: str, name: str, done: int, total: int) -> None:
             with self._progress_lock:
@@ -732,8 +750,9 @@ def main(argv=None) -> None:
             threading.Timer(1.25, settle).start()
             pct = done * 100 // total if total else 100
             self.progress.emit(kind, pct)
-            arrow = "↑" if kind == "send" else "↓"
-            self.status.emit(f"{arrow} {name} {pct}%")
+            label = "↑ 发送" if kind == "send" else "↓ 接收"
+            self._last_status = f"{label} {name} {pct}%"
+            self.status.emit(self._last_status)
 
         def _apply_settings(self, peer_name: str | None = None,
                             secret: str | None = None,
@@ -756,6 +775,12 @@ def main(argv=None) -> None:
         def _apply_settings_blocking(self, peer_name, secret, port) -> None:
             cfg = self._lan_cfg
             with self._engine_lock:
+                selected_service = self.node._last_selected_service
+                selected = self.node.selected_peer()
+                if selected:
+                    selected_service = next(
+                        (peer.service_name for peer in self.node.peers()
+                         if peer.name == selected), selected_service)
                 self.node.stop()
                 if peer_name is not None:
                     cfg.peer_name = peer_name
@@ -772,11 +797,13 @@ def main(argv=None) -> None:
                     _save_config(cfg)
                     self.node = self._make_node(cfg)
                     self.status.emit("缺少 cryptography 库，加密未开启")
+                self.node._last_selected_service = selected_service
                 self.node.start()
             self.peersChanged.emit()
 
         def _route_status(self, msg: str) -> None:
             """出错信息走 persistentHint(持续显示)，普通信息走 hint(2.2s 消失)。"""
+            self._last_status = msg
             if msg and ("失败" in msg or "无法" in msg):
                 self.errorState.emit(msg)
             else:
@@ -802,10 +829,26 @@ def main(argv=None) -> None:
             except Exception:
                 return []
 
+        @Slot(result=int)
+        def actualPort(self) -> int:
+            """当前节点实际监听端口；固定端口被占用时也返回回退后的端口。"""
+            try:
+                return int(self.node.actual_port)
+            except Exception:
+                return 0
+
+        @Slot(result=str)
+        def lastStatus(self) -> str:
+            return self._last_status
+
         @Slot(result=str)
         def peerStatus(self) -> str:
             """持续状态：始终返回空(桌宠不显示持续文字，只有出错时才显示)。"""
             return ""
+
+        @Slot(result=str)
+        def missingTargetMessage(self) -> str:
+            return "还没发现设备" if not self.node.peers() else "先点选一台目标设备"
 
         def _select_peer(self, name):
             """选中目标设备(由右键菜单触发)。"""
@@ -822,7 +865,7 @@ def main(argv=None) -> None:
             if not path:
                 return
             if not self.node.selected_peer():
-                self.status.emit("右键选择目标设备")
+                self.status.emit(self.missingTargetMessage())
                 return
             self._enqueue_path(path)
 
@@ -860,11 +903,11 @@ def main(argv=None) -> None:
             临时打包目录的清理已下沉到 per-file 回调(_enqueue_path 里的
             _cleanup),这里不再统一清理,避免跨批次误删/漏删。"""
             if total > 1:
-                self.status.emit(f"已吞入 {ok}/{total} 个")
+                self.status.emit(f"已发送 {ok}/{total} 个文件")
 
         @Slot(result=bool)
         def hasTarget(self) -> bool:
-            """QML 用来判断拖入文件时是否该播吸入动画。"""
+            """QML 用来判断拖入文件时是否该播发送动画。"""
             return self.node.selected_peer() is not None
 
         @Slot(result=bool)
@@ -873,7 +916,7 @@ def main(argv=None) -> None:
 
         @Slot(result=bool)
         def toggleTrustedOnly(self) -> bool:
-            """切换「仅接收目标设备」：拦掉局域网里陌生设备的投喂。"""
+            """切换「仅接收目标设备」：拦掉其他设备发来的文件。"""
             self._lan_cfg.trusted_only = not self._lan_cfg.trusted_only
             _save_config(self._lan_cfg)
             return self._lan_cfg.trusted_only
@@ -887,7 +930,8 @@ def main(argv=None) -> None:
         def clearRecent(self) -> None:
             """清空最近接收列表(只清记录,不动磁盘上的文件)。"""
             self._recent.clear()
-            self.emit_out.emit("")   # 复用信号触发界面刷新列表
+            self._save_recent()
+            self.recentChanged.emit()
 
         @Slot(str)
         def openPath(self, path: str):
@@ -960,6 +1004,47 @@ def main(argv=None) -> None:
         @Slot(result="QVariantList")
         def manualPeers(self) -> list:
             return [dict(m) for m in (self._lan_cfg.manual_peers or [])]
+
+        @Slot("QVariantList", result=bool)
+        def setManualPeers(self, peers: list) -> bool:
+            """一次提交设置页的手动设备草稿，并同步当前节点。"""
+            normalized: list[dict] = []
+            positions: dict[tuple[str, int], int] = {}
+            try:
+                for raw in peers or []:
+                    host = str(raw.get("host", "")).strip()
+                    name = str(raw.get("name", "")).strip()
+                    port = int(raw.get("port", 0))
+                    if not host or " " in host or not 1 <= port <= 65535:
+                        return False
+                    entry = {"name": name, "host": host, "port": port}
+                    key = (host, port)
+                    if key in positions:
+                        normalized[positions[key]] = entry
+                    else:
+                        positions[key] = len(normalized)
+                        normalized.append(entry)
+            except (AttributeError, TypeError, ValueError):
+                return False
+
+            old = [dict(entry) for entry in (self._lan_cfg.manual_peers or [])]
+            if old == normalized:
+                return True
+            old_by_key = {(str(entry["host"]), int(entry["port"])): entry
+                          for entry in old}
+            new_by_key = {(entry["host"], entry["port"]): entry
+                          for entry in normalized}
+            if isinstance(self.node, P2PNode):
+                for key, entry in old_by_key.items():
+                    if key not in new_by_key or new_by_key[key] != entry:
+                        self.node.remove_manual_peer(*key)
+                for key, entry in new_by_key.items():
+                    if key not in old_by_key or old_by_key[key] != entry:
+                        self.node.add_manual_peer(
+                            entry["name"], entry["host"], entry["port"])
+            self._lan_cfg.manual_peers = [dict(entry) for entry in normalized]
+            _save_config(self._lan_cfg)
+            return True
 
         @Slot(str, str, int, result=bool)
         def addManualPeer(self, name: str, host: str, port: int) -> bool:
@@ -1076,6 +1161,10 @@ def main(argv=None) -> None:
         @Slot(result=str)
         def releasesPage(self) -> str:
             return _RELEASES_PAGE
+
+        @Slot(result=str)
+        def repositoryPage(self) -> str:
+            return _REPOSITORY_PAGE
 
         @Slot()
         def checkUpdate(self) -> None:

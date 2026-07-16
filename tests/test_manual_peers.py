@@ -107,3 +107,44 @@ def test_manual_peer_add_remove_updates_config(tmp_path):
         assert not any("100.64.0.2" in p.hosts for p in node.peers())
     finally:
         node.stop()
+
+
+def test_occupied_fixed_port_falls_back_and_reports_actual_port(tmp_path):
+    """Match Android: an occupied fixed port must not prevent startup."""
+    blocker = socket.socket()
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    blocker.bind(("", 0))
+    blocker.listen(1)
+    requested = blocker.getsockname()[1]
+    statuses = []
+    node = P2PNode(
+        P2PConfig(inbox=str(tmp_path / "fallback_inbox"),
+                  listen_port=requested, peer_name="Fallback",
+                  enable_mdns=False),
+        on_status=statuses.append,
+    )
+    try:
+        node.start()
+        assert node.actual_port > 0
+        assert node.actual_port != requested
+        assert statuses[-1] == (
+            f"墨洞已开启 · 端口 {requested} 被占用，当前端口 {node.actual_port}")
+    finally:
+        node.stop()
+        blocker.close()
+
+
+def test_listener_start_failure_is_reported_without_crashing(tmp_path, monkeypatch):
+    statuses = []
+    node = _node(tmp_path, "Failure")
+
+    def fail_start():
+        raise OSError("no sockets")
+
+    monkeypatch.setattr(node, "_start_tcp_server", fail_start)
+    node.on_status = statuses.append
+    node.start()
+    assert node.actual_port == 0
+    assert not node._running
+    assert statuses == ["墨洞未开启：监听端口启动失败"]
