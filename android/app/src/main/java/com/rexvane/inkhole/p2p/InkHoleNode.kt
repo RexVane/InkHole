@@ -67,6 +67,10 @@ class InkHoleNode(
         private const val LOST_PROBE_TIMEOUT_MS = 1200        // 单次 TCP 探活超时
         private const val LOST_PROBE_ATTEMPTS = 3             // 连续失败几次才判定真离线
         private const val LOST_PROBE_INTERVAL_MS = 1000L      // 两次探活间隔
+        // 全量存活探活：定期 TCP 探测所有对端(含自动发现),本机断网/对端崩溃时清残留
+        private const val PROBE_INTERVAL_MS = 5_000L          // 探活轮询间隔
+        private const val PROBE_STRIKES = 2                   // 自动发现设备连续失败几轮剔除
+        private const val PROBE_STRIKES_MANUAL = 4            // 手动设备双倍容忍(息屏 WiFi 休眠易误判)
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -135,7 +139,7 @@ class InkHoleNode(
         }
         // 手动设备:乐观注册(真离线的话探活循环 ~10s 内剔除,回线自动加回)
         manualPeers.forEach { registerManual(it) }
-        if (manualPeers.isNotEmpty()) startManualProbeLoop()
+        startProbeLoop()  // 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留
         // 发现自愈:NSD 发现流偶尔"卡死"(WiFi 省电丢组播/系统服务抽风),
         // 表现为对端明明在线列表却空着。列表持续为空时周期性重启发现。
         scope.launch {
@@ -180,24 +184,61 @@ class InkHoleNode(
         addPeer(m.key, m.name.ifEmpty { m.host }, m.host, m.port)
     }
 
-    /** 手动设备探活:离线连续 2 轮剔除;不在列表且连得上就加回(无 NSD 通告可依赖)。 */
-    private fun startManualProbeLoop() {
+    /** 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留。
+     *  自动发现的设备:连续失败 PROBE_STRIKES 轮剔除(~10s),误移除后自动重启发现让 NSD 重新找回。
+     *  手动设备:双倍容忍度(息屏 WiFi 休眠易误判);若不在列表但探活成功则自动加回(回线恢复)。 */
+    private fun startProbeLoop() {
         scope.launch {
             val strikes = HashMap<String, Int>()
             while (running) {
-                delay(5_000)
+                delay(PROBE_INTERVAL_MS)
+                // 获取当前所有已知对端的探活目标(key、hosts、port)
+                val targets = synchronized(peersLock) {
+                    peers.map { (key, peer) ->
+                        Triple(key, peer.hosts, peer.port)
+                    }
+                }
+                // 清理已不在列表的对端的失败计数
+                val currentKeys = targets.map { it.first }.toSet()
+                strikes.keys.retainAll(currentKeys)
+
+                var autoRemovedThisRound = false
+                for ((key, hosts, port) in targets) {
+                    if (!running) break
+                    val present = synchronized(peersLock) { peers.containsKey(key) }
+                    if (!present) continue  // 已被其他逻辑移除,跳过
+
+                    // 探活:只要有一个 host 能连上就算活着(多网卡/VPN 场景)
+                    val alive = hosts.any { host -> probeAlive(host, port) }
+                    val isManual = key.startsWith("manual|")
+                    val threshold = if (isManual) PROBE_STRIKES_MANUAL else PROBE_STRIKES
+
+                    if (!alive) {
+                        val s = (strikes[key] ?: 0) + 1
+                        if (s >= threshold) {
+                            strikes.remove(key)
+                            removePeer(key)
+                            if (!isManual) autoRemovedThisRound = true
+                        } else {
+                            strikes[key] = s
+                        }
+                    } else {
+                        strikes.remove(key)
+                    }
+                }
+
+                // 自动发现设备被移除后,重启发现让 NSD 重新找回(Android NSD 不会自动重触发 onServiceFound)
+                if (autoRemovedThisRound) {
+                    restartDiscovery()
+                }
+
+                // 手动设备特殊处理:不在列表但能连上 → 自动加回(回线恢复)
                 for (m in manualPeers) {
                     if (!running) break
                     val present = synchronized(peersLock) { peers.containsKey(m.key) }
-                    val alive = probeAlive(m.host, m.port)
-                    when {
-                        present && !alive -> {
-                            val s = (strikes[m.key] ?: 0) + 1
-                            if (s >= 2) { strikes.remove(m.key); removePeer(m.key) }
-                            else strikes[m.key] = s
-                        }
-                        !present && alive -> { strikes.remove(m.key); registerManual(m) }
-                        else -> strikes.remove(m.key)
+                    if (!present && probeAlive(m.host, m.port)) {
+                        strikes.remove(m.key)
+                        registerManual(m)
                     }
                 }
             }
