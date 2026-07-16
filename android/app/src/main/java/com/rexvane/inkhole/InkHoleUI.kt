@@ -248,8 +248,8 @@ fun MainScreen(
             }
             Text(
                 when {
-                    pendingCount > 0 && selectedPeer == null -> "有 $pendingCount 个待发文件 · 点选下方设备立刻发出"
-                    selectedPeer != null -> "轻点墨洞选择文件 → 吞入即发送"
+                    pendingCount > 0 && selectedPeer == null -> "有 $pendingCount 个待发送文件 · 点选下方设备立即发送"
+                    selectedPeer != null -> "轻点墨洞选择文件"
                     peers.isNotEmpty() -> "点选下方设备作为目标"
                     else -> "等待附近的墨洞上线…"
                 },
@@ -283,7 +283,7 @@ fun MainScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("已吐出", color = TextSecondary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text("已接收", color = TextSecondary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (receivedFiles.isNotEmpty()) {
                         IconButton(onClick = onClearHistory, modifier = Modifier.size(30.dp)) {

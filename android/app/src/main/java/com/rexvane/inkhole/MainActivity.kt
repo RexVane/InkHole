@@ -47,6 +47,10 @@ import java.io.File
  */
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        private const val PREF_USAGE_GUIDE_SEEN = "usage_guide_seen"
+    }
+
     // UI 状态
     private val peers = mutableStateListOf<Peer>()
     private val selectedPeer = mutableStateOf<String?>(null)
@@ -61,6 +65,7 @@ class MainActivity : ComponentActivity() {
     private val secret = mutableStateOf("")
     private val trustedOnly = mutableStateOf(false)
     private var showSettings = mutableStateOf(false)
+    private val showUsageGuide = mutableStateOf(false)
 
     // 应用内更新
     private val updateInfo = mutableStateOf<Updater.Info?>(null)
@@ -155,6 +160,49 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun closeUsageGuide() {
+        getSharedPreferences("inkhole", Context.MODE_PRIVATE).edit()
+            .putBoolean(PREF_USAGE_GUIDE_SEEN, true)
+            .apply()
+        showUsageGuide.value = false
+    }
+
+    @androidx.compose.runtime.Composable
+    private fun GuideSection(title: String, body: String) {
+        Text(title, fontSize = 14.sp,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Text(body, fontSize = 12.sp,
+            color = androidx.compose.ui.graphics.Color.Gray)
+        Spacer(Modifier.height(12.dp))
+    }
+
+    @androidx.compose.runtime.Composable
+    private fun UsageGuideDialog() {
+        if (!showUsageGuide.value) return
+        AlertDialog(
+            onDismissRequest = { closeUsageGuide() },
+            title = { Text("使用说明") },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    GuideSection("局域网",
+                        "两台设备连接同一个 WiFi，并同时打开墨洞。发现设备后，" +
+                            "点击对方设备，再点击墨洞图标选择文件发送。")
+                    GuideSection("跨网络",
+                        "两台设备登录同一个 Tailscale 网络。在设置中配置固定监听端口，" +
+                            "然后填写对方的 Tailscale IP 和监听端口添加设备。" +
+                            "添加后，发送方式与局域网相同。")
+                    Text("收到的文件保存在 Download/InkHole，也可以在首页「已接收」中查看。",
+                        fontSize = 12.sp,
+                        color = androidx.compose.ui.graphics.Color.Gray)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { closeUsageGuide() }) { Text("知道了") }
+            },
+        )
+    }
+
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()) { /* 拒绝也能用，只是没通知/旧机型不导出 */ }
 
@@ -182,7 +230,7 @@ class MainActivity : ComponentActivity() {
                 transferKind.value = kind
                 transferPct.value = if (pct >= 100f) -1f else pct
                 statusMsg.value =
-                    "${if (kind == "send") "↑ 吞入" else "↓ 吐出"} $filename ${pct.toInt()}%"
+                    "${if (kind == "send") "↑ 发送" else "↓ 接收"} $filename ${pct.toInt()}%"
             }
     }
 
@@ -193,6 +241,7 @@ class MainActivity : ComponentActivity() {
         peerName.value = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         secret.value = prefs.getString("secret", "") ?: ""
         trustedOnly.value = prefs.getBoolean("trusted_only", false)
+        showUsageGuide.value = !prefs.getBoolean(PREF_USAGE_GUIDE_SEEN, false)
 
         requestNeededPermissions()
         InkHoleService.start(this)
@@ -221,7 +270,7 @@ class MainActivity : ComponentActivity() {
                     onSendClick = {
                         if (selectedPeer.value == null) {
                             statusMsg.value = if (peers.isEmpty())
-                                "还没发现设备，两台设备要连同一个 WiFi" else "先点选一台目标设备"
+                                "还没发现设备" else "先点选一台目标设备"
                         } else {
                             filePicker.launch(arrayOf("*/*"))
                         }
@@ -240,6 +289,7 @@ class MainActivity : ComponentActivity() {
                 )
                 SettingsDialog()
                 UpdateDialog()
+                UsageGuideDialog()
             }
         }
     }
@@ -275,7 +325,7 @@ class MainActivity : ComponentActivity() {
             sendUris(uris)
         } else {
             pendingShares.addAll(uris)
-            statusMsg.value = "收到 ${pendingShares.size} 个待发文件"
+            statusMsg.value = "收到 ${pendingShares.size} 个待发送文件"
         }
     }
 
@@ -316,7 +366,7 @@ class MainActivity : ComponentActivity() {
                     contentResolver.openInputStream(uri)?.use { input ->
                         dst.outputStream().use { input.copyTo(it) }
                     } ?: continue
-                    runOnUiThread { statusMsg.value = "吞入: $name" }
+                    runOnUiThread { statusMsg.value = "发送：$name" }
                     if (node.sendFile(dst.absolutePath)) okCount++
                 } catch (e: Exception) {
                     runOnUiThread { statusMsg.value = "发送失败: ${e.message}" }
@@ -325,7 +375,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             if (uris.size > 1) {
-                runOnUiThread { statusMsg.value = "已吞入 $okCount/${uris.size} 个文件" }
+                runOnUiThread { statusMsg.value = "已发送 $okCount/${uris.size} 个文件" }
             }
         }.start()
     }
@@ -433,7 +483,8 @@ class MainActivity : ComponentActivity() {
                                     color = androidx.compose.ui.graphics.Color.Gray,
                                 )
                                 Text(
-                                    text = "端口：${if (actualPort > 0) actualPort else "未启动"}",
+                                    text = "端口：${if (actualPort > 0) actualPort else "未启动"}" +
+                                        "（建议自定义固定端口）",
                                     fontSize = 12.sp,
                                     color = androidx.compose.ui.graphics.Color.Gray,
                                     modifier = Modifier.padding(bottom = 12.dp)
@@ -563,6 +614,18 @@ class MainActivity : ComponentActivity() {
                                 manualHost = androidx.compose.ui.text.input.TextFieldValue("")
                             }
                         }) { Text("添加设备") }
+
+                        Spacer(Modifier.height(14.dp))
+                        Text("帮助与更新", fontSize = 14.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+                        Row {
+                            TextButton(onClick = {
+                                showUsageGuide.value = true
+                            }) { Text("使用说明") }
+                            TextButton(onClick = { checkUpdate() }) {
+                                Text(if (checkingUpdate.value) "检查中…" else "检查更新")
+                            }
+                        }
                     }
                 },
                 confirmButton = {
@@ -598,12 +661,7 @@ class MainActivity : ComponentActivity() {
                     }) { Text("保存") }
                 },
                 dismissButton = {
-                    Row {
-                        TextButton(onClick = { checkUpdate() }) {
-                            Text(if (checkingUpdate.value) "检查中…" else "检查更新")
-                        }
-                        TextButton(onClick = { showSettings.value = false }) { Text("取消") }
-                    }
+                    TextButton(onClick = { showSettings.value = false }) { Text("取消") }
                 },
             )
         }

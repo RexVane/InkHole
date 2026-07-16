@@ -238,7 +238,7 @@ class InkHoleService : Service() {
             Notification.Builder(this, CHANNEL_FILES) else Notification.Builder(this)
         builder.setSmallIcon(R.drawable.ic_notification)
             .setColor(0xFF58E6C8.toInt())
-            .setContentTitle("墨洞吐出文件")
+            .setContentTitle("墨洞已接收文件")
             .setContentText(record.name)
             .setAutoCancel(true)
         if (record.uri != null) {

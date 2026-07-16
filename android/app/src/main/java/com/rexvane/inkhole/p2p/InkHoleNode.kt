@@ -338,7 +338,7 @@ class InkHoleNode(
             ok = true
 
             listener.onFileReceived(safeName, dst.absolutePath)
-            listener.onStatus("收到: $safeName")
+            listener.onStatus("已接收：$safeName")
         } catch (e: java.io.EOFException) {
             // 探活空连接(probe)：对端 connect 后立即 close，读协议头时 EOF，静默忽略
         } catch (e: Exception) {
@@ -449,7 +449,7 @@ class InkHoleNode(
                     return false
                 }
             }
-            listener.onStatus("已发送: ${file.name}")
+            listener.onStatus("已发送：${file.name}")
             true
         } catch (e: Exception) {
             listener.onStatus("发送失败: ${e.message}")
