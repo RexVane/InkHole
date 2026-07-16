@@ -143,7 +143,7 @@ xattr -cr /Applications/InkHolePet.app
 
 ### 问题反馈
 
-提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.3.9）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
+提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.3.10）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
 
 ## Tests
 

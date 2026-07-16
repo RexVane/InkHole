@@ -9,6 +9,8 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -53,6 +55,14 @@ class InkHoleService : Service() {
     }
 
     private var fileNotifId = 100
+    private val notificationLargeIcon: Bitmap? by lazy {
+        val drawable = applicationInfo.loadIcon(packageManager) ?: return@lazy null
+        val size = (64 * resources.displayMetrics.density).toInt()
+        Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also { bitmap ->
+            drawable.setBounds(0, 0, size, size)
+            drawable.draw(Canvas(bitmap))
+        }
+    }
     // 息屏后 vivo/各厂商会让 WiFi 休眠,TCP 监听对外不可达,对端把本机判离线。
     // 前台服务期间持有高性能 WifiLock,保持 WiFi 常联通(亮屏恢复即自愈的
     // "设备消失又回来"就是它治的)。
@@ -211,14 +221,15 @@ class InkHoleService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val builder = if (Build.VERSION.SDK_INT >= 26)
             Notification.Builder(this, CHANNEL_STATUS) else Notification.Builder(this)
-        return builder
+        builder
             .setSmallIcon(R.drawable.ic_notification)
             .setColor(0xFF58E6C8.toInt())
             .setContentTitle("墨洞")
             .setContentText(text)
             .setContentIntent(openApp)
             .setOngoing(true)
-            .build()
+        notificationLargeIcon?.let { builder.setLargeIcon(it) }
+        return builder.build()
     }
 
     private fun updateStatusNotification(text: String) {
@@ -241,6 +252,7 @@ class InkHoleService : Service() {
             .setContentTitle("墨洞吐出文件")
             .setContentText(record.name)
             .setAutoCancel(true)
+        notificationLargeIcon?.let { builder.setLargeIcon(it) }
         if (record.uri != null) {
             val view = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(record.uri, record.mime)
