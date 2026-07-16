@@ -576,33 +576,6 @@ class MainActivity : ComponentActivity() {
                                 color = androidx.compose.ui.graphics.Color(0xFFF08A7C))
                         }
                         Spacer(Modifier.height(8.dp))
-                        manualList.forEach { m ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    if (m.name.isNotEmpty()) {
-                                        Text(m.name, fontSize = 13.sp)
-                                    }
-                                    Text("${m.host}:${m.port}", fontSize = 12.sp,
-                                        color = androidx.compose.ui.graphics.Color.Gray)
-                                }
-                                TextButton(onClick = {
-                                    // 编辑 = 回填输入框并移除原条目,改完点「添加设备」保存
-                                    manualName = m.name
-                                    manualHost = androidx.compose.ui.text.input.TextFieldValue(
-                                        m.host,
-                                        selection = androidx.compose.ui.text.TextRange(m.host.length))
-                                    manualPort = m.port.toString()
-                                    editingPeer = m
-                                }) { Text("编辑") }
-                                TextButton(onClick = {
-                                    manualList.remove(m)
-                                    if (editingPeer == m) editingPeer = null
-                                }) { Text("删除") }
-                            }
-                        }
                         OutlinedTextField(
                             value = manualName,
                             onValueChange = { manualName = it },
@@ -653,6 +626,33 @@ class MainActivity : ComponentActivity() {
                                 manualHost = androidx.compose.ui.text.input.TextFieldValue("")
                             }
                         }) { Text(if (editingPeer == null) "添加设备" else "保存设备") }
+                        manualList.forEach { m ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    if (m.name.isNotEmpty()) {
+                                        Text(m.name, fontSize = 13.sp)
+                                    }
+                                    Text("${m.host}:${m.port}", fontSize = 12.sp,
+                                        color = androidx.compose.ui.graphics.Color.Gray)
+                                }
+                                TextButton(onClick = {
+                                    // 回填输入框，点「保存设备」后再替换原条目。
+                                    manualName = m.name
+                                    manualHost = androidx.compose.ui.text.input.TextFieldValue(
+                                        m.host,
+                                        selection = androidx.compose.ui.text.TextRange(m.host.length))
+                                    manualPort = m.port.toString()
+                                    editingPeer = m
+                                }) { Text("编辑") }
+                                TextButton(onClick = {
+                                    manualList.remove(m)
+                                    if (editingPeer == m) editingPeer = null
+                                }) { Text("删除") }
+                            }
+                        }
 
                         Spacer(Modifier.height(14.dp))
                         Text("帮助与更新", fontSize = 14.sp,
