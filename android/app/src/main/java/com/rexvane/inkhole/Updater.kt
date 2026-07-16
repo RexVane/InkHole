@@ -16,6 +16,7 @@ import java.security.MessageDigest
 /** GitHub Releases 检查更新与 APK 应用内更新。 */
 object Updater {
 
+    const val REPOSITORY_PAGE = "https://github.com/RexVane/InkHole"
     const val RELEASES_PAGE = "https://github.com/RexVane/InkHole/releases/latest"
     private const val API = "https://api.github.com/repos/RexVane/InkHole/releases/latest"
     private const val MAX_APK_SIZE = 250L * 1024 * 1024

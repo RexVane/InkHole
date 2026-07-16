@@ -665,6 +665,20 @@ class MainActivity : ComponentActivity() {
                                 Text(if (checkingUpdate.value) "检查中…" else "检查更新")
                             }
                         }
+                        TextButton(onClick = {
+                            try {
+                                startActivity(Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse(Updater.REPOSITORY_PAGE),
+                                ))
+                            } catch (e: Exception) {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "无法打开 GitHub: ${e.message}",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                        }) { Text("GitHub 仓库") }
                     }
                 },
                 confirmButton = {
