@@ -137,7 +137,7 @@ class InkHoleNode(
         } catch (e: Exception) {
             listener.onStatus("NSD 发现启动失败: ${e.message}")
         }
-        // 手动设备:乐观注册(真离线的话探活循环 ~10s 内剔除,回线自动加回)
+        // 手动设备:乐观注册(真离线的话探活循环约 20s 后剔除,回线自动加回)
         manualPeers.forEach { registerManual(it) }
         startProbeLoop()  // 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留
         // 发现自愈:NSD 发现流偶尔"卡死"(WiFi 省电丢组播/系统服务抽风),

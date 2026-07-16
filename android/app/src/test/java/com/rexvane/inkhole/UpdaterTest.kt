@@ -20,8 +20,8 @@ class UpdaterTest {
 
     @Test
     fun semanticVersionsCompareNumerically() {
-        assertTrue(Updater.versionNewer("v1.3.19", "1.3.18"))
-        assertFalse(Updater.versionNewer("v1.3.18", "1.3.18"))
-        assertFalse(Updater.versionNewer("v1.3.9", "1.3.18"))
+        assertTrue(Updater.versionNewer("v1.3.20", "1.3.19"))
+        assertFalse(Updater.versionNewer("v1.3.19", "1.3.19"))
+        assertFalse(Updater.versionNewer("v1.3.9", "1.3.19"))
     }
 }
