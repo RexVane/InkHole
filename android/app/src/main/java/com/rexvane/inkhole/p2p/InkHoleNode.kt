@@ -5,12 +5,15 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import kotlinx.coroutines.*
 import java.io.*
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** 检测到设备/收到文件/状态变化时的回调。 */
@@ -54,6 +57,11 @@ class InkHoleNode(
         private const val DISK_MARGIN = 256L * 1024 * 1024   // 收完至少还要剩这么多
         private const val PROGRESS_INTERVAL_MS = 250L
         private const val CHUNK_ENC_THRESHOLD = 32L * 1024 * 1024  // 超过走 WHE2 分块
+        private const val MAX_WHE1_SIZE = 64L * 1024 * 1024
+        private const val HEADER_TIMEOUT_MS = 15_000
+        private const val RECV_IDLE_TIMEOUT_MS = 300_000
+        private const val DRAIN_TIMEOUT_MS = 2_000
+        private const val MAX_INCOMING_CONNECTIONS = 4
         private const val DRAIN_CAP = 8L * 1024 * 1024       // 拒收时最多帮对端消化的字节数
         // onServiceLost 误报兜底：探活参数(连续失败才真移除)
         private const val LOST_PROBE_TIMEOUT_MS = 1200        // 单次 TCP 探活超时
@@ -64,14 +72,22 @@ class InkHoleNode(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var nsdManager: NsdManager? = null
     private var serverSocket: ServerSocket? = null
+    private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
+    private val incomingSlots = Semaphore(MAX_INCOMING_CONNECTIONS)
     private var actualPort = 0
     // 唯一实例 ID 持久化到 SharedPreferences：同一台设备无论 App/前台服务重启
     // 多少次都用同一个服务名，避免旧注册变成永不消失的"幽灵设备"。
     private val instanceId = loadOrCreateInstanceId(context)
+    private val advertisedPeerName = ReceiveFiles.utf8Prefix(peerName, 200)
+        .ifBlank { "Android" }
+    private val requestedServiceName =
+        "${ReceiveFiles.utf8Prefix(advertisedPeerName.replace(".", "-"), 40)}-$instanceId"
 
     private fun loadOrCreateInstanceId(ctx: Context): String {
         val prefs = ctx.getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-        prefs.getString("instance_id", null)?.takeIf { it.isNotEmpty() }?.let { return it }
+        prefs.getString("instance_id", null)
+            ?.takeIf { it.matches(Regex("[0-9a-fA-F]{8}")) }
+            ?.let { return it.lowercase() }
         val id = UUID.randomUUID().toString().replace("-", "").take(8)
         prefs.edit().putString("instance_id", id).apply()
         return id
@@ -80,6 +96,7 @@ class InkHoleNode(
     // serviceName(唯一) -> Peer
     private val peers = LinkedHashMap<String, Peer>()
     private val peersLock = Any()
+    private val receiveFileLock = Any()
     // onServiceLost 误报兜底：正在 TCP 探活确认的 serviceName，避免并发重复探活
     private val probingLost = java.util.Collections.synchronizedSet(HashSet<String>())
     @Volatile private var selectedPeer: String? = null   // 显示名
@@ -98,9 +115,24 @@ class InkHoleNode(
         if (running) return
         running = true
         inboxDir.mkdirs()
-        startTcpServer()
-        registerNsd()
-        discoverNsd()
+        val tcpStarted = startTcpServer()
+        try {
+            nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+        } catch (e: Exception) {
+            listener.onStatus("NSD 初始化失败: ${e.message}")
+        }
+        if (actualPort > 0) {
+            try {
+                registerNsd()
+            } catch (e: Exception) {
+                listener.onStatus("NSD 注册失败: ${e.message}")
+            }
+        }
+        try {
+            discoverNsd()
+        } catch (e: Exception) {
+            listener.onStatus("NSD 发现启动失败: ${e.message}")
+        }
         // 手动设备:乐观注册(真离线的话探活循环 ~10s 内剔除,回线自动加回)
         manualPeers.forEach { registerManual(it) }
         if (manualPeers.isNotEmpty()) startManualProbeLoop()
@@ -109,20 +141,38 @@ class InkHoleNode(
         scope.launch {
             while (running) {
                 delay(30_000)
-                val empty = synchronized(peersLock) { peers.isEmpty() }
-                if (empty && running) restartDiscovery()
+                val hasDiscoveredPeer = synchronized(peersLock) {
+                    peers.keys.any { !it.startsWith("manual|") }
+                }
+                if (!hasDiscoveredPeer && running) restartDiscovery()
             }
         }
-        listener.onStatus("墨洞已开启 · $peerName")
+        listener.onStatus(
+            when {
+                !tcpStarted -> "墨洞未开启：监听端口启动失败"
+                listenPort != 0 && actualPort != listenPort ->
+                    "墨洞已开启 · 端口 $listenPort 被占用，当前端口 $actualPort"
+                else -> "墨洞已开启 · $peerName"
+            }
+        )
     }
 
     /** 重启 NSD 发现(手动刷新按钮/自愈循环用)。stop 是异步的,稍等再启。 */
     fun restartDiscovery() {
         val nsd = nsdManager ?: return
+        if (!running || !discoveryRestartPending.compareAndSet(false, true)) return
         try { discoveryListener?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
         scope.launch {
-            delay(400)
-            if (running) try { discoverNsd() } catch (_: Exception) {}
+            try {
+                delay(400)
+                if (running) try {
+                    discoverNsd()
+                } catch (e: Exception) {
+                    listener.onStatus("NSD 发现启动失败: ${e.message}")
+                }
+            } finally {
+                discoveryRestartPending.set(false)
+            }
         }
     }
 
@@ -162,6 +212,14 @@ class InkHoleNode(
             try { registrationListener?.let { nsd.unregisterService(it) } } catch (_: Exception) {}
         }
         try { serverSocket?.close() } catch (_: IOException) {}
+        serverSocket = null
+        activeSockets.forEach { socket ->
+            try { socket.close() } catch (_: IOException) {}
+        }
+        activeSockets.clear()
+        actualPort = 0
+        resolveQueue.clear()
+        resolving.set(false)
         scope.cancel()
         synchronized(peersLock) { peers.clear() }
         listener.onPeerChanged(emptyList())
@@ -177,7 +235,7 @@ class InkHoleNode(
             bind(java.net.InetSocketAddress(port.coerceIn(0, 65535)))
         }
 
-    private fun startTcpServer() {
+    private fun startTcpServer(): Boolean {
         val server = try {
             try {
                 bindServer(listenPort)
@@ -190,32 +248,58 @@ class InkHoleNode(
             }.also { actualPort = it.localPort }
         } catch (e: IOException) {
             listener.onStatus("TCP 启动失败: ${e.message}")
-            return
+            return false
         }
         serverSocket = server
         scope.launch {
             while (running) {
                 try {
                     val conn = server.accept()
-                    launch { handleConnection(conn) }
+                    if (!incomingSlots.tryAcquire()) {
+                        try { conn.close() } catch (_: IOException) {}
+                        continue
+                    }
+                    activeSockets.add(conn)
+                    if (!running) {
+                        activeSockets.remove(conn)
+                        incomingSlots.release()
+                        try { conn.close() } catch (_: IOException) {}
+                        break
+                    }
+                    launch {
+                        try {
+                            handleConnection(conn)
+                        } finally {
+                            activeSockets.remove(conn)
+                            incomingSlots.release()
+                        }
+                    }
                 } catch (e: IOException) {
                     if (running) listener.onStatus("接收连接失败: ${e.message}")
                     break
                 }
             }
         }
+        return true
     }
 
+    // 接收是对端发起的，不主动清理系统缓存；只按当前真实可用空间保守判断。
+    @android.annotation.SuppressLint("UsableSpace")
     private fun handleConnection(conn: Socket) {
         var partFile: File? = null
         var wantAck = false
         var ok = false
+        var headerRead = false
+        var receivedName = ""
         try {
+            conn.soTimeout = HEADER_TIMEOUT_MS
             val input = BufferedInputStream(conn.getInputStream())
             // 先读协议头再做 trusted 判断:存活探测的空连接(连上即断)在
             // readHeader 处 EOF 静默结束,不会被当成陌生传输拒收刷屏
             val header = WHPP.readHeader(input)
+            headerRead = true
             wantAck = header.wantAck
+            conn.soTimeout = RECV_IDLE_TIMEOUT_MS
 
             // 仅接收目标设备：来源 IP 不在选中设备的地址列表就拒收。
             // 必须按完整列表匹配——桌面多网卡/VPN 时连接源 IP 常不是
@@ -226,15 +310,16 @@ class InkHoleNode(
                 val sel = selectedPeer?.let { s ->
                     synchronized(peersLock) { peers.values.find { it.name == s } }
                 }
-                if (sel == null || src == null || src !in sel.hosts) {
+                if (sel == null || src == null || src !in allowedSourceAddresses(sel)) {
                     listener.onStatus("已拒收 ${src ?: "?"} 的传输（仅接收目标设备）")
-                    drain(input, minOf(header.size, DRAIN_CAP))
+                    drain(conn, input, minOf(header.size, DRAIN_CAP))
                     return   // finally 统一回 ACK_FAIL
                 }
             }
 
             // basename 防路径穿越
-            val safeName = File(header.filename).name.ifEmpty { "unknown" }
+            val safeName = ReceiveFiles.safeName(header.filename)
+            receivedName = safeName
 
             // size 来自网络，不可信
             if (header.size < 0 || header.size > WHPP.MAX_FILE_SIZE) {
@@ -243,17 +328,23 @@ class InkHoleNode(
             }
             if (header.size + DISK_MARGIN > inboxDir.usableSpace) {
                 listener.onStatus("拒收 $safeName：存储空间不足")
-                drain(input, minOf(header.size, DRAIN_CAP))
+                drain(conn, input, minOf(header.size, DRAIN_CAP))
                 return
             }
             if (header.encrypted && secret.isEmpty()) {
                 listener.onStatus("拒收 $safeName：对方启用了加密，本机未设口令")
-                drain(input, minOf(header.size, DRAIN_CAP))
+                drain(conn, input, minOf(header.size, DRAIN_CAP))
+                return
+            }
+            if (header.encrypted && header.encMode != "chunked" &&
+                header.size > MAX_WHE1_SIZE) {
+                listener.onStatus("拒收 $safeName：整块加密文件过大")
+                drain(conn, input, DRAIN_CAP)
                 return
             }
 
-            val dst = File(inboxDir, safeName)
-            partFile = File(inboxDir, "$safeName.part")
+            val part = File.createTempFile("inkhole-", ".part", inboxDir)
+            partFile = part
             var lastReport = 0L
             fun report(done: Long) {
                 val now = System.currentTimeMillis()
@@ -276,10 +367,11 @@ class InkHoleNode(
                 var consumed = 32L
                 var intact = true
                 val din = DataInputStream(input)
-                FileOutputStream(partFile).use { fout ->
+                FileOutputStream(part).use { fout ->
                     while (consumed < header.size) {
                         val ctLen = try { din.readInt() } catch (_: IOException) { intact = false; break }
                         if (ctLen < 16 || ctLen > Crypto.CHUNK_SIZE + 16) { intact = false; break }
+                        if (consumed + 4L + ctLen > header.size) { intact = false; break }
                         val ct = ByteArray(ctLen)
                         try { din.readFully(ct) } catch (_: IOException) { intact = false; break }
                         val plain = decryptor.decryptChunk(ct)
@@ -298,7 +390,7 @@ class InkHoleNode(
                 }
             } else {
                 // 明文 / WHE1 整块加密：写 .part
-                FileOutputStream(partFile).use { fout ->
+                FileOutputStream(part).use { fout ->
                     val buf = ByteArray(WHPP.BUFFER_SIZE)
                     var remaining = header.size
                     while (remaining > 0) {
@@ -318,31 +410,37 @@ class InkHoleNode(
 
                 // WHE1 整块加密：解密成功才算收到
                 if (header.encrypted) {
-                    val blob = partFile.readBytes()
+                    val blob = part.readBytes()
                     val plain = Crypto.decrypt(secret, blob)
                     if (plain == null) {
                         listener.onStatus("解密失败: $safeName（两端口令不一致？）")
                         return
                     }
-                    partFile.writeBytes(plain)
+                    part.writeBytes(plain)
                 }
             }
 
-            // 原子改名 (覆盖同名)
-            if (dst.exists()) dst.delete()
-            if (!partFile.renameTo(dst)) {
+            val dst = synchronized(receiveFileLock) {
+                val candidate = ReceiveFiles.uniqueFile(inboxDir, safeName)
+                candidate.takeIf { part.renameTo(it) }
+            }
+            if (dst == null) {
                 listener.onStatus("落盘失败: $safeName")
                 return
             }
             partFile = null
             ok = true
 
-            listener.onFileReceived(safeName, dst.absolutePath)
-            listener.onStatus("已接收：$safeName")
+            listener.onFileReceived(dst.name, dst.absolutePath)
+            listener.onStatus("已接收：${dst.name}")
         } catch (e: java.io.EOFException) {
             // 探活空连接(probe)：对端 connect 后立即 close，读协议头时 EOF，静默忽略
+            if (headerRead) listener.onStatus("接收中断: ${receivedName.ifEmpty { "未知文件" }}")
+        } catch (_: SocketTimeoutException) {
+            // 未发协议头的半开连接静默关闭；传输开始后超时才提示用户。
+            if (headerRead) listener.onStatus("接收中断: ${receivedName.ifEmpty { "未知文件" }}")
         } catch (e: Exception) {
-            listener.onStatus("接收失败: ${e.message ?: "未知错误"}")
+            if (running) listener.onStatus("接收失败: ${e.message ?: "未知错误"}")
         } finally {
             if (wantAck) {
                 try {
@@ -359,8 +457,9 @@ class InkHoleNode(
 
     /** 拒收时把对端已发出的最多 n 字节读掉再关连接——
      *  不读就 close 会触发 RST，可能冲掉已排队的失败回执。 */
-    private fun drain(input: InputStream, n: Long) {
+    private fun drain(conn: Socket, input: InputStream, n: Long) {
         try {
+            conn.soTimeout = DRAIN_TIMEOUT_MS
             val buf = ByteArray(WHPP.BUFFER_SIZE)
             var left = n
             while (left > 0) {
@@ -373,7 +472,8 @@ class InkHoleNode(
 
     // ---- 发送文件 ----
 
-    fun sendFile(filePath: String): Boolean {
+    @Synchronized
+    fun sendFile(filePath: String, displayName: String = File(filePath).name): Boolean {
         val file = File(filePath)
         if (!file.isFile) {
             listener.onStatus("文件不存在")
@@ -388,68 +488,79 @@ class InkHoleNode(
             return false
         }
 
+        val transferName = ReceiveFiles.safeName(displayName)
         return try {
-            val socket = Socket()
-            socket.connect(java.net.InetSocketAddress(peer.host, peer.port), 15_000)
-            socket.use { s ->
-                val out = BufferedOutputStream(s.getOutputStream())
-                var lastReport = 0L
-                val progress: (Long, Long) -> Unit = { done, total ->
-                    val now = System.currentTimeMillis()
-                    if (done >= total || now - lastReport >= PROGRESS_INTERVAL_MS) {
-                        lastReport = now
-                        listener.onProgress("send", file.name, done, total)
-                    }
-                }
-
-                if (secret.isNotEmpty() && file.length() > CHUNK_ENC_THRESHOLD) {
-                    // 大文件走 WHE2 分块流式加密：内存峰值 4MB
-                    val wireSize = Crypto.chunkedWireSize(file.length())
-                    WHPP.writeHeader(out, WHPP.Header(
-                        file.name, wireSize, encrypted = true, wantAck = true,
-                        encMode = "chunked"))
-                    val enc = Crypto.ChunkedEncryptor(secret)
-                    out.write(enc.streamHeader)
-                    var sent = enc.streamHeader.size.toLong()
-                    val dout = DataOutputStream(out)
-                    file.inputStream().use { fin ->
-                        val buf = ByteArray(Crypto.CHUNK_SIZE)
-                        while (true) {
-                            val n = readFull(fin, buf)
-                            if (n <= 0) break
-                            val ct = enc.encryptChunk(buf, n)
-                            dout.writeInt(ct.size)
-                            dout.write(ct)
-                            sent += 4 + ct.size
-                            progress(sent, wireSize)
+            val socket = connectToPeer(peer)
+            activeSockets.add(socket)
+            if (!running) {
+                activeSockets.remove(socket)
+                socket.close()
+                throw IOException("墨洞节点已停止")
+            }
+            try {
+                socket.use { s ->
+                    val out = BufferedOutputStream(s.getOutputStream())
+                    var lastReport = 0L
+                    val progress: (Long, Long) -> Unit = { done, total ->
+                        val now = System.currentTimeMillis()
+                        if (done >= total || now - lastReport >= PROGRESS_INTERVAL_MS) {
+                            lastReport = now
+                            listener.onProgress("send", transferName, done, total)
                         }
                     }
-                    dout.flush()
-                } else if (secret.isNotEmpty()) {
-                    // 小文件 WHE1 整块(与所有旧版本互通)
-                    val plain = file.readBytes()
-                    val enc = Crypto.encrypt(secret, plain)
-                    WHPP.writeFrame(
-                        out, file.name, enc.size.toLong(), true,
-                        ByteArrayInputStream(enc)
-                    ) { progress(it, enc.size.toLong()) }
-                } else {
-                    // 明文: 流式
-                    WHPP.writeFrame(
-                        out, file.name, file.length(), false,
-                        file.inputStream()
-                    ) { progress(it, file.length()) }
-                }
 
-                // 等接收方回执。老版本对端读完即关连接 -> read 返回 -1，按成功；超时也不误报
-                s.soTimeout = 60_000
-                val resp = try { s.getInputStream().read() } catch (_: SocketTimeoutException) { -1 }
-                if (resp == WHPP.ACK_FAIL) {
-                    listener.onStatus("${peer.name} 接收失败（口令不一致、被拒收或存储问题）")
-                    return false
+                    if (secret.isNotEmpty() && file.length() > CHUNK_ENC_THRESHOLD) {
+                        // 大文件走 WHE2 分块流式加密：内存峰值 4MB
+                        val wireSize = Crypto.chunkedWireSize(file.length())
+                        WHPP.writeHeader(out, WHPP.Header(
+                            transferName, wireSize, encrypted = true, wantAck = true,
+                            encMode = "chunked"))
+                        val enc = Crypto.ChunkedEncryptor(secret)
+                        out.write(enc.streamHeader)
+                        var sent = enc.streamHeader.size.toLong()
+                        val dout = DataOutputStream(out)
+                        file.inputStream().use { fin ->
+                            val buf = ByteArray(Crypto.CHUNK_SIZE)
+                            while (true) {
+                                val n = readFull(fin, buf)
+                                if (n <= 0) break
+                                val ct = enc.encryptChunk(buf, n)
+                                dout.writeInt(ct.size)
+                                dout.write(ct)
+                                sent += 4 + ct.size
+                                progress(sent, wireSize)
+                            }
+                        }
+                        dout.flush()
+                    } else if (secret.isNotEmpty()) {
+                        // 小文件 WHE1 整块(与所有旧版本互通)
+                        val plain = file.readBytes()
+                        val enc = Crypto.encrypt(secret, plain)
+                        WHPP.writeFrame(
+                            out, transferName, enc.size.toLong(), true,
+                            ByteArrayInputStream(enc)
+                        ) { progress(it, enc.size.toLong()) }
+                    } else {
+                        // 明文: 流式
+                        file.inputStream().use { input ->
+                            WHPP.writeFrame(
+                                out, transferName, file.length(), false, input
+                            ) { progress(it, file.length()) }
+                        }
+                    }
+
+                    // 等接收方回执。老版本对端读完即关连接 -> read 返回 -1，按成功；超时也不误报
+                    s.soTimeout = 60_000
+                    val resp = try { s.getInputStream().read() } catch (_: SocketTimeoutException) { -1 }
+                    if (resp == WHPP.ACK_FAIL) {
+                        listener.onStatus("${peer.name} 接收失败（口令不一致、被拒收或存储问题）")
+                        return false
+                    }
                 }
+            } finally {
+                activeSockets.remove(socket)
             }
-            listener.onStatus("已发送：${file.name}")
+            listener.onStatus("已发送：$transferName")
             true
         } catch (e: Exception) {
             listener.onStatus("发送失败: ${e.message}")
@@ -466,6 +577,51 @@ class InkHoleNode(
             off += n
         }
         return if (off == 0) -1 else off
+    }
+
+    private fun connectToPeer(peer: Peer): Socket {
+        var lastError: Exception? = null
+        val targets = (listOf(peer.host) + peer.hosts)
+            .filter { it.isNotBlank() }
+            .distinct()
+            .flatMap { host ->
+                try {
+                    InetAddress.getAllByName(host).mapNotNull { it.hostAddress }
+                        .ifEmpty { listOf(host) }
+                } catch (_: Exception) {
+                    listOf(host)
+                }
+            }
+            .distinct()
+        for (host in targets) {
+            if (!running) throw IOException("墨洞节点已停止")
+            val socket = Socket()
+            try {
+                socket.connect(java.net.InetSocketAddress(host, peer.port), 15_000)
+                if (!running) {
+                    socket.close()
+                    throw IOException("墨洞节点已停止")
+                }
+                return socket
+            } catch (e: Exception) {
+                lastError = e
+                try { socket.close() } catch (_: IOException) {}
+            }
+        }
+        throw lastError ?: IOException("目标设备没有可用地址")
+    }
+
+    private fun allowedSourceAddresses(peer: Peer): Set<String> {
+        val allowed = LinkedHashSet<String>()
+        for (host in listOf(peer.host) + peer.hosts) {
+            allowed.add(host)
+            try {
+                InetAddress.getAllByName(host).forEach { address ->
+                    address.hostAddress?.let { allowed.add(it) }
+                }
+            } catch (_: Exception) {}
+        }
+        return allowed
     }
 
     // ---- 对端管理 ----
@@ -500,20 +656,37 @@ class InkHoleNode(
         var added = false
         var finalName: String
         synchronized(peersLock) {
+            val baseName = ReceiveFiles.utf8Prefix(
+                displayName.filterNot { it.isISOControl() }.trim(),
+                200,
+            ).ifBlank { host }
+            fun uniqueName(): String {
+                var candidate = baseName
+                var n = 2
+                while (peers.any { (key, peer) ->
+                        key != serviceName && peer.name == candidate
+                    }) {
+                    candidate = "$baseName (${n++})"
+                }
+                return candidate
+            }
             val existing = peers[serviceName]
             if (existing != null) {
-                // 同一服务重新解析(IP 变化)：原地更新
-                peers[serviceName] = existing.copy(host = host, port = port, hosts = hosts)
-                finalName = existing.name
+                // 同一服务重新解析：同步地址和对端改名，并保持选中状态。
+                finalName = uniqueName()
+                peers[serviceName] = existing.copy(
+                    name = finalName,
+                    host = host,
+                    port = port,
+                    hosts = hosts,
+                )
+                if (selectedPeer == existing.name && lastSelectedService == serviceName) {
+                    selectedPeer = finalName
+                }
             } else {
                 // 不同设备撞了显示名：给后来者加 " (2)" 后缀
-                var name = displayName
-                var n = 2
-                while (peers.values.any { it.name == name }) {
-                    name = "$displayName (${n++})"
-                }
-                peers[serviceName] = Peer(name, host, port, serviceName, hosts)
-                finalName = name
+                finalName = uniqueName()
+                peers[serviceName] = Peer(finalName, host, port, serviceName, hosts)
                 added = true
             }
             // 智能保留：若此设备的 serviceName 匹配之前选中的，自动恢复选择
@@ -522,7 +695,7 @@ class InkHoleNode(
                 listener.onStatus("目标设备 $finalName 重新上线，已自动恢复选中")
             }
         }
-        if (added) listener.onStatus("发现: $displayName")
+        if (added) listener.onStatus("发现: $finalName")
         listener.onPeerChanged(getPeers())
     }
 
@@ -542,7 +715,8 @@ class InkHoleNode(
                 repeat(LOST_PROBE_ATTEMPTS) { attempt ->
                     val peer = synchronized(peersLock) { peers[serviceName] }
                         ?: return@launch          // 已被别处移除，无需再探
-                    if (probeAlive(peer.host, peer.port)) return@launch  // 还活着，误报忽略
+                    val hosts = (listOf(peer.host) + peer.hosts).distinct()
+                    if (hosts.any { probeAlive(it, peer.port) }) return@launch  // 还活着，误报忽略
                     if (attempt < LOST_PROBE_ATTEMPTS - 1) delay(LOST_PROBE_INTERVAL_MS)
                 }
                 // 连续都失败：确认真离线
@@ -566,28 +740,28 @@ class InkHoleNode(
     private var discoveryListener: NsdManager.DiscoveryListener? = null
 
     private fun registerNsd() {
-        nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+        val nsd = nsdManager ?: return
         val info = NsdServiceInfo().apply {
             // 服务名带唯一后缀：两台同名手机(如同型号 Build.MODEL)不再撞名
-            serviceName = "${peerName.replace(".", "-")}-$instanceId"
+            serviceName = requestedServiceName
             serviceType = SERVICE_TYPE
             port = actualPort
             // 与桌面版 zeroconf 互通的 TXT 属性
-            setAttribute("peer_name", peerName)
+            setAttribute("peer_name", advertisedPeerName)
             setAttribute("instance_id", instanceId)
         }
         registrationListener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
                 // 系统冲突改名后这里才是真实注册名，自我过滤必须用它
-                registeredName = serviceInfo.serviceName
+                if (running) registeredName = serviceInfo.serviceName
             }
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                listener.onStatus("NSD 注册失败: $errorCode")
+                if (running) listener.onStatus("NSD 注册失败: $errorCode")
             }
             override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {}
             override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
         }
-        nsdManager!!.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener)
+        nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener)
     }
 
     // ---- NSD 发现 ----
@@ -596,13 +770,21 @@ class InkHoleNode(
 
     private val resolveQueue = ConcurrentLinkedQueue<NsdServiceInfo>()
     private val resolving = AtomicBoolean(false)
+    private val discoveryRestartPending = AtomicBoolean(false)
 
     private fun enqueueResolve(serviceInfo: NsdServiceInfo) {
+        if (!running) return
         resolveQueue.add(serviceInfo)
         drainResolveQueue()
     }
 
+    @Suppress("DEPRECATION")
     private fun drainResolveQueue() {
+        if (!running) {
+            resolveQueue.clear()
+            resolving.set(false)
+            return
+        }
         if (!resolving.compareAndSet(false, true)) return
         val next = resolveQueue.poll()
         if (next == null) {
@@ -612,24 +794,49 @@ class InkHoleNode(
         // 用"发现时"的服务名做对端表的 key：resolve 返回的名字转义可能不一致
         // (含空格等字符时)，而 onServiceLost 给的是发现时的名字
         val discoveryName = next.serviceName
-        nsdManager?.resolveService(next, object : NsdManager.ResolveListener {
-            override fun onServiceResolved(info: NsdServiceInfo) {
-                handleResolved(discoveryName, info)
-                resolving.set(false)
-                drainResolveQueue()
-            }
-            override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
-                if (errorCode == NsdManager.FAILURE_ALREADY_ACTIVE) {
-                    resolveQueue.add(next)   // 稍后重试
+        val nsd = nsdManager
+        if (nsd == null) {
+            resolving.set(false)
+            return
+        }
+        try {
+            nsd.resolveService(next, object : NsdManager.ResolveListener {
+                override fun onServiceResolved(info: NsdServiceInfo) {
+                    if (running) handleResolved(discoveryName, info)
+                    resolving.set(false)
+                    if (running) drainResolveQueue()
                 }
-                resolving.set(false)
+                override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
+                    if (running && errorCode == NsdManager.FAILURE_ALREADY_ACTIVE) {
+                        resolveQueue.add(next)   // 稍后重试
+                    }
+                    resolving.set(false)
+                    if (running) drainResolveQueue()
+                }
+            })
+        } catch (e: Exception) {
+            resolving.set(false)
+            if (running) {
+                listener.onStatus("NSD 解析失败: ${e.message}")
                 drainResolveQueue()
             }
-        }) ?: resolving.set(false)
+        }
     }
 
+    @Suppress("DEPRECATION")
     private fun handleResolved(discoveryName: String, info: NsdServiceInfo) {
-        val host = info.host?.hostAddress ?: return
+        if (!running) return
+        val resolvedHosts = LinkedHashSet<String>()
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            try {
+                info.hostAddresses.forEach { address ->
+                    address.hostAddress?.let { resolvedHosts.add(it) }
+                }
+            } catch (_: Exception) {}
+        } else {
+            info.host?.hostAddress?.let { resolvedHosts.add(it) }
+        }
+        val host = resolvedHosts.firstOrNull() ?: return
         val attrs = try { info.attributes } catch (_: Exception) { emptyMap<String, ByteArray>() }
         val txtInstanceId = attrs["instance_id"]?.toString(Charsets.UTF_8)
         // 不添加自己：优先按实例 ID(可靠)；老版本对端无此属性，回退按注册名
@@ -641,14 +848,9 @@ class InkHoleNode(
         if (displayName == peerName && host in localIps()) return
         // 对端全部地址：TXT ips(桌面端宣告,多网卡/VPN 全覆盖) + API34 hostAddresses
         val hosts = LinkedHashSet<String>()
-        hosts.add(host)
+        hosts.addAll(resolvedHosts)
         attrs["ips"]?.toString(Charsets.UTF_8)?.split(",")
             ?.map { it.trim() }?.filter { it.isNotEmpty() }?.let { hosts.addAll(it) }
-        if (android.os.Build.VERSION.SDK_INT >= 34) {
-            try {
-                info.hostAddresses.forEach { a -> a.hostAddress?.let { hosts.add(it) } }
-            } catch (_: Exception) {}
-        }
         addPeer(discoveryName, displayName, host, info.port, hosts.toList())
     }
 
@@ -665,17 +867,21 @@ class InkHoleNode(
     }
 
     private fun discoverNsd() {
+        if (!running) return
+        val nsd = nsdManager ?: return
         discoveryListener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {}
             override fun onDiscoveryStopped(serviceType: String) {}
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                if (!running) return
                 // 跳过自己(用系统实际注册名比对；冲突改名场景由 resolve 后的 instance_id 兜底)
-                if (serviceInfo.serviceName == (registeredName ?: "${peerName.replace(".", "-")}-$instanceId")) return
+                if (serviceInfo.serviceName == (registeredName ?: requestedServiceName)) return
                 enqueueResolve(serviceInfo)
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                if (!running) return
                 // NSD onServiceLost 在 WiFi 组播丢包时经常误报(设备其实还在线)。
                 // 直接移除会导致"离线→仅接收目标拒收→又上线"的反复抖动。
                 // 先 TCP 探活确认真连不上再移除。
@@ -683,10 +889,10 @@ class InkHoleNode(
             }
 
             override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
-                listener.onStatus("NSD 发现启动失败: $errorCode")
+                if (running) listener.onStatus("NSD 发现启动失败: $errorCode")
             }
             override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
         }
-        nsdManager!!.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+        nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
     }
 }

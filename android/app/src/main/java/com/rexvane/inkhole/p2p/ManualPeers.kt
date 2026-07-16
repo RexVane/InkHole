@@ -20,9 +20,9 @@ object ManualPeers {
             val arr = JSONArray(raw)
             (0 until arr.length()).mapNotNull { i ->
                 val o = arr.optJSONObject(i) ?: return@mapNotNull null
-                val host = o.optString("host").trim()
+                val host = normalizeHost(o.optString("host")) ?: return@mapNotNull null
                 val port = o.optInt("port")
-                if (host.isEmpty() || port !in 1..65535) null
+                if (port !in 1..65535) null
                 else ManualPeer(o.optString("name").trim(), host, port)
             }
         } catch (_: Exception) {
@@ -76,9 +76,16 @@ object ManualPeers {
     fun normalizeHost(raw: String): String? {
         var s = raw.trim()
         if (s.isEmpty()) return null
-        if (s.any { it.isLetter() }) {          // 主机名:只清理空白
-            val host = s.replace(" ", "")
-            return host.ifEmpty { null }
+        if (s.any { it.isLetter() }) {
+            val host = s.filterNot { it.isWhitespace() }.trimEnd('.')
+            if (host.isEmpty() || host.length > 253) return null
+            val labels = host.split('.')
+            if (labels.any { label ->
+                    label.isEmpty() || label.length > 63 ||
+                        label.startsWith('-') || label.endsWith('-') ||
+                        label.any { !it.isLetterOrDigit() && it != '-' }
+                }) return null
+            return host
         }
         s = s.replace('。', '.').replace('，', '.').replace(',', '.').replace(' ', '.')
         s = s.replace(Regex("\\.+"), ".").trim('.')

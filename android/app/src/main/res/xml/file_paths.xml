@@ -2,6 +2,7 @@
 <paths>
     <!-- 应用私有收件箱(导出失败时兜底打开用) -->
     <external-files-path name="inbox" path="." />
+    <files-path name="internal_inbox" path="." />
     <!-- Android 9 及以下：公共 Downloads/InkHole 里的文件经 FileProvider 打开 -->
     <external-path name="downloads" path="Download/InkHole/" />
     <!-- 应用内更新:缓存目录里的新版 APK 交给系统安装器 -->

@@ -1,5 +1,6 @@
 package com.rexvane.inkhole
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Uri
 import com.rexvane.inkhole.p2p.Peer
@@ -26,6 +27,8 @@ data class ReceivedFile(
  * 接收历史持久化到 SharedPreferences(最近 50 条)，重启 App 不丢。
  */
 object InkHoleBus {
+    // 节点只持有 applicationContext，并在 Service.onDestroy 中清空。
+    @SuppressLint("StaticFieldLeak")
     @Volatile var node: InkHoleNode? = null
     @Volatile var uiListener: InkHoleListener? = null
 
@@ -39,6 +42,7 @@ object InkHoleBus {
     private const val HISTORY_KEY = "history"
     private const val HISTORY_MAX = 50
 
+    @Synchronized
     fun loadHistory(context: Context) {
         if (receivedFiles.isNotEmpty()) return
         try {
@@ -61,6 +65,7 @@ object InkHoleBus {
         }
     }
 
+    @Synchronized
     fun saveHistory(context: Context) {
         try {
             val arr = JSONArray()
@@ -79,6 +84,16 @@ object InkHoleBus {
         }
     }
 
+    @Synchronized
+    fun recordReceived(context: Context, record: ReceivedFile) {
+        receivedFiles.add(0, record)
+        while (receivedFiles.size > HISTORY_MAX) {
+            receivedFiles.removeAt(receivedFiles.lastIndex)
+        }
+        saveHistory(context)
+    }
+
+    @Synchronized
     fun clearHistory(context: Context) {
         receivedFiles.clear()
         saveHistory(context)

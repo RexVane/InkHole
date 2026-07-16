@@ -88,6 +88,7 @@ fun InkHoleHero(
     searching: Boolean,          // true = 还没发现设备，播放雷达波纹
     onTap: () -> Unit,
     modifier: Modifier = Modifier,
+    diameter: androidx.compose.ui.unit.Dp = 230.dp,
 ) {
     val infinite = rememberInfiniteTransition(label = "hole")
     val spin1 by infinite.animateFloat(
@@ -109,7 +110,7 @@ fun InkHoleHero(
 
     Box(
         modifier = modifier
-            .size(230.dp)
+            .size(diameter)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -203,7 +204,6 @@ fun MainScreen(
     selectedPeer: String?,
     receivedFiles: List<ReceivedFile>,
     transferPct: Float,
-    transferKind: String,
     pendingCount: Int,
     onDeviceClick: (Peer) -> Unit,
     onSendClick: () -> Unit,
@@ -217,103 +217,112 @@ fun MainScreen(
         topBar = { InkTopBar(onRefreshClick, onSettingsClick) },
         containerColor = BgDark,
     ) { padding ->
-        Column(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 18.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
+                .padding(padding),
         ) {
-            // 墨洞英雄区：轻点选文件发送
-            InkHoleHero(
-                transferPct = transferPct,
-                searching = peers.isEmpty(),
-                onTap = onSendClick,
-            )
-
-            // 状态文字(平滑切换)
-            AnimatedContent(
-                targetState = statusMsg,
-                transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(160)) },
-                label = "status",
-            ) { msg ->
-                Text(
-                    msg,
-                    color = if (transferPct >= 0f) Teal else TextSecondary,
-                    fontSize = 13.sp,
-                    textAlign = TextAlign.Center,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            Text(
-                when {
-                    pendingCount > 0 && selectedPeer == null -> "有 $pendingCount 个待发送文件 · 点选下方设备立即发送"
-                    selectedPeer != null -> "轻点墨洞选择文件"
-                    peers.isNotEmpty() -> "点选下方设备作为目标"
-                    else -> "等待附近的墨洞上线…"
-                },
-                color = TextDim,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(top = 3.dp),
-            )
-
-            Spacer(Modifier.height(14.dp))
-
-            // 设备横排
-            if (peers.isNotEmpty()) {
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    items(peers, key = { it.serviceName.ifEmpty { it.name } }) { peer ->
-                        DeviceChip(
-                            peer = peer,
-                            selected = peer.name == selectedPeer,
-                            onClick = { onDeviceClick(peer) },
-                        )
-                    }
-                }
-                Spacer(Modifier.height(16.dp))
-            }
-
-            // 收件区
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            val heroDiameter = (maxHeight * 0.38f).coerceIn(130.dp, 230.dp)
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text("已接收", color = TextSecondary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (receivedFiles.isNotEmpty()) {
-                        IconButton(onClick = onClearHistory, modifier = Modifier.size(30.dp)) {
-                            Icon(Icons.Outlined.DeleteSweep, contentDescription = "清空记录",
-                                tint = TextDim, modifier = Modifier.size(17.dp))
+                // 墨洞英雄区：轻点选文件发送
+                InkHoleHero(
+                    transferPct = transferPct,
+                    searching = peers.isEmpty(),
+                    onTap = onSendClick,
+                    diameter = heroDiameter,
+                )
+
+                // 状态文字(平滑切换)
+                AnimatedContent(
+                    targetState = statusMsg,
+                    transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(160)) },
+                    label = "status",
+                ) { msg ->
+                    Text(
+                        msg,
+                        color = if (transferPct >= 0f) Teal else TextSecondary,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Text(
+                    when {
+                        pendingCount > 0 && selectedPeer == null ->
+                            "有 $pendingCount 个待发送文件 · 点选下方设备立即发送"
+                        selectedPeer != null -> "轻点墨洞选择文件"
+                        peers.isNotEmpty() -> "点选下方设备作为目标"
+                        else -> "等待附近的墨洞上线…"
+                    },
+                    color = TextDim,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(top = 3.dp),
+                )
+
+                Spacer(Modifier.height(14.dp))
+
+                // 设备横排
+                if (peers.isNotEmpty()) {
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        items(peers, key = { it.serviceName.ifEmpty { it.name } }) { peer ->
+                            DeviceChip(
+                                peer = peer,
+                                selected = peer.name == selectedPeer,
+                                onClick = { onDeviceClick(peer) },
+                            )
                         }
                     }
-                    TextButton(onClick = onOpenInbox) {
-                        Icon(Icons.Outlined.Folder, contentDescription = null,
-                            tint = Teal, modifier = Modifier.size(15.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("下载目录", color = Teal, fontSize = 12.sp)
+                    Spacer(Modifier.height(16.dp))
+                }
+
+                // 收件区
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("已接收", color = TextSecondary, fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (receivedFiles.isNotEmpty()) {
+                            IconButton(onClick = onClearHistory, modifier = Modifier.size(30.dp)) {
+                                Icon(Icons.Outlined.DeleteSweep, contentDescription = "清空记录",
+                                    tint = TextDim, modifier = Modifier.size(17.dp))
+                            }
+                        }
+                        TextButton(onClick = onOpenInbox) {
+                            Icon(Icons.Outlined.Folder, contentDescription = null,
+                                tint = Teal, modifier = Modifier.size(15.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("下载目录", color = Teal, fontSize = 12.sp)
+                        }
                     }
                 }
-            }
-            if (receivedFiles.isEmpty()) {
-                Text(
-                    "还没有收到过文件",
-                    color = TextDim, fontSize = 12.sp,
-                    modifier = Modifier.padding(vertical = 18.dp),
-                )
-            } else {
-                LazyColumn(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    items(receivedFiles, key = { "${it.time}-${it.name}" }) { rec ->
-                        FileCard(rec) { onOpenFile(rec) }
+                if (receivedFiles.isEmpty()) {
+                    Text(
+                        "还没有收到过文件",
+                        color = TextDim, fontSize = 12.sp,
+                        modifier = Modifier.padding(vertical = 18.dp),
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        items(receivedFiles) { rec ->
+                            FileCard(rec) { onOpenFile(rec) }
+                        }
+                        item { Spacer(Modifier.height(12.dp)) }
                     }
-                    item { Spacer(Modifier.height(12.dp)) }
                 }
             }
         }
@@ -495,7 +504,6 @@ fun PreviewMainScreen() {
                     System.currentTimeMillis() - 7200_000),
             ),
             transferPct = 63f,
-            transferKind = "recv",
             pendingCount = 0,
             onDeviceClick = {}, onSendClick = {}, onOpenInbox = {},
             onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},
@@ -513,7 +521,6 @@ fun PreviewEmptyState() {
             selectedPeer = null,
             receivedFiles = emptyList(),
             transferPct = -1f,
-            transferKind = "",
             pendingCount = 0,
             onDeviceClick = {}, onSendClick = {}, onOpenInbox = {},
             onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},

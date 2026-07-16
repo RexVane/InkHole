@@ -56,6 +56,18 @@ jobs:
             echo "signed=no" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Test and lint Android
+        run: gradle testDebugUnitTest lintDebug --no-daemon --stacktrace
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          APP_VERSION="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          test "v$APP_VERSION" = "${GITHUB_REF##*/}" || {
+            echo "Tag ${GITHUB_REF##*/} does not match Android version v$APP_VERSION" >&2
+            exit 1
+          }
+
       - name: Build APK
         env:
           ANDROID_KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}
@@ -63,6 +75,10 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          if [[ "$GITHUB_REF" == refs/tags/* && "${{ steps.keystore.outputs.signed }}" != "yes" ]]; then
+            echo "Release tags require the fixed Android release keystore" >&2
+            exit 1
+          fi
           if [ "${{ steps.keystore.outputs.signed }}" = "yes" ]; then
             gradle assembleRelease --no-daemon --stacktrace
           else

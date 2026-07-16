@@ -19,7 +19,10 @@ import androidx.core.content.FileProvider
 import com.rexvane.inkhole.p2p.Peer
 import com.rexvane.inkhole.p2p.InkHoleListener
 import com.rexvane.inkhole.p2p.InkHoleNode
+import com.rexvane.inkhole.p2p.ReceiveFiles
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 前台服务：拥有 P2P 节点的生命周期。
@@ -52,11 +55,12 @@ class InkHoleService : Service() {
         }
     }
 
-    private var fileNotifId = 100
+    private val fileNotifId = AtomicInteger(100)
     // 息屏后 vivo/各厂商会让 WiFi 休眠,TCP 监听对外不可达,对端把本机判离线。
     // 前台服务期间持有高性能 WifiLock,保持 WiFi 常联通(亮屏恢复即自愈的
     // "设备消失又回来"就是它治的)。
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    private val exportLock = Any()
 
     override fun onCreate() {
         super.onCreate()
@@ -90,13 +94,17 @@ class InkHoleService : Service() {
 
     private fun startNode() {
         val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-        val name = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
+        val storedName = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
+        val name = storedName.filterNot { it.isISOControl() }.trim().take(40)
+            .ifEmpty { Build.MODEL }
+        if (name != storedName) prefs.edit().putString("peer_name", name).apply()
         val secret = prefs.getString("secret", "") ?: ""
         val trustedOnly = prefs.getBoolean("trusted_only", false)
         val listenPort = prefs.getInt("listen_port", 0)
-        val inbox = File(getExternalFilesDir(null), "收件箱")
+        val inboxRoot = getExternalFilesDir(null) ?: filesDir
+        val inbox = File(inboxRoot, "收件箱")
 
-        val node = InkHoleNode(this, name, inbox, secret, trustedOnly, listenPort,
+        val node = InkHoleNode(applicationContext, name, inbox, secret, trustedOnly, listenPort,
                                listener = forwarder)
         // 设置变更重建时恢复选中目标：对端被重新发现后智能保留会自动选回
         InkHoleBus.pendingSelectedService?.let {
@@ -129,14 +137,14 @@ class InkHoleService : Service() {
 
         override fun onFileReceived(filename: String, path: String) {
             val record = exportToDownloads(File(path))
-            InkHoleBus.receivedFiles.add(0, record)
-            InkHoleBus.saveHistory(this@InkHoleService)
+            InkHoleBus.recordReceived(this@InkHoleService, record)
             notifyFileReceived(record)
             InkHoleBus.uiListener?.onFileReceived(filename, path)
         }
 
         override fun onStatus(msg: String) {
             InkHoleBus.lastStatus = msg
+            updateStatusNotification(msg)
             InkHoleBus.uiListener?.onStatus(msg)
         }
 
@@ -152,36 +160,59 @@ class InkHoleService : Service() {
         val mime = guessMime(src.name)
         val size = src.length()
         val now = System.currentTimeMillis()
-        try {
-            if (Build.VERSION.SDK_INT >= 29) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            var inserted: Uri? = null
+            try {
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, src.name)
                     put(MediaStore.MediaColumns.MIME_TYPE, mime)
                     put(MediaStore.MediaColumns.RELATIVE_PATH,
                         Environment.DIRECTORY_DOWNLOADS + "/InkHole")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
-                val uri = contentResolver.insert(
+                inserted = contentResolver.insert(
                     MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    contentResolver.openOutputStream(uri)?.use { out ->
-                        src.inputStream().use { it.copyTo(out) }
-                    }
-                    src.delete()
-                    return ReceivedFile(src.name, uri, mime, size, now)
+                val uri = inserted ?: throw IOException("无法创建下载文件")
+                val out = contentResolver.openOutputStream(uri)
+                    ?: throw IOException("无法打开下载文件")
+                out.use { output -> src.inputStream().use { it.copyTo(output) } }
+                val published = contentResolver.update(uri, ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }, null, null)
+                if (published <= 0) throw IOException("无法发布下载文件")
+                val displayName = try {
+                    contentResolver.query(
+                        uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    } ?: src.name
+                } catch (_: Exception) {
+                    src.name
                 }
-            } else if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                == PackageManager.PERMISSION_GRANTED) {
+                src.delete()
+                return ReceivedFile(displayName, uri, mime, size, now)
+            } catch (_: Exception) {
+                inserted?.let { uri ->
+                    try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+                }
+            }
+        } else if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            == PackageManager.PERMISSION_GRANTED) {
+            try {
                 val dir = File(Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_DOWNLOADS), "InkHole")
-                dir.mkdirs()
-                val dst = File(dir, src.name)
-                src.copyTo(dst, overwrite = true)
-                src.delete()
+                if (!dir.exists() && !dir.mkdirs()) throw IOException("无法创建下载目录")
+                val dst = synchronized(exportLock) {
+                    val candidate = ReceiveFiles.uniqueFile(dir, src.name)
+                    src.copyTo(candidate, overwrite = false)
+                    candidate
+                }
                 val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", dst)
+                src.delete()
                 return ReceivedFile(dst.name, uri, mime, size, now)
+            } catch (_: Exception) {
+                // 导出失败不丢文件：留在私有收件箱，仍可从 App 内打开
             }
-        } catch (_: Exception) {
-            // 导出失败不丢文件：留在私有收件箱，仍可从 App 内打开
         }
         val uri = try {
             FileProvider.getUriForFile(this, "$packageName.fileprovider", src)
@@ -205,6 +236,7 @@ class InkHoleService : Service() {
             CHANNEL_FILES, "收到文件", NotificationManager.IMPORTANCE_DEFAULT))
     }
 
+    @Suppress("DEPRECATION")
     private fun buildStatusNotification(text: String): Notification {
         val openApp = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
@@ -228,6 +260,7 @@ class InkHoleService : Service() {
         } catch (_: Exception) {}
     }
 
+    @Suppress("DEPRECATION")
     private fun notifyFileReceived(record: ReceivedFile) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -251,7 +284,7 @@ class InkHoleService : Service() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
         }
         try {
-            nm.notify(fileNotifId++, builder.build())
+            nm.notify(fileNotifId.getAndIncrement(), builder.build())
         } catch (_: Exception) {}
     }
 }

@@ -2,24 +2,32 @@ package com.rexvane.inkhole
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.content.FileProvider
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 
 /** GitHub Releases 检查更新与 APK 应用内更新。 */
 object Updater {
 
     const val RELEASES_PAGE = "https://github.com/RexVane/InkHole/releases/latest"
     private const val API = "https://api.github.com/repos/RexVane/InkHole/releases/latest"
+    private const val MAX_APK_SIZE = 250L * 1024 * 1024
 
     data class Info(val version: String, val apkUrl: String, val notes: String)
 
     /** 把 GitHub Release Markdown 压缩为更新弹窗里的简短要点。 */
     internal fun summarizeReleaseNotes(raw: String, maxItems: Int = 4): String {
         val items = mutableListOf<String>()
-        val stopSections = listOf("安装", "下载", "校验", "checksum")
+        val stopSections = listOf(
+            "安装", "下载", "校验", "install", "download", "verify", "checksum",
+        )
         for (rawLine in raw.replace("\r\n", "\n").lines()) {
             val line = rawLine.trim()
             if (line.isEmpty()) continue
@@ -84,26 +92,31 @@ object Updater {
 
     private fun fetchLatestFromApi(): Info {
         val conn = URL(API).openConnection() as HttpURLConnection
-        conn.connectTimeout = 10_000
-        conn.readTimeout = 15_000
-        conn.setRequestProperty("User-Agent", "InkHole-Updater")
-        conn.setRequestProperty("Accept", "application/vnd.github+json")
-        conn.inputStream.use { input ->
-            val data = JSONObject(input.bufferedReader().readText())
-            val tag = data.optString("tag_name").trim()
-            val notes = summarizeReleaseNotes(data.optString("body"))
-            var apk = ""
-            val assets = data.optJSONArray("assets")
-            if (assets != null) {
-                for (i in 0 until assets.length()) {
-                    val a = assets.optJSONObject(i) ?: continue
-                    if (a.optString("name").endsWith(".apk")) {
-                        apk = a.optString("browser_download_url")
-                        break
+        try {
+            conn.connectTimeout = 10_000
+            conn.readTimeout = 15_000
+            conn.setRequestProperty("User-Agent", "InkHole-Updater")
+            conn.setRequestProperty("Accept", "application/vnd.github+json")
+            conn.inputStream.use { input ->
+                val data = JSONObject(input.bufferedReader().readText())
+                val tag = data.optString("tag_name").trim()
+                require(tag.isNotEmpty()) { "最新版本号为空" }
+                val notes = summarizeReleaseNotes(data.optString("body"))
+                var apk = ""
+                val assets = data.optJSONArray("assets")
+                if (assets != null) {
+                    for (i in 0 until assets.length()) {
+                        val a = assets.optJSONObject(i) ?: continue
+                        if (a.optString("name").endsWith(".apk")) {
+                            apk = a.optString("browser_download_url")
+                            break
+                        }
                     }
                 }
+                return Info(tag, apk, notes)
             }
-            return Info(tag, apk, notes)
+        } finally {
+            conn.disconnect()
         }
     }
 
@@ -122,29 +135,79 @@ object Updater {
     }
 
     /** 下载 APK 到应用缓存(阻塞,调用方放线程)。返回文件。 */
+    @Synchronized
     fun downloadApk(ctx: Context, url: String, onProgress: (Int) -> Unit): File {
         val dir = File(ctx.cacheDir, "update").apply { mkdirs() }
         val dst = File(dir, "InkHole-update.apk")
-        val conn = URL(url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 15_000
-        conn.readTimeout = 30_000
-        conn.instanceFollowRedirects = true
-        conn.setRequestProperty("User-Agent", "InkHole-Updater")
-        val total = conn.contentLengthLong
-        conn.inputStream.use { input ->
-            dst.outputStream().use { out ->
-                val buf = ByteArray(256 * 1024)
-                var done = 0L
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                    done += n
-                    if (total > 0) onProgress((done * 100 / total).toInt())
+        val source = URL(url)
+        require(source.protocol.equals("https", ignoreCase = true)) { "更新地址不是 HTTPS" }
+        val conn = source.openConnection() as HttpURLConnection
+        try {
+            conn.connectTimeout = 15_000
+            conn.readTimeout = 30_000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", "InkHole-Updater")
+            val code = conn.responseCode
+            if (code !in 200..299) throw IOException("下载服务器返回 HTTP $code")
+            val total = conn.contentLengthLong
+            if (total > MAX_APK_SIZE) throw IOException("安装包大小异常")
+            conn.inputStream.use { input ->
+                dst.outputStream().use { out ->
+                    val buf = ByteArray(256 * 1024)
+                    var done = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        done += n
+                        if (done > MAX_APK_SIZE) throw IOException("安装包大小异常")
+                        out.write(buf, 0, n)
+                        if (total > 0) onProgress((done * 100 / total).toInt())
+                    }
                 }
             }
+            verifyApk(ctx, dst)
+            return dst
+        } catch (e: Exception) {
+            dst.delete()
+            throw e
+        } finally {
+            conn.disconnect()
         }
-        return dst
+    }
+
+    @Suppress("DEPRECATION")
+    private fun verifyApk(ctx: Context, apk: File) {
+        val pm = ctx.packageManager
+        val flags = if (Build.VERSION.SDK_INT >= 28) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            PackageManager.GET_SIGNATURES
+        }
+        val archive = pm.getPackageArchiveInfo(apk.absolutePath, flags)
+            ?: throw IOException("下载内容不是有效 APK")
+        if (archive.packageName != ctx.packageName) {
+            throw IOException("安装包应用标识不匹配")
+        }
+        val installed = pm.getPackageInfo(ctx.packageName, flags)
+        val archiveSigners = signerDigests(archive)
+        val installedSigners = signerDigests(installed)
+        if (archiveSigners.isEmpty() || archiveSigners != installedSigners) {
+            throw IOException("安装包签名与当前版本不一致")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun signerDigests(info: PackageInfo): Set<String> {
+        val signatures = if (Build.VERSION.SDK_INT >= 28) {
+            info.signingInfo?.apkContentsSigners.orEmpty()
+        } else {
+            info.signatures.orEmpty()
+        }
+        return signatures.mapTo(LinkedHashSet()) { signature ->
+            MessageDigest.getInstance("SHA-256")
+                .digest(signature.toByteArray())
+                .joinToString("") { "%02x".format(it) }
+        }
     }
 
     /** 拉起系统安装器(首次会引导授权"安装未知应用")。 */

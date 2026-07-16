@@ -35,6 +35,7 @@ import com.rexvane.inkhole.p2p.Peer
 import com.rexvane.inkhole.p2p.InkHoleListener
 import com.rexvane.inkhole.p2p.ManualPeer
 import com.rexvane.inkhole.p2p.ManualPeers
+import com.rexvane.inkhole.p2p.ReceiveFiles
 import java.io.File
 
 /**
@@ -49,6 +50,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val PREF_USAGE_GUIDE_SEEN = "usage_guide_seen"
+        private const val STATE_PENDING_SHARES = "pending_shares"
     }
 
     // UI 状态
@@ -57,8 +59,7 @@ class MainActivity : ComponentActivity() {
     private val statusMsg = mutableStateOf("正在启动…")
     private val receivedFiles = mutableStateListOf<ReceivedFile>()
     private val pendingShares = mutableStateListOf<Uri>()   // 分享进来、等选设备的文件
-    private val transferPct = mutableStateOf(-1f)           // -1=空闲
-    private val transferKind = mutableStateOf("")
+    private val transferPct = mutableFloatStateOf(-1f)      // -1=空闲
 
     // 设置
     private val peerName = mutableStateOf(Build.MODEL)
@@ -111,8 +112,12 @@ class MainActivity : ComponentActivity() {
                     runOnUiThread { statusMsg.value = "正在下载新版本… $p%" }
                 }
                 runOnUiThread {
-                    statusMsg.value = "下载完成，请在安装器中确认"
-                    Updater.installApk(this, apk)
+                    try {
+                        statusMsg.value = "下载完成，请在安装器中确认"
+                        Updater.installApk(this, apk)
+                    } catch (e: Exception) {
+                        statusMsg.value = "无法打开安装器: ${e.message}"
+                    }
                 }
             } catch (e: Exception) {
                 runOnUiThread { statusMsg.value = "更新下载失败: ${e.message}" }
@@ -213,10 +218,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private val uiListener = object : InkHoleListener {
-        override fun onPeerChanged(list: List<Peer>) = runOnUiThread {
-            peers.clear()
-            peers.addAll(list)
-            if (selectedPeer.value != null && list.none { it.name == selectedPeer.value }) {
+        override fun onPeerChanged(peers: List<Peer>) = runOnUiThread {
+            this@MainActivity.peers.clear()
+            this@MainActivity.peers.addAll(peers)
+            if (selectedPeer.value != null && peers.none { it.name == selectedPeer.value }) {
                 selectedPeer.value = null   // 选中的设备离线了
             }
         }
@@ -227,8 +232,7 @@ class MainActivity : ComponentActivity() {
         override fun onProgress(kind: String, filename: String, done: Long, total: Long) =
             runOnUiThread {
                 val pct = if (total > 0) (done * 100f / total) else 100f
-                transferKind.value = kind
-                transferPct.value = if (pct >= 100f) -1f else pct
+                transferPct.floatValue = if (pct >= 100f) -1f else pct
                 statusMsg.value =
                     "${if (kind == "send") "↑ 发送" else "↓ 接收"} $filename ${pct.toInt()}%"
             }
@@ -238,7 +242,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-        peerName.value = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
+        peerName.value = (prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL)
+            .filterNot { it.isISOControl() }.trim().take(40).ifEmpty { Build.MODEL }
         secret.value = prefs.getString("secret", "") ?: ""
         trustedOnly.value = prefs.getBoolean("trusted_only", false)
         showUsageGuide.value = !prefs.getBoolean(PREF_USAGE_GUIDE_SEEN, false)
@@ -254,7 +259,12 @@ class MainActivity : ComponentActivity() {
         selectedPeer.value = InkHoleBus.node?.getSelectedPeer()
         refreshReceived()
 
-        handleShareIntent(intent)
+        if (savedInstanceState == null) {
+            handleShareIntent(intent)
+        } else {
+            savedInstanceState.getStringArrayList(STATE_PENDING_SHARES)
+                ?.mapTo(pendingShares, Uri::parse)
+        }
 
         setContent {
             InkHoleTheme {
@@ -263,8 +273,7 @@ class MainActivity : ComponentActivity() {
                     peers = peers,
                     selectedPeer = selectedPeer.value,
                     receivedFiles = receivedFiles,
-                    transferPct = transferPct.value,
-                    transferKind = transferKind.value,
+                    transferPct = transferPct.floatValue,
                     pendingCount = pendingShares.size,
                     onDeviceClick = { peer -> onDeviceClicked(peer) },
                     onSendClick = {
@@ -299,6 +308,14 @@ class MainActivity : ComponentActivity() {
         handleShareIntent(intent)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putStringArrayList(
+            STATE_PENDING_SHARES,
+            ArrayList(pendingShares.map(Uri::toString)),
+        )
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
         // 只摘掉 UI 监听；节点在前台服务里继续跑
         if (InkHoleBus.uiListener === uiListener) InkHoleBus.uiListener = null
@@ -321,6 +338,8 @@ class MainActivity : ComponentActivity() {
     private fun handleShareIntent(intent: Intent?) {
         val uris = intent?.streamUris().orEmpty()
         if (uris.isEmpty()) return
+        intent?.action = null
+        intent?.removeExtra(Intent.EXTRA_STREAM)
         if (selectedPeer.value != null) {
             sendUris(uris)
         } else {
@@ -329,9 +348,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun Intent.streamUris(): List<Uri> {
-        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return emptyList()
-        return if (Build.VERSION.SDK_INT >= 33) {
+    private fun Intent.streamUris(): List<Uri> = try {
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) {
+            emptyList()
+        } else if (Build.VERSION.SDK_INT >= 33) {
             when (action) {
                 Intent.ACTION_SEND ->
                     listOfNotNull(getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))
@@ -347,6 +367,8 @@ class MainActivity : ComponentActivity() {
                     getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM).orEmpty()
             }
         }
+    } catch (_: Exception) {
+        emptyList()
     }
 
     /** 把 content uri 复制到 cache 后经 P2P 发送(顺序发，避免并发写同名缓存)。 */
@@ -360,14 +382,15 @@ class MainActivity : ComponentActivity() {
             for (uri in uris) {
                 var tmp: File? = null
                 try {
-                    val name = File(queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}").name
-                    val dst = File(cacheDir, name)
+                    val name = ReceiveFiles.safeName(
+                        queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}")
+                    val dst = File.createTempFile("inkhole-send-", ".tmp", cacheDir)
                     tmp = dst
                     contentResolver.openInputStream(uri)?.use { input ->
                         dst.outputStream().use { input.copyTo(it) }
                     } ?: continue
                     runOnUiThread { statusMsg.value = "发送：$name" }
-                    if (node.sendFile(dst.absolutePath)) okCount++
+                    if (node.sendFile(dst.absolutePath, name)) okCount++
                 } catch (e: Exception) {
                     runOnUiThread { statusMsg.value = "发送失败: ${e.message}" }
                 } finally {
@@ -460,6 +483,8 @@ class MainActivity : ComponentActivity() {
             }
             var manualPort by remember { mutableStateOf("52130") }
             var manualError by remember { mutableStateOf("") }
+            var settingsError by remember { mutableStateOf("") }
+            var editingPeer by remember { mutableStateOf<ManualPeer?>(null) }
             AlertDialog(
                 onDismissRequest = { showSettings.value = false },
                 title = { Text("设置") },
@@ -496,7 +521,9 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(6.dp))
                         OutlinedTextField(
                             value = nameInput,
-                            onValueChange = { nameInput = it },
+                            onValueChange = { value ->
+                                nameInput = value.filterNot { it.isISOControl() }.take(40)
+                            },
                             label = { Text("设备名称") },
                             singleLine = true,
                         )
@@ -537,10 +564,17 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(6.dp))
                         OutlinedTextField(
                             value = portInput,
-                            onValueChange = { portInput = it.filter { c -> c.isDigit() }.take(5) },
+                            onValueChange = {
+                                portInput = it.filter { c -> c.isDigit() }.take(5)
+                                settingsError = ""
+                            },
                             label = { Text("本机监听端口（留空=自动，如 52130）") },
                             singleLine = true,
                         )
+                        if (settingsError.isNotEmpty()) {
+                            Text(settingsError, fontSize = 11.sp,
+                                color = androidx.compose.ui.graphics.Color(0xFFF08A7C))
+                        }
                         Spacer(Modifier.height(8.dp))
                         manualList.forEach { m ->
                             Row(
@@ -561,9 +595,12 @@ class MainActivity : ComponentActivity() {
                                         m.host,
                                         selection = androidx.compose.ui.text.TextRange(m.host.length))
                                     manualPort = m.port.toString()
-                                    manualList.remove(m)
+                                    editingPeer = m
                                 }) { Text("编辑") }
-                                TextButton(onClick = { manualList.remove(m) }) { Text("删除") }
+                                TextButton(onClick = {
+                                    manualList.remove(m)
+                                    if (editingPeer == m) editingPeer = null
+                                }) { Text("删除") }
                             }
                         }
                         OutlinedTextField(
@@ -608,12 +645,14 @@ class MainActivity : ComponentActivity() {
                                 manualError = "Tailscale IP 无效，或对方监听端口不在 1-65535 范围内"
                             } else {
                                 manualError = ""
+                                editingPeer?.let { manualList.remove(it) }
                                 manualList.removeAll { it.host == fixed && it.port == port }
                                 manualList.add(ManualPeer(manualName.trim(), fixed, port))
+                                editingPeer = null
                                 manualName = ""
                                 manualHost = androidx.compose.ui.text.input.TextFieldValue("")
                             }
-                        }) { Text("添加设备") }
+                        }) { Text(if (editingPeer == null) "添加设备" else "保存设备") }
 
                         Spacer(Modifier.height(14.dp))
                         Text("帮助与更新", fontSize = 14.sp,
@@ -632,31 +671,37 @@ class MainActivity : ComponentActivity() {
                     TextButton(onClick = {
                         // 只有设置真正变化时才重建节点(改名/口令/端口/手动设备需生效)；
                         // 没变就不动，避免已连接的设备无谓断开、要重新点连接。
-                        val portVal = portInput.toIntOrNull()?.takeIf { it in 1..65535 } ?: 0
-                        val manualChanged = ManualPeers.load(prefs) != manualList.toList()
-                        val changed = nameInput != peerName.value ||
-                            secretInput != secret.value ||
-                            trustedInput != trustedOnly.value ||
-                            portVal != originalPort ||
-                            manualChanged
-                        peerName.value = nameInput
-                        secret.value = secretInput
-                        trustedOnly.value = trustedInput
-                        prefs.edit()
-                            .putString("peer_name", nameInput)
-                            .putString("secret", secretInput)
-                            .putBoolean("trusted_only", trustedInput)
-                            .putInt("listen_port", portVal)
-                            .apply()
-                        ManualPeers.save(prefs, manualList.toList())
-                        showSettings.value = false
-                        if (changed) {
-                            // 重启前记住当前选中目标，重建后由智能保留自动选回
-                            InkHoleBus.pendingSelectedService =
-                                InkHoleBus.node?.getSelectedServiceName()
-                            selectedPeer.value = null
-                            peers.clear()
-                            InkHoleService.restart(this@MainActivity)
+                        val parsedPort = portInput.toIntOrNull()
+                        if (portInput.isNotBlank() && parsedPort !in 1..65535) {
+                            settingsError = "本机监听端口必须在 1-65535 范围内"
+                        } else {
+                            val portVal = parsedPort ?: 0
+                            val normalizedName = nameInput.trim().ifEmpty { Build.MODEL }
+                            val manualChanged = ManualPeers.load(prefs) != manualList.toList()
+                            val changed = normalizedName != peerName.value ||
+                                secretInput != secret.value ||
+                                trustedInput != trustedOnly.value ||
+                                portVal != originalPort ||
+                                manualChanged
+                            peerName.value = normalizedName
+                            secret.value = secretInput
+                            trustedOnly.value = trustedInput
+                            prefs.edit()
+                                .putString("peer_name", normalizedName)
+                                .putString("secret", secretInput)
+                                .putBoolean("trusted_only", trustedInput)
+                                .putInt("listen_port", portVal)
+                                .apply()
+                            ManualPeers.save(prefs, manualList.toList())
+                            showSettings.value = false
+                            if (changed) {
+                                // 重启前记住当前选中目标，重建后由智能保留自动选回
+                                InkHoleBus.pendingSelectedService =
+                                    InkHoleBus.node?.getSelectedServiceName()
+                                selectedPeer.value = null
+                                peers.clear()
+                                InkHoleService.restart(this@MainActivity)
+                            }
                         }
                     }) { Text("保存") }
                 },
