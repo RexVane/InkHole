@@ -480,7 +480,7 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(14.dp))
                         Text("跨网络配置", fontSize = 14.sp,
                             fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                        Text("跨网直连时固定本机监听端口，并填写对方 IP 与端口",
+                        Text("跨网直连时固定本机监听端口，并填写对方 Tailscale IP 与监听端口",
                             fontSize = 11.sp,
                             color = androidx.compose.ui.graphics.Color.Gray)
                         Spacer(Modifier.height(6.dp))
@@ -522,32 +522,30 @@ class MainActivity : ComponentActivity() {
                             singleLine = true,
                         )
                         Spacer(Modifier.height(6.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            OutlinedTextField(
-                                value = manualHost,
-                                onValueChange = { tfv ->
-                                    // 光标在末尾才自动补点(不打扰中间编辑),并把光标固定回末尾——
-                                    // 否则 Compose 会把光标留在旧 offset,后续输入全插错位
-                                    manualHost = if (tfv.selection.end == tfv.text.length) {
-                                        val masked = ManualPeers.maskTyping(tfv.text)
-                                        androidx.compose.ui.text.input.TextFieldValue(
-                                            masked,
-                                            selection = androidx.compose.ui.text.TextRange(masked.length))
-                                    } else tfv
-                                },
-                                label = { Text("对方 IP") },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            OutlinedTextField(
-                                value = manualPort,
-                                onValueChange = { manualPort = it.filter { c -> c.isDigit() }.take(5) },
-                                label = { Text("端口") },
-                                singleLine = true,
-                                modifier = Modifier.width(92.dp),
-                            )
-                        }
+                        OutlinedTextField(
+                            value = manualHost,
+                            onValueChange = { tfv ->
+                                // 光标在末尾才自动补点(不打扰中间编辑),并把光标固定回末尾——
+                                // 否则 Compose 会把光标留在旧 offset,后续输入全插错位
+                                manualHost = if (tfv.selection.end == tfv.text.length) {
+                                    val masked = ManualPeers.maskTyping(tfv.text)
+                                    androidx.compose.ui.text.input.TextFieldValue(
+                                        masked,
+                                        selection = androidx.compose.ui.text.TextRange(masked.length))
+                                } else tfv
+                            },
+                            label = { Text("对方 Tailscale IP") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = manualPort,
+                            onValueChange = { manualPort = it.filter { c -> c.isDigit() }.take(5) },
+                            label = { Text("对方的监听端口") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
                         if (manualError.isNotEmpty()) {
                             Text(manualError, fontSize = 11.sp,
                                 color = androidx.compose.ui.graphics.Color(0xFFF08A7C))
@@ -556,7 +554,7 @@ class MainActivity : ComponentActivity() {
                             val fixed = ManualPeers.normalizeHost(manualHost.text)
                             val port = manualPort.toIntOrNull()
                             if (fixed == null || port == null || port !in 1..65535) {
-                                manualError = "IP 无效或有歧义，请检查（端口 1-65535）"
+                                manualError = "Tailscale IP 无效，或对方监听端口不在 1-65535 范围内"
                             } else {
                                 manualError = ""
                                 manualList.removeAll { it.host == fixed && it.port == port }
