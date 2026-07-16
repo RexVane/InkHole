@@ -624,6 +624,7 @@ class MainActivity : ComponentActivity() {
                                 editingPeer = null
                                 manualName = ""
                                 manualHost = androidx.compose.ui.text.input.TextFieldValue("")
+                                manualPort = ""
                             }
                         }) { Text(if (editingPeer == null) "添加设备" else "保存设备") }
                         manualList.forEach { m ->
