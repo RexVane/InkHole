@@ -304,8 +304,9 @@ class MainActivity : ComponentActivity() {
         InkHoleBus.loadHistory(this)
         InkHoleBus.uiListener = uiListener
 
-        // 服务可能早已在跑(锁屏收文件后点开)：恢复最近状态
-        peers.addAll(InkHoleBus.lastPeers)
+        // 服务可能早已在跑(锁屏收文件后点开)：恢复最近状态。节点活着时以它的
+        // 实时列表为准——lastPeers 可能属于已被系统杀死的旧节点,是陈旧状态。
+        peers.addAll(InkHoleBus.node?.getPeers() ?: InkHoleBus.lastPeers)
         statusMsg.value = InkHoleBus.lastStatus
         selectedPeer.value = InkHoleBus.node?.getSelectedPeer()
         sendingActive.value = sendWorkerRunning.get()
@@ -360,6 +361,19 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShareIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 回前台先与节点全量对表,再立即触发一轮探活:息屏期间探活循环随
+        // 进程冻结,下线设备的剔除毫无进展,不踢一脚就得干等下个轮询周期,
+        // 用户看到的是"设备早就关了还显示在线"。
+        InkHoleBus.node?.let { node ->
+            peers.clear()
+            peers.addAll(node.getPeers())
+            selectedPeer.value = node.getSelectedPeer()
+            node.probeNow()
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

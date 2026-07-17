@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import java.io.*
 import java.net.InetAddress
 import java.net.NetworkInterface
@@ -149,8 +150,9 @@ class InkHoleNode(
         } catch (e: Exception) {
             listener.onStatus("NSD 发现启动失败: ${e.message}")
         }
-        // 手动设备:乐观注册(真离线的话探活循环约 20s 后剔除,回线自动加回)
-        manualPeers.forEach { registerManual(it) }
+        // 手动设备不再启动即乐观入列:前台服务被厂商省电反复杀死重启,每次
+        // 重启都会把早已关机的对端"复活"成假在线。改由探活循环首轮(立即执行)
+        // 验证,连得上才显示——列表语义收紧为"当前真实在线的设备"。
         startProbeLoop()  // 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留
         // 发现自愈:NSD 发现流偶尔"卡死"(WiFi 省电丢组播/系统服务抽风),
         // 表现为对端明明在线列表却空着。列表持续为空时周期性重启发现。
@@ -163,6 +165,9 @@ class InkHoleNode(
                 if (!hasDiscoveredPeer && running) restartDiscovery()
             }
         }
+        // 把当前列表主动推给 UI:服务被杀重启后 Activity 可能还挂着旧节点的
+        // 设备列表,周围没有设备时不会再有 onPeerChanged 事件来纠正它。
+        listener.onPeerChanged(getPeers())
         listener.onStatus(
             when {
                 !tcpStarted -> "墨洞未开启：监听端口启动失败"
@@ -197,13 +202,13 @@ class InkHoleNode(
     }
 
     /** 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留。
+     *  首轮立即执行:手动设备的"验证后上线"也靠它,启动后 ~1s 内在线的手动设备就会出现。
      *  自动发现的设备:连续失败 PROBE_STRIKES 轮剔除(~10s),误移除后自动重启发现让 NSD 重新找回。
      *  手动设备:双倍容忍度(息屏 WiFi 休眠易误判);若不在列表但探活成功则自动加回(回线恢复)。 */
     private fun startProbeLoop() {
         scope.launch {
             val strikes = HashMap<String, Int>()
             while (running) {
-                delay(PROBE_INTERVAL_MS)
                 // 获取当前所有已知对端的探活目标(key、hosts、port)
                 val targets = synchronized(peersLock) {
                     peers.map { (key, peer) ->
@@ -212,21 +217,26 @@ class InkHoleNode(
                 }
                 val lanLinks = currentLanLinks()
                 // 清理已不在列表的对端的失败计数
-                val currentKeys = targets.map { it.first }.toSet()
-                strikes.keys.retainAll(currentKeys)
+                strikes.keys.retainAll(targets.map { it.first }.toSet())
+
+                // 设备级并行探活:串行时一台离线设备就按地址数×1.2s 拖慢一整轮,
+                // 多台离线时状态清理以分钟计,亮屏后旧设备迟迟不消失
+                val probed = targets.map { (key, hosts, port) ->
+                    async {
+                        val isManual = key.startsWith("manual|")
+                        // 自动发现条目必须仍可经当前 WiFi/以太网到达。Windows 通告里可能
+                        // 同时带 Tailscale 地址，不能用 VPN 兜底把已离开局域网的设备留在列表。
+                        val probeHosts = if (isManual) hosts
+                            else LanReachability.hostsOnCurrentLan(hosts, lanLinks)
+                        Triple(key, isManual, probeHosts.any { host -> probeAlive(host, port) })
+                    }
+                }.awaitAll()
 
                 var autoRemovedThisRound = false
-                for ((key, hosts, port) in targets) {
+                for ((key, isManual, alive) in probed) {
                     if (!running) break
                     val present = synchronized(peersLock) { peers.containsKey(key) }
                     if (!present) continue  // 已被其他逻辑移除,跳过
-
-                    val isManual = key.startsWith("manual|")
-                    // 自动发现条目必须仍可经当前 WiFi/以太网到达。Windows 通告里可能
-                    // 同时带 Tailscale 地址，不能用 VPN 兜底把已离开局域网的设备留在列表。
-                    val probeHosts = if (isManual) hosts
-                        else LanReachability.hostsOnCurrentLan(hosts, lanLinks)
-                    val alive = probeHosts.any { host -> probeAlive(host, port) }
                     val threshold = if (isManual) PROBE_STRIKES_MANUAL else PROBE_STRIKES
 
                     if (!alive) {
@@ -248,17 +258,30 @@ class InkHoleNode(
                     restartDiscovery()
                 }
 
-                // 手动设备特殊处理:不在列表但能连上 → 自动加回(回线恢复)
-                for (m in manualPeers) {
-                    if (!running) break
-                    val present = synchronized(peersLock) { peers.containsKey(m.key) }
-                    if (!present && probeAlive(m.host, m.port)) {
-                        strikes.remove(m.key)
-                        registerManual(m)
-                    }
+                // 手动设备兜底:不在列表但能连上 → 加回(启动首轮的"验证后上线"同样走这里)
+                manualPeers.filter { m ->
+                    synchronized(peersLock) { !peers.containsKey(m.key) }
+                }.map { m ->
+                    async { if (probeAlive(m.host, m.port)) m else null }
+                }.awaitAll().filterNotNull().forEach { m ->
+                    if (!running) return@forEach
+                    strikes.remove(m.key)
+                    registerManual(m)
                 }
+
+                // 间隔期可被 probeNow() 提前唤醒:回前台立即刷新在线状态
+                withTimeoutOrNull(PROBE_INTERVAL_MS) { probeKick.receive() }
             }
         }
+    }
+
+    // 回前台立即探活的信号;CONFLATED 让连续多次触发合并成一轮
+    private val probeKick = Channel<Unit>(Channel.CONFLATED)
+
+    /** 立即开始一轮全量探活。息屏期间探活循环随进程冻结,下线设备的剔除
+     *  不会推进;Activity 回前台时踢一脚,不用干等下一个轮询周期。 */
+    fun probeNow() {
+        probeKick.trySend(Unit)
     }
 
     fun stop() {
@@ -985,7 +1008,23 @@ class InkHoleNode(
         hosts.addAll(resolvedHosts)
         attrs["ips"]?.toString(Charsets.UTF_8)?.split(",")
             ?.map { it.trim() }?.filter { it.isNotEmpty() }?.let { hosts.addAll(it) }
-        addPeer(discoveryName, displayName, host, info.port, hosts.toList())
+        val hostList = hosts.toList()
+        // 已在列表的服务:直接同步地址与对端改名(存活由探活循环负责)
+        if (synchronized(peersLock) { peers.containsKey(discoveryName) }) {
+            addPeer(discoveryName, displayName, host, info.port, hostList)
+            return
+        }
+        // 新发现的服务先 TCP 验证再入列。系统 mDNS 缓存(Android 13+ 常驻缓存,
+        // 对端崩溃/断网不发 goodbye 时记录可存活几十分钟)会在重启发现时立即
+        // 回灌陈旧记录——探活循环刚剔除的下线设备下一秒又被 resolve"复活",
+        // 表现为对端明明关了却一直显示在线。可达性标准与探活循环一致:仅认
+        // 当前 WiFi/以太网可达的地址,不给 Tailscale 等 VPN 路径兜底的机会。
+        scope.launch {
+            val candidates = LanReachability.hostsOnCurrentLan(hostList, currentLanLinks())
+            if (candidates.any { probeAlive(it, info.port) } && running) {
+                addPeer(discoveryName, displayName, host, info.port, hostList)
+            }
+        }
     }
 
     private fun localIps(): Set<String> {
@@ -1009,8 +1048,12 @@ class InkHoleNode(
             manager.allNetworks.flatMap { network ->
                 val capabilities = manager.getNetworkCapabilities(network)
                     ?: return@flatMap emptyList()
-                val isLan = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                // Android 的 VPN 网络会继承底层网络的 transport(Tailscale 跑在
+                // WiFi 上时同时报告 WIFI + VPN),必须显式排除 VPN,否则 TUN 接口
+                // 地址也会被当成局域网链路。
+                val isLan = (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) &&
+                    !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
                 if (!isLan) return@flatMap emptyList()
                 manager.getLinkProperties(network)?.linkAddresses.orEmpty().mapNotNull { link ->
                     val address = link.address
