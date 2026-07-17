@@ -71,7 +71,10 @@ class InkHoleNode(
         private const val DRAIN_TIMEOUT_MS = 2_000
         private const val MAX_INCOMING_CONNECTIONS = 4
         private const val DRAIN_CAP = 8L * 1024 * 1024       // 拒收时最多帮对端消化的字节数
-        private const val SOCKET_BUFFER = 1024 * 1024         // 高延迟 Tailscale/DERP 链路 TCP 缓冲
+        // TCP 收发缓冲(4MB):决定窗口上限,必须在 bind/connect 之前设置——
+        // 窗口缩放因子在握手时协商,连接建立后再放大不生效,且显式设置会
+        // 禁用内核自动调优,设晚了反而把窗口钉死在小值
+        private const val SOCKET_BUFFER = 4 * 1024 * 1024
         // onServiceLost 误报兜底：探活参数(连续失败才真移除)
         private const val LOST_PROBE_TIMEOUT_MS = 1200        // 单次 TCP 探活超时
         private const val LOST_PROBE_ATTEMPTS = 3             // 连续失败几次才判定真离线
@@ -309,10 +312,13 @@ class InkHoleNode(
     // ---- TCP 服务器 ----
 
     /** 绑定监听端口。必须开 SO_REUSEADDR:设置保存会重启节点,旧连接的
-     *  TIME_WAIT 会让立刻重绑同端口失败——不开的话固定端口会"莫名变随机"。 */
+     *  TIME_WAIT 会让立刻重绑同端口失败——不开的话固定端口会"莫名变随机"。
+     *  接收缓冲必须在 bind 前设在 ServerSocket 上:accept 出的连接继承它,
+     *  并以它协商窗口缩放,大文件接收吞吐的天花板在这里定下。 */
     private fun bindServer(port: Int): ServerSocket =
         ServerSocket().apply {
             reuseAddress = true
+            try { receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
             bind(java.net.InetSocketAddress(port.coerceIn(0, 65535)))
         }
 
@@ -336,7 +342,6 @@ class InkHoleNode(
             while (running) {
                 try {
                     val conn = server.accept()
-                    try { conn.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
                     if (!incomingSlots.tryAcquire()) {
                         try { conn.close() } catch (_: IOException) {}
                         continue
@@ -375,7 +380,7 @@ class InkHoleNode(
         var receivedName = ""
         try {
             conn.soTimeout = HEADER_TIMEOUT_MS
-            val input = BufferedInputStream(conn.getInputStream())
+            val input = BufferedInputStream(conn.getInputStream(), WHPP.BUFFER_SIZE)
             // 先读协议头再做 trusted 判断:存活探测的空连接(连上即断)在
             // readHeader 处 EOF 静默结束,不会被当成陌生传输拒收刷屏
             val header = WHPP.readHeader(input)
@@ -617,8 +622,6 @@ class InkHoleNode(
         sendInProgress.set(true)
         return try {
             val socket = connectToPeer(peer)
-            try { socket.sendBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
-            try { socket.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
             activeSockets.add(socket)
             activeSendSocket.set(socket)
             if (!running) {
@@ -752,6 +755,9 @@ class InkHoleNode(
         for (host in targets) {
             if (!running) throw IOException("墨洞节点已停止")
             val socket = Socket()
+            // 缓冲必须在 connect 前设置(窗口缩放在握手时协商),发送吞吐靠 sndbuf
+            try { socket.sendBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
+            try { socket.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
             try {
                 socket.connect(java.net.InetSocketAddress(host, peer.port), 15_000)
                 if (!running) {

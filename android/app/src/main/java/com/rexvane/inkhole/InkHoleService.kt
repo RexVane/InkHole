@@ -38,6 +38,7 @@ class InkHoleService : Service() {
         private const val CHANNEL_FILES = "inkhole_files"
         private const val NOTIF_STATUS_ID = 1
         private const val ACTION_RELOAD = "com.rexvane.inkhole.RELOAD"
+        private const val EXPORT_BUFFER = 1024 * 1024   // 导出到 Downloads 的复制缓冲
 
         fun start(context: Context) {
             val intent = Intent(context, InkHoleService::class.java)
@@ -179,7 +180,11 @@ class InkHoleService : Service() {
                 val uri = inserted ?: throw IOException("无法创建下载文件")
                 val out = contentResolver.openOutputStream(uri)
                     ?: throw IOException("无法打开下载文件")
-                out.use { output -> src.inputStream().use { it.copyTo(output) } }
+                // 1MB 缓冲:GB 级文件默认 8KB 会产生几十万次读写调用,
+                // 导出耗时数倍于必要值,用户看到"进度走完了还在转"
+                out.use { output ->
+                    src.inputStream().use { it.copyTo(output, EXPORT_BUFFER) }
+                }
                 val published = contentResolver.update(uri, ContentValues().apply {
                     put(MediaStore.MediaColumns.IS_PENDING, 0)
                 }, null, null)
@@ -208,7 +213,7 @@ class InkHoleService : Service() {
                 if (!dir.exists() && !dir.mkdirs()) throw IOException("无法创建下载目录")
                 val dst = synchronized(exportLock) {
                     val candidate = ReceiveFiles.uniqueFile(dir, src.name)
-                    src.copyTo(candidate, overwrite = false)
+                    src.copyTo(candidate, overwrite = false, bufferSize = EXPORT_BUFFER)
                     candidate
                 }
                 val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", dst)

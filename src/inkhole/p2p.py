@@ -42,7 +42,8 @@ from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
 _SERVICE_TYPE = "_inkhole._tcp.local."
 _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
 _BUFFER = 256 * 1024      # 256KB 传输块，降低大文件跨网传输的 Python IO 调用开销
-_SOCKET_BUFFER = 1024 * 1024       # 高延迟链路(Tailscale/DERP)需要更大的 TCP 缓冲
+_SOCKET_BUFFER = 4 * 1024 * 1024   # TCP 窗口上限:4MB @ RTT 200ms(DERP) ≈ 20MB/s,
+                                   # @ RTT 60ms(WiFi 抖动) ≈ 66MB/s,高于链路真实能力
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
 _MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
 _MAX_WHE1_SIZE = 256 * 1024 * 1024 # WHE1 整块解密需全量进内存，超过此值拒收(防内存耗尽)
@@ -66,12 +67,36 @@ class _SendCancelled(Exception):
 
 
 def _tune_transfer_socket(sock: socket.socket) -> None:
-    """Increase TCP windows for high-latency VPN/relay paths; OS caps are respected."""
+    """放大 TCP 收发缓冲。必须在 bind(服务端)/connect(客户端)之前调用：
+    窗口缩放因子在握手时按当时的缓冲协商，连接建立后再放大只改本地队列、
+    不改窗口上限；且显式设置会禁用系统自动调优，设晚了反而把窗口钉死。"""
     for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
         try:
             sock.setsockopt(socket.SOL_SOCKET, option, _SOCKET_BUFFER)
         except OSError:
             pass
+
+
+def _connect_transfer_socket(host: str, port: int, timeout: float) -> socket.socket:
+    """按传输要求建立发送连接(缓冲在 connect 前设置，见 _tune_transfer_socket)。"""
+    err: OSError | None = None
+    for af, socktype, proto, _c, sa in socket.getaddrinfo(
+            host, port, 0, socket.SOCK_STREAM):
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            _tune_transfer_socket(sock)
+            sock.settimeout(timeout)
+            sock.connect(sa)
+            return sock
+        except OSError as e:
+            err = e
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    raise err if err is not None else OSError(f"无法解析地址 {host}")
 
 
 # ---------- 配置 ----------
@@ -371,6 +396,9 @@ class P2PNode:
         def make_socket() -> socket.socket:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # 监听 socket 的缓冲会被 accept 出的连接继承,并决定握手时协商的
+            # 窗口缩放——大文件接收吞吐的天花板在这里定下
+            _tune_transfer_socket(sock)
             return sock
 
         self._server_sock = make_socket()
@@ -401,7 +429,6 @@ class P2PNode:
                 conn, addr = self._server_sock.accept()
             except OSError:
                 break  # server socket closed
-            _tune_transfer_socket(conn)
             threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True).start()
 
     def _handle_connection(self, conn: socket.socket, addr) -> None:
@@ -660,8 +687,7 @@ class P2PNode:
             last_err: OSError | None = None
             for host in (peer.hosts or [peer.host]):
                 try:
-                    sock = socket.create_connection((host, peer.port),
-                                                    timeout=_CONNECT_TIMEOUT)
+                    sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
                     break
                 except OSError as e:
                     last_err = e
@@ -669,7 +695,6 @@ class P2PNode:
                 raise last_err if last_err else OSError("无可用地址")
 
             try:
-                _tune_transfer_socket(sock)
                 with self._send_state_lock:
                     self._active_send_sock = sock
                 if cancellation_requested():
