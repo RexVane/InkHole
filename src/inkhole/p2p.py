@@ -747,10 +747,14 @@ class P2PNode:
 
             progress = _Progress(self.on_progress, "send", name, file_size)
 
-            # 多网卡/VPN 场景：逐个地址尝试，先通先用
+            # 多网卡/VPN 场景：逐个地址尝试，先通先用。局域网/直连地址优先,
+            # Tailscale(100.x)殿后——同 WiFi 时若先连 100.x 会绕道 relay,
+            # 把直连速度拖成几百 KB/s
             sock = None
             last_err: OSError | None = None
-            for host in (peer.hosts or [peer.host]):
+            send_hosts = sorted(peer.hosts or [peer.host],
+                                key=lambda h: 1 if _is_cgnat_ip(h) else 0)
+            for host in send_hosts:
                 try:
                     sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
                     break
@@ -1015,12 +1019,22 @@ class P2PNode:
                            for n, p in self._peers.items()]
             seen = set()
             auto_removed = False
+            ts_ip = _cgnat_source_ip()
             for key, hosts, port, display in targets:
                 seen.add(key)
+                is_manual = key.startswith("manual|")
+                # 本机 Tailscale 不在线:纯 CGNAT 地址的手动设备确定不可达,
+                # 立即剔除——确定性判断不烧 4 轮抖动容忍,关 Tailscale 后
+                # 跨网设备 5 秒内消失而不是挂半分多钟
+                if is_manual and ts_ip is None and hosts \
+                        and all(_is_cgnat_ip(h) for h in hosts):
+                    strikes.pop(key, None)
+                    self._on_peer_removed(display)
+                    continue
                 # 手动设备(Tailscale)探活给双倍超时:空闲后懒惰唤醒(打洞/DERP
                 # 建链)首次握手常超默认超时,太紧会把在线的跨网设备判死
                 probe_timeout = (self._probe_timeout * 2
-                                 if key.startswith("manual|") else self._probe_timeout)
+                                 if is_manual else self._probe_timeout)
                 alive = False
                 for host in hosts:
                     try:

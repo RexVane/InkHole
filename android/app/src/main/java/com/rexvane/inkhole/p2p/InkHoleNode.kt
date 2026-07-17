@@ -223,6 +223,7 @@ class InkHoleNode(
                     }
                 }
                 val lanLinks = currentLanLinks()
+                val tailscaleUp = tailscaleNetwork() != null
                 // 清理已不在列表的对端的失败计数
                 strikes.keys.retainAll(targets.map { it.first }.toSet())
 
@@ -231,6 +232,12 @@ class InkHoleNode(
                 val probed = targets.map { (key, hosts, port) ->
                     async {
                         val isManual = key.startsWith("manual|")
+                        // 本机 Tailscale 不在线:纯 CGNAT 地址的手动设备确定不可达,
+                        // 返回 null 让外层立即剔除——确定性判断不烧 4 轮抖动容忍
+                        if (isManual && !tailscaleUp && hosts.isNotEmpty() &&
+                            hosts.all { isCgnatAddress(it) }) {
+                            return@async Triple(key, true, null as Boolean?)
+                        }
                         // 自动发现条目必须仍可经当前 WiFi/以太网到达。Windows 通告里可能
                         // 同时带 Tailscale 地址，不能用 VPN 兜底把已离开局域网的设备留在列表。
                         val probeHosts = if (isManual) hosts
@@ -238,7 +245,7 @@ class InkHoleNode(
                         val timeout = if (isManual) PROBE_TIMEOUT_MANUAL_MS
                             else LOST_PROBE_TIMEOUT_MS
                         Triple(key, isManual,
-                            probeHosts.any { host -> probeAlive(host, port, timeout) })
+                            probeHosts.any { host -> probeAlive(host, port, timeout) } as Boolean?)
                     }
                 }.awaitAll()
 
@@ -247,6 +254,12 @@ class InkHoleNode(
                     if (!running) break
                     val present = synchronized(peersLock) { peers.containsKey(key) }
                     if (!present) continue  // 已被其他逻辑移除,跳过
+                    if (alive == null) {
+                        // Tailscale 离线 → 跨网设备立即消失,不再挂 30 多秒
+                        strikes.remove(key)
+                        removePeer(key)
+                        continue
+                    }
                     val threshold = if (isManual) PROBE_STRIKES_MANUAL else PROBE_STRIKES
 
                     if (!alive) {
@@ -768,6 +781,9 @@ class InkHoleNode(
                 }
             }
             .distinct()
+            // 局域网/直连地址优先,Tailscale(100.x)殿后:同 WiFi 时对端通告里
+            // 若 100.x 排前面,先连它就会绕道 relay 把直连速度拖成几百 KB/s
+            .sortedBy { if (isCgnatAddress(it)) 1 else 0 }
         for (host in targets) {
             if (!running) throw IOException("墨洞节点已停止")
             val socket = socketForHost(host)
