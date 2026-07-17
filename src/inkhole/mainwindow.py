@@ -1282,7 +1282,7 @@ class MainWindow(QWidget):
         info_lay.addWidget(self._local_info_lbl)
         self._version_info_lbl = _info_line(f"版本：v{self._bridge.appVersion()}")
         info_lay.addWidget(self._version_info_lbl)
-        self._port_info_lbl = _info_line("端口：未启动（建议自定义固定端口）")
+        self._port_info_lbl = _info_line("端口：未启动（建议自定义 1024-49151 固定端口）")
         info_lay.addWidget(self._port_info_lbl)
         left_col.addWidget(info_box)
 
@@ -1369,11 +1369,12 @@ class MainWindow(QWidget):
         left_col.addSpacing(6)
         left_col.addWidget(_section_label("跨网络配置"))
         network_hint = QLabel(
-            "跨网直连时固定本机监听端口，并填写对方 Tailscale IP 与监听端口")
+            "跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），"
+            "并填写对方 Tailscale IP 与监听端口")
         network_hint.setWordWrap(True)
         network_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
         left_col.addWidget(network_hint)
-        self._sp_port = OutlinedLineEdit("本机监听端口（留空=自动，如 52130）")
+        self._sp_port = OutlinedLineEdit("本机监听端口（留空=自动，建议 1024-49151，如 41300）")
         self._sp_port.setValidator(QIntValidator(1, 65535, self._sp_port))
         left_col.addWidget(self._sp_port)
 
@@ -1571,7 +1572,7 @@ class MainWindow(QWidget):
         self._local_info_lbl.setText(f"本机：{cfg.peer_name}-{cfg.instance_id}")
         self._version_info_lbl.setText(f"版本：v{self._bridge.appVersion()}")
         self._port_info_lbl.setText(
-            f"端口：{actual_port if actual_port else '未启动'}（建议自定义固定端口）")
+            f"端口：{actual_port if actual_port else '未启动'}（建议自定义 1024-49151 固定端口）")
         self._manual_draft = [dict(entry) for entry in self._bridge.manualPeers()]
         self._reset_manual_editor()
         self._refresh_manual_list()

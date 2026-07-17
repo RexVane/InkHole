@@ -656,7 +656,7 @@ class MainActivity : ComponentActivity() {
                                 )
                                 Text(
                                     text = "端口：${if (actualPort > 0) actualPort else "未启动"}" +
-                                        "（建议自定义固定端口）",
+                                        "（建议自定义 1024-49151 固定端口）",
                                     fontSize = 12.sp,
                                     color = androidx.compose.ui.graphics.Color.Gray,
                                     modifier = Modifier.padding(bottom = 12.dp)
@@ -705,7 +705,7 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(14.dp))
                         Text("跨网络配置", fontSize = 14.sp,
                             fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                        Text("跨网直连时固定本机监听端口，并填写对方 Tailscale IP 与监听端口",
+                        Text("跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），并填写对方 Tailscale IP 与监听端口",
                             fontSize = 11.sp,
                             color = androidx.compose.ui.graphics.Color.Gray)
                         Spacer(Modifier.height(6.dp))
@@ -715,7 +715,7 @@ class MainActivity : ComponentActivity() {
                                 portInput = it.filter { c -> c.isDigit() }.take(5)
                                 settingsError = ""
                             },
-                            label = { Text("本机监听端口（留空=自动，如 52130）") },
+                            label = { Text("本机监听端口（留空=自动，建议 1024-49151）") },
                             singleLine = true,
                         )
                         if (settingsError.isNotEmpty()) {

@@ -184,11 +184,11 @@ def test_settings_page_opens_and_populates(app):
     assert window._manual_host.text() == ""
     assert window._manual_port.text() == ""
     assert window._ed_name.labelText() == "设备名称"
-    assert window._sp_port.labelText() == "本机监听端口（留空=自动，如 52130）"
+    assert window._sp_port.labelText() == "本机监听端口（留空=自动，建议 1024-49151，如 41300）"
     assert window._manual_host.labelText() == "对方 Tailscale IP"
     assert window._local_info_lbl.text().startswith("本机：SMOKE-")
     assert window._version_info_lbl.text() == "版本：v0.0.0"
-    assert window._port_info_lbl.text() == "端口：43123（建议自定义固定端口）"
+    assert window._port_info_lbl.text() == "端口：43123（建议自定义 1024-49151 固定端口）"
     assert "IP" not in window._local_info_lbl.text()
 
 
