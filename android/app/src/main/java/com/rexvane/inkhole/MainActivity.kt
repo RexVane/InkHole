@@ -269,8 +269,10 @@ class MainActivity : ComponentActivity() {
                     progressSpeed >= 1024 -> " · %.0f KB/s".format(progressSpeed / 1024)
                     else -> ""
                 }
+                // 百分比与速度放最前:状态栏空间不够时截断的是文件名,
+                // 实时速度永远可见
                 statusMsg.value =
-                    "${if (kind == "send") "↑ 发送" else "↓ 接收"} $filename ${pct.toInt()}%$speedText"
+                    "${if (kind == "send") "↑ 发送" else "↓ 接收"} ${pct.toInt()}%$speedText · $filename"
             }
 
         override fun onTransferEnded(kind: String, filename: String, completed: Boolean) =

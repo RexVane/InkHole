@@ -952,11 +952,15 @@ class P2PNode:
             auto_removed = False
             for key, hosts, port, display in targets:
                 seen.add(key)
+                # 手动设备(Tailscale)探活给双倍超时:空闲后懒惰唤醒(打洞/DERP
+                # 建链)首次握手常超默认超时,太紧会把在线的跨网设备判死
+                probe_timeout = (self._probe_timeout * 2
+                                 if key.startswith("manual|") else self._probe_timeout)
                 alive = False
                 for host in hosts:
                     try:
                         socket.create_connection((host, port),
-                                                 timeout=self._probe_timeout).close()
+                                                 timeout=probe_timeout).close()
                         alive = True
                         break
                     except OSError:
@@ -998,7 +1002,7 @@ class P2PNode:
                 try:
                     socket.create_connection(
                         (entry["host"], int(entry["port"])),
-                        timeout=self._probe_timeout).close()
+                        timeout=self._probe_timeout * 2).close()
                 except OSError:
                     continue
                 self._register_manual(entry)

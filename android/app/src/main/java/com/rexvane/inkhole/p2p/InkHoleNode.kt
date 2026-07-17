@@ -83,6 +83,9 @@ class InkHoleNode(
         private const val PROBE_INTERVAL_MS = 5_000L          // 探活轮询间隔
         private const val PROBE_STRIKES = 2                   // 自动发现设备连续失败几轮剔除
         private const val PROBE_STRIKES_MANUAL = 4            // 手动设备双倍容忍(息屏 WiFi 休眠易误判)
+        // 手动设备探活超时:Tailscale 空闲后懒惰唤醒(打洞/DERP 建链)首次
+        // 握手常超 1.2s,太紧会把在线的跨网设备判死或迟迟不上线
+        private const val PROBE_TIMEOUT_MANUAL_MS = 3_000
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -231,7 +234,10 @@ class InkHoleNode(
                         // 同时带 Tailscale 地址，不能用 VPN 兜底把已离开局域网的设备留在列表。
                         val probeHosts = if (isManual) hosts
                             else LanReachability.hostsOnCurrentLan(hosts, lanLinks)
-                        Triple(key, isManual, probeHosts.any { host -> probeAlive(host, port) })
+                        val timeout = if (isManual) PROBE_TIMEOUT_MANUAL_MS
+                            else LOST_PROBE_TIMEOUT_MS
+                        Triple(key, isManual,
+                            probeHosts.any { host -> probeAlive(host, port, timeout) })
                     }
                 }.awaitAll()
 
@@ -265,7 +271,9 @@ class InkHoleNode(
                 manualPeers.filter { m ->
                     synchronized(peersLock) { !peers.containsKey(m.key) }
                 }.map { m ->
-                    async { if (probeAlive(m.host, m.port)) m else null }
+                    async {
+                        if (probeAlive(m.host, m.port, PROBE_TIMEOUT_MANUAL_MS)) m else null
+                    }
                 }.awaitAll().filterNotNull().forEach { m ->
                     if (!running) return@forEach
                     strikes.remove(m.key)
@@ -890,8 +898,9 @@ class InkHoleNode(
         }
     }
 
-    private fun probeAlive(host: String, port: Int): Boolean = try {
-        Socket().use { it.connect(java.net.InetSocketAddress(host, port), LOST_PROBE_TIMEOUT_MS) }
+    private fun probeAlive(host: String, port: Int,
+                           timeoutMs: Int = LOST_PROBE_TIMEOUT_MS): Boolean = try {
+        Socket().use { it.connect(java.net.InetSocketAddress(host, port), timeoutMs) }
         true
     } catch (_: Exception) {
         false

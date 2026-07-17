@@ -251,7 +251,8 @@ fun MainScreen(
                         color = if (transferPct >= 0f) Teal else TextSecondary,
                         fontSize = 13.sp,
                         textAlign = TextAlign.Center,
-                        maxLines = 1,
+                        // 长文件名换行到第二行,不再把百分比和实时速度挤成省略号
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
