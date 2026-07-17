@@ -77,6 +77,54 @@ def _tune_transfer_socket(sock: socket.socket) -> None:
             pass
 
 
+def _is_cgnat_ip(host: str) -> bool:
+    """100.64.0.0/10(运营商 CGNAT 段,Tailscale 用它分配虚拟 IP)。"""
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return a == 100 and 64 <= b <= 127
+
+
+def _cgnat_source_ip() -> str | None:
+    """本机 Tailscale 接口的 100.x 地址;Tailscale 不在线返回 None。"""
+    try:
+        import psutil
+        for addrs in psutil.net_if_addrs().values():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and _is_cgnat_ip(addr.address):
+                    return addr.address
+    except ImportError:
+        try:
+            for *_ignored, sockaddr in socket.getaddrinfo(
+                    socket.gethostname(), None, socket.AF_INET):
+                if _is_cgnat_ip(sockaddr[0]):
+                    return sockaddr[0]
+        except (socket.gaierror, OSError):
+            pass
+    except OSError:
+        pass
+    return None
+
+
+def _probe_connect(host: str, port: int, timeout: float) -> None:
+    """探活连接(连上即断,失败抛 OSError)。100.x(Tailscale)目标强制从
+    本机 Tailscale 接口出发,接口不在线直接判不可达——否则 connect 按
+    默认路由泄漏(被代理 TUN 假 accept / 进运营商 CGNAT),对端明明下线
+    探活却一直"成功",设备永远赖在列表里。"""
+    if _is_cgnat_ip(host):
+        src = _cgnat_source_ip()
+        if src is None:
+            raise OSError("Tailscale 接口不在线")
+        socket.create_connection((host, port), timeout=timeout,
+                                 source_address=(src, 0)).close()
+    else:
+        socket.create_connection((host, port), timeout=timeout).close()
+
+
 def _connect_transfer_socket(host: str, port: int, timeout: float) -> socket.socket:
     """按传输要求建立发送连接(缓冲在 connect 前设置，见 _tune_transfer_socket)。"""
     err: OSError | None = None
@@ -86,6 +134,12 @@ def _connect_transfer_socket(host: str, port: int, timeout: float) -> socket.soc
         try:
             sock = socket.socket(af, socktype, proto)
             _tune_transfer_socket(sock)
+            # Tailscale 目标必须从 Tailscale 接口出发(见 _probe_connect)
+            if af == socket.AF_INET and _is_cgnat_ip(sa[0]):
+                src = _cgnat_source_ip()
+                if src is None:
+                    raise OSError("Tailscale 接口不在线")
+                sock.bind((src, 0))
             sock.settimeout(timeout)
             sock.connect(sa)
             return sock
@@ -970,8 +1024,7 @@ class P2PNode:
                 alive = False
                 for host in hosts:
                     try:
-                        socket.create_connection((host, port),
-                                                 timeout=probe_timeout).close()
+                        _probe_connect(host, port, probe_timeout)
                         alive = True
                         break
                     except OSError:
@@ -1011,9 +1064,8 @@ class P2PNode:
                 if key in known:
                     continue
                 try:
-                    socket.create_connection(
-                        (entry["host"], int(entry["port"])),
-                        timeout=self._probe_timeout * 2).close()
+                    _probe_connect(entry["host"], int(entry["port"]),
+                                   self._probe_timeout * 2)
                 except OSError:
                     continue
                 self._register_manual(entry)

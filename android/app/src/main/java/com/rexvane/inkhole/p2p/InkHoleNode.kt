@@ -2,6 +2,7 @@ package com.rexvane.inkhole.p2p
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -769,7 +770,11 @@ class InkHoleNode(
             .distinct()
         for (host in targets) {
             if (!running) throw IOException("墨洞节点已停止")
-            val socket = Socket()
+            val socket = socketForHost(host)
+            if (socket == null) {
+                lastError = IOException("Tailscale 未连接，无法到达 $host")
+                continue
+            }
             // 缓冲必须在 connect 前设置(窗口缩放在握手时协商),发送吞吐靠 sndbuf
             try { socket.sendBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
             try { socket.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
@@ -905,12 +910,55 @@ class InkHoleNode(
         }
     }
 
-    private fun probeAlive(host: String, port: Int,
-                           timeoutMs: Int = LOST_PROBE_TIMEOUT_MS): Boolean = try {
-        Socket().use { it.connect(java.net.InetSocketAddress(host, port), timeoutMs) }
-        true
+    /** CGNAT 段(100.64.0.0/10,Tailscale 分配的地址)的 IPv4 字面量。 */
+    private fun isCgnatAddress(host: String): Boolean {
+        val parts = host.split(".")
+        if (parts.size != 4) return false
+        val a = parts[0].toIntOrNull() ?: return false
+        val b = parts[1].toIntOrNull() ?: return false
+        return a == 100 && b in 64..127
+    }
+
+    /** 真正的 Tailscale 网络 = 持有 100.64/10 地址的 VPN 网络。不能只看
+     *  TRANSPORT_VPN:Clash/Mihomo 等代理的 TUN 也是 VPN,且会对任意 TCP
+     *  连接先本地假 accept——纯 connect 探活在它上面永远"成功"。 */
+    private fun tailscaleNetwork(): Network? = try {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? ConnectivityManager
+        manager?.allNetworks?.firstOrNull { network ->
+            manager.getNetworkCapabilities(network)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true &&
+                manager.getLinkProperties(network)?.linkAddresses.orEmpty().any { link ->
+                    link.address.hostAddress?.let { isCgnatAddress(it) } == true
+                }
+        }
     } catch (_: Exception) {
-        false
+        null
+    }
+
+    /** 为目标地址创建出站 socket。100.x(Tailscale)目标必须绑定真正的
+     *  Tailscale 网络:它不在时返回 null 直接判不可达。否则 connect 走
+     *  默认路由——被代理 TUN 假 accept 或泄漏进运营商 CGNAT,表现为对端
+     *  明明下线(甚至 Tailscale 都没开)探活却一直"成功",设备永远在列表。 */
+    private fun socketForHost(host: String): Socket? {
+        if (!isCgnatAddress(host)) return Socket()
+        val vpn = tailscaleNetwork() ?: return null
+        return try {
+            vpn.socketFactory.createSocket()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun probeAlive(host: String, port: Int,
+                           timeoutMs: Int = LOST_PROBE_TIMEOUT_MS): Boolean {
+        val socket = socketForHost(host) ?: return false
+        return try {
+            socket.use { it.connect(java.net.InetSocketAddress(host, port), timeoutMs) }
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     // ---- NSD 注册 ----
