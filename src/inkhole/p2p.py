@@ -381,6 +381,14 @@ class P2PNode:
             sock = self._active_send_sock
         if sock is not None:
             try:
+                # 取消要立刻生效:SO_LINGER(0) 让 close 直接 RST 丢弃发送缓冲
+                # 里已排队的数据(最多 4MB)。否则内核会把缓冲慢慢发完才断开,
+                # 跨网中继链路上对端还要"收"十几秒才看到传输中断。
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+            except OSError:
+                pass
+            try:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
@@ -588,6 +596,9 @@ class P2PNode:
             if self.on_received:
                 self.on_received(dst)
             self._status(f"已接收：{os.path.basename(dst)}")
+        except (ConnectionResetError, ConnectionAbortedError):
+            # 对端取消发送(RST 硬断开)或网络断开:按"中断"而非"失败"提示
+            self._status(f"接收中断：{transfer_name or '未知文件'}")
         except Exception as e:
             self._status("接收失败", str(e))
         finally:

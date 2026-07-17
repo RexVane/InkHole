@@ -534,6 +534,9 @@ class InkHoleNode(
         } catch (_: SocketTimeoutException) {
             // 未发协议头的半开连接静默关闭；传输开始后超时才提示用户。
             if (headerRead) listener.onStatus("接收中断: ${receivedName.ifEmpty { "未知文件" }}")
+        } catch (_: java.net.SocketException) {
+            // 对端取消发送(RST 硬断开)或网络断开:按"中断"而非"失败"提示
+            if (headerRead) listener.onStatus("接收中断: ${receivedName.ifEmpty { "未知文件" }}")
         } catch (e: Exception) {
             if (running) listener.onStatus("接收失败: ${e.message ?: "未知错误"}")
         } finally {
@@ -583,6 +586,10 @@ class InkHoleNode(
         val active = sendInProgress.get()
         sendCancelled.set(true)
         activeSendSocket.get()?.let { socket ->
+            // 取消要立刻生效:SO_LINGER(0) 让 close 直接 RST 丢弃发送缓冲里
+            // 已排队的数据(最多 4MB),否则内核把缓冲慢慢发完才断开,跨网
+            // 中继链路上对端还要"收"十几秒才看到传输中断
+            try { socket.setSoLinger(true, 0) } catch (_: Exception) {}
             try { socket.close() } catch (_: IOException) {}
         }
         activeSendInput.get()?.let { input ->
