@@ -13,6 +13,7 @@ mainwindow.py
 """
 
 from __future__ import annotations
+import html
 import os
 import re
 import sys
@@ -27,7 +28,7 @@ from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
                                QLineEdit, QCheckBox,
-                               QMessageBox, QSizePolicy, QStackedWidget,
+                               QDialog, QSizePolicy, QStackedWidget,
                                QSizeGrip, QToolButton, QStyle,
                                QGraphicsOpacityEffect,
                                QApplication)
@@ -124,6 +125,26 @@ QLineEdit, QSpinBox, QPlainTextEdit {{ background: rgba(8,11,12,185); border: 1p
 QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {{ border-color: {_EDGE_HOVER};
                                    background: rgba(6,9,10,225); }}
 QSpinBox::up-button, QSpinBox::down-button {{ width: 0; }}
+
+QLineEdit#OutlinedField {{ background: #080B0C; border: 1px solid rgba(255,255,255,38);
+                           border-radius: 7px; padding: 9px 11px 3px 11px;
+                           min-height: 34px; }}
+QLineEdit#OutlinedField:hover {{ border-color: rgba(255,255,255,62); }}
+QLineEdit#OutlinedField:focus {{ background: #06090A; border: 1px solid {_TEAL}; }}
+QLineEdit#OutlinedField:read-only {{ background: #0D1112; color: {_TEXT_SECOND}; }}
+
+QDialog#InAppDialog {{ background: rgba(0,0,0,145); }}
+QFrame#DialogCard {{ background: #202627; border: 1px solid rgba(255,255,255,35);
+                     border-radius: 8px; }}
+QLabel#DialogTitle {{ color: {_TEXT}; font-size: 18px; font-weight: 700; }}
+QLabel#DialogBody {{ color: {_TEXT_SECOND}; font-size: 12px; }}
+QPushButton#DialogAction, QPushButton#DialogActionPrimary {{ background: transparent;
+                     border: none; border-radius: 6px; color: {_TEAL_BRIGHT};
+                     min-height: 24px; padding: 6px 10px; font-weight: 600; }}
+QPushButton#DialogAction:hover, QPushButton#DialogActionPrimary:hover {{
+                     background: rgba(90,216,192,20); color: {_TEAL_BRIGHT}; }}
+QPushButton#DialogAction:pressed, QPushButton#DialogActionPrimary:pressed {{
+                     background: rgba(90,216,192,34); }}
 
 QCheckBox {{ spacing: 9px; color: {_TEXT_SECOND}; padding: 3px 0; }}
 QCheckBox:hover {{ color: {_TEXT}; }}
@@ -360,6 +381,198 @@ class ElidedLabel(QLabel):
     def showEvent(self, e):
         super().showEvent(e)
         self._apply_elide()
+
+
+class OutlinedLineEdit(QLineEdit):
+    """Android-style outlined field whose label floats on focus or content."""
+
+    def __init__(self, label: str, empty_hint: str = "", parent=None):
+        super().__init__(parent)
+        self._label_text = label
+        self._empty_hint = empty_hint
+        self._label_progress = 0.0
+        self._label_target = 0.0
+        self.setObjectName("OutlinedField")
+        self.setAccessibleName(label)
+        self.setToolTip(label)
+        self.setMinimumHeight(48)
+
+        self._label_animation = QVariantAnimation(self)
+        self._label_animation.setDuration(145)
+        self._label_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._label_animation.valueChanged.connect(self._set_label_progress)
+        self.textChanged.connect(lambda _text: self._sync_label_state())
+
+    def labelText(self) -> str:
+        return self._label_text
+
+    def isLabelFloating(self) -> bool:
+        return self._label_target > 0.5
+
+    def _set_label_progress(self, value):
+        self._label_progress = float(value)
+        self.update()
+
+    def _sync_label_state(self, animate: bool | None = None):
+        target = 1.0 if self.hasFocus() or bool(self.text()) else 0.0
+        QLineEdit.setPlaceholderText(
+            self, self._empty_hint if target > 0.5 and not self.text() else "")
+        if target == self._label_target and self._label_progress == target:
+            return
+        self._label_target = target
+        self._label_animation.stop()
+        if animate is None:
+            animate = self.isVisible()
+        if not animate:
+            self._set_label_progress(target)
+            return
+        self._label_animation.setStartValue(self._label_progress)
+        self._label_animation.setEndValue(target)
+        self._label_animation.start()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._sync_label_state()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._sync_label_state()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_label_state(animate=False)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        progress = self._label_progress
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        font = QFont(self.font())
+        font.setPixelSize(round(13 - 3 * progress))
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        available = max(16, self.width() - 24)
+        while metrics.horizontalAdvance(self._label_text) > available \
+                and font.pixelSize() > 10:
+            font.setPixelSize(font.pixelSize() - 1)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+        label = metrics.elidedText(self._label_text, Qt.ElideRight, available)
+        label_width = min(available, metrics.horizontalAdvance(label))
+        label_height = metrics.height() + 2
+        resting_y = (self.height() - label_height) / 2
+        label_y = resting_y * (1.0 - progress)
+        label_x = 12.0 - 2.0 * progress
+
+        if progress > 0.02:
+            if self.isReadOnly():
+                fill = QColor("#0D1112")
+            elif self.hasFocus():
+                fill = QColor("#06090A")
+            else:
+                fill = QColor("#080B0C")
+            patch = QRectF(label_x - 4, max(0.0, label_y - 1),
+                           label_width + 8, label_height + 2)
+            painter.fillRect(patch, fill)
+
+        painter.setPen(QColor(_TEAL_BRIGHT if self.hasFocus() else _TEXT_DIM))
+        painter.drawText(QRectF(label_x, label_y, available, label_height),
+                         Qt.AlignLeft | Qt.AlignVCenter, label)
+
+
+class AndroidStyleDialog(QDialog):
+    """Frameless in-app modal matching Android Material AlertDialog behavior."""
+
+    def __init__(self, parent: QWidget, title: str, body_html: str):
+        super().__init__(parent)
+        self.title_text = title
+        self.body_html = body_html
+        self._clicked_action: str | None = None
+        self.actions: dict[str, QPushButton] = {}
+        self.setObjectName("InAppDialog")
+        self.setWindowTitle(title)
+        self.setAccessibleName(title)
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModal)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(_QSS)
+
+        screen = QVBoxLayout(self)
+        screen.setContentsMargins(24, 24, 24, 24)
+        screen.addStretch(1)
+        center = QHBoxLayout()
+        center.addStretch(1)
+
+        self._card = QFrame()
+        self._card.setObjectName("DialogCard")
+        self._card.setFixedWidth(460)
+        card_layout = QVBoxLayout(self._card)
+        card_layout.setContentsMargins(24, 22, 24, 16)
+        card_layout.setSpacing(16)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("DialogTitle")
+        card_layout.addWidget(title_label)
+
+        self._body_label = QLabel(body_html)
+        self._body_label.setObjectName("DialogBody")
+        self._body_label.setTextFormat(Qt.RichText)
+        self._body_label.setWordWrap(True)
+        self._body_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._body_label.setMinimumWidth(380)
+        self._body_label.setMaximumWidth(412)
+        card_layout.addWidget(self._body_label)
+
+        self._action_layout = QHBoxLayout()
+        self._action_layout.setContentsMargins(0, 0, 0, 0)
+        self._action_layout.setSpacing(4)
+        self._action_layout.addStretch(1)
+        card_layout.addLayout(self._action_layout)
+
+        center.addWidget(self._card)
+        center.addStretch(1)
+        screen.addLayout(center)
+        screen.addStretch(1)
+
+        self._opacity = QGraphicsOpacityEffect(self._card)
+        self._card.setGraphicsEffect(self._opacity)
+        self._entrance_animation = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._entrance_animation.setDuration(150)
+        self._entrance_animation.setStartValue(0.0)
+        self._entrance_animation.setEndValue(1.0)
+        self._entrance_animation.setEasingCurve(QEasingCurve.OutCubic)
+
+    def addAction(self, key: str, text: str, primary: bool = False) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName("DialogActionPrimary" if primary else "DialogAction")
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(lambda _checked=False, action=key: self._choose(action))
+        self._action_layout.addWidget(button)
+        self.actions[key] = button
+        return button
+
+    def clickedAction(self) -> str | None:
+        return self._clicked_action
+
+    def _choose(self, action: str):
+        self._clicked_action = action
+        self.accept()
+
+    def showEvent(self, event):
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.frameGeometry())
+        super().showEvent(event)
+        self._entrance_animation.start()
+
+    def mousePressEvent(self, event):
+        if not self._card.geometry().contains(event.position().toPoint()):
+            self.reject()
+            return
+        super().mousePressEvent(event)
 
 
 class BrandMark(QWidget):
@@ -1043,47 +1256,35 @@ class MainWindow(QWidget):
 
         # ---- 1. 设备设置 ----
         left_col.addWidget(_section_label("设备设置"))
-        self._ed_name = QLineEdit()
-        self._ed_name.setPlaceholderText("设备名称")
+        self._ed_name = OutlinedLineEdit("设备名称")
         self._ed_name.setMaxLength(40)
         # 设备名输入框实时同步本机信息显示
         self._ed_name.textChanged.connect(
             lambda name: self._local_info_lbl.setText(f"本机：{name or cfg.peer_name}-{cfg.instance_id}")
         )
-        self._ed_inbox = QLineEdit()
+        self._ed_inbox = OutlinedLineEdit("收件箱")
         self._ed_inbox.setReadOnly(True)
         b_browse = QPushButton("更换目录")
         b_browse.setCursor(Qt.PointingHandCursor)
         b_browse.clicked.connect(self._choose_inbox)
 
-        def _field(title: str, control: QWidget) -> QWidget:
-            box = QWidget()
-            box_lay = QVBoxLayout(box)
-            box_lay.setContentsMargins(0, 0, 0, 0)
-            box_lay.setSpacing(6)
-            label = QLabel(title)
-            label.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
-            box_lay.addWidget(label)
-            box_lay.addWidget(control)
-            return box
-
-        left_col.addWidget(_field("设备名称", self._ed_name))
+        left_col.addWidget(self._ed_name)
         inbox_row = QWidget()
         inbox_lay = QHBoxLayout(inbox_row)
         inbox_lay.setContentsMargins(0, 0, 0, 0)
         inbox_lay.setSpacing(8)
         inbox_lay.addWidget(self._ed_inbox, 1)
         inbox_lay.addWidget(b_browse)
-        left_col.addWidget(_field("收件箱", inbox_row))
+        left_col.addWidget(inbox_row)
 
         # ---- 2. 传输安全 ----
         left_col.addSpacing(10)
         left_col.addWidget(_divider())
         left_col.addSpacing(6)
         left_col.addWidget(_section_label("传输安全"))
-        self._ed_secret = QLineEdit()
+        self._ed_secret = OutlinedLineEdit(
+            "加密口令（可选，两端一致）", "留空时不加密")
         self._ed_secret.setEchoMode(QLineEdit.Password)
-        self._ed_secret.setPlaceholderText("留空时不加密")
         b_eye = QToolButton()
         b_eye.setObjectName("Win")
         b_eye.setCheckable(True)
@@ -1104,7 +1305,7 @@ class MainWindow(QWidget):
         secret_lay.setSpacing(10)
         secret_lay.addWidget(self._ed_secret, 1)
         secret_lay.addWidget(b_eye)
-        left_col.addWidget(_field("加密口令（可选，两端一致）", secret_row))
+        left_col.addWidget(secret_row)
 
         def _toggle_row(title_text: str, detail: str):
             row = QWidget()
@@ -1140,25 +1341,21 @@ class MainWindow(QWidget):
         network_hint.setWordWrap(True)
         network_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
         left_col.addWidget(network_hint)
-        self._sp_port = QLineEdit()
+        self._sp_port = OutlinedLineEdit("本机监听端口（留空=自动，如 52130）")
         self._sp_port.setValidator(QIntValidator(1, 65535, self._sp_port))
-        self._sp_port.setPlaceholderText("留空=自动，如 52130")
-        left_col.addWidget(_field("本机监听端口", self._sp_port))
+        left_col.addWidget(self._sp_port)
 
         manual_row = QWidget()
         manual_lay = QHBoxLayout(manual_row)
         manual_lay.setContentsMargins(0, 0, 0, 0)
         manual_lay.setSpacing(8)
-        self._manual_name = QLineEdit()
-        self._manual_name.setPlaceholderText("备注（如 我的电脑，可选）")
+        self._manual_name = OutlinedLineEdit("备注（如 我的电脑，可选）")
         self._manual_name.setMinimumWidth(70)
-        self._manual_host = QLineEdit()
-        self._manual_host.setPlaceholderText("对方 Tailscale IP")
+        self._manual_host = OutlinedLineEdit("对方 Tailscale IP")
         self._manual_host.setMinimumWidth(90)
         self._manual_host.textEdited.connect(self._mask_manual_host)
-        self._manual_port = QLineEdit()
+        self._manual_port = OutlinedLineEdit("对方的监听端口")
         self._manual_port.setValidator(QIntValidator(1, 65535, self._manual_port))
-        self._manual_port.setPlaceholderText("对方的监听端口")
         self._manual_port.setMinimumWidth(80)
         self._manual_add_btn = QPushButton("添加设备")
         self._manual_add_btn.setCursor(Qt.PointingHandCursor)
@@ -1354,10 +1551,27 @@ class MainWindow(QWidget):
         self._reset_manual_editor()
         self._show_page(0)
 
+    def _show_android_dialog(self, title: str, body_html: str,
+                             actions: list[tuple[str, str, bool]]) -> str | None:
+        dialog = AndroidStyleDialog(self, title, body_html)
+        for key, text, primary in actions:
+            dialog.addAction(key, text, primary)
+        self._active_dialog = dialog
+        try:
+            dialog.exec()
+            return dialog.clickedAction()
+        finally:
+            self._active_dialog = None
+
+    def _show_notice(self, title: str, message: str):
+        body = ("<p style='margin:0; color:#B2BFBC;'>"
+                f"{html.escape(message).replace(chr(10), '<br>')}</p>")
+        self._show_android_dialog(title, body, [("ok", "知道了", True)])
+
     def _show_usage_guide(self):
-        """使用说明弹窗(首启自动弹一次 + 设置页入口)。富文本三段:
+        """使用说明面板(首启自动显示一次 + 设置页入口)。富文本三段:
         局域网 / 跨网络 / 文件位置,按桌面端工作流写。"""
-        html = (
+        body = (
             "<p style='margin:0 0 4px 0;'><b>局域网</b></p>"
             "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备连接同一个 WiFi，并同时打开"
             "墨洞。发现设备后，点击对方设备，再点击墨洞图标选择文件发送；也可以把文件拖到"
@@ -1370,12 +1584,8 @@ class MainWindow(QWidget):
             "<p style='margin:0; color:#B2BFBC;'>收到的文件保存在设置里的收件箱目录，也可以"
             "在首页「已接收」中查看。</p>"
         )
-        box = QMessageBox(self)
-        box.setWindowTitle("使用说明")
-        box.setTextFormat(Qt.RichText)
-        box.setText(html)
-        box.addButton("知道了", QMessageBox.AcceptRole)
-        box.exec()
+        self._show_android_dialog(
+            "使用说明", body, [("ok", "知道了", True)])
 
     def _check_update(self):
         self._update_btn.setEnabled(False)
@@ -1388,39 +1598,38 @@ class MainWindow(QWidget):
         self._update_btn.setEnabled(True)
         self._update_btn.setText("检查更新")
         if not latest:
-            QMessageBox.warning(self, "检查更新",
-                                f"{notes}\n\n可到发布页手动查看：\n"
-                                f"{self._bridge.releasesPage()}")
+            self._show_notice(
+                "检查更新",
+                f"{notes}\n\n可到发布页手动查看：\n{self._bridge.releasesPage()}")
             return
         if not has_new:
-            QMessageBox.information(
-                self, "检查更新",
-                f"已是最新版本 v{self._bridge.appVersion()}")
+            self._show_notice(
+                "检查更新", f"已是最新版本 v{self._bridge.appVersion()}")
             return
         import sys as _sys
         packaged = bool(getattr(_sys, "frozen", False)) and _sys.platform == "win32"
         summary = (notes or "").strip()
         can_direct = packaged and bool(asset_url)
-        box = QMessageBox(self)
-        box.setWindowTitle("发现新版本")
-        box.setText(
-            f"当前版本：v{self._bridge.appVersion()}\n"
-            f"最新版本：{latest}\n"
-            f"更新状态：{'可直接更新' if can_direct else '可前往发布页下载'}")
-        box.setInformativeText(
-            f"本次更新\n{summary or '发布说明暂不可用'}")
+        notes_html = html.escape(summary or "发布说明暂不可用").replace("\n", "<br>")
+        body = (
+            f"<p style='margin:0 0 2px 0; color:#8F9B98;'>当前版本：v"
+            f"{html.escape(self._bridge.appVersion())}</p>"
+            f"<p style='margin:0 0 2px 0; color:#8F9B98;'>最新版本："
+            f"{html.escape(latest)}</p>"
+            f"<p style='margin:0 0 14px 0; color:#58CDB5;'>更新状态："
+            f"{'可直接更新' if can_direct else '可前往发布页下载'}</p>"
+            "<p style='margin:0 0 5px 0; color:#F1F4F3;'><b>本次更新</b></p>"
+            f"<p style='margin:0; color:#B2BFBC;'>{notes_html}</p>"
+        )
+        actions: list[tuple[str, str, bool]] = [("cancel", "取消", False)]
+        actions.append(("release", "查看发布页", not can_direct))
         if can_direct:
-            b_auto = box.addButton("立即更新", QMessageBox.AcceptRole)
-        else:
-            b_auto = None
-        b_page = box.addButton("查看发布页", QMessageBox.ActionRole)
-        box.addButton("取消", QMessageBox.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if b_auto is not None and clicked is b_auto:
+            actions.append(("update", "立即更新", True))
+        clicked = self._show_android_dialog("发现新版本", body, actions)
+        if clicked == "update":
             self._on_status("开始自动更新，完成后将自动重启…")
             self._bridge.performUpdate(asset_url)
-        elif clicked is b_page:
+        elif clicked == "release":
             self._bridge.openPath(self._bridge.releasesPage())
 
     # ---- 手动设备(Tailscale/固定 IP 直连) ----
@@ -1485,8 +1694,8 @@ class MainWindow(QWidget):
             port = 0
         host = normalize_manual_host(raw)
         if host is None or not 1 <= port <= 65535:
-            QMessageBox.warning(self, "手动设备",
-                                "Tailscale IP 无效，或对方监听端口不在 1-65535 范围内")
+            self._show_notice(
+                "手动设备", "Tailscale IP 无效，或对方监听端口不在 1-65535 范围内")
             return
         if host != raw.strip():
             self._manual_host.setText(host)   # 回显修正结果,用户可见实际用的地址
@@ -1530,7 +1739,7 @@ class MainWindow(QWidget):
     def _save_settings(self):
         name = self._ed_name.text().strip()
         if not name:
-            QMessageBox.warning(self, "墨洞", "设备名称不能为空")
+            self._show_notice("墨洞", "设备名称不能为空")
             return
         port_text = self._sp_port.text().strip()
         try:
@@ -1538,8 +1747,7 @@ class MainWindow(QWidget):
         except ValueError:
             port = -1
         if port_text and not 1 <= port <= 65535:
-            QMessageBox.warning(
-                self, "墨洞", "本机监听端口必须在 1-65535 范围内")
+            self._show_notice("墨洞", "本机监听端口必须在 1-65535 范围内")
             return
         inbox = self._ed_inbox.text()
         if inbox:

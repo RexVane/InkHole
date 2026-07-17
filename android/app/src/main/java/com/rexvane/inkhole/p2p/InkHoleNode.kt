@@ -1,6 +1,8 @@
 package com.rexvane.inkhole.p2p
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import kotlinx.coroutines.*
@@ -198,6 +200,7 @@ class InkHoleNode(
                         Triple(key, peer.hosts, peer.port)
                     }
                 }
+                val lanLinks = currentLanLinks()
                 // 清理已不在列表的对端的失败计数
                 val currentKeys = targets.map { it.first }.toSet()
                 strikes.keys.retainAll(currentKeys)
@@ -208,9 +211,12 @@ class InkHoleNode(
                     val present = synchronized(peersLock) { peers.containsKey(key) }
                     if (!present) continue  // 已被其他逻辑移除,跳过
 
-                    // 探活:只要有一个 host 能连上就算活着(多网卡/VPN 场景)
-                    val alive = hosts.any { host -> probeAlive(host, port) }
                     val isManual = key.startsWith("manual|")
+                    // 自动发现条目必须仍可经当前 WiFi/以太网到达。Windows 通告里可能
+                    // 同时带 Tailscale 地址，不能用 VPN 兜底把已离开局域网的设备留在列表。
+                    val probeHosts = if (isManual) hosts
+                        else LanReachability.hostsOnCurrentLan(hosts, lanLinks)
+                    val alive = probeHosts.any { host -> probeAlive(host, port) }
                     val threshold = if (isManual) PROBE_STRIKES_MANUAL else PROBE_STRIKES
 
                     if (!alive) {
@@ -756,7 +762,8 @@ class InkHoleNode(
                 repeat(LOST_PROBE_ATTEMPTS) { attempt ->
                     val peer = synchronized(peersLock) { peers[serviceName] }
                         ?: return@launch          // 已被别处移除，无需再探
-                    val hosts = (listOf(peer.host) + peer.hosts).distinct()
+                    val hosts = LanReachability.hostsOnCurrentLan(
+                        (listOf(peer.host) + peer.hosts).distinct(), currentLanLinks())
                     if (hosts.any { probeAlive(it, peer.port) }) return@launch  // 还活着，误报忽略
                     if (attempt < LOST_PROBE_ATTEMPTS - 1) delay(LOST_PROBE_INTERVAL_MS)
                 }
@@ -905,6 +912,29 @@ class InkHoleNode(
             }
         } catch (_: Exception) {}
         return ips
+    }
+
+    /** 当前真正的局域网链路；排除蜂窝网络和 Tailscale 等 VPN transport。 */
+    @Suppress("DEPRECATION")
+    private fun currentLanLinks(): List<LanLink> {
+        return try {
+            val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as? ConnectivityManager ?: return emptyList()
+            manager.allNetworks.flatMap { network ->
+                val capabilities = manager.getNetworkCapabilities(network)
+                    ?: return@flatMap emptyList()
+                val isLan = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                if (!isLan) return@flatMap emptyList()
+                manager.getLinkProperties(network)?.linkAddresses.orEmpty().mapNotNull { link ->
+                    val address = link.address
+                    if (address.isLoopbackAddress || address.isAnyLocalAddress) null
+                    else address.hostAddress?.let { LanLink(it, link.prefixLength) }
+                }
+            }.distinct()
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun discoverNsd() {

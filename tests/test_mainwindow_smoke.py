@@ -151,6 +151,15 @@ def _make_window(app):
     return MainWindow(bridge, ctl), bridge
 
 
+def _capture_android_dialogs(monkeypatch):
+    from inkhole.mainwindow import AndroidStyleDialog
+
+    dialogs = []
+    monkeypatch.setattr(
+        AndroidStyleDialog, "exec", lambda self: dialogs.append(self) or 0)
+    return dialogs
+
+
 def test_window_constructs_without_attribute_error(app):
     """Constructing the window must not reference undefined bridge members."""
     window, _ = _make_window(app)
@@ -167,6 +176,9 @@ def test_settings_page_opens_and_populates(app):
     assert window._manual_name.text() == ""
     assert window._manual_host.text() == ""
     assert window._manual_port.text() == ""
+    assert window._ed_name.labelText() == "设备名称"
+    assert window._sp_port.labelText() == "本机监听端口（留空=自动，如 52130）"
+    assert window._manual_host.labelText() == "对方 Tailscale IP"
     assert window._local_info_lbl.text().startswith("本机：SMOKE-")
     assert window._version_info_lbl.text() == "版本：v0.0.0"
     assert window._port_info_lbl.text() == "端口：43123（建议自定义固定端口）"
@@ -229,29 +241,26 @@ def test_manual_peer_remove_is_draft_until_save(app):
 
 def test_manual_peer_rejects_bad_input(app, monkeypatch):
     """Ambiguous/invalid host must be rejected with a warning, not stored."""
-    from PySide6.QtWidgets import QMessageBox
-    warned = []
-    monkeypatch.setattr(QMessageBox, "warning",
-                        staticmethod(lambda *a, **k: warned.append(a)))
+    dialogs = _capture_android_dialogs(monkeypatch)
     window, bridge = _make_window(app)
     window._open_settings()
     window._manual_host.setText("11111")   # 多种拆分方式,有歧义必须拒绝
     window._add_manual_peer()
     assert bridge.manualPeers() == []
-    assert warned
+    assert dialogs
+    assert dialogs[-1].title_text == "手动设备"
+    assert "Tailscale IP 无效" in dialogs[-1].body_html
 
 
 def test_explicit_zero_listen_port_is_rejected(app, monkeypatch):
     """Only a blank field means automatic; typed 0 is invalid like Android."""
-    from PySide6.QtWidgets import QMessageBox
-    warned = []
-    monkeypatch.setattr(QMessageBox, "warning",
-                        staticmethod(lambda *a, **k: warned.append(a)))
+    dialogs = _capture_android_dialogs(monkeypatch)
     window, bridge = _make_window(app)
     window._open_settings()
     window._sp_port.setText("0")
     window._save_settings()
-    assert warned
+    assert dialogs
+    assert "本机监听端口必须在 1-65535 范围内" in dialogs[-1].body_html
     assert bridge.applied_settings is None
     assert window._stack.currentIndex() == 1
 
@@ -274,30 +283,50 @@ def test_repository_button_opens_github(app):
 
 def test_update_dialog_matches_android_summary(app, monkeypatch):
     """Available-update dialog exposes versions, availability and changes."""
-    from PySide6.QtWidgets import QMessageBox
-
-    captured = {}
-    original_text = QMessageBox.setText
-    original_info = QMessageBox.setInformativeText
-
-    def capture_text(box, value):
-        captured["text"] = value
-        original_text(box, value)
-
-    def capture_info(box, value):
-        captured["info"] = value
-        original_info(box, value)
-
-    monkeypatch.setattr(QMessageBox, "setText", capture_text)
-    monkeypatch.setattr(QMessageBox, "setInformativeText", capture_info)
-    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
-
+    dialogs = _capture_android_dialogs(monkeypatch)
     window, _ = _make_window(app)
     window._on_update_check(True, "v1.2.3", "• 修复设备发现", "")
-    assert "当前版本：v0.0.0" in captured["text"]
-    assert "最新版本：v1.2.3" in captured["text"]
-    assert "更新状态：可前往发布页下载" in captured["text"]
-    assert captured["info"] == "本次更新\n• 修复设备发现"
+    assert dialogs
+    dialog = dialogs[-1]
+    assert dialog.title_text == "发现新版本"
+    assert "当前版本：v0.0.0" in dialog.body_html
+    assert "最新版本：v1.2.3" in dialog.body_html
+    assert "更新状态：可前往发布页下载" in dialog.body_html
+    assert "本次更新" in dialog.body_html
+    assert "• 修复设备发现" in dialog.body_html
+    assert set(dialog.actions) == {"cancel", "release"}
+
+
+def test_usage_guide_uses_android_style_in_app_dialog(app, monkeypatch):
+    dialogs = _capture_android_dialogs(monkeypatch)
+    window, _ = _make_window(app)
+    window._show_usage_guide()
+    assert dialogs
+    dialog = dialogs[-1]
+    assert dialog.title_text == "使用说明"
+    assert "局域网" in dialog.body_html
+    assert "跨网络" in dialog.body_html
+    assert set(dialog.actions) == {"ok"}
+
+
+def test_outlined_field_label_floats_on_focus_or_content(app):
+    from inkhole.mainwindow import OutlinedLineEdit
+
+    field = OutlinedLineEdit("设备名称")
+    assert not field.isLabelFloating()
+    field.setText("桌面电脑")
+    assert field.isLabelFloating()
+    field.clear()
+    assert not field.isLabelFloating()
+
+    field.show()
+    field.setFocus()
+    app.processEvents()
+    assert field.isLabelFloating()
+    field.clearFocus()
+    app.processEvents()
+    assert not field.isLabelFloating()
+    field.close()
 
 
 def test_normalize_manual_host():
