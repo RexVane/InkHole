@@ -151,6 +151,10 @@ class InkHoleService : Service() {
         override fun onProgress(kind: String, filename: String, done: Long, total: Long) {
             InkHoleBus.uiListener?.onProgress(kind, filename, done, total)
         }
+
+        override fun onTransferEnded(kind: String, filename: String, completed: Boolean) {
+            InkHoleBus.uiListener?.onTransferEnded(kind, filename, completed)
+        }
     }
 
     // ---- 收件箱导出：应用私有目录 -> 系统 Downloads/InkHole ----

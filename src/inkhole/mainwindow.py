@@ -79,6 +79,11 @@ QPushButton#Primary {{ color: #09231E; font-weight: 700; border: none;
         stop:0 #7BE3CE, stop:1 #4FC3AC); min-height: 28px;
         padding: 8px 22px; border-radius: 8px; }}
 QPushButton#Primary:hover {{ background: #8BEAD6; color: #061A16; }}
+QPushButton#CancelAction {{ color: {_ERROR}; background: rgba(240,138,124,12);
+                            border: 1px solid rgba(240,138,124,72);
+                            min-height: 28px; padding: 8px 18px; border-radius: 8px; }}
+QPushButton#CancelAction:hover {{ color: #FFB0A5; background: rgba(240,138,124,24);
+                                 border-color: rgba(240,138,124,125); }}
 QPushButton#QuietAction {{ background: rgba(255,255,255,9); border-color: transparent;
                            min-height: 20px; padding: 4px 10px; font-size: 12px; }}
 QPushButton#QuietAction:hover {{ background: rgba(255,255,255,18);
@@ -822,6 +827,13 @@ class HoleWidget(QWidget):
         if generation == self._progress_generation:
             self._progress_target = 0.0
 
+    @Slot()
+    def clear_transfer_progress(self):
+        self._progress_generation += 1
+        self._progress_target = 0.0
+        self._progress = 0.0
+        self.update()
+
     def showEvent(self, e):
         super().showEvent(e)
         self._clock.restart()
@@ -1028,6 +1040,10 @@ class MainWindow(QWidget):
         bridge.updateCheckFinished.connect(self._on_update_check)
         if hasattr(bridge, "progress"):
             bridge.progress.connect(self._hole.set_transfer_progress)
+        if hasattr(bridge, "progressCleared"):
+            bridge.progressCleared.connect(self._hole.clear_transfer_progress)
+        if hasattr(bridge, "sendStateChanged"):
+            bridge.sendStateChanged.connect(self._set_send_active)
         self._refresh_peers()
         self._refresh_recent()
         if hasattr(bridge, "lastStatus"):
@@ -1095,7 +1111,18 @@ class MainWindow(QWidget):
         self._send_btn.setCursor(Qt.PointingHandCursor)
         self._send_btn.setFixedWidth(156)
         self._send_btn.clicked.connect(self._pick_and_send)
-        send_row.addWidget(self._send_btn)
+        self._cancel_send_btn = QPushButton("取消发送")
+        self._cancel_send_btn.setObjectName("CancelAction")
+        self._cancel_send_btn.setIcon(
+            self.style().standardIcon(QStyle.SP_DialogCancelButton))
+        self._cancel_send_btn.setCursor(Qt.PointingHandCursor)
+        self._cancel_send_btn.setFixedWidth(156)
+        self._cancel_send_btn.clicked.connect(self._bridge.cancelTransfer)
+        self._send_action_stack = QStackedWidget()
+        self._send_action_stack.setFixedWidth(156)
+        self._send_action_stack.addWidget(self._send_btn)
+        self._send_action_stack.addWidget(self._cancel_send_btn)
+        send_row.addWidget(self._send_action_stack)
         send_row.addStretch(1)
         left.addLayout(send_row)
 
@@ -1195,6 +1222,11 @@ class MainWindow(QWidget):
 
         body.addWidget(side, 11)
         return page
+
+    @Slot(bool)
+    def _set_send_active(self, active: bool):
+        self._send_action_stack.setCurrentIndex(1 if active else 0)
+        self._hole.setEnabled(not active)
 
     # ================= 设置页 =================
     def _build_settings_header(self) -> QHBoxLayout:

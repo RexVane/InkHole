@@ -2,6 +2,8 @@ package com.rexvane.inkhole.p2p
 
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
+import java.io.InterruptedIOException
 import java.io.InputStream
 import java.io.OutputStream
 import org.json.JSONObject
@@ -9,7 +11,7 @@ import org.json.JSONObject
 /** WHPP (InkHole P2P Protocol) 常量与读写工具。 */
 object WHPP {
     val MAGIC = "WHPP".toByteArray(Charsets.US_ASCII)
-    const val BUFFER_SIZE = 65536
+    const val BUFFER_SIZE = 256 * 1024
     const val MAX_HEADER = 64 * 1024              // header 长度上限(来自网络，不可信)
     const val MAX_FILE_SIZE = 1L shl 40           // 单文件 1TB 上限，防恶意 size 声明
     const val ACK_OK: Int = 0x01                  // 接收方回执：成功落盘
@@ -65,14 +67,18 @@ object WHPP {
         dataStream: InputStream,
         wantAck: Boolean = true,
         onProgress: ((Long) -> Unit)? = null,
+        shouldCancel: (() -> Boolean)? = null,
     ) {
         writeHeader(out, Header(filename, size, encrypted, wantAck))
         // 写文件数据
         val buf = ByteArray(BUFFER_SIZE)
         var sent = 0L
-        while (true) {
-            val n = dataStream.read(buf)
-            if (n < 0) break
+        while (sent < size) {
+            if (shouldCancel?.invoke() == true) throw InterruptedIOException("发送已取消")
+            val wanted = minOf(buf.size.toLong(), size - sent).toInt()
+            val n = dataStream.read(buf, 0, wanted)
+            if (n < 0) throw EOFException("文件读取不完整")
+            if (n == 0) continue
             out.write(buf, 0, n)
             sent += n
             onProgress?.invoke(sent)

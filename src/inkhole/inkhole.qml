@@ -373,6 +373,12 @@ Window {
             if (win.collapsed) win.expand();          // 传输中探出来给用户看进度
             if (pct >= 100) ringHide.restart();
         }
+        function onProgressCleared() {
+            ringHide.stop();
+            win.transferPct = -1;
+            ring.requestPaint();
+            if (win.edge >= 0) autoHide.restart();
+        }
     }
 
     // 传完后进度环稍作停留再消失

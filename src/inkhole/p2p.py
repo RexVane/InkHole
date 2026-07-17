@@ -41,7 +41,8 @@ from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
 # ---------- 常量 ----------
 _SERVICE_TYPE = "_inkhole._tcp.local."
 _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
-_BUFFER = 65536           # 64KB 传输块
+_BUFFER = 256 * 1024      # 256KB 传输块，降低大文件跨网传输的 Python IO 调用开销
+_SOCKET_BUFFER = 1024 * 1024       # 高延迟链路(Tailscale/DERP)需要更大的 TCP 缓冲
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
 _MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
 _MAX_WHE1_SIZE = 256 * 1024 * 1024 # WHE1 整块解密需全量进内存，超过此值拒收(防内存耗尽)
@@ -58,6 +59,19 @@ _PROBE_TIMEOUT = 1.5               # 探测单个地址的 TCP 连接超时(秒)
 _PROBE_STRIKES = 2                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
 _NET_CHECK_INTERVAL = 5.0          # 网络监控轮询间隔(秒)
 _NET_WAKE_GAP = 20.0               # 单轮 sleep 实际耗时超过此值判定为睡眠唤醒，触发 mDNS 重建
+
+
+class _SendCancelled(Exception):
+    pass
+
+
+def _tune_transfer_socket(sock: socket.socket) -> None:
+    """Increase TCP windows for high-latency VPN/relay paths; OS caps are respected."""
+    for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, option, _SOCKET_BUFFER)
+        except OSError:
+            pass
 
 
 # ---------- 配置 ----------
@@ -151,13 +165,15 @@ class P2PNode:
                  on_received: Callable[[str], None] | None = None,
                  on_status: Callable[[str], None] | None = None,
                  on_peers_changed: Callable[[], None] | None = None,
-                 on_progress: Callable[[str, str, int, int], None] | None = None):
+                 on_progress: Callable[[str, str, int, int], None] | None = None,
+                 on_transfer_end: Callable[[str, str, bool], None] | None = None):
         self.cfg = cfg
         self.on_sent = on_sent
         self.on_received = on_received
         self.on_status = on_status
         self.on_peers_changed = on_peers_changed
         self.on_progress = on_progress   # (kind:"send"/"recv", 文件名, 已传字节, 总字节)
+        self.on_transfer_end = on_transfer_end  # (kind, 文件名, 是否完整完成)
 
         # 本节点唯一实例 ID：进服务名保证唯一(两台设备同名不再冲突)，
         # 进 TXT 属性用于"不发现自己"(比按显示名过滤可靠)。
@@ -188,6 +204,10 @@ class P2PNode:
         # TCP 服务器
         self._server_sock: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
+        self._send_state_lock = threading.Lock()
+        self._active_send_sock: socket.socket | None = None
+        self._send_active = False
+        self._send_cancelled = threading.Event()
 
         # 对端存活探测(幽灵设备兜底)；参数做成实例属性主要为了测试提速
         self._probe_interval = _PROBE_INTERVAL
@@ -318,6 +338,7 @@ class P2PNode:
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
         self._running = False
+        self.cancel_send()
         with self._mdns_lock:
             self._teardown_mdns()
         if self._server_sock:
@@ -326,6 +347,23 @@ class P2PNode:
             except Exception:
                 pass
             self._server_sock = None
+
+    def cancel_send(self) -> bool:
+        """Cancel only the active outbound transfer; inbound transfers keep running."""
+        self._send_cancelled.set()
+        with self._send_state_lock:
+            active = self._send_active
+            sock = self._active_send_sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return active
 
     # ---------- TCP 服务器 ----------
     def _start_tcp_server(self) -> None:
@@ -363,6 +401,7 @@ class P2PNode:
                 conn, addr = self._server_sock.accept()
             except OSError:
                 break  # server socket closed
+            _tune_transfer_socket(conn)
             threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True).start()
 
     def _handle_connection(self, conn: socket.socket, addr) -> None:
@@ -376,6 +415,8 @@ class P2PNode:
         part_path = None
         want_ack = False
         ok = False
+        transfer_name = ""
+        transfer_started = False
         try:
             # 空闲超时：对端发一半停住不能永久占住线程和 .part 文件
             conn.settimeout(_RECV_IDLE_TIMEOUT)
@@ -444,6 +485,8 @@ class P2PNode:
             dst = _unique_path(self.cfg.inbox, filename)
             part_path = dst + f".{uuid.uuid4().hex[:8]}.part"
             progress = _Progress(self.on_progress, "recv", filename, size)
+            transfer_name = filename
+            transfer_started = True
 
             if encrypted and enc_mode == "chunked":
                 # WHE2 分块流：边收边解密边落盘，内存峰值 4MB
@@ -535,9 +578,15 @@ class P2PNode:
                     os.remove(part_path)
                 except OSError:
                     pass
+            if transfer_started and self.on_transfer_end:
+                try:
+                    self.on_transfer_end("recv", transfer_name, ok)
+                except Exception:
+                    pass
 
     # ---------- 发送文件 ----------
-    def send_file(self, local_path: str) -> bool:
+    def send_file(self, local_path: str,
+                  should_cancel: Callable[[], bool] | None = None) -> bool:
         """把文件直接发给选中的对端。成功返回 True。
 
         header 带 want_ack：新版接收方处理完回 1 字节回执，落盘失败能被
@@ -555,7 +604,25 @@ class P2PNode:
             return False
 
         name = os.path.basename(local_path)
+        completed = False
+
+        def cancellation_requested() -> bool:
+            if self._send_cancelled.is_set():
+                return True
+            if should_cancel is None:
+                return False
+            try:
+                return bool(should_cancel())
+            except Exception:
+                return False
+
+        self._send_cancelled.clear()
+        with self._send_state_lock:
+            self._send_active = True
+            self._active_send_sock = None
         try:
+            if cancellation_requested():
+                raise _SendCancelled()
             plain_size = os.path.getsize(local_path)
             enc_mode = ""
             data = None
@@ -568,6 +635,8 @@ class P2PNode:
                 # 小文件保持 WHE1 整块(与所有旧版本互通)
                 with open(local_path, "rb") as f:
                     data = encrypt(self.cfg.secret, f.read())
+                if cancellation_requested():
+                    raise _SendCancelled()
                 encrypted = True
                 file_size = len(data)
             else:
@@ -600,6 +669,11 @@ class P2PNode:
                 raise last_err if last_err else OSError("无可用地址")
 
             try:
+                _tune_transfer_socket(sock)
+                with self._send_state_lock:
+                    self._active_send_sock = sock
+                if cancellation_requested():
+                    raise _SendCancelled()
                 # create_connection 的 10s 连接超时会留在 socket 上，数据阶段
                 # 放宽到 60s——接收方磁盘偶发卡顿不该被误判成发送失败
                 sock.settimeout(_SEND_IO_TIMEOUT)
@@ -612,12 +686,16 @@ class P2PNode:
                     # 边读边加密边发，恒定内存
                     with open(local_path, "rb") as f:
                         for blob in encrypt_chunks(self.cfg.secret, f):
+                            if cancellation_requested():
+                                raise _SendCancelled()
                             sock.sendall(blob)
                             sent += len(blob)
                             progress.update(sent)
                 elif data is not None:
                     # 加密数据已在内存，分块发送
                     while sent < len(data):
+                        if cancellation_requested():
+                            raise _SendCancelled()
                         sock.sendall(data[sent:sent + _BUFFER])
                         sent = min(sent + _BUFFER, len(data))
                         progress.update(sent)
@@ -625,6 +703,8 @@ class P2PNode:
                     # 明文：流式从磁盘读
                     with open(local_path, "rb") as f:
                         while True:
+                            if cancellation_requested():
+                                raise _SendCancelled()
                             chunk = f.read(_BUFFER)
                             if not chunk:
                                 break
@@ -638,23 +718,50 @@ class P2PNode:
                 try:
                     resp = sock.recv(1)
                 except (socket.timeout, OSError):
+                    if cancellation_requested():
+                        raise _SendCancelled()
                     resp = b""
                 if resp == _ACK_FAIL:
                     self._status(f"{peer.name} 接收失败（口令不一致、被拒收或存储问题）")
                     return False
             finally:
-                sock.close()
+                with self._send_state_lock:
+                    if self._active_send_sock is sock:
+                        self._active_send_sock = None
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            completed = True
+            if self.on_sent:
+                self.on_sent(name)
+            self._status(f"已发送：{name}")
+            return True
+        except _SendCancelled:
+            self._status(f"已取消发送：{name}")
+            return False
         except (ConnectionRefusedError, socket.timeout, OSError) as e:
-            self._status("发送失败", str(e))
+            if cancellation_requested():
+                self._status(f"已取消发送：{name}")
+            else:
+                self._status("发送失败", str(e))
             return False
         except Exception as e:
-            self._status("发送失败", str(e))
+            if cancellation_requested():
+                self._status(f"已取消发送：{name}")
+            else:
+                self._status("发送失败", str(e))
             return False
-
-        if self.on_sent:
-            self.on_sent(name)
-        self._status(f"已发送：{name}")
-        return True
+        finally:
+            with self._send_state_lock:
+                self._active_send_sock = None
+                self._send_active = False
+            self._send_cancelled.clear()
+            if self.on_transfer_end:
+                try:
+                    self.on_transfer_end("send", name, completed)
+                except Exception:
+                    pass
 
     # ---------- 对端管理 ----------
     def peers(self) -> list[PeerInfo]:

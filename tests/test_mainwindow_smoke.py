@@ -56,6 +56,8 @@ class FakeBridge(QObject):
     emit_out = Signal(str)
     recentChanged = Signal()
     progress = Signal(str, int)
+    progressCleared = Signal()
+    sendStateChanged = Signal(bool)
     updateCheckFinished = Signal(bool, str, str, str)
 
     def __init__(self):
@@ -64,6 +66,7 @@ class FakeBridge(QObject):
         self._manual = []
         self.opened_paths = []
         self.applied_settings = None
+        self.cancel_calls = 0
 
     # ---- query surface used by the window ----
     def lanConfig(self):
@@ -108,6 +111,10 @@ class FakeBridge(QObject):
 
     def checkUpdate(self):
         pass
+
+    def cancelTransfer(self):
+        self.cancel_calls += 1
+        return True
 
     def performUpdate(self, url):
         pass
@@ -266,10 +273,22 @@ def test_explicit_zero_listen_port_is_rejected(app, monkeypatch):
 
 
 def test_peer_and_transfer_signals_drive_window(app):
-    """peersChanged / progress / errorState flow through without raising."""
+    """Transfer progress, cancellation state and errors flow into the window."""
     window, bridge = _make_window(app)
     bridge.peersChanged.emit()
     bridge.progress.emit("send", 42)
+    assert window._hole._progress_target == pytest.approx(0.42)
+    bridge.progressCleared.emit()
+    assert window._hole._progress_target == 0
+    assert window._hole._progress == 0
+    bridge.sendStateChanged.emit(True)
+    assert window._send_action_stack.currentIndex() == 1
+    assert not window._hole.isEnabled()
+    window._cancel_send_btn.click()
+    assert bridge.cancel_calls == 1
+    bridge.sendStateChanged.emit(False)
+    assert window._send_action_stack.currentIndex() == 0
+    assert window._hole.isEnabled()
     bridge.errorState.emit("boom")
     bridge.errorState.emit("")
     assert window._state_lbl._full_text == "等待附近的墨洞上线…"

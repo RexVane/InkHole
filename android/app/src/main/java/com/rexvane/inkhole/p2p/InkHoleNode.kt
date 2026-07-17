@@ -17,6 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /** 检测到设备/收到文件/状态变化时的回调。 */
 interface InkHoleListener {
@@ -25,6 +26,10 @@ interface InkHoleListener {
     fun onStatus(msg: String)
     /** 传输进度。kind = "send"/"recv"；节流后最多约 4 次/秒。 */
     fun onProgress(kind: String, filename: String, done: Long, total: Long) {}
+    /** 成功、失败、断网或取消都会触发；UI 用它可靠清除卡住的进度环。 */
+    fun onTransferEnded(kind: String, filename: String, completed: Boolean) {}
+    /** Activity 重建后也能恢复发送按钮/取消按钮状态。 */
+    fun onSendingChanged(active: Boolean) {}
 }
 
 data class Peer(
@@ -65,6 +70,7 @@ class InkHoleNode(
         private const val DRAIN_TIMEOUT_MS = 2_000
         private const val MAX_INCOMING_CONNECTIONS = 4
         private const val DRAIN_CAP = 8L * 1024 * 1024       // 拒收时最多帮对端消化的字节数
+        private const val SOCKET_BUFFER = 1024 * 1024         // 高延迟 Tailscale/DERP 链路 TCP 缓冲
         // onServiceLost 误报兜底：探活参数(连续失败才真移除)
         private const val LOST_PROBE_TIMEOUT_MS = 1200        // 单次 TCP 探活超时
         private const val LOST_PROBE_ATTEMPTS = 3             // 连续失败几次才判定真离线
@@ -79,6 +85,10 @@ class InkHoleNode(
     private var nsdManager: NsdManager? = null
     private var serverSocket: ServerSocket? = null
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
+    private val activeSendSocket = AtomicReference<Socket?>(null)
+    private val activeSendInput = AtomicReference<InputStream?>(null)
+    private val sendInProgress = AtomicBoolean(false)
+    private val sendCancelled = AtomicBoolean(false)
     private val incomingSlots = Semaphore(MAX_INCOMING_CONNECTIONS)
     private var actualPort = 0
     // 唯一实例 ID 持久化到 SharedPreferences：同一台设备无论 App/前台服务重启
@@ -253,6 +263,7 @@ class InkHoleNode(
 
     fun stop() {
         running = false
+        cancelSend()
         // 注册/发现可能从未成功，注销时系统会抛 IllegalArgumentException——不能让退出流程崩掉
         nsdManager?.let { nsd ->
             try { discoveryListener?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
@@ -302,6 +313,7 @@ class InkHoleNode(
             while (running) {
                 try {
                     val conn = server.accept()
+                    try { conn.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
                     if (!incomingSlots.tryAcquire()) {
                         try { conn.close() } catch (_: IOException) {}
                         continue
@@ -499,6 +511,9 @@ class InkHoleNode(
             }
             try { conn.close() } catch (_: IOException) {}
             partFile?.delete()
+            if (receivedName.isNotEmpty()) {
+                listener.onTransferEnded("recv", receivedName, ok)
+            }
         }
     }
 
@@ -519,11 +534,47 @@ class InkHoleNode(
 
     // ---- 发送文件 ----
 
-    @Synchronized
     fun sendFile(filePath: String, displayName: String = File(filePath).name): Boolean {
         val file = File(filePath)
         if (!file.isFile) {
             listener.onStatus("文件不存在")
+            return false
+        }
+        return sendStream(file.length(), displayName) { file.inputStream() }
+    }
+
+    fun cancelSend(): Boolean {
+        val active = sendInProgress.get()
+        sendCancelled.set(true)
+        activeSendSocket.get()?.let { socket ->
+            try { socket.close() } catch (_: IOException) {}
+        }
+        activeSendInput.get()?.let { input ->
+            try { input.close() } catch (_: IOException) {}
+        }
+        return active
+    }
+
+    fun isSending(): Boolean = sendInProgress.get()
+
+    private fun <T> useSendInput(factory: () -> InputStream,
+                                 block: (InputStream) -> T): T {
+        val input = factory()
+        activeSendInput.set(input)
+        return try {
+            input.use(block)
+        } finally {
+            activeSendInput.compareAndSet(input, null)
+        }
+    }
+
+    /** 直接从 content:// 等输入流发送，避免大文件先完整复制到 cache 再读一遍。 */
+    @Synchronized
+    fun sendStream(plainSize: Long, displayName: String,
+                   shouldCancel: (() -> Boolean)? = null,
+                   inputFactory: () -> InputStream): Boolean {
+        if (plainSize < 0 || plainSize > WHPP.MAX_FILE_SIZE) {
+            listener.onStatus("文件大小无效")
             return false
         }
         val selected = selectedPeer ?: run {
@@ -536,17 +587,26 @@ class InkHoleNode(
         }
 
         val transferName = ReceiveFiles.safeName(displayName)
+        var completed = false
+        fun cancellationRequested(): Boolean =
+            sendCancelled.get() || shouldCancel?.invoke() == true
+        sendCancelled.set(false)
+        sendInProgress.set(true)
         return try {
             val socket = connectToPeer(peer)
+            try { socket.sendBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
+            try { socket.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
             activeSockets.add(socket)
+            activeSendSocket.set(socket)
             if (!running) {
                 activeSockets.remove(socket)
                 socket.close()
                 throw IOException("墨洞节点已停止")
             }
+            if (cancellationRequested()) throw java.io.InterruptedIOException("发送已取消")
             try {
                 socket.use { s ->
-                    val out = BufferedOutputStream(s.getOutputStream())
+                    val out = BufferedOutputStream(s.getOutputStream(), WHPP.BUFFER_SIZE)
                     var lastReport = 0L
                     val progress: (Long, Long) -> Unit = { done, total ->
                         val now = System.currentTimeMillis()
@@ -556,24 +616,30 @@ class InkHoleNode(
                         }
                     }
 
-                    if (secret.isNotEmpty() && file.length() > CHUNK_ENC_THRESHOLD) {
+                    if (secret.isNotEmpty() && plainSize > CHUNK_ENC_THRESHOLD) {
                         // 大文件走 WHE2 分块流式加密：内存峰值 4MB
-                        val wireSize = Crypto.chunkedWireSize(file.length())
+                        val wireSize = Crypto.chunkedWireSize(plainSize)
                         WHPP.writeHeader(out, WHPP.Header(
                             transferName, wireSize, encrypted = true, wantAck = true,
                             encMode = "chunked"))
                         val enc = Crypto.ChunkedEncryptor(secret)
                         out.write(enc.streamHeader)
                         var sent = enc.streamHeader.size.toLong()
+                        var plainRead = 0L
                         val dout = DataOutputStream(out)
-                        file.inputStream().use { fin ->
+                        useSendInput(inputFactory) { fin ->
                             val buf = ByteArray(Crypto.CHUNK_SIZE)
-                            while (true) {
-                                val n = readFull(fin, buf)
-                                if (n <= 0) break
+                            while (plainRead < plainSize) {
+                                if (cancellationRequested()) {
+                                    throw java.io.InterruptedIOException("发送已取消")
+                                }
+                                val wanted = minOf(buf.size.toLong(), plainSize - plainRead).toInt()
+                                val n = readFull(fin, buf, wanted)
+                                if (n <= 0) throw EOFException("文件读取不完整")
                                 val ct = enc.encryptChunk(buf, n)
                                 dout.writeInt(ct.size)
                                 dout.write(ct)
+                                plainRead += n
                                 sent += 4 + ct.size
                                 progress(sent, wireSize)
                             }
@@ -581,45 +647,65 @@ class InkHoleNode(
                         dout.flush()
                     } else if (secret.isNotEmpty()) {
                         // 小文件 WHE1 整块(与所有旧版本互通)
-                        val plain = file.readBytes()
+                        val plain = useSendInput(inputFactory) { it.readBytes() }
+                        if (plain.size.toLong() != plainSize) throw EOFException("文件读取不完整")
+                        if (cancellationRequested()) {
+                            throw java.io.InterruptedIOException("发送已取消")
+                        }
                         val enc = Crypto.encrypt(secret, plain)
                         WHPP.writeFrame(
                             out, transferName, enc.size.toLong(), true,
-                            ByteArrayInputStream(enc)
-                        ) { progress(it, enc.size.toLong()) }
+                            ByteArrayInputStream(enc),
+                            onProgress = { progress(it, enc.size.toLong()) },
+                            shouldCancel = ::cancellationRequested,
+                        )
                     } else {
                         // 明文: 流式
-                        file.inputStream().use { input ->
+                        useSendInput(inputFactory) { input ->
                             WHPP.writeFrame(
-                                out, transferName, file.length(), false, input
-                            ) { progress(it, file.length()) }
+                                out, transferName, plainSize, false, input,
+                                onProgress = { progress(it, plainSize) },
+                                shouldCancel = ::cancellationRequested,
+                            )
                         }
                     }
 
                     // 等接收方回执。老版本对端读完即关连接 -> read 返回 -1，按成功；超时也不误报
                     s.soTimeout = 60_000
-                    val resp = try { s.getInputStream().read() } catch (_: SocketTimeoutException) { -1 }
+                    val resp = try { s.getInputStream().read() } catch (e: Exception) {
+                        if (cancellationRequested()) throw java.io.InterruptedIOException("发送已取消")
+                        if (e is SocketTimeoutException) -1 else throw e
+                    }
                     if (resp == WHPP.ACK_FAIL) {
                         listener.onStatus("${peer.name} 接收失败（口令不一致、被拒收或存储问题）")
                         return false
                     }
                 }
             } finally {
+                activeSendSocket.compareAndSet(socket, null)
                 activeSockets.remove(socket)
             }
+            completed = true
             listener.onStatus("已发送：$transferName")
             true
         } catch (e: Exception) {
-            listener.onStatus("发送失败: ${e.message}")
+            if (cancellationRequested()) listener.onStatus("已取消发送：$transferName")
+            else listener.onStatus("发送失败: ${e.message}")
             false
+        } finally {
+            activeSendSocket.set(null)
+            activeSendInput.set(null)
+            sendInProgress.set(false)
+            sendCancelled.set(false)
+            listener.onTransferEnded("send", transferName, completed)
         }
     }
 
     /** 尽量读满 buf(文件尾可能不足)，返回实际读到的字节数；EOF 返回 -1。 */
-    private fun readFull(input: InputStream, buf: ByteArray): Int {
+    private fun readFull(input: InputStream, buf: ByteArray, limit: Int = buf.size): Int {
         var off = 0
-        while (off < buf.size) {
-            val n = input.read(buf, off, buf.size - off)
+        while (off < limit) {
+            val n = input.read(buf, off, limit - off)
             if (n < 0) break
             off += n
         }

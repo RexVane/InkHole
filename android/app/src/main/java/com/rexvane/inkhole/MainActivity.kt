@@ -36,7 +36,11 @@ import com.rexvane.inkhole.p2p.InkHoleListener
 import com.rexvane.inkhole.p2p.ManualPeer
 import com.rexvane.inkhole.p2p.ManualPeers
 import com.rexvane.inkhole.p2p.ReceiveFiles
+import com.rexvane.inkhole.p2p.WHPP
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 主界面(纯 UI)。P2P 节点的生命周期在 InkHoleService(前台服务)：
@@ -51,6 +55,10 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val PREF_USAGE_GUIDE_SEEN = "usage_guide_seen"
         private const val STATE_PENDING_SHARES = "pending_shares"
+        // Activity 横竖屏重建时发送线程仍在工作；队列和取消标记必须跨实例共享。
+        private val sendQueue = ConcurrentLinkedQueue<Uri>()
+        private val sendWorkerRunning = AtomicBoolean(false)
+        private val sendCancelled = AtomicBoolean(false)
     }
 
     // UI 状态
@@ -60,6 +68,11 @@ class MainActivity : ComponentActivity() {
     private val receivedFiles = mutableStateListOf<ReceivedFile>()
     private val pendingShares = mutableStateListOf<Uri>()   // 分享进来、等选设备的文件
     private val transferPct = mutableFloatStateOf(-1f)      // -1=空闲
+    private val sendingActive = mutableStateOf(false)
+    private var activeProgressKey: String? = null
+    private var progressSampleTime = 0L
+    private var progressSampleDone = 0L
+    private var progressSpeed = 0.0
 
     // 设置
     private val peerName = mutableStateOf(Build.MODEL)
@@ -231,11 +244,49 @@ class MainActivity : ComponentActivity() {
         override fun onStatus(msg: String) = runOnUiThread { statusMsg.value = msg }
         override fun onProgress(kind: String, filename: String, done: Long, total: Long) =
             runOnUiThread {
+                val key = "$kind|$filename"
+                val now = System.currentTimeMillis()
+                if (activeProgressKey != key || done < progressSampleDone) {
+                    activeProgressKey = key
+                    progressSampleTime = now
+                    progressSampleDone = done
+                    progressSpeed = 0.0
+                } else {
+                    val elapsed = now - progressSampleTime
+                    if (elapsed > 0) {
+                        val instant = (done - progressSampleDone) * 1000.0 / elapsed
+                        progressSpeed = if (progressSpeed <= 0) instant
+                            else progressSpeed * 0.65 + instant * 0.35
+                        progressSampleTime = now
+                        progressSampleDone = done
+                    }
+                }
                 val pct = if (total > 0) (done * 100f / total) else 100f
                 transferPct.floatValue = if (pct >= 100f) -1f else pct
+                val speedText = when {
+                    progressSpeed >= 1024 * 1024 ->
+                        " · %.1f MB/s".format(progressSpeed / 1024 / 1024)
+                    progressSpeed >= 1024 -> " · %.0f KB/s".format(progressSpeed / 1024)
+                    else -> ""
+                }
                 statusMsg.value =
-                    "${if (kind == "send") "↑ 发送" else "↓ 接收"} $filename ${pct.toInt()}%"
+                    "${if (kind == "send") "↑ 发送" else "↓ 接收"} $filename ${pct.toInt()}%$speedText"
             }
+
+        override fun onTransferEnded(kind: String, filename: String, completed: Boolean) =
+            runOnUiThread {
+                if (activeProgressKey == "$kind|$filename") {
+                    activeProgressKey = null
+                    progressSampleTime = 0L
+                    progressSampleDone = 0L
+                    progressSpeed = 0.0
+                    transferPct.floatValue = -1f
+                }
+            }
+
+        override fun onSendingChanged(active: Boolean) = runOnUiThread {
+            sendingActive.value = active
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -257,6 +308,7 @@ class MainActivity : ComponentActivity() {
         peers.addAll(InkHoleBus.lastPeers)
         statusMsg.value = InkHoleBus.lastStatus
         selectedPeer.value = InkHoleBus.node?.getSelectedPeer()
+        sendingActive.value = sendWorkerRunning.get()
         refreshReceived()
 
         if (savedInstanceState == null) {
@@ -274,6 +326,7 @@ class MainActivity : ComponentActivity() {
                     selectedPeer = selectedPeer.value,
                     receivedFiles = receivedFiles,
                     transferPct = transferPct.floatValue,
+                    sending = sendingActive.value,
                     pendingCount = pendingShares.size,
                     onDeviceClick = { peer -> onDeviceClicked(peer) },
                     onSendClick = {
@@ -284,6 +337,7 @@ class MainActivity : ComponentActivity() {
                             filePicker.launch(arrayOf("*/*"))
                         }
                     },
+                    onCancelSend = { cancelSending() },
                     onOpenInbox = { openInbox() },
                     onOpenFile = { rec -> openFile(rec) },
                     onClearHistory = {
@@ -371,36 +425,98 @@ class MainActivity : ComponentActivity() {
         emptyList()
     }
 
-    /** 把 content uri 复制到 cache 后经 P2P 发送(顺序发，避免并发写同名缓存)。 */
+    /** URI 进入单工作线程队列；已知大小时直接流式发送，不再复制整份大文件。 */
     private fun sendUris(uris: List<Uri>) {
-        val node = InkHoleBus.node ?: run {
+        if (InkHoleBus.node == null) {
             statusMsg.value = "墨洞未就绪"
             return
         }
+        if (!sendWorkerRunning.get()) sendCancelled.set(false)
+        uris.forEach(sendQueue::add)
+        startSendWorker()
+    }
+
+    private fun startSendWorker() {
+        if (!sendWorkerRunning.compareAndSet(false, true)) return
+        InkHoleBus.uiListener?.onSendingChanged(true)
         Thread {
             var okCount = 0
-            for (uri in uris) {
-                var tmp: File? = null
-                try {
-                    val name = ReceiveFiles.safeName(
-                        queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}")
-                    val dst = File.createTempFile("inkhole-send-", ".tmp", cacheDir)
-                    tmp = dst
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        dst.outputStream().use { input.copyTo(it) }
-                    } ?: continue
-                    runOnUiThread { statusMsg.value = "发送：$name" }
-                    if (node.sendFile(dst.absolutePath, name)) okCount++
-                } catch (e: Exception) {
-                    runOnUiThread { statusMsg.value = "发送失败: ${e.message}" }
-                } finally {
-                    tmp?.delete()
+            var total = 0
+            var wasCancelled = false
+            try {
+                while (!sendCancelled.get()) {
+                    val uri = sendQueue.poll() ?: break
+                    total++
+                    if (sendOneUri(uri)) okCount++
+                }
+                wasCancelled = sendCancelled.get()
+            } finally {
+                if (wasCancelled) sendQueue.clear()
+                sendWorkerRunning.set(false)
+                if (!wasCancelled && sendQueue.isNotEmpty()) {
+                    startSendWorker()  // 处理 poll 空与新入队撞车的窄窗口
+                } else {
+                    sendCancelled.set(false)
+                    InkHoleBus.uiListener?.onSendingChanged(false)
+                    when {
+                        wasCancelled -> InkHoleBus.uiListener?.onStatus("已取消发送")
+                        total > 1 -> InkHoleBus.uiListener?.onStatus(
+                            "已发送 $okCount/$total 个文件")
+                    }
                 }
             }
-            if (uris.size > 1) {
-                runOnUiThread { statusMsg.value = "已发送 $okCount/${uris.size} 个文件" }
-            }
         }.start()
+    }
+
+    private fun sendOneUri(uri: Uri): Boolean {
+        val node = InkHoleBus.node ?: return false
+        var tmp: File? = null
+        return try {
+            val name = ReceiveFiles.safeName(
+                queryDisplayName(uri) ?: "file_${System.currentTimeMillis()}")
+            val size = queryContentSize(uri)
+            InkHoleBus.uiListener?.onStatus("发送：$name")
+            if (size != null) {
+                node.sendStream(size, name, shouldCancel = { sendCancelled.get() }) {
+                    contentResolver.openInputStream(uri)
+                        ?: throw IOException("无法读取文件")
+                }
+            } else {
+                // 极少数文档提供方不报告大小；此时才回退缓存文件以确定协议 size。
+                val dst = File.createTempFile("inkhole-send-", ".tmp", cacheDir)
+                tmp = dst
+                contentResolver.openInputStream(uri)?.use { input ->
+                    dst.outputStream().buffered(WHPP.BUFFER_SIZE).use { output ->
+                        val buffer = ByteArray(WHPP.BUFFER_SIZE)
+                        while (true) {
+                            if (sendCancelled.get()) throw java.io.InterruptedIOException()
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                        }
+                    }
+                } ?: throw IOException("无法读取文件")
+                if (sendCancelled.get()) false else node.sendStream(
+                    dst.length(), name, shouldCancel = { sendCancelled.get() }) {
+                    dst.inputStream()
+                }
+            }
+        } catch (e: Exception) {
+            if (!sendCancelled.get()) {
+                InkHoleBus.uiListener?.onStatus("发送失败: ${e.message}")
+            }
+            false
+        } finally {
+            tmp?.delete()
+        }
+    }
+
+    private fun cancelSending() {
+        if (!sendingActive.value && sendQueue.isEmpty() && InkHoleBus.node?.isSending() != true) return
+        sendCancelled.set(true)
+        sendQueue.clear()
+        InkHoleBus.node?.cancelSend()
+        statusMsg.value = "正在取消发送…"
     }
 
     private fun queryDisplayName(uri: Uri): String? =
@@ -408,6 +524,21 @@ class MainActivity : ComponentActivity() {
             val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
             if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
         }
+
+    private fun queryContentSize(uri: Uri): Long? {
+        val cursorSize = try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+                val idx = c.getColumnIndex(OpenableColumns.SIZE)
+                if (idx >= 0 && c.moveToFirst() && !c.isNull(idx)) c.getLong(idx) else null
+            }
+        } catch (_: Exception) { null }
+        if (cursorSize != null && cursorSize >= 0) return cursorSize
+        return try {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                afd.length.takeIf { it >= 0 }
+            }
+        } catch (_: Exception) { null }
+    }
 
     // ---- 接收侧 UI ----
 

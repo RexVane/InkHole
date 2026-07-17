@@ -27,6 +27,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.Computer
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Folder
@@ -204,9 +205,11 @@ fun MainScreen(
     selectedPeer: String?,
     receivedFiles: List<ReceivedFile>,
     transferPct: Float,
+    sending: Boolean,
     pendingCount: Int,
     onDeviceClick: (Peer) -> Unit,
     onSendClick: () -> Unit,
+    onCancelSend: () -> Unit,
     onOpenInbox: () -> Unit,
     onOpenFile: (ReceivedFile) -> Unit,
     onClearHistory: () -> Unit,
@@ -233,7 +236,7 @@ fun MainScreen(
                 InkHoleHero(
                     transferPct = transferPct,
                     searching = peers.isEmpty(),
-                    onTap = onSendClick,
+                    onTap = { if (!sending) onSendClick() },
                     diameter = heroDiameter,
                 )
 
@@ -252,18 +255,31 @@ fun MainScreen(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                Text(
-                    when {
-                        pendingCount > 0 && selectedPeer == null ->
-                            "有 $pendingCount 个待发送文件 · 点选下方设备立即发送"
-                        selectedPeer != null -> "轻点墨洞选择文件"
-                        peers.isNotEmpty() -> "点选下方设备作为目标"
-                        else -> "等待附近的墨洞上线…"
-                    },
-                    color = TextDim,
-                    fontSize = 11.sp,
-                    modifier = Modifier.padding(top = 3.dp),
-                )
+                Box(
+                    modifier = Modifier.height(34.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (sending) {
+                        TextButton(onClick = onCancelSend) {
+                            Icon(Icons.Default.Close, contentDescription = null,
+                                modifier = Modifier.size(15.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("取消发送", fontSize = 12.sp)
+                        }
+                    } else {
+                        Text(
+                            when {
+                                pendingCount > 0 && selectedPeer == null ->
+                                    "有 $pendingCount 个待发送文件 · 点选下方设备立即发送"
+                                selectedPeer != null -> "轻点墨洞选择文件"
+                                peers.isNotEmpty() -> "点选下方设备作为目标"
+                                else -> "等待附近的墨洞上线…"
+                            },
+                            color = TextDim,
+                            fontSize = 11.sp,
+                        )
+                    }
+                }
 
                 Spacer(Modifier.height(14.dp))
 
@@ -504,9 +520,10 @@ fun PreviewMainScreen() {
                     System.currentTimeMillis() - 7200_000),
             ),
             transferPct = 63f,
+            sending = true,
             pendingCount = 0,
             onDeviceClick = {}, onSendClick = {}, onOpenInbox = {},
-            onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},
+            onCancelSend = {}, onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},
         )
     }
 }
@@ -521,9 +538,10 @@ fun PreviewEmptyState() {
             selectedPeer = null,
             receivedFiles = emptyList(),
             transferPct = -1f,
+            sending = false,
             pendingCount = 0,
             onDeviceClick = {}, onSendClick = {}, onOpenInbox = {},
-            onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},
+            onCancelSend = {}, onOpenFile = {}, onClearHistory = {}, onSettingsClick = {},
         )
     }
 }

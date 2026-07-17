@@ -386,10 +386,14 @@ def test_partial_transfer_not_delivered():
     tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         received = []
+        transfer_ends = []
+        transfer_done = threading.Event()
         node_b = P2PNode(
             P2PConfig(inbox=os.path.join(tmpdir, "Bob_inbox"), peer_name="Bob",
                       enable_mdns=False),
             on_received=lambda p: received.append(p),
+            on_transfer_end=lambda kind, name, completed: (
+                transfer_ends.append((kind, name, completed)), transfer_done.set()),
         )
         node_b.start()
         time.sleep(0.3)
@@ -408,13 +412,16 @@ def test_partial_transfer_not_delivered():
         sock.sendall(header)
         sock.sendall(b"x" * 50)
         sock.close()
-        time.sleep(0.8)
+        check("接收中断结束回调触发", transfer_done.wait(timeout=5))
 
         with open(existing, "r", encoding="utf-8") as f:
             content = f.read()
         check("旧文件未被半截文件覆盖", content == "完整的旧文件")
         check("on_received 未触发", len(received) == 0)
-        check(".part 残留已清理", not os.path.exists(existing + ".part"))
+        check("接收结束回调标记失败",
+              transfer_ends == [("recv", "report.txt", False)])
+        check(".part 残留已清理",
+              not any(name.endswith(".part") for name in os.listdir(node_b.cfg.inbox)))
 
         node_b.stop()
     finally:
@@ -666,6 +673,106 @@ def test_send_queue():
     check("批量完成回调触发", done.wait(timeout=5))
     check("按放入顺序串行发送", sent_order == ["a", "b", "c"])
     check("聚合结果 2/3", batch_results == [(2, 3)])
+
+
+def test_send_queue_cancel_discards_pending_items():
+    """Cancelling a batch stops its active item and cleans every queued item."""
+    print("\n=== 测试: 发送队列取消 ===")
+    from inkhole.pet import SendQueue
+
+    started = threading.Event()
+    cancel_seen = threading.Event()
+    idle = threading.Event()
+    sent = []
+    cleaned = []
+    batches = []
+    busy_states = []
+
+    def fake_send(path):
+        sent.append(path)
+        started.set()
+        return not cancel_seen.wait(timeout=5)
+
+    def on_busy(busy):
+        busy_states.append(busy)
+        if not busy:
+            idle.set()
+
+    q = SendQueue(
+        fake_send,
+        on_batch_done=lambda ok, total: batches.append((ok, total)),
+        on_busy_changed=on_busy,
+        cancel_fn=cancel_seen.set,
+    )
+    for path in ("active", "queued-a", "queued-b"):
+        q.put(path, on_done=lambda p, ok: cleaned.append((p, ok)))
+
+    check("当前文件已开始", started.wait(timeout=5))
+    check("取消报告有活动批次", q.cancel())
+    check("发送队列回到空闲", idle.wait(timeout=5))
+    check("只有当前文件进入发送函数", sent == ["active"])
+    check("当前和排队文件都执行失败清理回调",
+          sorted(cleaned) == sorted([
+              ("active", False), ("queued-a", False), ("queued-b", False)]))
+    check("取消批次不显示批量成功结果", batches == [])
+    check("忙碌状态完整闭合", busy_states == [True, False])
+    check("取消后队列不再忙碌", not q.busy())
+
+
+def test_cancel_active_transfer_ends_both_sides():
+    """Closing the outbound socket clears both progress paths and all .part data."""
+    print("\n=== 测试: 活动传输取消后双方结束 ===")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        first_receive = threading.Event()
+        sender_done = threading.Event()
+        receiver_done = threading.Event()
+        sender_ends = []
+        receiver_ends = []
+
+        node_a = make_node(tmpdir, "Alice")
+        node_b = P2PNode(
+            P2PConfig(inbox=os.path.join(tmpdir, "Bob_inbox"), peer_name="Bob",
+                      enable_mdns=False),
+            on_progress=lambda *_: (first_receive.set(), time.sleep(0.2)),
+            on_transfer_end=lambda kind, name, completed: (
+                receiver_ends.append((kind, name, completed)), receiver_done.set()),
+        )
+        node_a.on_transfer_end = lambda kind, name, completed: (
+            sender_ends.append((kind, name, completed)), sender_done.set())
+        node_a.start()
+        node_b.start()
+        time.sleep(0.2)
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        src = os.path.join(tmpdir, "cancel.bin")
+        with open(src, "wb") as f:
+            f.truncate(64 * 1024 * 1024)
+
+        result = []
+        worker = threading.Thread(target=lambda: result.append(node_a.send_file(src)))
+        worker.start()
+        check("接收方已显示传输进度", first_receive.wait(timeout=5))
+        check("取消命中当前发送", node_a.cancel_send())
+        worker.join(timeout=5)
+        check("发送线程及时退出", not worker.is_alive())
+        check("发送函数返回失败", result == [False])
+        check("发送方结束回调触发", sender_done.wait(timeout=5))
+        check("接收方结束回调触发", receiver_done.wait(timeout=5))
+        check("发送方结束标记为未完成",
+              sender_ends == [("send", "cancel.bin", False)])
+        check("接收方结束标记为未完成",
+              receiver_ends == [("recv", "cancel.bin", False)])
+        check("接收端未生成正式文件",
+              not os.path.exists(os.path.join(node_b.cfg.inbox, "cancel.bin")))
+        check("接收端未残留 .part 文件",
+              not any(name.endswith(".part") for name in os.listdir(node_b.cfg.inbox)))
+
+        node_a.stop()
+        node_b.stop()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------- 测试 16: 仅接收目标设备(trusted_only) ----------
@@ -1207,6 +1314,8 @@ if __name__ == "__main__":
         test_chunked_encryption_roundtrip,
         test_chunked_crypto_tamper,
         test_send_queue,
+        test_send_queue_cancel_discards_pending_items,
+        test_cancel_active_transfer_ends_both_sides,
         test_trusted_only,
         test_multi_host_fallback,
         test_ghost_peer_eviction,

@@ -29,6 +29,7 @@ import json
 import queue
 import argparse
 import threading
+import time
 from collections import deque
 
 from .p2p import P2PNode, P2PConfig
@@ -210,13 +211,17 @@ class SendQueue:
     不依赖 Qt，可单测。
     """
 
-    def __init__(self, send_fn, on_batch_done=None, on_busy_changed=None):
+    def __init__(self, send_fn, on_batch_done=None, on_busy_changed=None,
+                 cancel_fn=None):
         self._send = send_fn
         self._on_batch_done = on_batch_done
         self._on_busy_changed = on_busy_changed
-        # 队列元素是 (path, on_done)：on_done 可为 None
-        self._q: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._cancel_current = cancel_fn
+        # generation 让 cancel() 能同时覆盖「刚出队、尚未开始」的竞态窗口。
+        self._q: queue.Queue[tuple[int, str, object]] = queue.Queue()
         self._lock = threading.Lock()
+        self._generation = 0
+        self._active_generation: int | None = None
         self._batch_total = 0
         self._batch_ok = 0
         self._working = False
@@ -234,7 +239,7 @@ class SendQueue:
             if self._batch_total == 0 and not self._working:
                 notify = True
             self._batch_total += 1
-            self._q.put((path, on_done))
+            self._q.put((self._generation, path, on_done))
         if notify and self._on_busy_changed:
             self._on_busy_changed(True)
 
@@ -242,11 +247,68 @@ class SendQueue:
         with self._lock:
             return self._working or self._batch_total > 0
 
+    def cancel_requested(self) -> bool:
+        """Whether cancel() invalidated the item currently inside send_fn."""
+        with self._lock:
+            return (self._active_generation is not None and
+                    self._active_generation != self._generation)
+
+    def cancel(self) -> bool:
+        """Cancel the active file and discard every queued file in this batch."""
+        pending = []
+        with self._lock:
+            busy_before = self._working or self._batch_total > 0
+            old_generation = self._generation
+            self._generation += 1
+            active = self._active_generation == old_generation
+            self._batch_total = 0
+            self._batch_ok = 0
+            while True:
+                try:
+                    pending.append(self._q.get_nowait())
+                except queue.Empty:
+                    break
+
+        for _generation, path, on_done in pending:
+            if on_done is not None:
+                try:
+                    on_done(path, False)
+                except Exception:
+                    pass
+            self._q.task_done()
+
+        if active and self._cancel_current is not None:
+            try:
+                self._cancel_current()
+            except Exception:
+                pass
+        elif busy_before and self._cancel_current is not None:
+            # Covers cancellation while send_file is entering its active state.
+            try:
+                self._cancel_current()
+            except Exception:
+                pass
+
+        if busy_before and not active and self._on_busy_changed:
+            self._on_busy_changed(False)
+        return busy_before
+
     def _loop(self) -> None:
         while True:
-            path, on_done = self._q.get()
+            generation, path, on_done = self._q.get()
             with self._lock:
-                self._working = True
+                stale = generation != self._generation
+                if not stale:
+                    self._working = True
+                    self._active_generation = generation
+            if stale:
+                if on_done is not None:
+                    try:
+                        on_done(path, False)
+                    except Exception:
+                        pass
+                self._q.task_done()
+                continue
             ok = False
             try:
                 ok = bool(self._send(path))
@@ -260,20 +322,28 @@ class SendQueue:
                 except Exception:
                     pass
             batch_done = None
+            notify_idle = False
             with self._lock:
-                if ok:
-                    self._batch_ok += 1
-                if self._q.empty():
-                    batch_done = (self._batch_ok, self._batch_total)
-                    self._batch_ok = 0
-                    self._batch_total = 0
-                    self._working = False
+                cancelled = generation != self._generation
+                self._active_generation = None
+                self._working = False
+                if cancelled:
+                    notify_idle = self._q.empty() and self._batch_total == 0
+                else:
+                    if ok:
+                        self._batch_ok += 1
+                    if self._q.empty():
+                        batch_done = (self._batch_ok, self._batch_total)
+                        self._batch_ok = 0
+                        self._batch_total = 0
+                        notify_idle = True
+            self._q.task_done()
             if batch_done and self._on_batch_done:
                 try:
                     self._on_batch_done(*batch_done)
                 except Exception:
                     pass
-            if batch_done and self._on_busy_changed:
+            if notify_idle and self._on_busy_changed:
                 try:
                     self._on_busy_changed(False)
                 except Exception:
@@ -666,7 +736,9 @@ def main(argv=None) -> None:
         recentChanged = Signal()      # 接收历史变化(不触发桌宠接收动画)
         errorState = Signal(str)      # 错误信息(持续显示，非空=有错误，空=清除)
         progress = Signal(str, int)   # 传输进度(kind "send"/"recv", 百分比 0-100)
+        progressCleared = Signal()
         transferStateChanged = Signal(bool)
+        sendStateChanged = Signal(bool)
         # 检查更新结果: has_new, 最新版本号, 更新说明摘要, 资产下载 url(空=无对应平台包)
         updateCheckFinished = Signal(bool, str, str, str)
 
@@ -685,6 +757,8 @@ def main(argv=None) -> None:
             self._progress_lock = threading.Lock()
             self._progress_generation = 0
             self._progress_active = False
+            self._progress_key = None
+            self._speed_state = {}
             self._last_status = "正在启动…"
             self._lan_cfg = cfg
             # 设置保存会后台重启节点(mDNS 重新注册,阻塞数秒不能占 UI 线程);
@@ -694,10 +768,11 @@ def main(argv=None) -> None:
             self.node = self._make_node(cfg)
             # 串行发送队列：拖一堆文件不再开一堆并发连接
             self._sendq = SendQueue(
-                lambda p: self.node.send_file(p),
+                lambda p: self.node.send_file(
+                    p, should_cancel=self._sendq.cancel_requested),
                 on_batch_done=lambda ok, total: self._on_batch_done(ok, total),
-                on_busy_changed=lambda _busy: self.transferStateChanged.emit(
-                    self._transfer_active()),
+                on_busy_changed=self._on_send_busy_changed,
+                cancel_fn=lambda: self.node.cancel_send(),
             )
             self.node.start()
 
@@ -710,7 +785,13 @@ def main(argv=None) -> None:
                 on_peers_changed=lambda: self.peersChanged.emit(),
                 on_progress=lambda kind, name, done, total: self._on_progress(
                     kind, name, done, total),
+                on_transfer_end=lambda kind, name, completed: self._on_transfer_end(
+                    kind, name, completed),
             )
+
+        def _on_send_busy_changed(self, busy: bool) -> None:
+            self.sendStateChanged.emit(busy)
+            self.transferStateChanged.emit(self._transfer_active())
 
         @Slot(result=bool)
         def isTransferActive(self) -> bool:
@@ -734,10 +815,22 @@ def main(argv=None) -> None:
             _save_config(self._lan_cfg, recent_files=list(self._recent))
 
         def _on_progress(self, kind: str, name: str, done: int, total: int) -> None:
+            key = (kind, name)
+            now = time.monotonic()
+            previous = self._speed_state.get(key)
+            speed = 0.0
+            if previous is not None:
+                prev_time, prev_done, prev_speed = previous
+                elapsed = now - prev_time
+                if elapsed > 0 and done >= prev_done:
+                    instant = (done - prev_done) / elapsed
+                    speed = instant if prev_speed <= 0 else prev_speed * 0.65 + instant * 0.35
+            self._speed_state[key] = (now, done, speed)
             with self._progress_lock:
                 self._progress_generation += 1
                 generation = self._progress_generation
                 self._progress_active = True
+                self._progress_key = key
             self.transferStateChanged.emit(True)
 
             def settle():
@@ -751,8 +844,32 @@ def main(argv=None) -> None:
             pct = done * 100 // total if total else 100
             self.progress.emit(kind, pct)
             label = "↑ 发送" if kind == "send" else "↓ 接收"
-            self._last_status = f"{label} {name} {pct}%"
+            speed_text = ""
+            if speed >= 1024 * 1024:
+                speed_text = f" · {speed / 1024 / 1024:.1f} MB/s"
+            elif speed >= 1024:
+                speed_text = f" · {speed / 1024:.0f} KB/s"
+            self._last_status = f"{label} {name} {pct}%{speed_text}"
             self.status.emit(self._last_status)
+
+        def _on_transfer_end(self, kind: str, name: str, _completed: bool) -> None:
+            key = (kind, name)
+            self._speed_state.pop(key, None)
+            with self._progress_lock:
+                if self._progress_key != key:
+                    return
+                self._progress_generation += 1
+                self._progress_active = False
+                self._progress_key = None
+            self.progressCleared.emit()
+            self.transferStateChanged.emit(self._transfer_active())
+
+        @Slot(result=bool)
+        def cancelTransfer(self) -> bool:
+            cancelled = self._sendq.cancel()
+            if cancelled:
+                self.status.emit("正在取消发送…")
+            return cancelled
 
         def _apply_settings(self, peer_name: str | None = None,
                             secret: str | None = None,
