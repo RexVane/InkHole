@@ -1,6 +1,6 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.4.0`），与 Windows/macOS 桌面端在同一局域网或 Tailscale 网络内互传文件。
+墨洞 Android 客户端（当前版本 `1.4.1`），与 Windows/macOS 桌面端在同一局域网或 Tailscale 网络内互传文件。
 
 ## 功能
 
