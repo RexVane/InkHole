@@ -8,7 +8,7 @@
 
 不在同一网络时，桌面端可在设置里**手动添加设备**（填对方 IP 与监听端口直连）。配合 [Tailscale](https://tailscale.com) 等虚拟局域网：两台电脑登录同一 Tailscale 账号、互填对方的 `100.x` 虚拟 IP，即可像局域网一样异地互传。
 
-桌面端体验：**在主窗口选择目标 → 点击选择文件或拖入窗口 → 墨洞显示传输进度 → 对端文件落入收件箱**。桌宠仍可作为常驻桌面的快捷拖放入口。
+桌面端体验：**在主窗口选择目标 → 点击选择发送内容或拖入窗口 → 墨洞显示传输进度 → 对端内容落入收件箱**。桌宠仍可作为常驻桌面的快捷拖放入口。
 
 ## Windows 主窗口
 
@@ -196,4 +196,4 @@ PYTHONPATH=src python3 -m inkhole.pet --secret '两边一致的口令'
 PYTHONPATH=src QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
 ```
 
-覆盖 P2P 文件与 WHF1 文件夹端到端传输、WHE1/WHE2 加密、WHPC 能力协商、旧版 ZIP 回退、取消与进度、路径安全和原子落盘；另覆盖手动设备在线状态、桌面主窗口与设置页。当前 Python 测试为 `60 passed`，Android 协议与存储测试及 Lint 独立执行。
+覆盖 P2P 文件与 WHF1 文件夹端到端传输、WHE1/WHE2 加密、WHPC 能力协商、旧版 ZIP 回退、取消与进度、路径安全和原子落盘；另覆盖手动设备在线状态、桌面主窗口、混合内容选择与设置页。当前 Python 测试为 `63 passed`，Android 协议与存储测试及 Lint 独立执行。

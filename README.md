@@ -18,7 +18,7 @@ pip install PySide6 zeroconf cryptography psutil
 PYTHONPATH=src python -m inkhole.pet
 PYTHONPATH=src python -m inkhole.pet --name 我的Mac
 
-# 3. 在主窗口选择目标设备 → 点击选择文件或直接拖入 → 传过去
+# 3. 在主窗口选择目标设备 → 点击选择发送内容或直接拖入 → 传过去
 ```
 
 也可以直接 `python -m inkhole`（等价于启动桌宠）。
@@ -153,7 +153,7 @@ xattr -cr /Applications/InkHolePet.app
 make test        # 全量测试（Windows Git Bash / macOS / Linux 均可,等价 pytest）
 ```
 
-覆盖三块：**P2P 引擎端到端**（TCP 直连传输、取消与双方结束回调、端到端加密 WHE1/WHE2、WHPC 能力协商、WHF1 文件夹流、旧版 ZIP 回退、路径穿越与重名防御、原子落盘、设备选择和在线状态等）、**手动添加设备**（启动注册、真实直连传输、离线剔除与回线自动恢复、配置增删同步）、**桌面主窗口离屏冒烟**（bridge 契约、响应式设置页、手动设备 UI、版本比较与进度清理）。当前 Python 测试 `60 passed`，Android 另有协议、存储与更新单元测试及 Lint。
+覆盖三块：**P2P 引擎端到端**（TCP 直连传输、取消与双方结束回调、端到端加密 WHE1/WHE2、WHPC 能力协商、WHF1 文件夹流、旧版 ZIP 回退、路径穿越与重名防御、原子落盘、设备选择和在线状态等）、**手动添加设备**（启动注册、真实直连传输、离线剔除与回线自动恢复、配置增删同步）、**桌面主窗口离屏冒烟**（bridge 契约、响应式设置页、手动设备 UI、混合内容选择、版本比较与进度清理）。当前 Python 测试 `63 passed`，Android 另有协议、存储与更新单元测试及 Lint。
 
 桌面端同名文件或文件夹：收件箱已有同名项时自动加 " (2)" 后缀，绝不覆盖；传输中断不会留下正式文件或目录。Android 文件夹导出也会选择唯一根目录名。
 

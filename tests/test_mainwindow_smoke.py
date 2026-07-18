@@ -20,8 +20,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QObject, Signal, Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication, QBoxLayout  # noqa: E402
+from PySide6.QtCore import QObject, QItemSelectionModel, Signal, Qt  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QBoxLayout, QDialog,
+                               QDialogButtonBox, QTreeView)  # noqa: E402
 
 from inkhole.p2p import P2PConfig  # noqa: E402
 
@@ -65,6 +66,7 @@ class FakeBridge(QObject):
         self.node = _FakeNode()
         self._manual = []
         self.opened_paths = []
+        self.dropped_paths = []
         self.applied_settings = None
         self.cancel_calls = 0
 
@@ -122,6 +124,9 @@ class FakeBridge(QObject):
     def openPath(self, path):
         self.opened_paths.append(path)
 
+    def dropFile(self, path):
+        self.dropped_paths.append(path)
+
     # ---- 手动设备 ----
     def manualPeers(self):
         return [dict(m) for m in self._manual]
@@ -172,6 +177,63 @@ def test_window_constructs_without_attribute_error(app):
     window, _ = _make_window(app)
     assert window is not None
     assert window._stack.count() == 2   # 主页 + 单一设置页
+
+
+def test_home_hole_uses_prominent_preferred_size(app):
+    window, _ = _make_window(app)
+    window.resize(960, 640)
+    window.show()
+    app.processEvents()
+
+    assert window._hole.width() >= 224
+    assert window._hole.height() >= 224
+
+
+def test_send_content_dialog_accepts_files_and_folders(app, tmp_path):
+    from inkhole.mainwindow import SendContentDialog
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("content", encoding="utf-8")
+    dialog = SendContentDialog(start_dir=str(tmp_path))
+    dialog.show()
+    app.processEvents()
+
+    view = dialog.findChild(QTreeView, "treeView")
+    model = view.model()
+    for path in (folder, file_path):
+        index = model.index(str(path))
+        assert index.isValid()
+        view.selectionModel().select(
+            index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+    buttons = dialog.findChild(QDialogButtonBox, "buttonBox")
+    buttons.button(QDialogButtonBox.Open).click()
+    app.processEvents()
+
+    assert dialog.result() == QDialog.Accepted
+    assert set(dialog.selected_paths()) == {
+        os.path.normpath(str(folder)), os.path.normpath(str(file_path))}
+
+
+def test_send_button_uses_one_picker_for_files_and_folders(
+        app, monkeypatch, tmp_path):
+    from inkhole.mainwindow import SendContentDialog
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("content", encoding="utf-8")
+    paths = [str(file_path), str(folder)]
+    monkeypatch.setattr(SendContentDialog, "exec", lambda _self: QDialog.Accepted)
+    monkeypatch.setattr(SendContentDialog, "selected_paths", lambda _self: paths)
+
+    window, bridge = _make_window(app)
+    bridge.node._selected = "peer"
+    window._send_btn.click()
+
+    assert window._send_btn.menu() is None
+    assert bridge.dropped_paths == paths
 
 
 def test_settings_page_opens_and_populates(app):

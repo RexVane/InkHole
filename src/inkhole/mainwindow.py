@@ -20,7 +20,8 @@ import sys
 import math
 import time
 
-from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, Slot, Signal,
+from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QSize, Slot, Signal,
+                            QStandardPaths,
                             QElapsedTimer, QVariantAnimation,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
@@ -29,10 +30,10 @@ from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
                                QLineEdit, QCheckBox,
-                               QDialog, QSizePolicy, QStackedWidget,
+                               QDialog, QDialogButtonBox, QSizePolicy, QStackedWidget,
                                QSizeGrip, QToolButton, QStyle,
                                QGraphicsOpacityEffect,
-                               QApplication, QBoxLayout, QMenu)
+                               QApplication, QBoxLayout)
 
 # ---------- 设计令牌 ----------
 _TEAL = "#5AD8C0"
@@ -610,6 +611,52 @@ class AndroidStyleDialog(QDialog):
         super().mousePressEvent(event)
 
 
+class SendContentDialog(QFileDialog):
+    """Qt picker whose Send action accepts files and directories together."""
+
+    def __init__(self, parent=None, start_dir: str | None = None):
+        if not start_dir or not os.path.isdir(start_dir):
+            start_dir = QStandardPaths.writableLocation(
+                QStandardPaths.DesktopLocation)
+        if not start_dir or not os.path.isdir(start_dir):
+            start_dir = os.path.expanduser("~")
+        super().__init__(parent, "选择发送内容", start_dir)
+        self._chosen_paths: list[str] = []
+        self.setOption(QFileDialog.DontUseNativeDialog, True)
+        self.setFileMode(QFileDialog.ExistingFiles)
+        self.setAcceptMode(QFileDialog.AcceptOpen)
+        self.setNameFilter("所有内容 (*)")
+        self.setLabelText(QFileDialog.Accept, "发送")
+
+        # QFileDialog normally treats an accepted directory as navigation.
+        # Keep double-click navigation, but make the explicit Send button return
+        # every selected file and directory without applying that restriction.
+        buttons = self.findChild(QDialogButtonBox, "buttonBox")
+        if buttons is not None:
+            try:
+                buttons.accepted.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            buttons.accepted.connect(self._accept_selected)
+
+    def _accept_selected(self):
+        chosen = []
+        for path in self.selectedFiles():
+            normalized = os.path.normpath(path)
+            if os.path.exists(normalized) and normalized not in chosen:
+                chosen.append(normalized)
+        if not chosen:
+            return
+        self._chosen_paths = chosen
+        QDialog.done(self, QDialog.Accepted)
+
+    def selected_paths(self) -> list[str]:
+        if self._chosen_paths:
+            return list(self._chosen_paths)
+        return [os.path.normpath(path) for path in self.selectedFiles()
+                if os.path.exists(path)]
+
+
 class BrandMark(QWidget):
     """标题栏中的小型墨洞标记。"""
 
@@ -891,6 +938,9 @@ class HoleWidget(QWidget):
         timer.setTimerType(Qt.PreciseTimer)
         timer.start(16)
         self._timer = timer
+
+    def sizeHint(self) -> QSize:
+        return QSize(224, 224)
 
     def _tick(self):
         dt = min(0.05, max(0.001, self._clock.restart() / 1000.0))
@@ -1225,12 +1275,7 @@ class MainWindow(QWidget):
         self._send_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         self._send_btn.setCursor(Qt.PointingHandCursor)
         self._send_btn.setFixedWidth(156)
-        send_menu = QMenu(self._send_btn)
-        pick_files = send_menu.addAction("选择文件")
-        pick_files.triggered.connect(self._pick_and_send)
-        pick_folder = send_menu.addAction("选择文件夹")
-        pick_folder.triggered.connect(self._pick_and_send_folder)
-        self._send_btn.setMenu(send_menu)
+        self._send_btn.clicked.connect(self._pick_and_send)
         self._cancel_send_btn = QPushButton("取消发送")
         self._cancel_send_btn.setObjectName("CancelAction")
         self._cancel_send_btn.setIcon(
@@ -1749,7 +1794,7 @@ class MainWindow(QWidget):
         body = (
             "<p style='margin:0 0 4px 0;'><b>局域网</b></p>"
             "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备连接同一个 WiFi，并同时打开"
-            "墨洞。发现设备后，点击对方设备，再点击墨洞图标选择文件发送；也可以把文件拖到"
+            "墨洞。发现设备后，点击对方设备，再点击墨洞图标选择发送内容；也可以把内容拖到"
             "窗口或墨洞图标。</p>"
             "<p style='margin:0 0 4px 0;'><b>跨网络</b></p>"
             "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备登录同一个 Tailscale 网络。"
@@ -2092,19 +2137,13 @@ class MainWindow(QWidget):
                 "还没发现设备" if not self._bridge.node.peers()
                 else "先点选一台目标设备")
             return
-        files, _ = QFileDialog.getOpenFileNames(self, "选择要发送的文件")
-        for fp in files:
-            self._bridge.dropFile(fp)
-
-    def _pick_and_send_folder(self):
-        if not self._bridge.node.selected_peer():
-            self._on_error(
-                "还没发现设备" if not self._bridge.node.peers()
-                else "先点选一台目标设备")
+        dialog = SendContentDialog(
+            self, getattr(self, "_send_dialog_dir", None))
+        if dialog.exec() != QDialog.Accepted:
             return
-        folder = QFileDialog.getExistingDirectory(self, "选择要发送的文件夹")
-        if folder:
-            self._bridge.dropFile(folder)
+        self._send_dialog_dir = dialog.directory().absolutePath()
+        for path in dialog.selected_paths():
+            self._bridge.dropFile(path)
 
     @Slot(str)
     def _on_status(self, msg: str):
