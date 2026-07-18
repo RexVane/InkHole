@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QObject, Signal  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QObject, Signal, Qt  # noqa: E402
+from PySide6.QtWidgets import QApplication, QBoxLayout  # noqa: E402
 
 from inkhole.p2p import P2PConfig  # noqa: E402
 
@@ -190,6 +190,60 @@ def test_settings_page_opens_and_populates(app):
     assert window._version_info_lbl.text() == "版本：v0.0.0"
     assert window._port_info_lbl.text() == "端口：43123（建议自定义 1024-49151 固定端口）"
     assert "IP" not in window._local_info_lbl.text()
+
+
+def test_compact_window_keeps_transfer_metrics_visible(app):
+    window, bridge = _make_window(app)
+    window.resize(720, 480)
+    window.show()
+    app.processEvents()
+
+    long_name = "macOS-" + "very-long-filename-" * 8 + ".dmg"
+    bridge.status.emit(f"↓ 接收 {long_name} 63% · 12.4 MB/s")
+    app.processEvents()
+
+    assert window.width() == 720
+    assert window.height() == 480
+    assert window._status_meta_lbl.isVisible()
+    assert window._status_meta_lbl.text() == "63% · 12.4 MB/s"
+    status_bottom = window._status_bar.mapTo(
+        window, window._status_bar.rect().bottomRight()).y()
+    assert status_bottom < window.height()
+
+
+def test_settings_layout_reflows_on_narrow_windows(app):
+    window, _bridge = _make_window(app)
+    window.resize(800, 520)
+    window.show()
+    window._open_settings()
+    app.processEvents()
+
+    assert window._settings_columns.direction() == QBoxLayout.TopToBottom
+    assert not window._settings_divider.isVisible()
+    assert len(window._settings_groups) == 5
+
+    window.resize(960, 640)
+    app.processEvents()
+    assert window._settings_columns.direction() == QBoxLayout.LeftToRight
+    assert window._settings_divider.isVisible()
+
+
+def test_in_app_dialog_paints_translucent_dark_backdrop(app):
+    from inkhole.mainwindow import AndroidStyleDialog
+
+    window, _bridge = _make_window(app)
+    window.show()
+    dialog = AndroidStyleDialog(
+        window, "使用说明", "<p style='color:#B2BFBC;'>说明内容</p>")
+    dialog.addAction("ok", "知道了", True)
+    dialog.show()
+    app.processEvents()
+
+    backdrop = dialog.grab().toImage().pixelColor(2, 2)
+    assert dialog.testAttribute(Qt.WA_TranslucentBackground)
+    assert dialog.testAttribute(Qt.WA_NoSystemBackground)
+    assert backdrop.alpha() < 255
+    assert max(backdrop.red(), backdrop.green(), backdrop.blue()) < 20
 
 
 def test_manual_peer_add_and_remove(app):

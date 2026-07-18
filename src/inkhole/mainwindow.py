@@ -24,14 +24,15 @@ from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, Slot, Signal,
                             QElapsedTimer, QVariantAnimation,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
-                           QPen, QFont, QIcon, QPixmap, QIntValidator)
+                           QPen, QFont, QIcon, QPixmap, QIntValidator,
+                           QPainterPath)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
                                QLineEdit, QCheckBox,
                                QDialog, QSizePolicy, QStackedWidget,
                                QSizeGrip, QToolButton, QStyle,
                                QGraphicsOpacityEffect,
-                               QApplication)
+                               QApplication, QBoxLayout)
 
 # ---------- 设计令牌 ----------
 _TEAL = "#5AD8C0"
@@ -47,9 +48,15 @@ _EDGE = "rgba(255,255,255,24)"
 _EDGE_HOVER = "rgba(90,216,192,118)"
 _ERROR = "#F08A7C"
 
+_TRANSFER_STATUS_RE = re.compile(
+    r"^(?P<label>[↑↓]\s*(?:发送|接收)\s+.+?)\s+"
+    r"(?P<meta>\d{1,3}%(?:\s*·\s*[\d.]+\s*[KMGT]?B/s)?)$"
+)
+
 _QSS = f"""
 QWidget {{ background: transparent; color: {_TEXT}; font-size: 13px;
-           font-family: "Segoe UI Variable Text", "Microsoft YaHei UI", sans-serif;
+           font-family: "SF Pro Text", "PingFang SC", "Segoe UI Variable Text",
+                        "Microsoft YaHei UI", sans-serif;
            letter-spacing: 0px; }}
 QLabel {{ background: transparent; }}
 
@@ -70,6 +77,10 @@ QToolButton#Win, QToolButton#WinClose {{ border: none; background: transparent;
                                         border-radius: 6px; padding: 0; }}
 QToolButton#Win:hover {{ background: rgba(255,255,255,20); }}
 QToolButton#WinClose:hover {{ background: rgba(224,74,74,180); }}
+QToolButton#SettingsBack {{ border: 1px solid {_EDGE}; background: rgba(255,255,255,9);
+                            border-radius: 8px; padding: 0; }}
+QToolButton#SettingsBack:hover {{ background: rgba(90,216,192,18);
+                                  border-color: {_EDGE_HOVER}; }}
 
 QPushButton#Link {{ border: none; background: transparent; color: {_TEAL};
                     font-size: 12px; min-height: 20px; padding: 3px 4px; }}
@@ -98,8 +109,12 @@ QPushButton#ModeOption:disabled {{ color: rgba(178,191,188,75); }}
 
 QFrame#TransferPane {{ background: rgba(19,24,25,225); border: 1px solid {_EDGE};
                        border-radius: 8px; }}
-QFrame#SettingsSurface {{ background: rgba(19,24,25,235); border: 1px solid {_EDGE};
-                          border-radius: 8px; }}
+QFrame#SettingsSurface {{ background: transparent; border: none; }}
+QFrame#SettingsGroup {{ background: rgba(22,28,29,232); border: 1px solid {_EDGE};
+                        border-radius: 8px; }}
+QFrame#IdentityStrip {{ background: rgba(7,11,12,150);
+                        border: 1px solid rgba(255,255,255,14);
+                        border-radius: 7px; }}
 QFrame#StatusBar {{ background: rgba(255,255,255,8); border: 1px solid rgba(255,255,255,15);
                     border-radius: 7px; }}
 QFrame#HLine {{ background: rgba(255,255,255,18); max-height: 1px; border: none; }}
@@ -132,7 +147,7 @@ QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {{ border-color: {_EDGE_HO
 QSpinBox::up-button, QSpinBox::down-button {{ width: 0; }}
 
 QLineEdit#OutlinedField {{ background: #080B0C; border: 1px solid rgba(255,255,255,38);
-                           border-radius: 7px; padding: 9px 11px 3px 11px;
+                           border-radius: 8px; padding: 9px 11px 3px 11px;
                            min-height: 34px; }}
 QLineEdit#OutlinedField:hover {{ border-color: rgba(255,255,255,62); }}
 QLineEdit#OutlinedField:focus {{ background: #06090A; border: 1px solid {_TEAL}; }}
@@ -500,9 +515,11 @@ class AndroidStyleDialog(QDialog):
         self.setAccessibleName(title)
         self.setModal(True)
         self.setWindowModality(Qt.WindowModal)
-        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setWindowFlags(
+            Qt.Dialog | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
         self.setStyleSheet(_QSS)
 
         screen = QVBoxLayout(self)
@@ -513,6 +530,8 @@ class AndroidStyleDialog(QDialog):
 
         self._card = QFrame()
         self._card.setObjectName("DialogCard")
+        self._card.setAttribute(Qt.WA_StyledBackground, True)
+        self._card.setAutoFillBackground(False)
         self._card.setFixedWidth(460)
         card_layout = QVBoxLayout(self._card)
         card_layout.setContentsMargins(24, 22, 24, 16)
@@ -549,6 +568,13 @@ class AndroidStyleDialog(QDialog):
         self._entrance_animation.setStartValue(0.0)
         self._entrance_animation.setEndValue(1.0)
         self._entrance_animation.setEasingCurve(QEasingCurve.OutCubic)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 150))
 
     def addAction(self, key: str, text: str, primary: bool = False) -> QPushButton:
         button = QPushButton(text)
@@ -692,6 +718,66 @@ class InteractiveCard(QFrame):
             p.drawRoundedRect(QRectF(0, 14, 3, max(10, self.height() - 28)), 1.5, 1.5)
 
 
+class SettingsRow(QFrame):
+    """设置页中的轻量交互行，提供 Material 风格的悬停过渡。"""
+
+    activated = Signal()
+
+    def __init__(self, clickable: bool = False, parent=None):
+        super().__init__(parent)
+        self._clickable = clickable
+        self._hover = 0.0
+        self.setMinimumHeight(56)
+        self.setCursor(Qt.PointingHandCursor if clickable else Qt.ArrowCursor)
+        self.setFocusPolicy(Qt.StrongFocus if clickable else Qt.NoFocus)
+        self._hover_animation = QVariantAnimation(self)
+        self._hover_animation.setDuration(160)
+        self._hover_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._hover_animation.valueChanged.connect(self._set_hover)
+
+    def _set_hover(self, value):
+        self._hover = float(value)
+        self.update()
+
+    def _animate_hover(self, target: float):
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._hover)
+        self._hover_animation.setEndValue(target)
+        self._hover_animation.start()
+
+    def enterEvent(self, event):
+        self._animate_hover(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_hover(0.0)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (self._clickable and event.button() == Qt.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            self.activated.emit()
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if self._clickable and event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.activated.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        alpha = int(3 + self._hover * 13)
+        if self.hasFocus():
+            alpha = max(alpha, 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, alpha))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
+
+
 class ToggleSwitch(QCheckBox):
     """保留 QCheckBox API 的轻量动画开关。"""
 
@@ -790,7 +876,7 @@ class HoleWidget(QWidget):
         self._progress_target = 0.0
         self._progress_kind = "send"
         self._progress_generation = 0
-        self.setMinimumSize(270, 270)
+        self.setMinimumSize(160, 160)
         self.setMaximumSize(310, 310)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.PointingHandCursor)
@@ -807,6 +893,16 @@ class HoleWidget(QWidget):
         self._t += dt
         self._progress += (self._progress_target - self._progress) * min(1.0, dt * 10.0)
         self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._clock.restart()
+        if not self._timer.isActive():
+            self._timer.start(16)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
 
     @Slot(bool)
     def set_searching(self, searching: bool):
@@ -998,8 +1094,14 @@ class MainWindow(QWidget):
         self.setWindowTitle("墨洞 InkHole")
         if icon:
             self.setWindowIcon(icon)
-        self.resize(960, 640)
-        self.setMinimumSize(800, 580)
+        self.setMinimumSize(720, 480)
+        initial_width, initial_height = 960, 640
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            initial_width = min(initial_width, max(720, available.width() - 32))
+            initial_height = min(initial_height, max(480, available.height() - 32))
+        self.resize(initial_width, initial_height)
         self.setStyleSheet(_QSS)
         self.setAcceptDrops(True)
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -1048,12 +1150,19 @@ class MainWindow(QWidget):
         self._refresh_recent()
         if hasattr(bridge, "lastStatus"):
             self._on_status(bridge.lastStatus())
+        self._apply_home_density(self.width() < 820 or self.height() < 560)
 
     # ---- 中性深色背景 + 轻微结构纹理 ----
     def paintEvent(self, _e):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         w, h = self.width(), self.height()
+        radius = 0.0 if self.isMaximized() else 10.0
+        if radius:
+            window_path = QPainterPath()
+            window_path.addRoundedRect(
+                QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+            p.setClipPath(window_path)
         base_alpha = 232 if self._backdrop_ok else 255
         base = QLinearGradient(0, 0, 0, h)
         base.setColorAt(0.0, QColor(16, 21, 22, base_alpha))
@@ -1083,6 +1192,7 @@ class MainWindow(QWidget):
     def _build_home_page(self) -> QWidget:
         page = QWidget()
         body = QHBoxLayout(page)
+        self._home_body = body
         body.setContentsMargins(30, 10, 30, 24)
         body.setSpacing(24)
 
@@ -1090,6 +1200,7 @@ class MainWindow(QWidget):
         transfer = QFrame()
         transfer.setObjectName("TransferPane")
         left = QVBoxLayout(transfer)
+        self._transfer_layout = left
         left.setContentsMargins(24, 22, 24, 18)
         left.setSpacing(8)
         left.addWidget(_section_label("发送目标"))
@@ -1137,8 +1248,15 @@ class MainWindow(QWidget):
             f"background:{_TEAL_DIM}; border-radius:1px;")
         self._status_lbl = ElidedLabel("等待操作")
         self._status_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
+        self._status_meta_lbl = QLabel()
+        self._status_meta_lbl.setObjectName("StatusMetric")
+        self._status_meta_lbl.setStyleSheet(
+            f"color:{_TEAL_BRIGHT}; font-size:11px; font-weight:600;")
+        self._status_meta_lbl.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        self._status_meta_lbl.hide()
         status_lay.addWidget(self._status_mark)
         status_lay.addWidget(self._status_lbl, 1)
+        status_lay.addWidget(self._status_meta_lbl)
         self._status_effect = QGraphicsOpacityEffect(self._status_bar)
         self._status_effect.setOpacity(1.0)
         self._status_bar.setGraphicsEffect(self._status_effect)
@@ -1153,6 +1271,7 @@ class MainWindow(QWidget):
 
         # 右：设备与最近接收，使用信息栏而非嵌套面板
         side = QWidget()
+        self._side_widget = side
         side.setMinimumWidth(330)
         right = QVBoxLayout(side)
         right.setContentsMargins(0, 2, 0, 0)
@@ -1228,12 +1347,39 @@ class MainWindow(QWidget):
         self._send_action_stack.setCurrentIndex(1 if active else 0)
         self._hole.setEnabled(not active)
 
+    def _apply_home_density(self, compact: bool):
+        if getattr(self, "_home_compact", None) == compact:
+            return
+        self._home_compact = compact
+        if compact:
+            self._home_body.setContentsMargins(18, 6, 18, 14)
+            self._home_body.setSpacing(16)
+            self._transfer_layout.setContentsMargins(18, 14, 18, 12)
+            self._transfer_layout.setSpacing(6)
+            self._state_lbl.setFixedHeight(38)
+            self._state_lbl.setStyleSheet(
+                f"color:{_TEXT_SECOND}; font-size:16px; font-weight:650;")
+            self._side_widget.setMinimumWidth(300)
+            self._hole.setMaximumSize(270, 270)
+        else:
+            self._home_body.setContentsMargins(30, 10, 30, 24)
+            self._home_body.setSpacing(24)
+            self._transfer_layout.setContentsMargins(24, 22, 24, 18)
+            self._transfer_layout.setSpacing(8)
+            self._state_lbl.setFixedHeight(46)
+            self._state_lbl.setStyleSheet(
+                f"color:{_TEXT_SECOND}; font-size:18px; font-weight:650;")
+            self._side_widget.setMinimumWidth(330)
+            self._hole.setMaximumSize(310, 310)
+
     # ================= 设置页 =================
     def _build_settings_header(self) -> QHBoxLayout:
         top = QHBoxLayout()
-        back = QPushButton("返回")
-        back.setObjectName("Link")
+        back = QToolButton()
+        back.setObjectName("SettingsBack")
         back.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
+        back.setFixedSize(34, 34)
+        back.setToolTip("返回主页")
         back.setCursor(Qt.PointingHandCursor)
         back.clicked.connect(self._cancel_settings)
         title = QLabel("设置")
@@ -1247,29 +1393,89 @@ class MainWindow(QWidget):
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
         outer = QVBoxLayout(page)
+        self._settings_outer = outer
         outer.setContentsMargins(30, 10, 30, 24)
-        outer.setSpacing(14)
+        outer.setSpacing(12)
         outer.addLayout(self._build_settings_header())
 
         panel = QFrame()
         panel.setObjectName("SettingsSurface")
         lay = QVBoxLayout(panel)
-        lay.setContentsMargins(28, 24, 28, 20)
-        lay.setSpacing(18)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
 
         columns = QHBoxLayout()
-        columns.setSpacing(26)
+        columns.setContentsMargins(0, 0, 6, 2)
+        columns.setSpacing(16)
         self._settings_columns = columns
+        self._settings_groups: list[QFrame] = []
+
+        def _settings_group(title_text: str):
+            group = QFrame()
+            group.setObjectName("SettingsGroup")
+            group_lay = QVBoxLayout(group)
+            group_lay.setContentsMargins(16, 14, 16, 15)
+            group_lay.setSpacing(10)
+            group_lay.addWidget(_section_label(title_text))
+            self._settings_groups.append(group)
+            return group, group_lay
+
+        def _toggle_row(title_text: str, detail: str):
+            row = SettingsRow(clickable=True)
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(10, 7, 10, 7)
+            row_lay.setSpacing(12)
+            copy = QVBoxLayout()
+            copy.setSpacing(2)
+            title_lbl = QLabel(title_text)
+            title_lbl.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
+            detail_lbl = QLabel(detail)
+            detail_lbl.setWordWrap(True)
+            detail_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+            copy.addWidget(title_lbl)
+            copy.addWidget(detail_lbl)
+            checkbox = ToggleSwitch()
+            checkbox.setAccessibleName(title_text)
+            row_lay.addLayout(copy, 1)
+            row_lay.addWidget(checkbox, 0, Qt.AlignVCenter)
+            row.activated.connect(checkbox.toggle)
+            return row, checkbox
+
+        def _action_row(title_text: str, detail: str, button_text: str,
+                        callback):
+            row = SettingsRow(clickable=True)
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(10, 7, 10, 7)
+            row_lay.setSpacing(12)
+            copy = QVBoxLayout()
+            copy.setSpacing(2)
+            title_lbl = QLabel(title_text)
+            title_lbl.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
+            detail_lbl = QLabel(detail)
+            detail_lbl.setWordWrap(True)
+            detail_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+            copy.addWidget(title_lbl)
+            copy.addWidget(detail_lbl)
+            button = QPushButton(button_text)
+            button.setObjectName("QuietAction")
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(callback)
+            row.activated.connect(button.click)
+            row_lay.addLayout(copy, 1)
+            row_lay.addWidget(button, 0, Qt.AlignVCenter)
+            return row, button, detail_lbl
 
         # ========== 左列:设备设置 + 传输安全 + 跨网络配置 ==========
         left_col = QVBoxLayout()
-        left_col.setSpacing(13)
+        left_col.setSpacing(12)
 
-        # ---- 本机信息(可选中复制) ----
+        # ---- 1. 设备设置 ----
+        device_group, device_lay = _settings_group("设备设置")
         cfg = self._bridge.lanConfig()
-        info_box = QWidget()
+        info_box = QFrame()
+        info_box.setObjectName("IdentityStrip")
         info_lay = QVBoxLayout(info_box)
-        info_lay.setContentsMargins(0, 0, 0, 8)
+        info_lay.setContentsMargins(12, 9, 12, 9)
         info_lay.setSpacing(3)
 
         def _info_line(text: str) -> QLabel:
@@ -1284,36 +1490,33 @@ class MainWindow(QWidget):
         info_lay.addWidget(self._version_info_lbl)
         self._port_info_lbl = _info_line("端口：未启动（建议自定义 1024-49151 固定端口）")
         info_lay.addWidget(self._port_info_lbl)
-        left_col.addWidget(info_box)
+        device_lay.addWidget(info_box)
 
-        # ---- 1. 设备设置 ----
-        left_col.addWidget(_section_label("设备设置"))
         self._ed_name = OutlinedLineEdit("设备名称")
         self._ed_name.setMaxLength(40)
-        # 设备名输入框实时同步本机信息显示
         self._ed_name.textChanged.connect(
             lambda name: self._local_info_lbl.setText(f"本机：{name or cfg.peer_name}-{cfg.instance_id}")
         )
         self._ed_inbox = OutlinedLineEdit("收件箱")
         self._ed_inbox.setReadOnly(True)
         b_browse = QPushButton("更换目录")
+        b_browse.setObjectName("QuietAction")
+        b_browse.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
         b_browse.setCursor(Qt.PointingHandCursor)
         b_browse.clicked.connect(self._choose_inbox)
 
-        left_col.addWidget(self._ed_name)
+        device_lay.addWidget(self._ed_name)
         inbox_row = QWidget()
         inbox_lay = QHBoxLayout(inbox_row)
         inbox_lay.setContentsMargins(0, 0, 0, 0)
         inbox_lay.setSpacing(8)
         inbox_lay.addWidget(self._ed_inbox, 1)
         inbox_lay.addWidget(b_browse)
-        left_col.addWidget(inbox_row)
+        device_lay.addWidget(inbox_row)
+        left_col.addWidget(device_group)
 
         # ---- 2. 传输安全 ----
-        left_col.addSpacing(10)
-        left_col.addWidget(_divider())
-        left_col.addSpacing(6)
-        left_col.addWidget(_section_label("传输安全"))
+        security_group, security_lay = _settings_group("传输安全")
         self._ed_secret = OutlinedLineEdit(
             "加密口令（可选，两端一致）", "留空时不加密")
         self._ed_secret.setEchoMode(QLineEdit.Password)
@@ -1337,46 +1540,24 @@ class MainWindow(QWidget):
         secret_lay.setSpacing(10)
         secret_lay.addWidget(self._ed_secret, 1)
         secret_lay.addWidget(b_eye)
-        left_col.addWidget(secret_row)
-
-        def _toggle_row(title_text: str, detail: str):
-            row = QWidget()
-            row_lay = QHBoxLayout(row)
-            row_lay.setContentsMargins(0, 8, 0, 8)
-            row_lay.setSpacing(12)
-            copy = QVBoxLayout()
-            copy.setSpacing(2)
-            title_lbl = QLabel(title_text)
-            title_lbl.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
-            detail_lbl = QLabel(detail)
-            detail_lbl.setWordWrap(True)
-            detail_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
-            copy.addWidget(title_lbl)
-            copy.addWidget(detail_lbl)
-            checkbox = ToggleSwitch()
-            checkbox.setAccessibleName(title_text)
-            row_lay.addLayout(copy, 1)
-            row_lay.addWidget(checkbox, 0, Qt.AlignVCenter)
-            return row, checkbox
+        security_lay.addWidget(secret_row)
 
         trusted_row, self._cb_trusted = _toggle_row(
             "仅接收目标设备", "只允许当前选中的设备向本机发送文件")
-        left_col.addWidget(trusted_row)
+        security_lay.addWidget(trusted_row)
+        left_col.addWidget(security_group)
 
         # ---- 3. 跨网络配置 ----
-        left_col.addSpacing(10)
-        left_col.addWidget(_divider())
-        left_col.addSpacing(6)
-        left_col.addWidget(_section_label("跨网络配置"))
+        network_group, network_lay = _settings_group("跨网络配置")
         network_hint = QLabel(
             "跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），"
             "并填写对方 Tailscale IP 与监听端口")
         network_hint.setWordWrap(True)
         network_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
-        left_col.addWidget(network_hint)
+        network_lay.addWidget(network_hint)
         self._sp_port = OutlinedLineEdit("本机监听端口（留空=自动，建议 1024-49151，如 41300）")
         self._sp_port.setValidator(QIntValidator(1, 65535, self._sp_port))
-        left_col.addWidget(self._sp_port)
+        network_lay.addWidget(self._sp_port)
 
         manual_row = QWidget()
         manual_lay = QHBoxLayout(manual_row)
@@ -1391,124 +1572,76 @@ class MainWindow(QWidget):
         self._manual_port.setValidator(QIntValidator(1, 65535, self._manual_port))
         self._manual_port.setMinimumWidth(80)
         self._manual_add_btn = QPushButton("添加设备")
+        self._manual_add_btn.setObjectName("QuietAction")
         self._manual_add_btn.setCursor(Qt.PointingHandCursor)
         self._manual_add_btn.clicked.connect(self._add_manual_peer)
         manual_lay.addWidget(self._manual_name, 2)
         manual_lay.addWidget(self._manual_host, 3)
         manual_lay.addWidget(self._manual_port, 2)
         manual_lay.addWidget(self._manual_add_btn)
-        left_col.addWidget(manual_row)
+        network_lay.addWidget(manual_row)
 
         manual_box = QWidget()
         self._manual_list_lay = QVBoxLayout(manual_box)
         self._manual_list_lay.setContentsMargins(0, 4, 0, 0)
         self._manual_list_lay.setSpacing(4)
-        left_col.addWidget(manual_box)
+        network_lay.addWidget(manual_box)
+        left_col.addWidget(network_group)
 
         left_col.addStretch(1)
         columns.addLayout(left_col, 3)
-        columns.addWidget(_divider(vertical=True))
+        self._settings_divider = _divider(vertical=True)
+        columns.addWidget(self._settings_divider)
 
         # ========== 右列:应用行为 + 帮助与更新 ==========
         right_col = QVBoxLayout()
-        right_col.setSpacing(0)
+        right_col.setSpacing(12)
 
         # ---- 4. 应用行为 ----
-        right_col.addWidget(_section_label("应用行为"))
-        right_col.addSpacing(10)
-
+        behavior_group, behavior_lay = _settings_group("应用行为")
         pet_row, self._cb_pet = _toggle_row(
             "桌面挂件", "可拖动的墨洞图标,拖文件到上面发送")
-        right_col.addWidget(pet_row)
-        right_col.addWidget(_divider())
+        behavior_lay.addWidget(pet_row)
 
         autostart_row, self._cb_auto = _toggle_row(
             "开机自启", "开机后自动启动墨洞(后台接收)")
-        right_col.addWidget(autostart_row)
+        behavior_lay.addWidget(autostart_row)
+        right_col.addWidget(behavior_group)
 
         # ---- 5. 帮助与更新 ----
-        right_col.addSpacing(10)
-        right_col.addWidget(_divider())
-        right_col.addSpacing(6)
-        right_col.addWidget(_section_label("帮助与更新"))
-        right_col.addSpacing(10)
+        help_group, help_lay = _settings_group("帮助与更新")
+        guide_row, _b_guide, _guide_detail = _action_row(
+            "使用说明", "局域网 / 跨网络传输与文件位置", "查看说明",
+            self._show_usage_guide)
+        help_lay.addWidget(guide_row)
 
-        # 使用说明
-        guide_row = QWidget()
-        guide_lay = QHBoxLayout(guide_row)
-        guide_lay.setContentsMargins(0, 8, 0, 8)
-        guide_lay.setSpacing(12)
-        guide_copy = QVBoxLayout()
-        guide_copy.setSpacing(2)
-        guide_title = QLabel("使用说明")
-        guide_title.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
-        guide_detail = QLabel("局域网 / 跨网络传输与文件位置")
-        guide_detail.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
-        guide_copy.addWidget(guide_title)
-        guide_copy.addWidget(guide_detail)
-        b_guide = QPushButton("查看说明")
-        b_guide.setObjectName("QuietAction")
-        b_guide.setCursor(Qt.PointingHandCursor)
-        b_guide.clicked.connect(self._show_usage_guide)
-        guide_lay.addLayout(guide_copy, 1)
-        guide_lay.addWidget(b_guide, 0, Qt.AlignVCenter)
-        right_col.addWidget(guide_row)
-        right_col.addWidget(_divider())
+        update_row, self._update_btn, self._version_lbl = _action_row(
+            "检查更新", f"当前版本 v{self._bridge.appVersion()}", "检查更新",
+            self._check_update)
+        help_lay.addWidget(update_row)
 
-        # 检查更新
-        update_row = QWidget()
-        update_lay = QHBoxLayout(update_row)
-        update_lay.setContentsMargins(0, 8, 0, 8)
-        update_lay.setSpacing(12)
-        update_copy = QVBoxLayout()
-        update_copy.setSpacing(2)
-        update_title = QLabel("检查更新")
-        update_title.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
-        self._version_lbl = QLabel(f"当前版本 v{self._bridge.appVersion()}")
-        self._version_lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
-        update_copy.addWidget(update_title)
-        update_copy.addWidget(self._version_lbl)
-        self._update_btn = QPushButton("检查更新")
-        self._update_btn.setObjectName("QuietAction")
-        self._update_btn.setCursor(Qt.PointingHandCursor)
-        self._update_btn.clicked.connect(self._check_update)
-        update_lay.addLayout(update_copy, 1)
-        update_lay.addWidget(self._update_btn, 0, Qt.AlignVCenter)
-        right_col.addWidget(update_row)
-        right_col.addWidget(_divider())
-
-        repository_row = QWidget()
-        repository_lay = QHBoxLayout(repository_row)
-        repository_lay.setContentsMargins(0, 8, 0, 8)
-        repository_lay.setSpacing(12)
-        repository_copy = QVBoxLayout()
-        repository_copy.setSpacing(2)
-        repository_title = QLabel("GitHub 仓库")
-        repository_title.setStyleSheet(f"color:{_TEXT}; font-size:12.5px;")
-        repository_detail = QLabel("查看源码、问题反馈与历史版本")
-        repository_detail.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
-        repository_copy.addWidget(repository_title)
-        repository_copy.addWidget(repository_detail)
-        self._repository_btn = QPushButton("打开仓库")
-        self._repository_btn.setObjectName("QuietAction")
-        self._repository_btn.setCursor(Qt.PointingHandCursor)
-        self._repository_btn.clicked.connect(
+        repository_row, self._repository_btn, _repository_detail = _action_row(
+            "GitHub 仓库", "查看源码、问题反馈与历史版本", "打开仓库",
             lambda: self._bridge.openPath(self._bridge.repositoryPage()))
-        repository_lay.addLayout(repository_copy, 1)
-        repository_lay.addWidget(self._repository_btn, 0, Qt.AlignVCenter)
-        right_col.addWidget(repository_row)
+        help_lay.addWidget(repository_row)
+        right_col.addWidget(help_group)
         right_col.addStretch(1)
         columns.addLayout(right_col, 2)
         columns.setStretch(0, 3)
         columns.setStretch(2, 2)
-        # 内容装进滚动区:窗口高度不足时出滚动条,而不是把输入框压扁裁切
+
         content = QWidget()
         content.setLayout(columns)
         content_scroll = QScrollArea()
+        content_scroll.setObjectName("SettingsScroll")
         content_scroll.setWidgetResizable(True)
         content_scroll.setFrameShape(QFrame.NoFrame)
         content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         content_scroll.setWidget(content)
+        content_scroll.viewport().setAutoFillBackground(False)
+        content_scroll.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        content_scroll.verticalScrollBar().setSingleStep(18)
+        self._settings_scroll = content_scroll
         lay.addWidget(content_scroll, 1)
         lay.addWidget(_divider())
 
@@ -1546,8 +1679,8 @@ class MainWindow(QWidget):
         effect = QGraphicsOpacityEffect(page)
         page.setGraphicsEffect(effect)
         animation = QPropertyAnimation(effect, b"opacity", self)
-        animation.setDuration(170)
-        animation.setStartValue(0.18)
+        animation.setDuration(220)
+        animation.setStartValue(0.08)
         animation.setEndValue(1.0)
         animation.setEasingCurve(QEasingCurve.OutCubic)
         animation.finished.connect(
@@ -1953,10 +2086,20 @@ class MainWindow(QWidget):
 
     @Slot(str)
     def _on_status(self, msg: str):
+        text = msg or "等待操作"
         self._status_mark.setStyleSheet(
             f"background:{_TEAL_DIM}; border-radius:1px;")
         self._status_lbl.setStyleSheet(f"color:{_TEXT_SECOND}; font-size:11px;")
-        self._status_lbl.set_full_text(msg or "等待操作")
+        match = _TRANSFER_STATUS_RE.match(text)
+        if match:
+            self._status_lbl.set_full_text(match.group("label"))
+            self._status_meta_lbl.setText(match.group("meta"))
+            self._status_meta_lbl.show()
+        else:
+            self._status_lbl.set_full_text(text)
+            self._status_meta_lbl.clear()
+            self._status_meta_lbl.hide()
+        self._status_bar.setToolTip(text)
         self._animate_status()
 
     @Slot(str)
@@ -1966,6 +2109,9 @@ class MainWindow(QWidget):
                 f"background:{_ERROR}; border-radius:1px;")
             self._status_lbl.setStyleSheet(f"color:{_ERROR}; font-size:11px;")
             self._status_lbl.set_full_text(msg)
+            self._status_meta_lbl.clear()
+            self._status_meta_lbl.hide()
+            self._status_bar.setToolTip(msg)
             self._animate_status()
 
     def _animate_status(self):
@@ -2003,11 +2149,28 @@ class MainWindow(QWidget):
     # ================= 磨砂 & 关闭 =================
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        compact = self.width() < 820 or self.height() < 560
+        if hasattr(self, "_home_body"):
+            self._apply_home_density(compact)
+        settings_outer = getattr(self, "_settings_outer", None)
+        if settings_outer is not None:
+            settings_outer.setContentsMargins(
+                18 if compact else 30,
+                6 if compact else 10,
+                18 if compact else 30,
+                14 if compact else 24,
+            )
         columns = getattr(self, "_settings_columns", None)
         if columns is not None:
-            narrow = self.width() < 880
-            columns.setStretch(0, 7 if narrow else 3)
-            columns.setStretch(2, 3 if narrow else 2)
+            narrow = self.width() < 900
+            direction = QBoxLayout.TopToBottom if narrow else QBoxLayout.LeftToRight
+            if columns.direction() != direction:
+                columns.setDirection(direction)
+            divider = getattr(self, "_settings_divider", None)
+            if divider is not None:
+                divider.setVisible(not narrow)
+            columns.setStretch(0, 0 if narrow else 3)
+            columns.setStretch(2, 0 if narrow else 2)
         grip = getattr(self, "_grip", None)
         if grip is not None:
             grip.move(self.width() - grip.width() - 2,
