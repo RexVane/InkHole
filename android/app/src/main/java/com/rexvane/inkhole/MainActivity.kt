@@ -77,6 +77,7 @@ class MainActivity : ComponentActivity() {
     // 设置
     private val peerName = mutableStateOf(Build.MODEL)
     private val secret = mutableStateOf("")
+    private val encryptionEnabled = mutableStateOf(false)
     private val trustedOnly = mutableStateOf(false)
     private var showSettings = mutableStateOf(false)
     private val showUsageGuide = mutableStateOf(false)
@@ -298,6 +299,8 @@ class MainActivity : ComponentActivity() {
         peerName.value = (prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL)
             .filterNot { it.isISOControl() }.trim().take(40).ifEmpty { Build.MODEL }
         secret.value = prefs.getString("secret", "") ?: ""
+        encryptionEnabled.value = prefs.getBoolean(
+            "encryption_enabled", secret.value.isNotEmpty())
         trustedOnly.value = prefs.getBoolean("trusted_only", false)
         showUsageGuide.value = !prefs.getBoolean(PREF_USAGE_GUIDE_SEEN, false)
 
@@ -620,6 +623,7 @@ class MainActivity : ComponentActivity() {
             val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
             var nameInput by remember { mutableStateOf(peerName.value) }
             var secretInput by remember { mutableStateOf(secret.value) }
+            var encryptionInput by remember { mutableStateOf(encryptionEnabled.value) }
             var trustedInput by remember { mutableStateOf(trustedOnly.value) }
             val originalPort = remember { prefs.getInt("listen_port", 0) }
             var portInput by remember {
@@ -688,9 +692,25 @@ class MainActivity : ComponentActivity() {
                         OutlinedTextField(
                             value = secretInput,
                             onValueChange = { secretInput = it },
-                            label = { Text("加密口令 (可选，两端一致)") },
+                            label = { Text("加密口令 (两端一致)") },
                             singleLine = true,
+                            enabled = encryptionInput,
                         )
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("端到端加密", fontSize = 14.sp)
+                                Text("使用 AES-256-GCM 保护传输内容，两端需使用相同口令",
+                                    fontSize = 11.sp,
+                                    color = androidx.compose.ui.graphics.Color.Gray)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Switch(checked = encryptionInput,
+                                onCheckedChange = { encryptionInput = it })
+                        }
                         Spacer(Modifier.height(12.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -845,7 +865,9 @@ class MainActivity : ComponentActivity() {
                         // 只有设置真正变化时才重建节点(改名/口令/端口/手动设备需生效)；
                         // 没变就不动，避免已连接的设备无谓断开、要重新点连接。
                         val parsedPort = portInput.toIntOrNull()
-                        if (portInput.isNotBlank() && parsedPort !in 1..65535) {
+                        if (encryptionInput && secretInput.isEmpty()) {
+                            settingsError = "启用端到端加密后必须填写加密口令"
+                        } else if (portInput.isNotBlank() && parsedPort !in 1..65535) {
                             settingsError = "本机监听端口必须在 1-65535 范围内"
                         } else {
                             val portVal = parsedPort ?: 0
@@ -853,15 +875,18 @@ class MainActivity : ComponentActivity() {
                             val manualChanged = ManualPeers.load(prefs) != manualList.toList()
                             val changed = normalizedName != peerName.value ||
                                 secretInput != secret.value ||
+                                encryptionInput != encryptionEnabled.value ||
                                 trustedInput != trustedOnly.value ||
                                 portVal != originalPort ||
                                 manualChanged
                             peerName.value = normalizedName
                             secret.value = secretInput
+                            encryptionEnabled.value = encryptionInput
                             trustedOnly.value = trustedInput
                             prefs.edit()
                                 .putString("peer_name", normalizedName)
                                 .putString("secret", secretInput)
+                                .putBoolean("encryption_enabled", encryptionInput)
                                 .putBoolean("trusted_only", trustedInput)
                                 .putInt("listen_port", portVal)
                                 .apply()

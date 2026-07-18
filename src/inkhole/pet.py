@@ -185,6 +185,7 @@ def _save_config(cfg: P2PConfig, **extra) -> None:
             for stale in ("ssh_relay", "relay", "transport_mode"):
                 data.pop(stale, None)
             data.update({"name": cfg.peer_name, "secret": cfg.secret,
+                         "encryption_enabled": bool(cfg.encryption_enabled),
                          "inbox": cfg.inbox, "port": cfg.listen_port,
                          "trusted_only": cfg.trusted_only,
                          "instance_id": cfg.instance_id,
@@ -371,6 +372,13 @@ def _build_config(argv=None):
         port = 0
     name = args.name if args.name is not None else str(saved.get("name") or "")
     secret = args.secret if args.secret is not None else str(saved.get("secret") or "")
+    saved_encryption = saved.get("encryption_enabled")
+    encryption_enabled = (
+        bool(saved_encryption) if isinstance(saved_encryption, bool)
+        else bool(secret))
+    if args.secret is not None:
+        # An explicit --secret (including an empty value) expresses the CLI intent.
+        encryption_enabled = bool(secret)
     trusted_only = bool(saved.get("trusted_only", False))
     instance_id = str(saved.get("instance_id") or "")   # 空则 P2PConfig 自动生成
     manual_peers = []
@@ -387,7 +395,8 @@ def _build_config(argv=None):
 
     cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret,
                     trusted_only=trusted_only, instance_id=instance_id,
-                    manual_peers=manual_peers)
+                    manual_peers=manual_peers,
+                    encryption_enabled=encryption_enabled)
     # 首次运行(配置里还没有 instance_id)时生成一个并落盘，之后重启复用同一 ID
     if not saved.get("instance_id"):
         _save_config(cfg)
@@ -872,8 +881,9 @@ def main(argv=None) -> None:
 
         def _apply_settings(self, peer_name: str | None = None,
                             secret: str | None = None,
-                            port: int | None = None) -> None:
-            """改名/改口令/改端口:写回配置并重启 P2P 节点(mDNS 需重新注册)。
+                            port: int | None = None,
+                            encryption_enabled: bool | None = None) -> None:
+            """改名/改口令/加密开关/改端口:写回配置并重启 P2P 节点。
 
             节点重启会阻塞数秒,放到后台线程;_restart_gate 串行化多次保存。
             """
@@ -881,14 +891,16 @@ def main(argv=None) -> None:
                 self._restart_gate.acquire()
                 self._restarting = True
                 try:
-                    self._apply_settings_blocking(peer_name, secret, port)
+                    self._apply_settings_blocking(
+                        peer_name, secret, port, encryption_enabled)
                 finally:
                     self._restarting = False
                     self._restart_gate.release()
 
             threading.Thread(target=worker, daemon=True).start()
 
-        def _apply_settings_blocking(self, peer_name, secret, port) -> None:
+        def _apply_settings_blocking(
+                self, peer_name, secret, port, encryption_enabled) -> None:
             cfg = self._lan_cfg
             with self._engine_lock:
                 selected_service = self.node._last_selected_service
@@ -902,6 +914,8 @@ def main(argv=None) -> None:
                     cfg.peer_name = peer_name
                 if secret is not None:
                     cfg.secret = secret
+                if encryption_enabled is not None:
+                    cfg.encryption_enabled = bool(encryption_enabled)
                 if port is not None:
                     cfg.listen_port = port
                 _save_config(cfg)
@@ -909,7 +923,7 @@ def main(argv=None) -> None:
                     self.node = self._make_node(cfg)
                 except SystemExit:
                     # 设了口令但没装 cryptography：退回不加密，保持能用
-                    cfg.secret = ""
+                    cfg.encryption_enabled = False
                     _save_config(cfg)
                     self.node = self._make_node(cfg)
                     self.status.emit("缺少 cryptography 库，加密未开启")
@@ -1197,8 +1211,11 @@ def main(argv=None) -> None:
                 None, "端到端加密口令",
                 "两台设备口令必须一致；留空关闭加密：",
                 QLineEdit.Normal, self._lan_cfg.secret)
-            if ok and secret != self._lan_cfg.secret:
-                self._apply_settings(secret=secret)
+            enabled = bool(secret)
+            if ok and (secret != self._lan_cfg.secret
+                       or enabled != self._lan_cfg.encryption_enabled):
+                self._apply_settings(secret=secret,
+                                     encryption_enabled=enabled)
                 self.status.emit("已开启端到端加密" if secret else "已关闭加密")
 
         @Slot(result=bool)
@@ -1414,11 +1431,14 @@ def main(argv=None) -> None:
     # 桌宠右键"关闭桌宠"走这里:与设置页开关同一持久化路径
     bridge._hide_pet = lambda: _set_pet_visible(False)
 
-    def _apply_identity(name: str, secret: str, port: int) -> None:
+    def _apply_identity(name: str, secret: str, port: int,
+                        encryption_enabled: bool) -> None:
         c = bridge._lan_cfg
-        if (name, secret, port) == (c.peer_name, c.secret, c.listen_port):
+        if (name, secret, port, encryption_enabled) == (
+                c.peer_name, c.secret, c.listen_port, c.encryption_enabled):
             return   # 没变就不重启节点
-        bridge._apply_settings(peer_name=name, secret=secret, port=port)
+        bridge._apply_settings(peer_name=name, secret=secret, port=port,
+                               encryption_enabled=encryption_enabled)
 
     # 主界面窗口(需要 QtWidgets；不可用时退回纯桌宠模式)
     main_win = None

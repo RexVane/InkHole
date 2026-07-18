@@ -1572,7 +1572,7 @@ class MainWindow(QWidget):
         # ---- 2. 传输安全 ----
         security_group, security_lay = _settings_group("传输安全")
         self._ed_secret = OutlinedLineEdit(
-            "加密口令（可选，两端一致）", "留空时不加密")
+            "加密口令（两端一致）", "启用端到端加密后必填")
         self._ed_secret.setEchoMode(QLineEdit.Password)
         b_eye = QToolButton()
         b_eye.setObjectName("Win")
@@ -1581,6 +1581,7 @@ class MainWindow(QWidget):
         b_eye.setFixedSize(30, 28)
         b_eye.setToolTip("显示/隐藏口令")
         b_eye.setCursor(Qt.PointingHandCursor)
+        self._secret_eye = b_eye
 
         def _toggle_secret(visible: bool):
             self._ed_secret.setEchoMode(
@@ -1595,6 +1596,14 @@ class MainWindow(QWidget):
         secret_lay.addWidget(self._ed_secret, 1)
         secret_lay.addWidget(b_eye)
         security_lay.addWidget(secret_row)
+
+        encrypt_row, self._cb_encrypt = _toggle_row(
+            "端到端加密", "使用 AES-256-GCM 保护传输内容，两端需使用相同口令")
+        self._cb_encrypt.setAccessibleName("端到端加密")
+
+        self._cb_encrypt.toggled.connect(
+            self._set_encryption_controls_enabled)
+        security_lay.addWidget(encrypt_row)
 
         trusted_row, self._cb_trusted = _toggle_row(
             "仅接收目标设备", "只允许当前选中的设备向本机发送文件")
@@ -1749,6 +1758,10 @@ class MainWindow(QWidget):
         cfg = self._bridge.lanConfig()
         self._ed_name.setText(cfg.peer_name)
         self._ed_secret.setText(cfg.secret)
+        encryption_enabled = bool(
+            getattr(cfg, "encryption_enabled", bool(cfg.secret)))
+        self._cb_encrypt.setChecked(encryption_enabled)
+        self._set_encryption_controls_enabled(encryption_enabled)
         self._sp_port.setText(str(cfg.listen_port) if cfg.listen_port else "")
         self._ed_inbox.setText(os.path.abspath(cfg.inbox))
         self._cb_trusted.setChecked(cfg.trusted_only)
@@ -1764,6 +1777,10 @@ class MainWindow(QWidget):
         self._reset_manual_editor()
         self._refresh_manual_list()
         self._show_page(1)
+
+    def _set_encryption_controls_enabled(self, enabled: bool):
+        self._ed_secret.setEnabled(enabled)
+        self._secret_eye.setEnabled(enabled)
 
     def _cancel_settings(self):
         """放弃设置页草稿；返回主页不触碰正在运行的节点。"""
@@ -1969,6 +1986,11 @@ class MainWindow(QWidget):
         if port_text and not 1 <= port <= 65535:
             self._show_notice("墨洞", "本机监听端口必须在 1-65535 范围内")
             return
+        encryption_enabled = self._cb_encrypt.isChecked()
+        secret = self._ed_secret.text()
+        if encryption_enabled and not secret:
+            self._show_notice("传输安全", "启用端到端加密后必须填写加密口令")
+            return
         inbox = self._ed_inbox.text()
         if inbox:
             self._bridge.setInbox(inbox)   # 单独持久化:即使名字/端口没变也要落盘
@@ -1978,8 +2000,7 @@ class MainWindow(QWidget):
         if self._cb_auto.isChecked() != bool(self._ctl["is_autostart"]()):
             self._ctl["set_autostart"](self._cb_auto.isChecked())
         self._bridge.setManualPeers(self._manual_draft)
-        self._ctl["apply_settings"](name, self._ed_secret.text(),
-                                    port)
+        self._ctl["apply_settings"](name, secret, port, encryption_enabled)
         self._manual_draft = []
         self._reset_manual_editor()
         self._show_page(0)

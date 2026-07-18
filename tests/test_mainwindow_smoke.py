@@ -157,8 +157,8 @@ def _make_window(app):
         "set_pet_visible": lambda on: None,
         "is_autostart": lambda: False,
         "set_autostart": lambda on: None,
-        "apply_settings": lambda name, secret, port: setattr(
-            bridge, "applied_settings", (name, secret, port)),
+        "apply_settings": lambda name, secret, port, enabled: setattr(
+            bridge, "applied_settings", (name, secret, port, enabled)),
     }
     return MainWindow(bridge, ctl), bridge
 
@@ -252,6 +252,34 @@ def test_settings_page_opens_and_populates(app):
     assert window._version_info_lbl.text() == "版本：v0.0.0"
     assert window._port_info_lbl.text() == "端口：43123（建议自定义 1024-49151 固定端口）"
     assert "IP" not in window._local_info_lbl.text()
+
+
+def test_encryption_toggle_controls_password_and_preserves_it(app):
+    window, bridge = _make_window(app)
+    bridge.node.cfg.secret = "saved-secret"
+    bridge.node.cfg.encryption_enabled = True
+    window._open_settings()
+
+    assert window._cb_encrypt.isChecked()
+    assert window._ed_secret.isEnabled()
+    window._cb_encrypt.setChecked(False)
+    assert not window._ed_secret.isEnabled()
+    window._save_settings()
+
+    assert bridge.applied_settings == ("SMOKE", "saved-secret", 0, False)
+
+
+def test_encryption_toggle_requires_password_when_enabled(app, monkeypatch):
+    dialogs = _capture_android_dialogs(monkeypatch)
+    window, bridge = _make_window(app)
+    window._open_settings()
+    window._cb_encrypt.setChecked(True)
+    window._ed_secret.clear()
+    window._save_settings()
+
+    assert dialogs
+    assert "必须填写加密口令" in dialogs[-1].body_html
+    assert bridge.applied_settings is None
 
 
 def test_compact_window_keeps_transfer_metrics_visible(app):

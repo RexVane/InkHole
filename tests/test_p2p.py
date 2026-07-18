@@ -56,7 +56,8 @@ def check(name, cond):
 
 
 # ---------- 工具 ----------
-def make_node(tmpdir, name="test", secret="", port=0):
+def make_node(tmpdir, name="test", secret="", port=0,
+              encryption_enabled=None):
     """创建一个 P2P 节点，收件箱在 tmpdir 下。
 
     enable_mdns=False：只起 TCP 层，手动注册对端。测试不碰真实 mDNS，
@@ -64,8 +65,40 @@ def make_node(tmpdir, name="test", secret="", port=0):
     """
     inbox = os.path.join(tmpdir, name + "_inbox")
     cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name,
-                    secret=secret, enable_mdns=False)
+                    secret=secret, enable_mdns=False,
+                    encryption_enabled=encryption_enabled)
     return P2PNode(cfg)
+
+
+def test_encryption_can_be_disabled_without_discarding_secret(tmp_path):
+    cfg = P2PConfig(inbox=str(tmp_path), secret="saved-secret",
+                    encryption_enabled=False)
+
+    assert cfg.secret == "saved-secret"
+    assert cfg.active_secret == ""
+
+
+def test_disabled_encryption_sends_plaintext_with_saved_secret(tmp_path):
+    node_a = make_node(str(tmp_path), "Alice", secret="saved-secret",
+                       encryption_enabled=False)
+    node_b = make_node(str(tmp_path), "Bob")
+    try:
+        node_a.start()
+        node_b.start()
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        source = tmp_path / "plain.txt"
+        source.write_text("encryption disabled", encoding="utf-8")
+
+        assert node_a.send_file(str(source))
+        received = wait_for_file(node_b.cfg.inbox, source.name)
+        assert received is not None
+        with open(received, encoding="utf-8") as received_file:
+            assert received_file.read() == "encryption disabled"
+    finally:
+        node_a.stop()
+        node_b.stop()
 
 
 def wait_for_peer(node, timeout=5.0):

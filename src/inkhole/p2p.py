@@ -176,19 +176,29 @@ class P2PConfig:
     inbox: str = "received"        # 收件箱：收到的文件落在这里
     listen_port: int = 0           # TCP 监听端口；0 = 操作系统自动分配
     peer_name: str = ""            # 本机显示名；空则用 hostname
-    secret: str = ""               # 端到端加密口令(两台电脑必须一致；空=不加密)
+    secret: str = ""               # 保存的端到端加密口令(实际是否使用由 encryption_enabled 决定)
     enable_mdns: bool = True       # False = 只起 TCP 不碰 mDNS(测试用，手动注册对端)
     trusted_only: bool = False     # True = 只接受当前选中目标设备的连接，其余拒收
     instance_id: str = ""          # 本机唯一实例 ID；持久化后同一设备重启不换服务名(见 P2PNode)
     # 手动添加的设备(Tailscale/固定 IP 直连用)：mDNS 组播不穿虚拟网卡,
     # 这些设备靠探测线程维持在线状态。元素: {"name": str, "host": str, "port": int}
     manual_peers: list = field(default_factory=list)
+    # None = 按旧配置兼容:有口令即启用;显式 False 可保留口令但暂时停用加密
+    encryption_enabled: bool | None = None
 
     def __post_init__(self):
         if not self.peer_name:
             self.peer_name = socket.gethostname()
         if not self.instance_id:
             self.instance_id = uuid.uuid4().hex[:8]
+        self.encryption_enabled = (
+            bool(self.secret) if self.encryption_enabled is None
+            else bool(self.encryption_enabled))
+
+    @property
+    def active_secret(self) -> str:
+        """Return the secret currently allowed to protect wire data."""
+        return self.secret if self.encryption_enabled else ""
 
 
 class PeerInfo:
@@ -627,7 +637,7 @@ class P2PNode:
         self._probe_strikes = _PROBE_STRIKES
         self._probe_thread: threading.Thread | None = None
 
-        if cfg.secret:
+        if cfg.active_secret:
             try:
                 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
             except ImportError:
@@ -920,7 +930,7 @@ class P2PNode:
                     return
             except OSError:
                 pass
-            if encrypted and not self.cfg.secret:
+            if encrypted and not self.cfg.active_secret:
                 self._status(f"拒收 {filename}：对方启用了加密，本机未设口令")
                 _drain(conn, min(size, _DRAIN_CAP))
                 return
@@ -941,7 +951,7 @@ class P2PNode:
                     self.cfg.inbox, f".inkhole-{uuid.uuid4().hex}.folder.part")
                 os.mkdir(folder_part_path)
                 reader = _FolderWireReader(
-                    conn, size, plain_size, self.cfg.secret, encrypted, progress)
+                    conn, size, plain_size, self.cfg.active_secret, encrypted, progress)
                 _receive_folder_stream(reader, folder_part_path)
                 _apply_mtime(folder_part_path, modified_ms)
                 with self._lock:
@@ -955,7 +965,7 @@ class P2PNode:
                     hdr32 = _recv_exact(conn, 32)
                     if hdr32 is None:
                         raise EOFError("加密流头不完整")
-                    decryptor = ChunkedDecryptor(self.cfg.secret, hdr32)
+                    decryptor = ChunkedDecryptor(self.cfg.active_secret, hdr32)
                     consumed = 32
                     progress.update(consumed)
                     with open(part_path, "wb") as output:
@@ -990,7 +1000,7 @@ class P2PNode:
                             progress.update(size - remaining)
                     if encrypted:
                         with open(part_path, "rb") as source:
-                            plain = decrypt(self.cfg.secret, source.read())
+                            plain = decrypt(self.cfg.active_secret, source.read())
                         if plain is None:
                             raise ValueError("解密失败（两端口令不一致？）")
                         with open(part_path, "wb") as output:
@@ -1130,7 +1140,8 @@ class P2PNode:
             manifest = _scan_folder(local_path, cancellation_requested)
             if cancellation_requested():
                 raise _SendCancelled()
-            encrypted = bool(self.cfg.secret)
+            secret = self.cfg.active_secret
+            encrypted = bool(secret)
             wire_size = (chunked_wire_size(manifest.plain_size)
                          if encrypted else manifest.plain_size)
             header_dict = {
@@ -1173,7 +1184,7 @@ class P2PNode:
                 sent = 0
                 with _FolderPayloadReader(manifest) as source:
                     if encrypted:
-                        for blob in encrypt_chunks(self.cfg.secret, source):
+                        for blob in encrypt_chunks(secret, source):
                             if cancellation_requested():
                                 raise _SendCancelled()
                             sock.sendall(blob)
@@ -1291,15 +1302,16 @@ class P2PNode:
             plain_size = os.path.getsize(local_path)
             enc_mode = ""
             data = None
-            if self.cfg.secret and plain_size > _CHUNK_ENC_THRESHOLD:
+            secret = self.cfg.active_secret
+            if secret and plain_size > _CHUNK_ENC_THRESHOLD:
                 # 大文件走 WHE2 分块流式加密：内存峰值 4MB，不再整块读入
                 encrypted = True
                 enc_mode = "chunked"
                 file_size = chunked_wire_size(plain_size)
-            elif self.cfg.secret:
+            elif secret:
                 # 小文件保持 WHE1 整块(与所有旧版本互通)
                 with open(local_path, "rb") as f:
-                    data = encrypt(self.cfg.secret, f.read())
+                    data = encrypt(secret, f.read())
                 if cancellation_requested():
                     raise _SendCancelled()
                 encrypted = True
@@ -1352,7 +1364,7 @@ class P2PNode:
                 if enc_mode == "chunked":
                     # 边读边加密边发，恒定内存
                     with open(local_path, "rb") as f:
-                        for blob in encrypt_chunks(self.cfg.secret, f):
+                        for blob in encrypt_chunks(secret, f):
                             if cancellation_requested():
                                 raise _SendCancelled()
                             sock.sendall(blob)

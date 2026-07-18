@@ -99,7 +99,10 @@ class InkHoleService : Service() {
         val name = storedName.filterNot { it.isISOControl() }.trim().take(40)
             .ifEmpty { Build.MODEL }
         if (name != storedName) prefs.edit().putString("peer_name", name).apply()
-        val secret = prefs.getString("secret", "") ?: ""
+        val storedSecret = prefs.getString("secret", "") ?: ""
+        val encryptionEnabled = prefs.getBoolean(
+            "encryption_enabled", storedSecret.isNotEmpty())
+        val secret = if (encryptionEnabled) storedSecret else ""
         val trustedOnly = prefs.getBoolean("trusted_only", false)
         val listenPort = prefs.getInt("listen_port", 0)
         val inboxRoot = getExternalFilesDir(null) ?: filesDir
