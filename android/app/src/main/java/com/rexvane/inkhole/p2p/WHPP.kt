@@ -6,11 +6,14 @@ import java.io.EOFException
 import java.io.InterruptedIOException
 import java.io.InputStream
 import java.io.OutputStream
+import org.json.JSONArray
 import org.json.JSONObject
 
 /** WHPP (InkHole P2P Protocol) 常量与读写工具。 */
 object WHPP {
     val MAGIC = "WHPP".toByteArray(Charsets.US_ASCII)
+    val CAP_MAGIC = "WHPC".toByteArray(Charsets.US_ASCII)
+    const val FOLDER_KIND = "folder-v1"
     const val BUFFER_SIZE = 256 * 1024
     const val MAX_HEADER = 64 * 1024              // header 长度上限(来自网络，不可信)
     const val MAX_FILE_SIZE = 1L shl 40           // 单文件 1TB 上限，防恶意 size 声明
@@ -23,6 +26,9 @@ object WHPP {
         val encrypted: Boolean,
         val wantAck: Boolean,
         val encMode: String = "",   // "" = WHE1 整块; "chunked" = WHE2 分块流
+        val kind: String = "file",
+        val plainSize: Long = size,
+        val modifiedMs: Long = 0,
     )
 
     /** 把 header JSON 序列化(与桌面版 Python 完全一致)。 */
@@ -33,6 +39,9 @@ object WHPP {
         json.put("encrypted", h.encrypted)
         json.put("want_ack", h.wantAck)
         if (h.encMode.isNotEmpty()) json.put("enc_mode", h.encMode)
+        if (h.kind != "file") json.put("kind", h.kind)
+        if (h.kind == FOLDER_KIND || h.plainSize != h.size) json.put("plain_size", h.plainSize)
+        if (h.modifiedMs > 0) json.put("mtime_ms", h.modifiedMs)
         return json.toString().toByteArray(Charsets.UTF_8)
     }
 
@@ -45,6 +54,9 @@ object WHPP {
             encrypted = json.optBoolean("encrypted", false),
             wantAck = json.optBoolean("want_ack", false),
             encMode = json.optString("enc_mode", ""),
+            kind = json.optString("kind", "file"),
+            plainSize = json.optLong("plain_size", json.getLong("size")),
+            modifiedMs = json.optLong("mtime_ms", 0),
         )
     }
 
@@ -92,10 +104,34 @@ object WHPP {
         val magic = ByteArray(4)
         din.readFully(magic)
         if (!magic.contentEquals(MAGIC)) throw IllegalArgumentException("bad magic")
+        return readHeaderAfterMagic(input)
+    }
+
+    /** Magic 已由连接分派器读取后，继续解析 WHPP JSON header。 */
+    fun readHeaderAfterMagic(input: InputStream): Header {
+        val din = DataInputStream(input)
         val headerLen = din.readInt()       // big-endian
         if (headerLen <= 0 || headerLen > MAX_HEADER) throw IllegalArgumentException("bad header len")
         val headerBytes = ByteArray(headerLen)
         din.readFully(headerBytes)
         return decodeHeader(headerBytes)
+    }
+
+    fun readMagic(input: InputStream): ByteArray = ByteArray(4).also {
+        DataInputStream(input).readFully(it)
+    }
+
+    /** WHPC response: magic + JSON length + supported capabilities. */
+    fun writeCapabilities(out: OutputStream) {
+        val body = JSONObject().apply {
+            put("version", 1)
+            put("caps", JSONArray().put(FOLDER_KIND))
+        }.toString().toByteArray(Charsets.UTF_8)
+        DataOutputStream(out).apply {
+            write(CAP_MAGIC)
+            writeInt(body.size)
+            write(body)
+            flush()
+        }
     }
 }

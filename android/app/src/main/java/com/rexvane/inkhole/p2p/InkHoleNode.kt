@@ -396,6 +396,7 @@ class InkHoleNode(
     @android.annotation.SuppressLint("UsableSpace")
     private fun handleConnection(conn: Socket) {
         var partFile: File? = null
+        var folderPart: File? = null
         var wantAck = false
         var ok = false
         var headerRead = false
@@ -403,9 +404,14 @@ class InkHoleNode(
         try {
             conn.soTimeout = HEADER_TIMEOUT_MS
             val input = BufferedInputStream(conn.getInputStream(), WHPP.BUFFER_SIZE)
-            // 先读协议头再做 trusted 判断:存活探测的空连接(连上即断)在
-            // readHeader 处 EOF 静默结束,不会被当成陌生传输拒收刷屏
-            val header = WHPP.readHeader(input)
+            // 存活探测空连接在 readMagic 处 EOF；WHPC 能力请求不进入传输流程。
+            val magic = WHPP.readMagic(input)
+            if (magic.contentEquals(WHPP.CAP_MAGIC)) {
+                WHPP.writeCapabilities(conn.getOutputStream())
+                return
+            }
+            if (!magic.contentEquals(WHPP.MAGIC)) return
+            val header = WHPP.readHeaderAfterMagic(input)
             headerRead = true
             wantAck = header.wantAck
             conn.soTimeout = RECV_IDLE_TIMEOUT_MS
@@ -429,13 +435,46 @@ class InkHoleNode(
             // basename 防路径穿越
             val safeName = ReceiveFiles.safeName(header.filename)
             receivedName = safeName
+            val isFolder = header.kind == WHPP.FOLDER_KIND
+            if (header.kind !in listOf("", "file", WHPP.FOLDER_KIND)) {
+                listener.onStatus("拒收 $safeName：不支持的传输类型")
+                return
+            }
 
             // size 来自网络，不可信
-            if (header.size < 0 || header.size > WHPP.MAX_FILE_SIZE) {
+            val sizeLimit = if (isFolder) Crypto.chunkedWireSize(WHPP.MAX_FILE_SIZE)
+                else WHPP.MAX_FILE_SIZE
+            if (header.size < 0 || header.size > sizeLimit) {
                 listener.onStatus("拒收 $safeName：文件大小非法")
                 return
             }
-            if (header.size + DISK_MARGIN > inboxDir.usableSpace) {
+            if (isFolder) {
+                if (header.plainSize < 8 || header.plainSize > WHPP.MAX_FILE_SIZE ||
+                    header.modifiedMs < 0) {
+                    listener.onStatus("拒收 $safeName：文件夹大小或时间非法")
+                    return
+                }
+                if (header.encrypted && (header.encMode != "chunked" ||
+                    header.size != Crypto.chunkedWireSize(header.plainSize))) {
+                    listener.onStatus("拒收 $safeName：文件夹加密声明非法")
+                    return
+                }
+                if (!header.encrypted && header.size != header.plainSize) {
+                    listener.onStatus("拒收 $safeName：文件夹大小声明不一致")
+                    return
+                }
+            }
+            val storageSize = if (isFolder) header.plainSize else header.size
+            // Android 10+ MediaStore export temporarily needs the private folder
+            // and public pending files at once. Reserve 2x so a completed receive
+            // does not become an unusable private-only folder during export.
+            val requiredSpace = if (isFolder && storageSize <=
+                (Long.MAX_VALUE - DISK_MARGIN) / 2) {
+                storageSize * 2 + DISK_MARGIN
+            } else if (storageSize <= Long.MAX_VALUE - DISK_MARGIN) {
+                storageSize + DISK_MARGIN
+            } else Long.MAX_VALUE
+            if (requiredSpace > inboxDir.usableSpace) {
                 listener.onStatus("拒收 $safeName：存储空间不足")
                 drain(conn, input, minOf(header.size, DRAIN_CAP))
                 return
@@ -445,15 +484,17 @@ class InkHoleNode(
                 drain(conn, input, minOf(header.size, DRAIN_CAP))
                 return
             }
-            if (header.encrypted && header.encMode != "chunked" &&
+            if (header.encrypted && header.encMode == "chunked" && header.size < 32) {
+                listener.onStatus("拒收 $safeName：加密流大小非法")
+                return
+            }
+            if (!isFolder && header.encrypted && header.encMode != "chunked" &&
                 header.size > MAX_WHE1_SIZE) {
                 listener.onStatus("拒收 $safeName：整块加密文件过大")
                 drain(conn, input, DRAIN_CAP)
                 return
             }
 
-            val part = File.createTempFile("inkhole-", ".part", inboxDir)
-            partFile = part
             var lastReport = 0L
             fun report(done: Long) {
                 val now = System.currentTimeMillis()
@@ -463,81 +504,109 @@ class InkHoleNode(
                 }
             }
 
-            if (header.encrypted && header.encMode == "chunked") {
-                // WHE2 分块流：边收边解密边落盘，内存峰值 4MB
-                val hdr32 = ByteArray(32)
-                DataInputStream(input).readFully(hdr32)
-                val decryptor = try {
-                    Crypto.ChunkedDecryptor(secret, hdr32)
-                } catch (e: IllegalArgumentException) {
-                    listener.onStatus("拒收 $safeName：加密流头非法")
+            val dst: File
+            if (isFolder) {
+                val staging = File(inboxDir, ".inkhole-${UUID.randomUUID()}.folder.part")
+                if (!staging.mkdir()) throw IOException("无法创建文件夹暂存目录")
+                folderPart = staging
+                val payload: InputStream = if (header.encrypted) {
+                    ChunkedFolderInputStream(
+                        input, header.size, header.plainSize, secret, ::report)
+                } else {
+                    BoundedPayloadInputStream(input, header.plainSize, ::report)
+                }
+                WHF1.receive(payload, header.plainSize, staging)
+                (payload as VerifiablePayloadInput).verifyComplete()
+                if (header.modifiedMs > 0) staging.setLastModified(header.modifiedMs)
+                val committed = synchronized(receiveFileLock) {
+                    val candidate = ReceiveFiles.uniqueDirectory(inboxDir, safeName)
+                    candidate.takeIf { staging.renameTo(it) }
+                }
+                if (committed == null) {
+                    listener.onStatus("落盘失败: $safeName")
                     return
                 }
-                var consumed = 32L
-                var intact = true
-                val din = DataInputStream(input)
-                FileOutputStream(part).use { fout ->
-                    while (consumed < header.size) {
-                        val ctLen = try { din.readInt() } catch (_: IOException) { intact = false; break }
-                        if (ctLen < 16 || ctLen > Crypto.CHUNK_SIZE + 16) { intact = false; break }
-                        if (consumed + 4L + ctLen > header.size) { intact = false; break }
-                        val ct = ByteArray(ctLen)
-                        try { din.readFully(ct) } catch (_: IOException) { intact = false; break }
-                        val plain = decryptor.decryptChunk(ct)
+                folderPart = null
+                dst = committed
+            } else {
+                val part = File.createTempFile("inkhole-", ".part", inboxDir)
+                partFile = part
+                if (header.encrypted && header.encMode == "chunked") {
+                    // WHE2 分块流：边收边解密边落盘，内存峰值 4MB
+                    val hdr32 = ByteArray(32)
+                    DataInputStream(input).readFully(hdr32)
+                    val decryptor = try {
+                        Crypto.ChunkedDecryptor(secret, hdr32)
+                    } catch (e: IllegalArgumentException) {
+                        listener.onStatus("拒收 $safeName：加密流头非法")
+                        return
+                    }
+                    var consumed = 32L
+                    var intact = true
+                    val din = DataInputStream(input)
+                    FileOutputStream(part).use { fout ->
+                        while (consumed < header.size) {
+                            val ctLen = try { din.readInt() } catch (_: IOException) { intact = false; break }
+                            if (ctLen < 16 || ctLen > Crypto.CHUNK_SIZE + 16) { intact = false; break }
+                            if (consumed + 4L + ctLen > header.size) { intact = false; break }
+                            val ct = ByteArray(ctLen)
+                            try { din.readFully(ct) } catch (_: IOException) { intact = false; break }
+                            val plain = decryptor.decryptChunk(ct)
+                            if (plain == null) {
+                                listener.onStatus("解密失败: $safeName（两端口令不一致？）")
+                                return
+                            }
+                            fout.write(plain)
+                            consumed += 4 + ctLen
+                            report(consumed)
+                        }
+                    }
+                    if (!intact || consumed != header.size) {
+                        listener.onStatus("接收中断: $safeName")
+                        return
+                    }
+                } else {
+                    // 明文 / WHE1 整块加密：写 .part
+                    FileOutputStream(part).use { fout ->
+                        val buf = ByteArray(WHPP.BUFFER_SIZE)
+                        var remaining = header.size
+                        while (remaining > 0) {
+                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
+                            val n = input.read(buf, 0, toRead)
+                            if (n < 0) break
+                            fout.write(buf, 0, n)
+                            remaining -= n
+                            report(header.size - remaining)
+                        }
+                        if (remaining > 0) {
+                            listener.onStatus("接收中断: $safeName")
+                            return
+                        }
+                    }
+
+                    // WHE1 整块加密：解密成功才算收到
+                    if (header.encrypted) {
+                        val blob = part.readBytes()
+                        val plain = Crypto.decrypt(secret, blob)
                         if (plain == null) {
                             listener.onStatus("解密失败: $safeName（两端口令不一致？）")
                             return
                         }
-                        fout.write(plain)
-                        consumed += 4 + ctLen
-                        report(consumed)
+                        part.writeBytes(plain)
                     }
                 }
-                if (!intact || consumed != header.size) {
-                    listener.onStatus("接收中断: $safeName")
+
+                val committed = synchronized(receiveFileLock) {
+                    val candidate = ReceiveFiles.uniqueFile(inboxDir, safeName)
+                    candidate.takeIf { part.renameTo(it) }
+                }
+                if (committed == null) {
+                    listener.onStatus("落盘失败: $safeName")
                     return
                 }
-            } else {
-                // 明文 / WHE1 整块加密：写 .part
-                FileOutputStream(part).use { fout ->
-                    val buf = ByteArray(WHPP.BUFFER_SIZE)
-                    var remaining = header.size
-                    while (remaining > 0) {
-                        val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                        val n = input.read(buf, 0, toRead)
-                        if (n < 0) break
-                        fout.write(buf, 0, n)
-                        remaining -= n
-                        report(header.size - remaining)
-                    }
-                    // 对端中途断连：半截文件绝不能顶着完整文件名落盘
-                    if (remaining > 0) {
-                        listener.onStatus("接收中断: $safeName")
-                        return
-                    }
-                }
-
-                // WHE1 整块加密：解密成功才算收到
-                if (header.encrypted) {
-                    val blob = part.readBytes()
-                    val plain = Crypto.decrypt(secret, blob)
-                    if (plain == null) {
-                        listener.onStatus("解密失败: $safeName（两端口令不一致？）")
-                        return
-                    }
-                    part.writeBytes(plain)
-                }
+                partFile = null
+                dst = committed
             }
-
-            val dst = synchronized(receiveFileLock) {
-                val candidate = ReceiveFiles.uniqueFile(inboxDir, safeName)
-                candidate.takeIf { part.renameTo(it) }
-            }
-            if (dst == null) {
-                listener.onStatus("落盘失败: $safeName")
-                return
-            }
-            partFile = null
             ok = true
 
             listener.onFileReceived(dst.name, dst.absolutePath)
@@ -554,6 +623,8 @@ class InkHoleNode(
         } catch (e: Exception) {
             if (running) listener.onStatus("接收失败: ${e.message ?: "未知错误"}")
         } finally {
+            partFile?.delete()
+            folderPart?.deleteRecursively()
             if (wantAck) {
                 try {
                     conn.getOutputStream().apply {
@@ -563,7 +634,6 @@ class InkHoleNode(
                 } catch (_: IOException) {}
             }
             try { conn.close() } catch (_: IOException) {}
-            partFile?.delete()
             if (receivedName.isNotEmpty()) {
                 listener.onTransferEnded("recv", receivedName, ok)
             }
@@ -992,6 +1062,7 @@ class InkHoleNode(
             // 与桌面版 zeroconf 互通的 TXT 属性
             setAttribute("peer_name", advertisedPeerName)
             setAttribute("instance_id", instanceId)
+            setAttribute("caps", WHPP.FOLDER_KIND)
         }
         registrationListener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {

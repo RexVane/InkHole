@@ -1,6 +1,6 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.3.30`），与 Windows/macOS 桌面端在同一局域网内互传文件。
+墨洞 Android 客户端（当前版本 `1.4.0`），与 Windows/macOS 桌面端在同一局域网或 Tailscale 网络内互传文件。
 
 ## 功能
 
@@ -17,10 +17,10 @@
 - 传输状态栏百分比与实时速度前置并支持两行显示，长文件名只截断名字、不遮挡速度。
 - 前台服务维持 P2P 节点，锁屏或切到后台后仍可接收。
 - 支持系统 `ACTION_SEND` / `ACTION_SEND_MULTIPLE` 分享入口。
-- 接收文件导出到系统 `Download/InkHole`，并发送可点击通知。
+- 接收文件导出到系统 `Download/InkHole`，文件夹保留相对目录结构并直接可用；Android 10+ 无法可靠创建完全空的公共目录，因此空目录会被忽略。
 - 设置内检查更新并应用内下载安装新 APK；更新弹窗显示当前/最新版本、可用状态和最多 4 条简洁版本变化（发布 APK 使用固定发布签名）。
 - 与桌面端同款品牌图标（自适应 + Android 13 单色图标 + 通知小图标）。
-- 兼容桌面端明文、WHE1 整块加密、WHE2 分块加密和 ACK 回执；桌面端发送的文件夹以 zip 文件接收。
+- 兼容桌面端明文、WHE1 整块加密、WHE2 分块加密和 ACK 回执；支持 WHPC 能力协商与 WHF1 流式文件夹接收，不需要先收 ZIP 再解压。
 
 ## 构建
 
@@ -41,7 +41,8 @@ cd android
 协议实现目标是与桌面版逐字节互通：
 
 - mDNS 服务类型: `_inkhole._tcp`（Android NSD 格式，兼容桌面版 zeroconf）
-- WHPP 协议: `[4B "WHPP"] [4B header_len] [JSON header] [文件数据]`
+- WHPP 协议: `[4B "WHPP"] [4B header_len] [JSON header] [文件或 WHF1 文件夹流]`
+- WHPC 能力探测: 新客户端通告 `folder-v1`，旧客户端由发送方自动回退 ZIP。
 - AES-256-GCM 加密: PBKDF2-HMAC-SHA256 100k 迭代，格式与桌面版 crypto.py 一致
 
 当前 Python 端 CI 覆盖 WHPP/WHE1/WHE2 协议行为，Android APK 由独立工作流构建；Python/Kotlin 固定向量互通测试仍列在项目待办中。

@@ -89,6 +89,16 @@ def wait_for_file(inbox, filename, timeout=5.0):
     return None
 
 
+def wait_for_directory(inbox, name, timeout=5.0):
+    deadline = time.time() + timeout
+    path = os.path.join(inbox, name)
+    while time.time() < deadline:
+        if os.path.isdir(path):
+            return path
+        time.sleep(0.2)
+    return None
+
+
 # ---------- 测试 1: TCP 直连传输 ----------
 def test_direct_transfer():
     print("\n=== 测试 1: TCP 直连传输 ===")
@@ -1188,11 +1198,9 @@ def test_zip_dir_preserves_empty_subdir():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---------- 测试: 文件夹发送端到端(打包 zip 送达) ----------
+# ---------- 测试: 文件夹流式发送端到端 ----------
 def test_folder_send_end_to_end():
     print("\n=== 测试: 文件夹发送端到端 ===")
-    import zipfile
-    from inkhole.p2p import _zip_dir
     tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
     try:
         node_a = make_node(tmpdir, "Alice")
@@ -1203,19 +1211,149 @@ def test_folder_send_end_to_end():
         node_a.select_peer("Bob")
 
         src = os.path.join(tmpdir, "项目")
-        os.makedirs(src)
+        os.makedirs(os.path.join(src, "src"))
+        os.makedirs(os.path.join(src, "空目录"))
         with open(os.path.join(src, "readme.txt"), "w", encoding="utf-8") as f:
             f.write("hello folder")
+        with open(os.path.join(src, "src", "main.py"), "w", encoding="utf-8") as f:
+            f.write("print('hello')\n")
 
-        zip_path = _zip_dir(src)
-        check("发送临时 zip 成功", node_a.send_file(zip_path))
+        check("流式发送文件夹成功", node_a.send_path(src))
 
-        got = wait_for_file(node_b.cfg.inbox, "项目.zip")
-        check("对端收到 项目.zip", got is not None)
-        with zipfile.ZipFile(got) as z:
-            check("zip 内含 readme.txt", "readme.txt" in z.namelist())
+        got = wait_for_directory(node_b.cfg.inbox, "项目")
+        check("对端直接收到可用目录", got is not None)
+        check("没有生成 zip", not os.path.exists(os.path.join(node_b.cfg.inbox, "项目.zip")))
+        check("空子目录被保留", os.path.isdir(os.path.join(got, "空目录")))
+        with open(os.path.join(got, "readme.txt"), encoding="utf-8") as f:
+            check("根目录文件内容一致", f.read() == "hello folder")
+        with open(os.path.join(got, "src", "main.py"), encoding="utf-8") as f:
+            check("嵌套文件内容一致", f.read() == "print('hello')\n")
+
+        check("再次发送同名目录成功", node_a.send_path(src))
+        check("同名目录不会覆盖", wait_for_directory(node_b.cfg.inbox, "项目 (2)") is not None)
     finally:
         node_a.stop(); node_b.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_encrypted_folder_stream():
+    print("\n=== 测试: 加密文件夹强制 WHE2 流式发送 ===")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        node_a = make_node(tmpdir, "Alice", secret="folder-secret")
+        node_b = make_node(tmpdir, "Bob", secret="folder-secret")
+        node_a.start(); node_b.start()
+        time.sleep(0.3)
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+
+        src = os.path.join(tmpdir, "机密项目")
+        os.makedirs(src)
+        with open(os.path.join(src, "tiny.txt"), "w", encoding="utf-8") as f:
+            f.write("small folder still uses chunked encryption")
+
+        # A folder must never enter the whole-payload WHE1 helper, even when tiny.
+        import inkhole.p2p as p2p_mod
+        original_encrypt = p2p_mod.encrypt
+        p2p_mod.encrypt = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("folder unexpectedly used WHE1"))
+        try:
+            check("小文件夹加密发送成功", node_a.send_path(src))
+        finally:
+            p2p_mod.encrypt = original_encrypt
+
+        got = wait_for_directory(node_b.cfg.inbox, "机密项目")
+        check("加密文件夹直接落为目录", got is not None)
+        with open(os.path.join(got, "tiny.txt"), encoding="utf-8") as f:
+            check("加密文件夹内容一致", f.read() == "small folder still uses chunked encryption")
+    finally:
+        node_a.stop(); node_b.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_folder_legacy_zip_fallback():
+    print("\n=== 测试: 旧客户端文件夹 ZIP 回退 ===")
+    import zipfile
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        node_a = make_node(tmpdir, "Alice")
+        node_b = make_node(tmpdir, "LegacyBob")
+        node_a.start(); node_b.start()
+        time.sleep(0.3)
+        node_a._on_peer_added("LegacyBob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("LegacyBob")
+        node_a._probe_peer_capabilities = lambda _peer: set()
+
+        src = os.path.join(tmpdir, "旧版兼容")
+        os.makedirs(src)
+        with open(os.path.join(src, "note.txt"), "w", encoding="utf-8") as f:
+            f.write("legacy")
+        check("旧客户端回退发送成功", node_a.send_path(src))
+        got = wait_for_file(node_b.cfg.inbox, "旧版兼容.zip")
+        check("旧客户端收到 zip", got is not None)
+        with zipfile.ZipFile(got) as archive:
+            check("回退 zip 保留内容", archive.read("note.txt") == b"legacy")
+    finally:
+        node_a.stop(); node_b.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_encrypted_folder_ack_reports_failure():
+    print("\n=== 测试: 加密文件夹失败回执 ===")
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    try:
+        node_a = make_node(tmpdir, "Alice", secret="sender-secret")
+        node_b = make_node(tmpdir, "Bob", secret="receiver-secret")
+        node_a.start(); node_b.start()
+        time.sleep(0.3)
+        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
+        node_a.select_peer("Bob")
+        src = os.path.join(tmpdir, "wrong-key")
+        os.makedirs(src)
+        with open(os.path.join(src, "data.bin"), "wb") as f:
+            f.write(os.urandom(1024))
+
+        check("口令不一致时发送方返回失败", node_a.send_path(src) is False)
+        check("口令不一致不落正式目录", not os.path.exists(
+            os.path.join(node_b.cfg.inbox, "wrong-key")))
+        check("口令不一致不残留暂存目录", not any(
+            name.endswith(".folder.part") for name in os.listdir(node_b.cfg.inbox)))
+    finally:
+        node_a.stop(); node_b.stop()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_folder_traversal_rejected_atomically():
+    print("\n=== 测试: WHF1 路径穿越被原子拒收 ===")
+    from inkhole.p2p import _ACK_FAIL, _FOLDER_ENTRY, _FOLDER_KIND, _FOLDER_MAGIC
+    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
+    node = make_node(tmpdir, "Receiver")
+    try:
+        node.start()
+        time.sleep(0.2)
+        relative = b"../escape.txt"
+        payload = (_FOLDER_MAGIC + struct.pack("!I", 1)
+                   + _FOLDER_ENTRY.pack(1, len(relative), 4, 0)
+                   + relative + b"evil")
+        header = json.dumps({
+            "filename": "unsafe-folder",
+            "size": len(payload),
+            "plain_size": len(payload),
+            "kind": _FOLDER_KIND,
+            "encrypted": False,
+            "want_ack": True,
+        }).encode("utf-8")
+        with socket.create_connection(("127.0.0.1", node.actual_port), timeout=3) as sock:
+            sock.sendall(_MAGIC + struct.pack("!I", len(header)) + header + payload)
+            check("接收方返回失败回执", sock.recv(1) == _ACK_FAIL)
+
+        check("越界文件未写入", not os.path.exists(os.path.join(tmpdir, "escape.txt")))
+        check("正式目录未落盘", not os.path.exists(
+            os.path.join(node.cfg.inbox, "unsafe-folder")))
+        check("隐藏暂存目录已清理", not any(
+            name.endswith(".folder.part") for name in os.listdir(node.cfg.inbox)))
+    finally:
+        node.stop()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -1329,6 +1467,10 @@ if __name__ == "__main__":
         test_zip_dir_empty,
         test_zip_dir_preserves_empty_subdir,
         test_folder_send_end_to_end,
+        test_encrypted_folder_stream,
+        test_folder_legacy_zip_fallback,
+        test_encrypted_folder_ack_reports_failure,
+        test_folder_traversal_rejected_atomically,
         test_send_queue_per_item_cleanup,
     ]
     for _t in _tests:

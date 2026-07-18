@@ -19,10 +19,24 @@ class WHPPTest {
             encrypted = true,
             wantAck = true,
             encMode = "chunked",
+            kind = WHPP.FOLDER_KIND,
+            plainSize = 1200,
+            modifiedMs = 1_700_000_000_000,
         )
         val output = ByteArrayOutputStream()
         WHPP.writeHeader(output, expected)
         assertEquals(expected, WHPP.readHeader(ByteArrayInputStream(output.toByteArray())))
+    }
+
+    @Test
+    fun capabilityResponseAdvertisesFolderV1() {
+        val output = ByteArrayOutputStream()
+        WHPP.writeCapabilities(output)
+        val input = java.io.DataInputStream(ByteArrayInputStream(output.toByteArray()))
+        val magic = ByteArray(4).also(input::readFully)
+        assertTrue(magic.contentEquals(WHPP.CAP_MAGIC))
+        val body = ByteArray(input.readInt()).also(input::readFully)
+        assertTrue(String(body, Charsets.UTF_8).contains(WHPP.FOLDER_KIND))
     }
 
     @Test

@@ -205,10 +205,9 @@ class SendQueue:
     """串行发送队列：一次拖 N 个文件不再开 N 个并发连接互踩。
 
     单工作线程按序发送；一批(队列清空)结束后回调 on_batch_done(成功数, 总数)，
-    多文件时给用户一个聚合结果。此外每个文件发送完成后可回调 per-item 的
-    on_done(path, ok)——临时打包目录用它「谁的 zip 发完就删谁」，精确绑定单个
-    文件，不再跨批次共享可变列表(消除连拖文件夹的清理竞态)。纯标准库实现，
-    不依赖 Qt，可单测。
+    多文件时给用户一个聚合结果。文件与文件夹都只传原始路径，协议工作线程
+    决定采用 folder-v1 流式传输还是旧客户端 ZIP 回退，因此不会阻塞 GUI。
+    纯标准库实现，不依赖 Qt，可单测。
     """
 
     def __init__(self, send_fn, on_batch_done=None, on_busy_changed=None,
@@ -768,7 +767,7 @@ def main(argv=None) -> None:
             self.node = self._make_node(cfg)
             # 串行发送队列：拖一堆文件不再开一堆并发连接
             self._sendq = SendQueue(
-                lambda p: self.node.send_file(
+                lambda p: self.node.send_path(
                     p, should_cancel=self._sendq.cancel_requested),
                 on_batch_done=lambda ok, total: self._on_batch_done(ok, total),
                 on_busy_changed=self._on_send_busy_changed,
@@ -973,8 +972,7 @@ def main(argv=None) -> None:
 
         @Slot(str)
         def dropFile(self, url: str):
-            """QML DropArea / 主窗口拖入的 url：文件直接入队，目录先打包成 zip。
-            队列单线程串行发送：一次拖 N 项不会开 N 个并发连接。"""
+            """QML DropArea / 主窗口拖入的文件或目录，交给后台队列串行发送。"""
             if self._restarting:
                 self.status.emit("正在应用新设置，请稍候再发送")
                 return
@@ -987,40 +985,16 @@ def main(argv=None) -> None:
             self._enqueue_path(path)
 
         def _enqueue_path(self, path: str):
-            """文件直接入队；目录打包成临时 zip 再入队,该 zip 发送完成后立即
-            清理它自己的临时目录。
-
-            清理精确绑定单个文件(SendQueue 的 per-item on_done),不再用跨批次
-            共享的可变列表——连续快速拖入多个文件夹时,每个文件夹各清各的临时
-            目录,不会被别的批次提前删除(漏发)或漏删(泄漏)。"""
-            if os.path.isfile(path):
+            """文件或目录原样入队；扫描、流式发送和回退都在工作线程执行。"""
+            if os.path.isfile(path) or os.path.isdir(path):
                 self._sendq.put(path)
-                return
-            if os.path.isdir(path):
-                from .p2p import _zip_dir
-                try:
-                    self.status.emit("正在打包文件夹…")
-                    zip_path = _zip_dir(path)
-                except Exception as e:
-                    self.status.emit(f"打包失败：{e}")
-                    return
-                # 用闭包捕获这个 zip 自己的临时目录：它发送完成(成/败)后即清理。
-                # 只在工作线程内、发送之后访问该目录变量,无共享状态、无需加锁。
-                temp_dir = os.path.dirname(zip_path)
-
-                def _cleanup(_path, _ok, _d=temp_dir):
-                    import shutil as _sh
-                    _sh.rmtree(_d, ignore_errors=True)
-
-                self._sendq.put(zip_path, on_done=_cleanup)
 
         def _on_batch_done(self, ok: int, total: int):
             """一批发送结束：多文件时聚合提示。
 
-            临时打包目录的清理已下沉到 per-file 回调(_enqueue_path 里的
-            _cleanup),这里不再统一清理,避免跨批次误删/漏删。"""
+            目录与文件都由协议层在单个队列任务内完整处理。"""
             if total > 1:
-                self.status.emit(f"已发送 {ok}/{total} 个文件")
+                self.status.emit(f"已发送 {ok}/{total} 项")
 
         @Slot(result=bool)
         def hasTarget(self) -> bool:

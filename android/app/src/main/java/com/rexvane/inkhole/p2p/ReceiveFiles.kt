@@ -32,6 +32,17 @@ internal object ReceiveFiles {
         }
     }
 
+    fun uniqueDirectory(directory: File, name: String): File {
+        val initial = File(directory, name)
+        if (!initial.exists()) return initial
+        var n = 2
+        while (true) {
+            val candidate = File(directory, "$name ($n)")
+            if (!candidate.exists()) return candidate
+            n++
+        }
+    }
+
     fun utf8Prefix(value: String, maxBytes: Int): String {
         var end = 0
         var used = 0

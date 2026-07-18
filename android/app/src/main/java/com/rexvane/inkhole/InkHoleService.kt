@@ -162,6 +162,7 @@ class InkHoleService : Service() {
     // 私有目录(Android/data/…)用户在文件管理器里根本找不到(Android 11+ 甚至无法访问)。
 
     private fun exportToDownloads(src: File): ReceivedFile {
+        if (src.isDirectory) return exportFolderToDownloads(src)
         val mime = guessMime(src.name)
         val size = src.length()
         val now = System.currentTimeMillis()
@@ -229,6 +230,118 @@ class InkHoleService : Service() {
         return ReceivedFile(src.name, uri, mime, size, now)
     }
 
+    private fun exportFolderToDownloads(src: File): ReceivedFile = synchronized(exportLock) {
+        val mime = "inode/directory"
+        val now = System.currentTimeMillis()
+        val files = src.walkTopDown().filter { it.isFile }
+            .sortedBy { it.relativeTo(src).invariantSeparatorsPath }
+            .toList()
+        val totalSize = files.fold(0L) { total, file ->
+            if (Long.MAX_VALUE - total < file.length()) Long.MAX_VALUE else total + file.length()
+        }
+
+        if (Build.VERSION.SDK_INT >= 29) {
+            // Scoped Storage cannot create a durable row for an empty directory.
+            // Empty-only trees are intentionally ignored; non-empty trees retain
+            // every file's relative parent under one unique public root.
+            if (files.isEmpty()) {
+                src.deleteRecursively()
+                return@synchronized ReceivedFile(src.name, null, mime, 0, now)
+            }
+            val publicRoot = uniqueMediaStoreFolderName(src.name)
+            val inserted = ArrayList<Uri>(files.size)
+            try {
+                for (file in files) {
+                    val relative = file.relativeTo(src).invariantSeparatorsPath
+                    val parent = relative.substringBeforeLast('/', "")
+                    val relativePath = buildString {
+                        append(Environment.DIRECTORY_DOWNLOADS)
+                        append("/InkHole/")
+                        append(publicRoot)
+                        if (parent.isNotEmpty()) {
+                            append('/')
+                            append(parent)
+                        }
+                    }
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+                        put(MediaStore.MediaColumns.MIME_TYPE, guessMime(file.name))
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    val uri = contentResolver.insert(
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IOException("无法创建下载文件")
+                    inserted += uri
+                    val output = contentResolver.openOutputStream(uri)
+                        ?: throw IOException("无法打开下载文件")
+                    output.use { out ->
+                        file.inputStream().use { it.copyTo(out, EXPORT_BUFFER) }
+                    }
+                }
+                for (uri in inserted) {
+                    val published = contentResolver.update(uri, ContentValues().apply {
+                        put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    }, null, null)
+                    if (published <= 0) throw IOException("无法发布下载文件夹")
+                }
+                src.deleteRecursively()
+                return@synchronized ReceivedFile(publicRoot, null, mime, totalSize, now)
+            } catch (_: Exception) {
+                inserted.forEach { uri ->
+                    try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
+                }
+                // Keep the complete private folder when public export fails.
+                return@synchronized ReceivedFile(src.name, null, mime, totalSize, now)
+            }
+        }
+
+        if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            == PackageManager.PERMISSION_GRANTED) {
+            var destination: File? = null
+            try {
+                val root = File(Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS), "InkHole")
+                if (!root.isDirectory && !root.mkdirs()) throw IOException("无法创建下载目录")
+                destination = ReceiveFiles.uniqueDirectory(root, src.name)
+                if (!src.copyRecursively(destination, overwrite = false)) {
+                    throw IOException("无法复制下载文件夹")
+                }
+                src.deleteRecursively()
+                return@synchronized ReceivedFile(destination.name, null, mime, totalSize, now)
+            } catch (_: Exception) {
+                destination?.deleteRecursively()
+            }
+        }
+        ReceivedFile(src.name, null, mime, totalSize, now)
+    }
+
+    private fun uniqueMediaStoreFolderName(name: String): String {
+        var candidate = name
+        var suffix = 2
+        while (mediaStoreFolderExists(candidate)) {
+            candidate = "$name ($suffix)"
+            suffix++
+        }
+        return candidate
+    }
+
+    private fun mediaStoreFolderExists(name: String): Boolean {
+        if (Build.VERSION.SDK_INT < 29) return false
+        val prefix = "${Environment.DIRECTORY_DOWNLOADS}/InkHole/$name/"
+        return try {
+            contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.MediaColumns._ID),
+                "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+                arrayOf("$prefix%"),
+                null,
+            )?.use { it.moveToFirst() } ?: false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun guessMime(name: String): String {
         val ext = name.substringAfterLast('.', "").lowercase()
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
@@ -280,7 +393,8 @@ class InkHoleService : Service() {
             Notification.Builder(this, CHANNEL_FILES) else Notification.Builder(this)
         builder.setSmallIcon(R.drawable.ic_notification)
             .setColor(0xFF58E6C8.toInt())
-            .setContentTitle("墨洞已接收文件")
+            .setContentTitle(if (record.mime == "inode/directory")
+                "墨洞已接收文件夹" else "墨洞已接收文件")
             .setContentText(record.name)
             .setAutoCancel(true)
         if (record.uri != null) {
@@ -290,6 +404,12 @@ class InkHoleService : Service() {
             }
             builder.setContentIntent(PendingIntent.getActivity(
                 this, record.uri.hashCode(), view,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+        } else if (record.mime == "inode/directory" && record.size > 0) {
+            val downloads = Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            builder.setContentIntent(PendingIntent.getActivity(
+                this, record.name.hashCode(), downloads,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
         }
         try {

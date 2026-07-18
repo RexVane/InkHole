@@ -432,7 +432,8 @@ private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
     }
 }
 
-private fun fileEmoji(name: String): String {
+private fun fileEmoji(name: String, mime: String = ""): String {
+    if (mime == "inode/directory") return "📁"
     return when (name.substringAfterLast('.', "").lowercase()) {
         "jpg", "jpeg", "png", "gif", "webp", "heic", "bmp" -> "🖼️"
         "mp4", "mov", "mkv", "avi", "webm" -> "🎬"
@@ -481,7 +482,7 @@ private fun FileCard(rec: ReceivedFile, onClick: () -> Unit) {
             .padding(horizontal = 13.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(fileEmoji(rec.name), fontSize = 18.sp)
+        Text(fileEmoji(rec.name, rec.mime), fontSize = 18.sp)
         Spacer(Modifier.width(11.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -496,7 +497,8 @@ private fun FileCard(rec: ReceivedFile, onClick: () -> Unit) {
             }
         }
         Spacer(Modifier.width(8.dp))
-        Text("打开", color = Teal.copy(alpha = 0.8f), fontSize = 11.sp)
+        Text(if (rec.mime == "inode/directory") "查看" else "打开",
+            color = Teal.copy(alpha = 0.8f), fontSize = 11.sp)
     }
 }
 

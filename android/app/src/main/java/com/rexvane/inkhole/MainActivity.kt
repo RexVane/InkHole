@@ -565,7 +565,13 @@ class MainActivity : ComponentActivity() {
 
     private fun openFile(rec: ReceivedFile) {
         val uri = rec.uri ?: run {
-            statusMsg.value = "文件在 Download/InkHole"
+            if (rec.mime == "inode/directory" && rec.size > 0) {
+                openInbox()
+                statusMsg.value = "文件夹在 Download/InkHole/${rec.name}"
+            } else {
+                statusMsg.value = if (rec.mime == "inode/directory")
+                    "Android 未导出完全空的文件夹" else "文件在 Download/InkHole"
+            }
             return
         }
         try {

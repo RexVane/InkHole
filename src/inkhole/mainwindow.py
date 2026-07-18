@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QDialog, QSizePolicy, QStackedWidget,
                                QSizeGrip, QToolButton, QStyle,
                                QGraphicsOpacityEffect,
-                               QApplication, QBoxLayout)
+                               QApplication, QBoxLayout, QMenu)
 
 # ---------- 设计令牌 ----------
 _TEAL = "#5AD8C0"
@@ -67,6 +67,10 @@ QPushButton:hover {{ background: rgba(43,51,52,245); border-color: {_EDGE_HOVER}
                      color: {_TEXT}; }}
 QPushButton:pressed {{ background: rgba(15,19,20,250); }}
 QPushButton:focus {{ border-color: {_TEAL_DIM}; }}
+QMenu {{ background: rgb(27,33,34); color: {_TEXT_SECOND};
+         border: 1px solid {_EDGE}; border-radius: 7px; padding: 5px; }}
+QMenu::item {{ border-radius: 5px; padding: 7px 24px 7px 10px; }}
+QMenu::item:selected {{ background: rgba(90,216,192,28); color: {_TEXT}; }}
 
 QPushButton#TitleAction {{ border: 1px solid {_EDGE}; background: rgba(255,255,255,10);
                            border-radius: 7px; min-height: 20px; padding: 5px 12px;
@@ -1216,12 +1220,17 @@ class MainWindow(QWidget):
 
         send_row = QHBoxLayout()
         send_row.addStretch(1)
-        self._send_btn = QPushButton("选择文件")
+        self._send_btn = QPushButton("选择发送内容")
         self._send_btn.setObjectName("Primary")
         self._send_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         self._send_btn.setCursor(Qt.PointingHandCursor)
         self._send_btn.setFixedWidth(156)
-        self._send_btn.clicked.connect(self._pick_and_send)
+        send_menu = QMenu(self._send_btn)
+        pick_files = send_menu.addAction("选择文件")
+        pick_files.triggered.connect(self._pick_and_send)
+        pick_folder = send_menu.addAction("选择文件夹")
+        pick_folder.triggered.connect(self._pick_and_send_folder)
+        self._send_btn.setMenu(send_menu)
         self._cancel_send_btn = QPushButton("取消发送")
         self._cancel_send_btn.setObjectName("CancelAction")
         self._cancel_send_btn.setIcon(
@@ -2036,11 +2045,14 @@ class MainWindow(QWidget):
 
     def _file_card(self, path: str) -> QFrame:
         card = InteractiveCard(compact=True)
-        card.setAccessibleName(f"打开文件 {os.path.basename(path)}")
+        is_directory = os.path.isdir(path)
+        kind_text = "文件夹" if is_directory else "文件"
+        card.setAccessibleName(f"打开{kind_text} {os.path.basename(path)}")
         lay = QHBoxLayout(card)
         lay.setContentsMargins(11, 8, 10, 8)
         lay.setSpacing(11)
-        suffix = os.path.splitext(path)[1].lstrip(".").upper()[:3] or "FILE"
+        suffix = ("DIR" if is_directory else
+                  (os.path.splitext(path)[1].lstrip(".").upper()[:3] or "FILE"))
         icon = QLabel(suffix)
         icon.setObjectName("FileBadge")
         icon.setFixedSize(38, 36)
@@ -2053,7 +2065,7 @@ class MainWindow(QWidget):
         copy.addWidget(name)
         try:
             meta_text = " · ".join(filter(None, (
-                format_file_size(os.path.getsize(path)),
+                "文件夹" if is_directory else format_file_size(os.path.getsize(path)),
                 format_file_time(os.path.getmtime(path)),
             )))
         except OSError:
@@ -2083,6 +2095,16 @@ class MainWindow(QWidget):
         files, _ = QFileDialog.getOpenFileNames(self, "选择要发送的文件")
         for fp in files:
             self._bridge.dropFile(fp)
+
+    def _pick_and_send_folder(self):
+        if not self._bridge.node.selected_peer():
+            self._on_error(
+                "还没发现设备" if not self._bridge.node.peers()
+                else "先点选一台目标设备")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "选择要发送的文件夹")
+        if folder:
+            self._bridge.dropFile(folder)
 
     @Slot(str)
     def _on_status(self, msg: str):

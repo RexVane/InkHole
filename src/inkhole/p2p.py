@@ -9,8 +9,9 @@ p2p.py
   - 可选 AES-256-GCM 端到端加密(复用 crypto.py)
 
 协议 (WHPP - InkHole P2P Protocol)：
-  [4B magic "WHPP"] [4B header_len] [header_len B JSON] [size B 文件数据]
-  JSON header: {"filename": "...", "size": 12345, "encrypted": true/false}
+  [4B magic "WHPP"] [4B header_len] [header_len B JSON] [size B 数据]
+  普通文件直接承载字节；kind=folder-v1 时承载 WHF1 目录条目流。
+  WHPC 独立连接用于能力探测，旧客户端自动回退 ZIP。
 
 使用：
   node = P2PNode(P2PConfig(inbox="~/inkhole"),
@@ -27,10 +28,12 @@ import sys
 import json
 import shutil
 import socket
+import stat
 import struct
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable
@@ -41,6 +44,10 @@ from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
 # ---------- 常量 ----------
 _SERVICE_TYPE = "_inkhole._tcp.local."
 _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
+_CAP_MAGIC = b"WHPC"      # capability probe; kept separate from file frames
+_FOLDER_MAGIC = b"WHF1"   # streamed folder payload magic
+_FOLDER_KIND = "folder-v1"
+_FOLDER_ENTRY = struct.Struct("!BIQQ")  # type, path bytes, file size, mtime ms
 _BUFFER = 256 * 1024      # 256KB 传输块，降低大文件跨网传输的 Python IO 调用开销
 _SOCKET_BUFFER = 4 * 1024 * 1024   # TCP 窗口上限:4MB @ RTT 200ms(DERP) ≈ 20MB/s,
                                    # @ RTT 60ms(WiFi 抖动) ≈ 66MB/s,高于链路真实能力
@@ -60,6 +67,16 @@ _PROBE_TIMEOUT = 1.5               # 探测单个地址的 TCP 连接超时(秒)
 _PROBE_STRIKES = 2                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
 _NET_CHECK_INTERVAL = 5.0          # 网络监控轮询间隔(秒)
 _NET_WAKE_GAP = 20.0               # 单轮 sleep 实际耗时超过此值判定为睡眠唤醒，触发 mDNS 重建
+_CAP_TIMEOUT = 3.0                  # folder-v1 能力探测读写超时
+_MAX_FOLDER_ENTRIES = 100_000       # 防恶意条目数耗尽 inode/内存
+_MAX_FOLDER_PATH = 4096             # 单条 UTF-8 相对路径字节上限
+_MAX_FOLDER_DEPTH = 128             # 防超深目录拖垮路径处理
+_PORTABLE_INVALID = '<>:"|?*'
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 class _SendCancelled(Exception):
@@ -227,6 +244,322 @@ def _service_label(name: str, instance_id: str) -> str:
     return f"{label}-{instance_id}"
 
 
+@dataclass(frozen=True)
+class _FolderEntryInfo:
+    path: str
+    path_bytes: bytes
+    source: str
+    is_dir: bool
+    size: int
+    mtime_ms: int
+
+
+@dataclass(frozen=True)
+class _FolderManifest:
+    root: str
+    entries: tuple[_FolderEntryInfo, ...]
+    plain_size: int
+    root_mtime_ms: int
+
+
+def _portable_path_parts(path: str) -> tuple[list[str], str]:
+    """Validate a WHF1 relative path and return components plus collision key."""
+    if not path or path.startswith("/") or "\\" in path or "\x00" in path:
+        raise ValueError("文件夹内含不安全路径")
+    parts = path.split("/")
+    if len(parts) > _MAX_FOLDER_DEPTH:
+        raise ValueError("文件夹目录层级过深")
+    keys = []
+    for component in parts:
+        encoded = component.encode("utf-8")
+        if (not component or component in (".", "..") or len(encoded) > 255
+                or component.rstrip(". ") != component
+                or any(ord(ch) < 32 or ch in _PORTABLE_INVALID for ch in component)
+                or component.split(".", 1)[0].upper() in _WINDOWS_RESERVED):
+            raise ValueError(f"文件夹内含跨平台不支持的名称：{component or '?'}")
+        keys.append(unicodedata.normalize("NFC", component).casefold())
+    return parts, "/".join(keys)
+
+
+def _is_reparse_point(st_result) -> bool:
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(st_result, "st_file_attributes", 0) & flag)
+
+
+def _scan_folder(path: str,
+                 should_cancel: Callable[[], bool] | None = None) -> _FolderManifest:
+    """Scan once and retain the exact metadata needed to stream a folder."""
+    root = os.path.abspath(path)
+    root_stat = os.stat(root, follow_symlinks=False)
+    if not stat.S_ISDIR(root_stat.st_mode) or os.path.islink(root) or _is_reparse_point(root_stat):
+        raise ValueError("不支持发送符号链接、联接或特殊目录")
+
+    entries: list[_FolderEntryInfo] = []
+    collision_keys: set[str] = set()
+    plain_size = 8  # WHF1 magic + entry_count
+    stack: list[tuple[str, str]] = [(root, "")]
+    while stack:
+        if should_cancel and should_cancel():
+            raise _SendCancelled()
+        current, relative_parent = stack.pop()
+        with os.scandir(current) as scan:
+            children = sorted(scan, key=lambda item: item.name.casefold())
+        directories: list[tuple[str, str]] = []
+        for child in children:
+            if should_cancel and should_cancel():
+                raise _SendCancelled()
+            relative = f"{relative_parent}/{child.name}" if relative_parent else child.name
+            path_bytes = relative.encode("utf-8")
+            if len(path_bytes) > _MAX_FOLDER_PATH:
+                raise ValueError(f"文件夹内路径过长：{relative}")
+            _parts, collision_key = _portable_path_parts(relative)
+            if collision_key in collision_keys:
+                raise ValueError(f"文件夹内存在跨平台重名路径：{relative}")
+            collision_keys.add(collision_key)
+
+            st_result = child.stat(follow_symlinks=False)
+            if child.is_symlink() or _is_reparse_point(st_result):
+                raise ValueError(f"不支持发送符号链接或联接：{relative}")
+            mtime_ms = min(max(0, st_result.st_mtime_ns // 1_000_000), 0xFFFFFFFFFFFFFFFF)
+            if stat.S_ISDIR(st_result.st_mode):
+                entry = _FolderEntryInfo(relative, path_bytes, child.path, True, 0, mtime_ms)
+                directories.append((child.path, relative))
+            elif stat.S_ISREG(st_result.st_mode):
+                entry = _FolderEntryInfo(
+                    relative, path_bytes, child.path, False, st_result.st_size, mtime_ms)
+            else:
+                raise ValueError(f"不支持发送特殊文件：{relative}")
+            entries.append(entry)
+            if len(entries) > _MAX_FOLDER_ENTRIES:
+                raise ValueError("文件夹条目过多")
+            plain_size += _FOLDER_ENTRY.size + len(path_bytes) + entry.size
+            if plain_size > _MAX_FILE_SIZE:
+                raise ValueError("文件夹总大小超过 1TB")
+        stack.extend(reversed(directories))
+
+    root_mtime_ms = min(max(0, root_stat.st_mtime_ns // 1_000_000), 0xFFFFFFFFFFFFFFFF)
+    return _FolderManifest(root, tuple(entries), plain_size, root_mtime_ms)
+
+
+class _FolderPayloadReader:
+    """File-like reader over a WHF1 manifest without building an archive."""
+
+    def __init__(self, manifest: _FolderManifest):
+        self._pieces = self._iter_pieces(manifest)
+        self._buffer = bytearray()
+        self._closed = False
+
+    @staticmethod
+    def _iter_pieces(manifest: _FolderManifest):
+        yield _FOLDER_MAGIC + struct.pack("!I", len(manifest.entries))
+        for entry in manifest.entries:
+            yield _FOLDER_ENTRY.pack(
+                0 if entry.is_dir else 1,
+                len(entry.path_bytes),
+                entry.size,
+                entry.mtime_ms,
+            )
+            yield entry.path_bytes
+            if entry.is_dir:
+                continue
+            remaining = entry.size
+            with open(entry.source, "rb") as source:
+                while remaining:
+                    chunk = source.read(min(_BUFFER, remaining))
+                    if not chunk:
+                        raise OSError(f"发送时文件发生变化：{entry.path}")
+                    remaining -= len(chunk)
+                    yield chunk
+                if source.read(1):
+                    raise OSError(f"发送时文件大小发生变化：{entry.path}")
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            return b""
+        if size == 0:
+            return b""
+        if size < 0:
+            chunks = [bytes(self._buffer)]
+            self._buffer.clear()
+            chunks.extend(self._pieces)
+            return b"".join(chunks)
+        while len(self._buffer) < size:
+            try:
+                self._buffer.extend(next(self._pieces))
+            except StopIteration:
+                break
+        result = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return result
+
+    def close(self) -> None:
+        self._closed = True
+        self._buffer.clear()
+        try:
+            self._pieces.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
+class _FolderWireReader:
+    """Expose an exact WHF1 plaintext stream from clear or WHE2 wire data."""
+
+    def __init__(self, conn: socket.socket, wire_size: int, plain_size: int,
+                 secret: str, encrypted: bool, progress):
+        self._conn = conn
+        self._wire_size = wire_size
+        self._plain_size = plain_size
+        self._progress = progress
+        self._wire_read = 0
+        self._plain_read = 0
+        self._encrypted = encrypted
+        self._plain_buffer = bytearray()
+        self._decryptor = None
+        if encrypted:
+            header = _recv_exact(conn, 32)
+            if header is None:
+                raise EOFError("加密流头不完整")
+            self._wire_read = 32
+            self._progress.update(self._wire_read)
+            self._decryptor = ChunkedDecryptor(secret, header)
+
+    def _read_clear(self, size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = self._conn.recv(min(_BUFFER, size - len(chunks)))
+            if not chunk:
+                raise EOFError("文件夹数据不完整")
+            chunks.extend(chunk)
+            self._wire_read += len(chunk)
+            self._progress.update(self._wire_read)
+        return bytes(chunks)
+
+    def _fill_encrypted(self, size: int) -> None:
+        while len(self._plain_buffer) < size:
+            if self._wire_read >= self._wire_size:
+                raise EOFError("加密文件夹数据不完整")
+            length_bytes = _recv_exact(self._conn, 4)
+            if length_bytes is None:
+                raise EOFError("加密文件夹数据不完整")
+            ciphertext_size = struct.unpack("!I", length_bytes)[0]
+            if (not 16 <= ciphertext_size <= CHUNK_SIZE + 16
+                    or self._wire_read + 4 + ciphertext_size > self._wire_size):
+                raise ValueError("加密文件夹分块非法")
+            ciphertext = _recv_exact(self._conn, ciphertext_size)
+            if ciphertext is None:
+                raise EOFError("加密文件夹数据不完整")
+            plain = self._decryptor.decrypt_chunk(ciphertext)
+            if plain is None:
+                raise ValueError("文件夹解密失败（两端口令不一致？）")
+            self._wire_read += 4 + ciphertext_size
+            self._plain_buffer.extend(plain)
+            self._progress.update(self._wire_read)
+
+    def read_exact(self, size: int) -> bytes:
+        if size < 0 or self._plain_read + size > self._plain_size:
+            raise ValueError("文件夹声明大小不一致")
+        if self._encrypted:
+            self._fill_encrypted(size)
+            result = bytes(self._plain_buffer[:size])
+            del self._plain_buffer[:size]
+        else:
+            result = self._read_clear(size)
+        self._plain_read += size
+        return result
+
+    def copy_exact(self, output, size: int) -> None:
+        remaining = size
+        while remaining:
+            chunk = self.read_exact(min(_BUFFER, remaining))
+            output.write(chunk)
+            remaining -= len(chunk)
+
+    def finish(self) -> None:
+        if (self._plain_read != self._plain_size or self._wire_read != self._wire_size
+                or self._plain_buffer):
+            raise ValueError("文件夹实际大小与声明不一致")
+
+
+def _apply_mtime(path: str, mtime_ms: int) -> None:
+    if mtime_ms <= 0:
+        return
+    try:
+        seconds = mtime_ms / 1000.0
+        try:
+            os.utime(path, (seconds, seconds), follow_symlinks=False)
+        except NotImplementedError:
+            os.utime(path, (seconds, seconds))
+    except (OSError, OverflowError, ValueError, NotImplementedError):
+        pass
+
+
+def _receive_folder_stream(reader: _FolderWireReader, staging: str) -> None:
+    if reader.read_exact(4) != _FOLDER_MAGIC:
+        raise ValueError("文件夹流标识非法")
+    entry_count = struct.unpack("!I", reader.read_exact(4))[0]
+    if entry_count > _MAX_FOLDER_ENTRIES:
+        raise ValueError("文件夹条目过多")
+
+    seen: set[str] = set()
+    file_keys: set[str] = set()
+    ancestor_keys: set[str] = set()
+    directory_mtimes: list[tuple[str, int, int]] = []
+    staging_abs = os.path.abspath(staging)
+    for _index in range(entry_count):
+        entry_type, path_size, file_size, mtime_ms = _FOLDER_ENTRY.unpack(
+            reader.read_exact(_FOLDER_ENTRY.size))
+        if not 0 < path_size <= _MAX_FOLDER_PATH:
+            raise ValueError("文件夹路径长度非法")
+        try:
+            relative = reader.read_exact(path_size).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("文件夹路径编码非法") from exc
+        parts, collision_key = _portable_path_parts(relative)
+        if collision_key in seen:
+            raise ValueError(f"文件夹内存在重名路径：{relative}")
+
+        normalized_parts = collision_key.split("/")
+        parent_keys = ["/".join(normalized_parts[:i]) for i in range(1, len(parts))]
+        if any(parent in file_keys for parent in parent_keys):
+            raise ValueError(f"文件与目录结构冲突：{relative}")
+        if entry_type == 1 and collision_key in ancestor_keys:
+            raise ValueError(f"文件与目录结构冲突：{relative}")
+        if entry_type not in (0, 1) or (entry_type == 0 and file_size != 0):
+            raise ValueError("文件夹条目类型非法")
+        if file_size > _MAX_FILE_SIZE:
+            raise ValueError("文件夹内文件大小非法")
+
+        target = os.path.abspath(os.path.join(staging_abs, *parts))
+        try:
+            if os.path.commonpath((staging_abs, target)) != staging_abs:
+                raise ValueError("文件夹路径越界")
+        except ValueError as exc:
+            raise ValueError("文件夹路径越界") from exc
+
+        seen.add(collision_key)
+        ancestor_keys.update(parent_keys)
+        if entry_type == 0:
+            os.makedirs(target, exist_ok=True)
+            directory_mtimes.append((target, mtime_ms, len(parts)))
+        else:
+            file_keys.add(collision_key)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "xb") as output:
+                reader.copy_exact(output, file_size)
+            _apply_mtime(target, mtime_ms)
+
+    reader.finish()
+    for directory, mtime_ms, _depth in sorted(
+            directory_mtimes, key=lambda item: item[2], reverse=True):
+        _apply_mtime(directory, mtime_ms)
+
+
 # ---------- P2P 引擎 ----------
 class P2PNode:
     """局域网点对点文件传输节点。
@@ -379,6 +712,7 @@ class P2PNode:
             properties={
                 b"peer_name": self.cfg.peer_name.encode("utf-8"),
                 b"instance_id": self._instance_id.encode("ascii"),
+                b"caps": _FOLDER_KIND.encode("ascii"),
                 # 全部本机 IPv4:Android NSD 只解析出一个地址,而本机发出
                 # 连接的源 IP 可能是另一块网卡(VPN/TUN/多网卡)——对端的
                 # "仅接收目标设备"需要完整列表才能正确放行
@@ -494,24 +828,24 @@ class P2PNode:
             threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True).start()
 
     def _handle_connection(self, conn: socket.socket, addr) -> None:
-        """接收一个文件：读 WHPP 头 + 文件数据，落盘到收件箱。
-
-        任何失败(中断/解密失败/写盘失败)都不允许把残缺文件顶着正式文件名
-        落盘——否则半截文件会覆盖收件箱里同名的完整文件。
-        对端 header 带 want_ack 时，结束前回 1 字节回执告知成败；
-        拒收路径先把对端已发出的数据消化掉(有限额)，回执才能可靠到达。
-        """
+        """Receive one WHPP file or one atomic WHF1 folder transaction."""
         part_path = None
+        folder_part_path = None
         want_ack = False
         ok = False
         transfer_name = ""
         transfer_started = False
         try:
-            # 空闲超时：对端发一半停住不能永久占住线程和 .part 文件
             conn.settimeout(_RECV_IDLE_TIMEOUT)
-            # 读 magic。放在 trusted_only 之前:存活探测的空连接(连上即断)
-            # 在这里静默结束,不会被当成陌生传输拒收刷屏
+            # Probe connections that close before sending four bytes remain silent.
             magic = _recv_exact(conn, 4)
+            if magic == _CAP_MAGIC:
+                body = json.dumps(
+                    {"version": 1, "caps": [_FOLDER_KIND]},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                conn.sendall(_CAP_MAGIC + struct.pack("!I", len(body)) + body)
+                return
             if magic != _MAGIC:
                 return
 
@@ -529,7 +863,6 @@ class P2PNode:
                     _drain(conn, _DRAIN_CAP)
                     return
 
-            # 读 header 长度 + header JSON
             hdr_len_bytes = _recv_exact(conn, 4)
             if not hdr_len_bytes:
                 return
@@ -541,121 +874,149 @@ class P2PNode:
                 return
             header = json.loads(hdr_bytes.decode("utf-8"))
 
-            filename = _safe_filename(str(header.get("filename", "")))  # 防 ../ 路径穿越 + 非法字符
+            filename = _safe_filename(str(header.get("filename", "")))
             size = header.get("size", 0)
             encrypted = bool(header.get("encrypted", False))
             enc_mode = str(header.get("enc_mode", ""))
             want_ack = bool(header.get("want_ack", False))
+            kind = str(header.get("kind", "file"))
+            is_folder = kind == _FOLDER_KIND
+            if kind not in ("", "file", _FOLDER_KIND):
+                self._status(f"拒收 {filename}：不支持的传输类型")
+                return
 
-            # size 来自网络，不可信：必须是合法范围内的整数
-            if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= _MAX_FILE_SIZE:
+            size_limit = chunked_wire_size(_MAX_FILE_SIZE) if is_folder else _MAX_FILE_SIZE
+            if (isinstance(size, bool) or not isinstance(size, int)
+                    or not 0 <= size <= size_limit):
                 self._status(f"拒收 {filename}：文件大小非法")
                 return
-            # 磁盘装不下就直接拒收，别收到一半才发现
+
+            plain_size = size
+            modified_ms = 0
+            if is_folder:
+                plain_size = header.get("plain_size", -1)
+                modified_ms = header.get("mtime_ms", 0)
+                if (isinstance(plain_size, bool) or not isinstance(plain_size, int)
+                        or not 8 <= plain_size <= _MAX_FILE_SIZE):
+                    self._status(f"拒收 {filename}：文件夹大小非法")
+                    return
+                if (isinstance(modified_ms, bool) or not isinstance(modified_ms, int)
+                        or not 0 <= modified_ms <= 0xFFFFFFFFFFFFFFFF):
+                    self._status(f"拒收 {filename}：文件夹时间非法")
+                    return
+                if encrypted:
+                    if enc_mode != "chunked" or size != chunked_wire_size(plain_size):
+                        self._status(f"拒收 {filename}：文件夹加密声明非法")
+                        return
+                elif size != plain_size:
+                    self._status(f"拒收 {filename}：文件夹大小声明不一致")
+                    return
+
+            storage_size = plain_size if is_folder else size
             try:
-                if size + _DISK_MARGIN > shutil.disk_usage(self.cfg.inbox).free:
+                if storage_size + _DISK_MARGIN > shutil.disk_usage(self.cfg.inbox).free:
                     self._status(f"拒收 {filename}：磁盘空间不足")
                     _drain(conn, min(size, _DRAIN_CAP))
                     return
             except OSError:
                 pass
-            # 对方加密但本机没口令：内容永远解不开，收下没有意义
             if encrypted and not self.cfg.secret:
                 self._status(f"拒收 {filename}：对方启用了加密，本机未设口令")
                 _drain(conn, min(size, _DRAIN_CAP))
                 return
-            # WHE1 整块解密需把密文全量读进内存，超大声明是内存耗尽攻击
+            if encrypted and enc_mode == "chunked" and size < 32:
+                self._status(f"拒收 {filename}：加密流大小非法")
+                return
             if encrypted and enc_mode != "chunked" and size > _MAX_WHE1_SIZE:
                 self._status(f"拒收 {filename}：整块加密文件过大")
                 _drain(conn, _DRAIN_CAP)
                 return
 
-            # 落盘绝不覆盖已有文件；.part 带随机后缀，并发收同名文件互不干扰
-            dst = _unique_path(self.cfg.inbox, filename)
-            part_path = dst + f".{uuid.uuid4().hex[:8]}.part"
             progress = _Progress(self.on_progress, "recv", filename, size)
             transfer_name = filename
             transfer_started = True
 
-            if encrypted and enc_mode == "chunked":
-                # WHE2 分块流：边收边解密边落盘，内存峰值 4MB
-                hdr32 = _recv_exact(conn, 32)
-                if hdr32 is None:
-                    self._status(f"接收中断：{filename}")
-                    return
-                try:
-                    decryptor = ChunkedDecryptor(self.cfg.secret, hdr32)
-                except ValueError:
-                    self._status(f"拒收 {filename}：加密流头非法")
-                    return
-                consumed = 32
-                intact = True
-                with open(part_path, "wb") as f:
-                    while consumed < size:
-                        len_bytes = _recv_exact(conn, 4)
-                        if len_bytes is None:
-                            intact = False
-                            break
-                        ct_len = struct.unpack("!I", len_bytes)[0]
-                        if not 16 <= ct_len <= CHUNK_SIZE + 16:
-                            intact = False
-                            break
-                        ct = _recv_exact(conn, ct_len)
-                        if ct is None:
-                            intact = False
-                            break
-                        plain = decryptor.decrypt_chunk(ct)
-                        if plain is None:
-                            self._status(f"解密失败：{filename}（两端口令不一致？）")
-                            return
-                        f.write(plain)
-                        consumed += 4 + ct_len
-                        progress.update(consumed)
-                if not intact or consumed != size:
-                    self._status(f"接收中断：{filename}")
-                    return
+            if is_folder:
+                folder_part_path = os.path.join(
+                    self.cfg.inbox, f".inkhole-{uuid.uuid4().hex}.folder.part")
+                os.mkdir(folder_part_path)
+                reader = _FolderWireReader(
+                    conn, size, plain_size, self.cfg.secret, encrypted, progress)
+                _receive_folder_stream(reader, folder_part_path)
+                _apply_mtime(folder_part_path, modified_ms)
+                with self._lock:
+                    dst = _unique_directory_path(self.cfg.inbox, filename)
+                    os.replace(folder_part_path, dst)
+                folder_part_path = None
             else:
-                # 明文 / WHE1 整块加密：流式写入 .part
-                remaining = size
-                with open(part_path, "wb") as f:
-                    while remaining > 0:
-                        chunk = conn.recv(min(_BUFFER, remaining))
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        remaining -= len(chunk)
-                        progress.update(size - remaining)
-                if remaining > 0:
-                    self._status(f"接收中断：{filename}")
-                    return
-
-                # WHE1 整块加密：解密成功才算收到
-                if encrypted:
-                    with open(part_path, "rb") as f:
-                        blob = f.read()
-                    plain = decrypt(self.cfg.secret, blob)
-                    if plain is None:
-                        self._status(f"解密失败：{filename}（两端口令不一致？）")
-                        return
-                    with open(part_path, "wb") as f:
-                        f.write(plain)
-
-            # 落盘时在锁内再取一次唯一名：并发收同名文件时先落盘的不被后来的覆盖
-            with self._lock:
                 dst = _unique_path(self.cfg.inbox, filename)
-                os.replace(part_path, dst)
-            part_path = None
-            ok = True
+                part_path = dst + f".{uuid.uuid4().hex[:8]}.part"
+                if encrypted and enc_mode == "chunked":
+                    hdr32 = _recv_exact(conn, 32)
+                    if hdr32 is None:
+                        raise EOFError("加密流头不完整")
+                    decryptor = ChunkedDecryptor(self.cfg.secret, hdr32)
+                    consumed = 32
+                    progress.update(consumed)
+                    with open(part_path, "wb") as output:
+                        while consumed < size:
+                            len_bytes = _recv_exact(conn, 4)
+                            if len_bytes is None:
+                                raise EOFError("加密文件数据不完整")
+                            ct_len = struct.unpack("!I", len_bytes)[0]
+                            if (not 16 <= ct_len <= CHUNK_SIZE + 16
+                                    or consumed + 4 + ct_len > size):
+                                raise ValueError("加密文件分块非法")
+                            ciphertext = _recv_exact(conn, ct_len)
+                            if ciphertext is None:
+                                raise EOFError("加密文件数据不完整")
+                            plain = decryptor.decrypt_chunk(ciphertext)
+                            if plain is None:
+                                raise ValueError("解密失败（两端口令不一致？）")
+                            output.write(plain)
+                            consumed += 4 + ct_len
+                            progress.update(consumed)
+                    if consumed != size:
+                        raise EOFError("加密文件数据不完整")
+                else:
+                    remaining = size
+                    with open(part_path, "wb") as output:
+                        while remaining > 0:
+                            chunk = conn.recv(min(_BUFFER, remaining))
+                            if not chunk:
+                                raise EOFError("文件数据不完整")
+                            output.write(chunk)
+                            remaining -= len(chunk)
+                            progress.update(size - remaining)
+                    if encrypted:
+                        with open(part_path, "rb") as source:
+                            plain = decrypt(self.cfg.secret, source.read())
+                        if plain is None:
+                            raise ValueError("解密失败（两端口令不一致？）")
+                        with open(part_path, "wb") as output:
+                            output.write(plain)
 
+                with self._lock:
+                    dst = _unique_path(self.cfg.inbox, filename)
+                    os.replace(part_path, dst)
+                part_path = None
+
+            ok = True
             if self.on_received:
                 self.on_received(dst)
             self._status(f"已接收：{os.path.basename(dst)}")
-        except (ConnectionResetError, ConnectionAbortedError):
-            # 对端取消发送(RST 硬断开)或网络断开:按"中断"而非"失败"提示
+        except (EOFError, ConnectionResetError, ConnectionAbortedError):
             self._status(f"接收中断：{transfer_name or '未知文件'}")
         except Exception as e:
             self._status("接收失败", str(e))
         finally:
+            if part_path and os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            if folder_part_path:
+                shutil.rmtree(folder_part_path, ignore_errors=True)
             if want_ack:
                 try:
                     conn.sendall(_ACK_OK if ok else _ACK_FAIL)
@@ -665,18 +1026,230 @@ class P2PNode:
                 conn.close()
             except OSError:
                 pass
-            if part_path and os.path.exists(part_path):
-                try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
             if transfer_started and self.on_transfer_end:
                 try:
                     self.on_transfer_end("recv", transfer_name, ok)
                 except Exception:
                     pass
 
-    # ---------- 发送文件 ----------
+    # ---------- 发送文件 / 文件夹 ----------
+    def _selected_send_peer(self) -> tuple[str | None, PeerInfo | None]:
+        with self._lock:
+            selected = self._selected_peer
+            return selected, self._peers.get(selected) if selected else None
+
+    def _probe_peer_capabilities(self, peer: PeerInfo) -> set[str]:
+        """Actively probe capabilities so manual/Tailscale peers work without TXT."""
+        hosts = sorted(peer.hosts or [peer.host],
+                       key=lambda host: 1 if _is_cgnat_ip(host) else 0)
+        for host in hosts:
+            sock = None
+            try:
+                sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
+                sock.settimeout(_CAP_TIMEOUT)
+                sock.sendall(_CAP_MAGIC)
+                if _recv_exact(sock, 4) != _CAP_MAGIC:
+                    return set()
+                size_bytes = _recv_exact(sock, 4)
+                if size_bytes is None:
+                    return set()
+                body_size = struct.unpack("!I", size_bytes)[0]
+                if not 0 < body_size <= _MAX_HEADER:
+                    return set()
+                body = _recv_exact(sock, body_size)
+                if body is None:
+                    return set()
+                decoded = json.loads(body.decode("utf-8"))
+                caps = decoded.get("caps", [])
+                return {str(cap) for cap in caps} if isinstance(caps, list) else set()
+            except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+                continue
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        return set()
+
+    def send_path(self, local_path: str,
+                  should_cancel: Callable[[], bool] | None = None) -> bool:
+        """Send a file, or stream a directory when the peer supports folder-v1."""
+        if os.path.isfile(local_path):
+            return self.send_file(local_path, should_cancel=should_cancel)
+        if not os.path.isdir(local_path):
+            self._status("文件不存在")
+            return False
+
+        selected, peer = self._selected_send_peer()
+        if not peer:
+            self._status("目标设备已离线" if selected else "请先选择目标设备")
+            return False
+        if _FOLDER_KIND in self._probe_peer_capabilities(peer):
+            return self._send_folder_stream(local_path, peer, should_cancel)
+
+        # Old clients only understand a single WHPP file. Build the legacy ZIP in
+        # the queue worker (never the GUI thread), then clean it on every outcome.
+        self._status("对端版本较旧，正在兼容打包文件夹…")
+        zip_path = None
+        try:
+            zip_path = _zip_dir(local_path, should_cancel=should_cancel)
+            return self.send_file(zip_path, should_cancel=should_cancel)
+        except _SendCancelled:
+            self._status(f"已取消发送：{os.path.basename(local_path)}")
+            return False
+        except Exception as exc:
+            self._status("文件夹打包失败", str(exc))
+            return False
+        finally:
+            if zip_path:
+                shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
+
+    def _send_folder_stream(self, local_path: str, peer: PeerInfo,
+                            should_cancel: Callable[[], bool] | None) -> bool:
+        name = os.path.basename(os.path.abspath(local_path)) or "folder"
+        completed = False
+
+        def cancellation_requested() -> bool:
+            if self._send_cancelled.is_set():
+                return True
+            if should_cancel is None:
+                return False
+            try:
+                return bool(should_cancel())
+            except Exception:
+                return False
+
+        self._send_cancelled.clear()
+        with self._send_state_lock:
+            self._send_active = True
+            self._active_send_sock = None
+        try:
+            _portable_path_parts(name)
+            self._status(f"正在扫描文件夹：{name}")
+            manifest = _scan_folder(local_path, cancellation_requested)
+            if cancellation_requested():
+                raise _SendCancelled()
+            encrypted = bool(self.cfg.secret)
+            wire_size = (chunked_wire_size(manifest.plain_size)
+                         if encrypted else manifest.plain_size)
+            header_dict = {
+                "filename": name,
+                "size": wire_size,
+                "plain_size": manifest.plain_size,
+                "kind": _FOLDER_KIND,
+                "mtime_ms": manifest.root_mtime_ms,
+                "encrypted": encrypted,
+                "want_ack": True,
+            }
+            if encrypted:
+                header_dict["enc_mode"] = "chunked"
+            header = json.dumps(header_dict, separators=(",", ":")).encode("utf-8")
+            progress = _Progress(self.on_progress, "send", name, wire_size)
+
+            sock = None
+            last_err: OSError | None = None
+            send_hosts = sorted(peer.hosts or [peer.host],
+                                key=lambda host: 1 if _is_cgnat_ip(host) else 0)
+            for host in send_hosts:
+                try:
+                    sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
+                    break
+                except OSError as exc:
+                    last_err = exc
+            if sock is None:
+                raise last_err if last_err else OSError("无可用地址")
+
+            try:
+                with self._send_state_lock:
+                    self._active_send_sock = sock
+                if cancellation_requested():
+                    raise _SendCancelled()
+                sock.settimeout(_SEND_IO_TIMEOUT)
+                sock.sendall(_MAGIC)
+                sock.sendall(struct.pack("!I", len(header)))
+                sock.sendall(header)
+
+                sent = 0
+                with _FolderPayloadReader(manifest) as source:
+                    if encrypted:
+                        for blob in encrypt_chunks(self.cfg.secret, source):
+                            if cancellation_requested():
+                                raise _SendCancelled()
+                            sock.sendall(blob)
+                            sent += len(blob)
+                            progress.update(sent)
+                    else:
+                        while sent < manifest.plain_size:
+                            if cancellation_requested():
+                                raise _SendCancelled()
+                            chunk = source.read(min(_BUFFER, manifest.plain_size - sent))
+                            if not chunk:
+                                raise OSError("文件夹读取不完整")
+                            sock.sendall(chunk)
+                            sent += len(chunk)
+                            progress.update(sent)
+                if sent != wire_size:
+                    raise OSError("文件夹发送大小不一致")
+
+                sock.settimeout(60)
+                try:
+                    response = sock.recv(1)
+                except socket.timeout:
+                    # Android may still be publishing a very large folder to
+                    # MediaStore after the private atomic commit.
+                    if cancellation_requested():
+                        raise _SendCancelled()
+                    response = _ACK_OK
+                except OSError:
+                    if cancellation_requested():
+                        raise _SendCancelled()
+                    response = b""
+                # folder-v1 was capability-negotiated, so EOF or reset cannot
+                # be treated as the legacy client's implicit success signal.
+                if response != _ACK_OK:
+                    self._status(f"{peer.name} 接收失败（口令不一致、路径或存储问题）")
+                    return False
+            finally:
+                with self._send_state_lock:
+                    if self._active_send_sock is sock:
+                        self._active_send_sock = None
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+            completed = True
+            if self.on_sent:
+                self.on_sent(name)
+            self._status(f"已发送：{name}")
+            return True
+        except _SendCancelled:
+            self._status(f"已取消发送：{name}")
+            return False
+        except (ConnectionRefusedError, socket.timeout, OSError, ValueError) as exc:
+            if cancellation_requested():
+                self._status(f"已取消发送：{name}")
+            else:
+                self._status("发送失败", str(exc))
+            return False
+        except Exception as exc:
+            if cancellation_requested():
+                self._status(f"已取消发送：{name}")
+            else:
+                self._status("发送失败", str(exc))
+            return False
+        finally:
+            with self._send_state_lock:
+                self._active_send_sock = None
+                self._send_active = False
+            self._send_cancelled.clear()
+            if self.on_transfer_end:
+                try:
+                    self.on_transfer_end("send", name, completed)
+                except Exception:
+                    pass
+
     def send_file(self, local_path: str,
                   should_cancel: Callable[[], bool] | None = None) -> bool:
         """把文件直接发给选中的对端。成功返回 True。
@@ -1297,7 +1870,21 @@ def _unique_path(directory: str, filename: str) -> str:
         n += 1
 
 
-def _zip_dir(src_dir: str) -> str:
+def _unique_directory_path(directory: str, name: str) -> str:
+    """Return `<name>`, `<name> (2)`, ... without treating dots as extensions."""
+    dst = os.path.join(directory, name)
+    if not os.path.exists(dst):
+        return dst
+    n = 2
+    while True:
+        dst = os.path.join(directory, f"{name} ({n})")
+        if not os.path.exists(dst):
+            return dst
+        n += 1
+
+
+def _zip_dir(src_dir: str,
+             should_cancel: Callable[[], bool] | None = None) -> str:
     """把目录递归打包成一个临时 zip，返回临时 zip 绝对路径。
 
     zip 名为 <目录basename>.zip，落在独立临时目录里（调用方发送后应删除
@@ -1307,20 +1894,35 @@ def _zip_dir(src_dir: str) -> str:
     import zipfile
     src_dir = os.path.abspath(src_dir)
     base = os.path.basename(src_dir.rstrip("/\\")) or "folder"
+    _portable_path_parts(base)
+    manifest = _scan_folder(src_dir, should_cancel)
     tmp_root = tempfile.mkdtemp(prefix="inkhole_zip_")
     zip_path = os.path.join(tmp_root, base + ".zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, dirs, files in os.walk(src_dir):
-            for fn in files:
-                full = os.path.join(root, fn)
-                arc = os.path.relpath(full, src_dir)
-                z.write(full, arc)
-            # 显式写目录条目（含空子目录），保持完整目录结构
-            for d in dirs:
-                full_d = os.path.join(root, d)
-                arc_d = os.path.relpath(full_d, src_dir).replace("\\", "/") + "/"
-                z.writestr(zipfile.ZipInfo(arc_d), "")
-    return zip_path
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for entry in manifest.entries:
+                if should_cancel and should_cancel():
+                    raise _SendCancelled()
+                if entry.is_dir:
+                    z.writestr(zipfile.ZipInfo(entry.path + "/"), "")
+                    continue
+                with open(entry.source, "rb") as source:
+                    with z.open(entry.path, "w", force_zip64=True) as output:
+                        remaining = entry.size
+                        while remaining:
+                            if should_cancel and should_cancel():
+                                raise _SendCancelled()
+                            chunk = source.read(min(_BUFFER, remaining))
+                            if not chunk:
+                                raise OSError(f"打包时文件发生变化：{entry.path}")
+                            output.write(chunk)
+                            remaining -= len(chunk)
+                        if source.read(1):
+                            raise OSError(f"打包时文件大小发生变化：{entry.path}")
+        return zip_path
+    except Exception:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise
 
 
 # ---------- 网络工具 ----------
