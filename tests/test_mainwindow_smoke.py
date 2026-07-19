@@ -492,6 +492,40 @@ def test_outlined_field_label_floats_on_focus_or_content(app):
     field.close()
 
 
+def test_outlined_field_floating_label_has_a_real_top_notch(app):
+    from inkhole.mainwindow import OutlinedLineEdit, _QSS
+
+    field = OutlinedLineEdit("Remote port")
+    field.setStyleSheet(_QSS)
+    field.resize(220, 48)
+    field.show()
+    field.setFocus()
+    field._set_label_progress(1.0)
+    app.processEvents()
+
+    image = field.grab().toImage()
+    _, _, _, label_height, label_x, label_y, _, ink_left, ink_width = \
+        field._label_geometry(1.0)
+    label_start = label_x + ink_left
+    # Sample the notch padding, not the glyph itself: the top edge is
+    # intentionally aligned with the label's vertical center.
+    notch_x = int(round(label_start + ink_width + 2))
+    top_y = int(round(label_y + label_height / 2.0))
+    left_border = int(round(label_start - 6))
+    right_border = min(
+        field.width() - 12, int(round(label_start + ink_width + 10)))
+    notch = image.pixelColor(notch_x, top_y)
+    left_line = image.pixelColor(left_border, top_y)
+    right_line = image.pixelColor(right_border, top_y)
+    old_top = image.pixelColor(right_border, 0)
+
+    assert notch.green() < 40
+    assert left_line.green() > 100
+    assert right_line.green() > 100
+    assert old_top.green() < 40
+    field.close()
+
+
 def test_normalize_manual_host():
     """IP 输入自动纠正:补点/清理标点/歧义拒绝/主机名放行。"""
     from inkhole.mainwindow import normalize_manual_host as fix

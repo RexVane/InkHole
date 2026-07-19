@@ -26,7 +26,7 @@ from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QSize, Slot, Signal,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
                            QPen, QFont, QIcon, QPixmap, QIntValidator,
-                           QPainterPath)
+                           QPainterPath, QFontMetrics)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
                                QLineEdit, QCheckBox,
@@ -151,12 +151,12 @@ QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus {{ border-color: {_EDGE_HO
                                    background: rgba(6,9,10,225); }}
 QSpinBox::up-button, QSpinBox::down-button {{ width: 0; }}
 
-QLineEdit#OutlinedField {{ background: #080B0C; border: 1px solid rgba(255,255,255,38);
+QLineEdit#OutlinedField {{ background: transparent; border: none;
                            border-radius: 8px; padding: 9px 11px 3px 11px;
                            min-height: 34px; }}
-QLineEdit#OutlinedField:hover {{ border-color: rgba(255,255,255,62); }}
-QLineEdit#OutlinedField:focus {{ background: #06090A; border: 1px solid {_TEAL}; }}
-QLineEdit#OutlinedField:read-only {{ background: #0D1112; color: {_TEXT_SECOND}; }}
+QLineEdit#OutlinedField:focus {{ background: transparent; border: none; }}
+QLineEdit#OutlinedField:read-only {{ background: transparent; color: {_TEXT_SECOND}; }}
+QLineEdit#OutlinedField:disabled {{ background: transparent; color: rgba(178,191,188,95); }}
 
 QDialog#InAppDialog {{ background: rgba(0,0,0,145); }}
 QFrame#DialogCard {{ background: #202627; border: 1px solid rgba(255,255,255,35);
@@ -420,6 +420,9 @@ class OutlinedLineEdit(QLineEdit):
         self.setObjectName("OutlinedField")
         self.setAccessibleName(label)
         self.setToolTip(label)
+        # The outline is drawn below so the floating label can cut a real gap
+        # in the top edge, matching Material's OutlinedTextField behavior.
+        self.setFrame(False)
         self.setMinimumHeight(48)
 
         self._label_animation = QVariantAnimation(self)
@@ -467,40 +470,121 @@ class OutlinedLineEdit(QLineEdit):
         super().showEvent(event)
         self._sync_label_state(animate=False)
 
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        progress = self._label_progress
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
 
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+    def _label_geometry(self, progress: float):
         font = QFont(self.font())
         font.setPixelSize(round(13 - 3 * progress))
-        painter.setFont(font)
-        metrics = painter.fontMetrics()
-        available = max(16, self.width() - 24)
+        metrics = QFontMetrics(font)
+        label_x = 12.0 + 4.0 * progress
+        available = max(16, self.width() - round(label_x) - 12)
         while metrics.horizontalAdvance(self._label_text) > available \
                 and font.pixelSize() > 10:
             font.setPixelSize(font.pixelSize() - 1)
-            painter.setFont(font)
-            metrics = painter.fontMetrics()
+            metrics = QFontMetrics(font)
         label = metrics.elidedText(self._label_text, Qt.ElideRight, available)
         label_width = min(available, metrics.horizontalAdvance(label))
+        # ``horizontalAdvance`` includes bearings and trailing whitespace.
+        # Use the actual ink bounds for the notch so the border resumes right
+        # after the rendered label rather than after the whole text layout box.
+        ink = metrics.tightBoundingRect(label)
+        ink_left = float(ink.left())
+        ink_width = float(max(0, ink.width()))
+        if ink_width <= 0.0:
+            ink_left = 0.0
+            ink_width = float(label_width)
         label_height = metrics.height() + 2
         resting_y = (self.height() - label_height) / 2
         label_y = resting_y * (1.0 - progress)
-        label_x = 12.0 - 2.0 * progress
+        return (font, label, label_width, label_height, label_x, label_y,
+                available, ink_left, ink_width)
 
+    def _outline_path(self, gap_start: float | None = None,
+                      gap_end: float | None = None,
+                      top_offset: float = 0.0) -> QPainterPath:
+        """Build a rounded outline, optionally leaving a top-label notch."""
+        offset = max(0.0, min(float(top_offset), max(0.0, self.height() - 2.0)))
+        rect = QRectF(0.5, 0.5 + offset, max(1.0, self.width() - 1.0),
+                      max(1.0, self.height() - 1.0 - offset))
+        radius = min(8.0, rect.height() / 2.0)
+        left, top = rect.left(), rect.top()
+        right, bottom = rect.right(), rect.bottom()
+        path = QPainterPath()
+        path.moveTo(left + radius, top)
+
+        top_left = left + radius
+        top_right = right - radius
+        has_gap = not (gap_start is None or gap_end is None
+                       or gap_end <= top_left or gap_start >= top_right)
+        if not has_gap:
+            path.lineTo(top_right, top)
+        else:
+            gap_start = max(top_left, gap_start)
+            gap_end = min(top_right, gap_end)
+            path.lineTo(gap_start, top)
+            path.moveTo(gap_end, top)
+            path.lineTo(top_right, top)
+
+        path.arcTo(QRectF(right - 2 * radius, top,
+                          2 * radius, 2 * radius), 90, -90)
+        path.lineTo(right, bottom - radius)
+        path.arcTo(QRectF(right - 2 * radius, bottom - 2 * radius,
+                          2 * radius, 2 * radius), 0, -90)
+        path.lineTo(left + radius, bottom)
+        path.arcTo(QRectF(left, bottom - 2 * radius,
+                          2 * radius, 2 * radius), 270, -90)
+        path.lineTo(left, top + radius)
+        path.arcTo(QRectF(left, top, 2 * radius, 2 * radius), 180, -90)
+        # With a notch the outline intentionally consists of two open top
+        # segments; closing the path would draw a line straight through it.
+        if not has_gap:
+            path.closeSubpath()
+        return path
+
+    def _outline_color(self) -> QColor:
+        if not self.isEnabled():
+            return QColor(255, 255, 255, 24)
+        if self.hasFocus():
+            return QColor(_TEAL)
+        if self.underMouse():
+            return QColor(255, 255, 255, 62)
+        return QColor(255, 255, 255, 38)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        progress = max(0.0, min(1.0, self._label_progress))
+        (font, label, label_width, label_height, label_x, label_y,
+         available, ink_left, ink_width) = self._label_geometry(progress)
+
+        gap_start = gap_end = None
         if progress > 0.02:
-            if self.isReadOnly():
-                fill = QColor("#0D1112")
-            elif self.hasFocus():
-                fill = QColor("#06090A")
-            else:
-                fill = QColor("#080B0C")
-            patch = QRectF(label_x - 4, max(0.0, label_y - 1),
-                           label_width + 8, label_height + 2)
-            painter.fillRect(patch, fill)
+            full_start = label_x + ink_left - 4.0
+            full_end = full_start + ink_width + 8.0
+            center = (full_start + full_end) / 2.0
+            gap_width = (full_end - full_start) * progress
+            gap_start = center - gap_width / 2.0
+            gap_end = center + gap_width / 2.0
 
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        painter.setPen(QPen(self._outline_color(), 1.0,
+                            Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setBrush(Qt.NoBrush)
+        # Material aligns the outline with the floating label's vertical
+        # center.  Deriving this from the rendered font keeps Windows and
+        # macOS metrics aligned instead of relying on a fixed pixel offset.
+        top_offset = (label_y + label_height / 2.0) * progress
+        painter.drawPath(self._outline_path(gap_start, gap_end,
+                                            top_offset=top_offset))
+
+        painter.setFont(font)
         painter.setPen(QColor(_TEAL_BRIGHT if self.hasFocus() else _TEXT_DIM))
         painter.drawText(QRectF(label_x, label_y, available, label_height),
                          Qt.AlignLeft | Qt.AlignVCenter, label)
