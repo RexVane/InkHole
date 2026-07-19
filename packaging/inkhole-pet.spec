@@ -20,8 +20,8 @@
   - zeroconf 提供 mDNS 局域网设备发现(P2P 模式核心依赖),已列入 hiddenimports。
   - cryptography 提供端到端加密(--secret),由 PyInstaller 钩子自动收集。
   - console=False:GUI 程序不弹黑窗/终端。
-  - macOS 上 pet.py 会尝试 import AppKit(pyobjc)实现"挂件常驻所有桌面";
-    未装 pyobjc 时自动跳过,功能不受影响。需要该效果时:pip install pyobjc-framework-Cocoa
+  - macOS 上 AppKit(pyobjc)提供原生文件/文件夹混选面板与挂件常驻所有桌面;
+    未装时选择器回退 Qt 版本,Spaces 增强自动跳过。
 """
 import os
 import sys
@@ -34,6 +34,13 @@ ICON_ICNS = os.path.join(PROJ, "assets", "inkhole.icns")
 APP_ICON = ICON_ICNS if sys.platform == "darwin" else ICON_ICO
 
 datas = [(QML, "inkhole")]
+hiddenimports = [
+    "inkhole.p2p", "inkhole.branding",
+    "zeroconf", "psutil",
+]
+if sys.platform == "darwin":
+    # AppKit provides the native mixed file/folder NSOpenPanel on macOS.
+    hiddenimports.extend(["AppKit", "Foundation"])
 
 # 排除明显用不到的重型 Qt 模块，降低发布包体积
 excluded = [
@@ -51,10 +58,7 @@ a = Analysis(
     pathex=[SRC],
     binaries=[],
     datas=datas,
-    hiddenimports=[
-        "inkhole.p2p", "inkhole.branding",
-        "zeroconf", "psutil",
-    ],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -181,9 +181,9 @@ QToolTip {{ color: {_TEXT}; background: #252B2C; border: 1px solid {_EDGE};
             padding: 5px 7px; }}
 """
 
-# The mixed file/folder picker must use Qt's non-native QFileDialog.  Give it
-# an isolated system-palette theme so the main window's dark QSS cannot leave
-# a transparent light macOS window with light text on top.
+# Qt fallback for platforms without a native mixed file/folder picker. Give it
+# an isolated system-palette theme so the main window's dark QSS cannot leave a
+# transparent light window with light text on top.
 _FILE_DIALOG_QSS = """
 QFileDialog {
     background-color: palette(window);
@@ -815,15 +815,73 @@ class AndroidStyleDialog(QDialog):
         super().mousePressEvent(event)
 
 
+def _send_start_directory(start_dir: str | None) -> str:
+    if not start_dir or not os.path.isdir(start_dir):
+        start_dir = QStandardPaths.writableLocation(
+            QStandardPaths.DesktopLocation)
+    if not start_dir or not os.path.isdir(start_dir):
+        start_dir = os.path.expanduser("~")
+    return start_dir
+
+
+def _use_macos_native_send_panel() -> bool:
+    """Use AppKit only under the real Cocoa plugin, never in offscreen tests."""
+    return sys.platform == "darwin" and QApplication.platformName() == "cocoa"
+
+
+def _pick_macos_send_paths(
+        start_dir: str | None) -> tuple[list[str], str] | None:
+    """Open a native macOS panel that accepts files and directories together.
+
+    None means AppKit is unavailable and the caller should use the Qt fallback;
+    an empty path list means the user cancelled the native panel.
+    """
+    try:
+        import AppKit
+        from Foundation import NSURL
+    except ImportError:
+        return None
+
+    start_dir = _send_start_directory(start_dir)
+    try:
+        panel = AppKit.NSOpenPanel.openPanel()
+        panel.setTitle_("选择发送内容")
+        panel.setPrompt_("发送")
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(True)
+        panel.setResolvesAliases_(True)
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(start_dir))
+
+        response = panel.runModal()
+        directory_url = panel.directoryURL()
+        current_dir = (str(directory_url.path())
+                       if directory_url is not None else start_dir)
+        accepted = getattr(AppKit, "NSModalResponseOK",
+                           getattr(AppKit, "NSOKButton", 1))
+        if response != accepted:
+            return [], current_dir
+
+        chosen: list[str] = []
+        for url in panel.URLs():
+            raw_path = url.path()
+            if raw_path is None:
+                continue
+            path = os.path.normpath(str(raw_path))
+            if os.path.exists(path) and path not in chosen:
+                chosen.append(path)
+        return chosen, current_dir
+    except Exception:
+        # PyObjC is optional in source environments. Keep the Qt fallback usable
+        # if AppKit cannot create a panel for any reason.
+        return None
+
+
 class SendContentDialog(QFileDialog):
-    """Qt picker whose Send action accepts files and directories together."""
+    """Qt fallback whose Send action accepts files and directories together."""
 
     def __init__(self, parent=None, start_dir: str | None = None):
-        if not start_dir or not os.path.isdir(start_dir):
-            start_dir = QStandardPaths.writableLocation(
-                QStandardPaths.DesktopLocation)
-        if not start_dir or not os.path.isdir(start_dir):
-            start_dir = os.path.expanduser("~")
+        start_dir = _send_start_directory(start_dir)
         super().__init__(parent, "选择发送内容", start_dir)
         self._chosen_paths: list[str] = []
         self.setOption(QFileDialog.DontUseNativeDialog, True)
@@ -2368,8 +2426,17 @@ class MainWindow(QWidget):
                 "还没发现设备" if not self._bridge.node.peers()
                 else "先点选一台目标设备")
             return
-        dialog = SendContentDialog(
-            self, getattr(self, "_send_dialog_dir", None))
+        start_dir = getattr(self, "_send_dialog_dir", None)
+        if _use_macos_native_send_panel():
+            native_result = _pick_macos_send_paths(start_dir)
+            if native_result is not None:
+                paths, current_dir = native_result
+                self._send_dialog_dir = current_dir
+                for path in paths:
+                    self._bridge.dropFile(path)
+                return
+
+        dialog = SendContentDialog(self, start_dir)
         if dialog.exec() != QDialog.Accepted:
             return
         self._send_dialog_dir = dialog.directory().absolutePath()

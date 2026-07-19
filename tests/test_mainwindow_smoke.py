@@ -257,6 +257,32 @@ def test_send_button_uses_one_picker_for_files_and_folders(
     assert bridge.dropped_paths == paths
 
 
+def test_send_button_uses_native_macos_picker_when_available(
+        app, monkeypatch, tmp_path):
+    import inkhole.mainwindow as mainwindow
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("content", encoding="utf-8")
+    paths = [str(file_path), str(folder)]
+    monkeypatch.setattr(mainwindow, "_use_macos_native_send_panel", lambda: True)
+    monkeypatch.setattr(
+        mainwindow, "_pick_macos_send_paths",
+        lambda _start_dir: (paths, str(tmp_path)))
+
+    def reject_qt_fallback(_self):
+        raise AssertionError("macOS should use NSOpenPanel, not QFileDialog")
+
+    monkeypatch.setattr(mainwindow.SendContentDialog, "exec", reject_qt_fallback)
+    window, bridge = _make_window(app)
+    bridge.node._selected = "peer"
+    window._send_btn.click()
+
+    assert bridge.dropped_paths == paths
+    assert window._send_dialog_dir == str(tmp_path)
+
+
 def test_settings_page_opens_and_populates(app):
     window, _ = _make_window(app)
     window._open_settings()

@@ -29,7 +29,7 @@ bash build-mac.sh
 # 产物:packaging/dist/InkHolePet.app
 ```
 
-依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。生成品牌图标时另需 `Pillow`；macOS 上「挂件常驻所有桌面」效果另需 `pyobjc-framework-Cocoa`（可选）。
+依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。生成品牌图标时另需 `Pillow`；macOS 使用 `pyobjc-framework-Cocoa` 提供原生文件/文件夹混选和「挂件常驻所有桌面」，缺少时选择器回退 Qt 版本且跳过 Spaces 增强。
 
 桌面任务栏、托盘、Windows 可执行文件和 macOS app bundle 使用同一双弧墨洞图标。修改 `src/inkhole/branding.py` 后安装 Pillow，并运行 `python packaging/generate-icons.py`，再提交 `assets/inkhole.png`、`.ico` 和 `.icns`。
 
