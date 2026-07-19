@@ -181,6 +181,126 @@ QToolTip {{ color: {_TEXT}; background: #252B2C; border: 1px solid {_EDGE};
             padding: 5px 7px; }}
 """
 
+# The mixed file/folder picker must use Qt's non-native QFileDialog.  Give it
+# an isolated system-palette theme so the main window's dark QSS cannot leave
+# a transparent light macOS window with light text on top.
+_FILE_DIALOG_QSS = """
+QFileDialog {
+    background-color: palette(window);
+    color: palette(window-text);
+}
+QFileDialog QWidget {
+    background-color: palette(window);
+    color: palette(window-text);
+    letter-spacing: 0px;
+}
+QFileDialog QLabel {
+    background-color: transparent;
+    color: palette(window-text);
+}
+QFileDialog QTreeView,
+QFileDialog QListView {
+    background-color: palette(base);
+    alternate-background-color: palette(alternate-base);
+    color: palette(text);
+    border: 1px solid palette(mid);
+    border-radius: 4px;
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+    outline: none;
+}
+QFileDialog QTreeView::item,
+QFileDialog QListView::item {
+    padding: 4px 3px;
+}
+QFileDialog QTreeView::item:selected,
+QFileDialog QListView::item:selected {
+    background-color: palette(highlight);
+    color: palette(highlighted-text);
+}
+QFileDialog QHeaderView,
+QFileDialog QHeaderView::section {
+    background-color: palette(button);
+    color: palette(button-text);
+    border: none;
+}
+QFileDialog QHeaderView::section {
+    border-right: 1px solid palette(mid);
+    border-bottom: 1px solid palette(mid);
+    padding: 5px 7px;
+}
+QFileDialog QLineEdit,
+QFileDialog QComboBox {
+    background-color: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
+    border-radius: 5px;
+    min-height: 24px;
+    padding: 4px 8px;
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+QFileDialog QComboBox QAbstractItemView {
+    background-color: palette(base);
+    color: palette(text);
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+QFileDialog QPushButton {
+    background-color: palette(button);
+    color: palette(button-text);
+    border: 1px solid palette(mid);
+    border-radius: 6px;
+    min-height: 26px;
+    padding: 5px 14px;
+}
+QFileDialog QPushButton:hover,
+QFileDialog QPushButton:focus {
+    border-color: palette(highlight);
+}
+QFileDialog QPushButton:disabled {
+    color: palette(mid);
+}
+QFileDialog QToolButton {
+    background-color: transparent;
+    color: palette(button-text);
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 4px;
+}
+QFileDialog QToolButton:hover {
+    background-color: palette(button);
+    border-color: palette(mid);
+}
+QFileDialog QDialogButtonBox {
+    background-color: palette(window);
+}
+QFileDialog QScrollBar:vertical {
+    background-color: palette(window);
+    width: 10px;
+    margin: 0;
+}
+QFileDialog QScrollBar:horizontal {
+    background-color: palette(window);
+    height: 10px;
+    margin: 0;
+}
+QFileDialog QScrollBar::handle {
+    background-color: palette(mid);
+    border-radius: 5px;
+    min-width: 28px;
+    min-height: 28px;
+}
+QFileDialog QScrollBar::add-line,
+QFileDialog QScrollBar::sub-line,
+QFileDialog QScrollBar::add-page,
+QFileDialog QScrollBar::sub-page {
+    width: 0;
+    height: 0;
+    background: transparent;
+}
+"""
+
 
 # ---------- Windows 原生磨砂 ----------
 def _enable_backdrop(hwnd: int) -> bool:
@@ -707,6 +827,12 @@ class SendContentDialog(QFileDialog):
         super().__init__(parent, "选择发送内容", start_dir)
         self._chosen_paths: list[str] = []
         self.setOption(QFileDialog.DontUseNativeDialog, True)
+        # QFileDialog inherits the main window's stylesheet through its parent.
+        # Reset its palette first, then explicitly theme every internal surface
+        # with system roles so both light and dark macOS appearances stay legible.
+        self.setPalette(QApplication.palette())
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(_FILE_DIALOG_QSS)
         self.setFileMode(QFileDialog.ExistingFiles)
         self.setAcceptMode(QFileDialog.AcceptOpen)
         self.setNameFilter("所有内容 (*)")

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QObject, QItemSelectionModel, Signal, Qt  # noqa: E402
+from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QBoxLayout, QDialog,
                                QDialogButtonBox, QTreeView)  # noqa: E402
 
@@ -214,6 +215,26 @@ def test_send_content_dialog_accepts_files_and_folders(app, tmp_path):
     assert dialog.result() == QDialog.Accepted
     assert set(dialog.selected_paths()) == {
         os.path.normpath(str(folder)), os.path.normpath(str(file_path))}
+
+
+def test_send_content_dialog_uses_system_palette_inside_dark_parent(app, tmp_path):
+    from inkhole.mainwindow import SendContentDialog
+
+    window, _bridge = _make_window(app)
+    dialog = SendContentDialog(window, start_dir=str(tmp_path))
+    dialog.show()
+    app.processEvents()
+
+    view = dialog.findChild(QTreeView, "treeView")
+    system_palette = app.palette()
+    dialog_palette = dialog.palette()
+    view_palette = view.palette()
+
+    assert dialog.testAttribute(Qt.WA_StyledBackground)
+    assert dialog_palette.color(QPalette.Window) == system_palette.color(QPalette.Window)
+    assert dialog_palette.color(QPalette.WindowText) == system_palette.color(QPalette.WindowText)
+    assert view_palette.color(QPalette.Base) == system_palette.color(QPalette.Base)
+    assert view_palette.color(QPalette.Text) == system_palette.color(QPalette.Text)
 
 
 def test_send_button_uses_one_picker_for_files_and_folders(
