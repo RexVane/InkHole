@@ -639,7 +639,8 @@ def main(argv=None) -> None:
         from PySide6.QtCore import QObject, Signal, Slot, QUrl, Qt
         from PySide6.QtGui import QGuiApplication
         from PySide6.QtQml import QQmlApplicationEngine
-        from .branding import make_app_icon as _make_app_icon
+        from .branding import (MACOS_ICON_SCALE,
+                               make_app_icon as _make_app_icon)
         # 托盘菜单需要 QtWidgets(QApplication/QSystemTrayIcon/QMenu);
         # 不可用时降级:仍能跑桌宠,只是没有系统托盘(见 _setup_tray 的容错)
         try:
@@ -1408,7 +1409,8 @@ def main(argv=None) -> None:
     # 有 QtWidgets 用 QApplication(支持托盘菜单),否则退回 QGuiApplication
     app = (QApplication if _HAS_WIDGETS else QGuiApplication)(sys.argv)
     app.setApplicationName("墨洞")
-    app.setWindowIcon(_make_app_icon())          # Dock/任务栏：墨黑底青环墨洞
+    app_icon_scale = MACOS_ICON_SCALE if sys.platform == "darwin" else 1.0
+    app.setWindowIcon(_make_app_icon(app_icon_scale))
     app.setQuitOnLastWindowClosed(False)         # 关挂件窗口不退出(托盘还在),仅菜单"退出"才退
     bridge = Bridge(cfg)
     engine = QQmlApplicationEngine()

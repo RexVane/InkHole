@@ -93,45 +93,38 @@ a.binaries = TOC([e for e in a.binaries if _keep(e[0])])
 a.datas = TOC([e for e in a.datas if _keep(e[0])])
 
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    name="InkHolePet",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=True,
-    upx=False,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=APP_ICON,
-)
-
-# Windows: onedir 模式——产物是文件夹，不解压到 %TEMP%，绕开 Defender 拦截
-# macOS:   保持 onefile EXE + BUNDLE，.app 本身就是目录格式，不存在 Defender 问题
+# 两个平台都使用 onedir。macOS 若把 onefile EXE 直接放进 BUNDLE，PyInstaller
+# 会同时运行负责解包的父进程和真正的 Qt 子进程；LaunchServices 会把两者都
+# 注册成前台 App，导致一次启动出现两个 Dock 图标。
 if sys.platform == "darwin":
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="InkHolePet",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+        icon=ICON_ICNS,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="InkHolePet",
+    )
     app = BUNDLE(
-        EXE(
-            pyz,
-            a.scripts,
-            a.binaries,
-            a.datas,
-            [],
-            name="InkHolePet",
-            debug=False,
-            strip=False,
-            upx=False,
-            console=False,
-            argv_emulation=False,
-            target_arch=None,
-            codesign_identity=None,
-            entitlements_file=None,
-            icon=ICON_ICNS,
-        ),
+        coll,
         name="InkHolePet.app",
         icon=ICON_ICNS,
         bundle_identifier="com.rexvane.inkhole-pet",
@@ -143,6 +136,23 @@ if sys.platform == "darwin":
         },
     )
 else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        name="InkHolePet",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=True,
+        upx=False,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+        icon=APP_ICON,
+    )
     coll = COLLECT(
         exe,
         a.binaries,

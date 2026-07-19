@@ -9,6 +9,7 @@ from PySide6.QtGui import (QColor, QIcon, QLinearGradient, QPainter, QPen,
 
 TEAL = QColor(90, 216, 192)
 AMBER = QColor(233, 189, 114)
+MACOS_ICON_SCALE = 0.80
 
 
 def paint_brand_mark(painter: QPainter, rect: QRectF) -> None:
@@ -41,31 +42,40 @@ def paint_brand_mark(painter: QPainter, rect: QRectF) -> None:
     painter.restore()
 
 
-def app_icon_pixmap(size: int) -> QPixmap:
-    """Render the brand mark on the dark rounded desktop app tile."""
+def app_icon_pixmap(size: int, canvas_scale: float = 1.0) -> QPixmap:
+    """Render the brand mark on the dark rounded desktop app tile.
+
+    ``canvas_scale`` leaves transparent space around the whole tile. macOS
+    app icons use its safe area instead of filling the complete ICNS canvas.
+    """
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing, True)
-    bounds = QRectF(0.5, 0.5, size - 1.0, size - 1.0)
-    corner = size * 0.22
+    scale = max(0.1, min(1.0, float(canvas_scale)))
+    tile_size = size * scale
+    canvas_inset = (size - tile_size) / 2.0
+    bounds = QRectF(canvas_inset + 0.5, canvas_inset + 0.5,
+                    tile_size - 1.0, tile_size - 1.0)
+    corner = tile_size * 0.22
     tile = QLinearGradient(bounds.topLeft(), bounds.bottomRight())
     tile.setColorAt(0.0, QColor(20, 27, 28))
     tile.setColorAt(1.0, QColor(7, 10, 11))
     painter.setBrush(tile)
-    painter.setPen(QPen(QColor(255, 255, 255, 26), max(1.0, size / 256.0)))
+    painter.setPen(QPen(QColor(255, 255, 255, 26),
+                        max(1.0, tile_size / 256.0)))
     painter.drawRoundedRect(bounds, corner, corner)
 
-    inset = size * 0.06
+    inset = tile_size * 0.06
     paint_brand_mark(painter, bounds.adjusted(inset, inset, -inset, -inset))
     painter.end()
     return pixmap
 
 
-def make_app_icon() -> QIcon:
+def make_app_icon(canvas_scale: float = 1.0) -> QIcon:
     """Build a multi-resolution icon for Windows, macOS and system trays."""
     icon = QIcon()
     for size in (16, 24, 32, 48, 64, 128, 256, 512, 1024):
-        icon.addPixmap(app_icon_pixmap(size))
+        icon.addPixmap(app_icon_pixmap(size, canvas_scale))
     return icon

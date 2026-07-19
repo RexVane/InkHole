@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# macOS 上构建墨洞桌宠.app(单文件 onefile -> .app 包)。
+# macOS 上构建墨洞桌宠.app(标准 onedir .app 包)。
 # 用法:bash packaging/build-mac.sh
 set -euo pipefail
 cd "$(dirname "$0")"
