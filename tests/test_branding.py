@@ -1,6 +1,14 @@
-from PySide6.QtWidgets import QApplication
+import os
 
-from inkhole.branding import MACOS_ICON_SCALE, app_icon_pixmap
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+pytest.importorskip("PySide6")
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from inkhole.branding import MACOS_ICON_SCALE, app_icon_pixmap  # noqa: E402
 
 
 def test_macos_icon_uses_transparent_safe_area():
