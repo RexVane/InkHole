@@ -35,7 +35,7 @@ APP_ICON = ICON_ICNS if sys.platform == "darwin" else ICON_ICO
 
 datas = [(QML, "inkhole")]
 hiddenimports = [
-    "inkhole.p2p", "inkhole.branding",
+    "inkhole.p2p", "inkhole.branding", "inkhole.macos",
     "zeroconf", "psutil",
 ]
 if sys.platform == "darwin":
@@ -135,6 +135,9 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "墨洞桌宠",
             "CFBundleDisplayName": "墨洞桌宠",
+            "CFBundleAllowMixedLocalizations": True,
+            "CFBundleDevelopmentRegion": "zh-Hans",
+            "CFBundleLocalizations": ["zh-Hans", "en"],
             "LSUIElement": False,
             "NSHighResolutionCapable": True,
         },

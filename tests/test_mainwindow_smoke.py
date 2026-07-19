@@ -23,7 +23,8 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QObject, QItemSelectionModel, Signal, Qt  # noqa: E402
 from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QBoxLayout, QDialog,
-                               QDialogButtonBox, QTreeView)  # noqa: E402
+                               QDialogButtonBox, QFileDialog,
+                               QTreeView)  # noqa: E402
 
 from inkhole.p2p import P2PConfig  # noqa: E402
 
@@ -201,6 +202,12 @@ def test_send_content_dialog_accepts_files_and_folders(app, tmp_path):
     dialog.show()
     app.processEvents()
 
+    assert dialog.labelText(QFileDialog.LookIn) == "位置："
+    assert dialog.labelText(QFileDialog.FileName) == "文件名称："
+    assert dialog.labelText(QFileDialog.FileType) == "文件类型："
+    assert dialog.labelText(QFileDialog.Accept) == "发送"
+    assert dialog.labelText(QFileDialog.Reject) == "取消"
+
     view = dialog.findChild(QTreeView, "treeView")
     model = view.model()
     for path in (folder, file_path):
@@ -281,6 +288,25 @@ def test_send_button_uses_native_macos_picker_when_available(
 
     assert bridge.dropped_paths == paths
     assert window._send_dialog_dir == str(tmp_path)
+
+
+def test_macos_native_picker_declares_chinese_and_english_localizations():
+    from inkhole.macos import configure_bundle_localizations
+
+    info = {}
+
+    class FakeBundle:
+        @staticmethod
+        def infoDictionary():
+            return info
+
+    configure_bundle_localizations(FakeBundle())
+
+    assert info == {
+        "CFBundleAllowMixedLocalizations": True,
+        "CFBundleDevelopmentRegion": "zh-Hans",
+        "CFBundleLocalizations": ["zh-Hans", "en"],
+    }
 
 
 def test_settings_page_opens_and_populates(app):

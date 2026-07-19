@@ -633,6 +633,12 @@ X-GNOME-Autostart-enabled=true"""
 
 
 def main(argv=None) -> None:
+    # Source launches run inside Homebrew Python.app, whose English-only bundle
+    # metadata otherwise makes native macOS panels ignore the system language.
+    # This must happen before importing PySide6/QApplication initializes Cocoa.
+    from .macos import configure_bundle_localizations
+    configure_bundle_localizations()
+
     cfg, size_override = _build_config(argv)
     _install_crash_log(cfg.inbox)   # 尽早安装:之后任何崩溃/print 都安全且留痕
     try:

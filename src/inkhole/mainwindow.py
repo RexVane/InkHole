@@ -35,6 +35,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QGraphicsOpacityEffect,
                                QApplication, QBoxLayout)
 
+from .macos import configure_bundle_localizations
+
 # ---------- 设计令牌 ----------
 _TEAL = "#5AD8C0"
 _TEAL_BRIGHT = "#83E8D3"
@@ -844,6 +846,7 @@ def _pick_macos_send_paths(
 
     start_dir = _send_start_directory(start_dir)
     try:
+        configure_bundle_localizations()
         panel = AppKit.NSOpenPanel.openPanel()
         panel.setTitle_("选择发送内容")
         panel.setPrompt_("发送")
@@ -894,7 +897,11 @@ class SendContentDialog(QFileDialog):
         self.setFileMode(QFileDialog.ExistingFiles)
         self.setAcceptMode(QFileDialog.AcceptOpen)
         self.setNameFilter("所有内容 (*)")
+        self.setLabelText(QFileDialog.LookIn, "位置：")
+        self.setLabelText(QFileDialog.FileName, "文件名称：")
+        self.setLabelText(QFileDialog.FileType, "文件类型：")
         self.setLabelText(QFileDialog.Accept, "发送")
+        self.setLabelText(QFileDialog.Reject, "取消")
 
         # QFileDialog normally treats an accepted directory as navigation.
         # Keep double-click navigation, but make the explicit Send button return
