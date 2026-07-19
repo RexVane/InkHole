@@ -209,7 +209,7 @@ class MainActivity : ComponentActivity() {
                             "点击对方设备，再点击墨洞图标选择文件发送。")
                     GuideSection("跨网络",
                         "两台设备登录同一个 Tailscale 网络。在设置中配置固定监听端口，" +
-                            "然后填写对方的 Tailscale IP 和监听端口添加设备。" +
+                            "然后填写对方的 Tailscale IP 或 MagicDNS 名称及监听端口添加设备。" +
                             "添加后，发送方式与局域网相同。")
                     Text("收到的文件保存在 Download/InkHole，也可以在首页「已接收」中查看。",
                         fontSize = 12.sp,
@@ -655,7 +655,7 @@ class MainActivity : ComponentActivity() {
                         androidx.compose.foundation.text.selection.SelectionContainer {
                             Column {
                                 Text(
-                                    text = "本机：${peerName.value}-$instanceId",
+                                    text = "本机：${peerName.value}-${instanceId.take(8)}",
                                     fontSize = 12.sp,
                                     color = androidx.compose.ui.graphics.Color.Gray,
                                 )
@@ -731,7 +731,7 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(14.dp))
                         Text("跨网络配置", fontSize = 14.sp,
                             fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                        Text("跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），并填写对方 Tailscale IP 与监听端口",
+                        Text("跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），并填写对方 Tailscale IP 或 MagicDNS 名称与监听端口",
                             fontSize = 11.sp,
                             color = androidx.compose.ui.graphics.Color.Gray)
                         Spacer(Modifier.height(6.dp))
@@ -768,7 +768,7 @@ class MainActivity : ComponentActivity() {
                                         selection = androidx.compose.ui.text.TextRange(masked.length))
                                 } else tfv
                             },
-                            label = { Text("对方 Tailscale IP") },
+                            label = { Text("Tailscale IP 或 MagicDNS 名称") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
@@ -788,12 +788,19 @@ class MainActivity : ComponentActivity() {
                             val fixed = ManualPeers.normalizeHost(manualHost.text)
                             val port = manualPort.toIntOrNull()
                             if (fixed == null || port == null || port !in 1..65535) {
-                                manualError = "Tailscale IP 无效，或对方监听端口不在 1-65535 范围内"
+                                manualError = "Tailscale 地址无效，或对方监听端口不在 1-65535 范围内"
                             } else {
                                 manualError = ""
+                                val retainedIdentity = editingPeer
+                                    ?.takeIf { it.host == fixed && it.port == port }
+                                    ?.instanceId
+                                    ?: manualList.firstOrNull {
+                                        it.host == fixed && it.port == port
+                                    }?.instanceId
                                 editingPeer?.let { manualList.remove(it) }
                                 manualList.removeAll { it.host == fixed && it.port == port }
-                                manualList.add(ManualPeer(manualName.trim(), fixed, port))
+                                manualList.add(ManualPeer(
+                                    manualName.trim(), fixed, port, retainedIdentity))
                                 editingPeer = null
                                 manualName = ""
                                 manualHost = androidx.compose.ui.text.input.TextFieldValue("")
@@ -872,13 +879,12 @@ class MainActivity : ComponentActivity() {
                         } else {
                             val portVal = parsedPort ?: 0
                             val normalizedName = nameInput.trim().ifEmpty { Build.MODEL }
-                            val manualChanged = ManualPeers.load(prefs) != manualList.toList()
-                            val changed = normalizedName != peerName.value ||
+                            val persistedManual = ManualPeers.load(prefs)
+                            val nodeSettingsChanged = normalizedName != peerName.value ||
                                 secretInput != secret.value ||
                                 encryptionInput != encryptionEnabled.value ||
                                 trustedInput != trustedOnly.value ||
-                                portVal != originalPort ||
-                                manualChanged
+                                portVal != originalPort
                             peerName.value = normalizedName
                             secret.value = secretInput
                             encryptionEnabled.value = encryptionInput
@@ -890,7 +896,9 @@ class MainActivity : ComponentActivity() {
                                 .putBoolean("trusted_only", trustedInput)
                                 .putInt("listen_port", portVal)
                                 .apply()
-                            ManualPeers.save(prefs, manualList.toList())
+                            val savedManual = ManualPeers.savePreservingPinnedIdentities(
+                                prefs, manualList.toList())
+                            val changed = nodeSettingsChanged || persistedManual != savedManual
                             showSettings.value = false
                             if (changed) {
                                 // 重启前记住当前选中目标，重建后由智能保留自动选回

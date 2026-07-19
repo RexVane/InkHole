@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.EOFException
 import java.io.InterruptedIOException
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -29,14 +30,32 @@ class WHPPTest {
     }
 
     @Test
-    fun capabilityResponseAdvertisesFolderV1() {
+    fun capabilityResponseRoundTripPreservesV2Identity() {
+        val instanceId = "0123456789abcdef0123456789abcdef"
         val output = ByteArrayOutputStream()
-        WHPP.writeCapabilities(output)
-        val input = java.io.DataInputStream(ByteArrayInputStream(output.toByteArray()))
-        val magic = ByteArray(4).also(input::readFully)
-        assertTrue(magic.contentEquals(WHPP.CAP_MAGIC))
-        val body = ByteArray(input.readInt()).also(input::readFully)
-        assertTrue(String(body, Charsets.UTF_8).contains(WHPP.FOLDER_KIND))
+        WHPP.writeCapabilities(output, instanceId, "工作电脑")
+
+        val capabilities = WHPP.readCapabilities(
+            ByteArrayInputStream(output.toByteArray()))
+        assertEquals(instanceId, capabilities.instanceId)
+        assertEquals("工作电脑", capabilities.peerName)
+        assertEquals(setOf(WHPP.FOLDER_KIND), capabilities.capabilities)
+    }
+
+    @Test
+    fun capabilityResponseRejectsLegacyVersion() {
+        val body = """{"version":1,"caps":["folder-v1"]}"""
+            .toByteArray(Charsets.UTF_8)
+        val output = ByteArrayOutputStream()
+        DataOutputStream(output).apply {
+            write(WHPP.CAP_MAGIC)
+            writeInt(body.size)
+            write(body)
+        }
+
+        assertThrows(IOException::class.java) {
+            WHPP.readCapabilities(ByteArrayInputStream(output.toByteArray()))
+        }
     }
 
     @Test

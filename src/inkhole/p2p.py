@@ -11,7 +11,7 @@ p2p.py
 协议 (WHPP - InkHole P2P Protocol)：
   [4B magic "WHPP"] [4B header_len] [header_len B JSON] [size B 数据]
   普通文件直接承载字节；kind=folder-v1 时承载 WHF1 目录条目流。
-  WHPC 独立连接用于能力探测，旧客户端自动回退 ZIP。
+  WHPC v2 独立连接用于身份和能力探测。
 
 使用：
   node = P2PNode(P2PConfig(inbox="~/inkhole"),
@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import ipaddress
 import shutil
 import socket
 import stat
@@ -45,6 +46,7 @@ from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
 _SERVICE_TYPE = "_inkhole._tcp.local."
 _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
 _CAP_MAGIC = b"WHPC"      # capability probe; kept separate from file frames
+_CAP_VERSION = 2
 _FOLDER_MAGIC = b"WHF1"   # streamed folder payload magic
 _FOLDER_KIND = "folder-v1"
 _FOLDER_ENTRY = struct.Struct("!BIQQ")  # type, path bytes, file size, mtime ms
@@ -77,10 +79,45 @@ _WINDOWS_RESERVED = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+_VIRTUAL_INTERFACE_KEYWORDS = (
+    "vmware", "virtualbox", "vbox", "hyper-v", "vethernet",
+    "docker", "vmmem", "wsl",
+)
 
 
 class _SendCancelled(Exception):
     pass
+
+
+class _IdentityMismatch(OSError):
+    pass
+
+
+class _TailnetUnavailable(OSError):
+    pass
+
+
+@dataclass(frozen=True)
+class _ResolvedEndpoint:
+    family: int
+    socktype: int
+    proto: int
+    sockaddr: tuple
+    address: str
+
+    @property
+    def is_tailnet(self) -> bool:
+        return _is_tailnet_ip(self.address)
+
+
+@dataclass(frozen=True)
+class _ProbeResult:
+    instance_id: str
+    peer_name: str
+    capabilities: frozenset[str]
+    connected_address: str
 
 
 def _tune_transfer_socket(sock: socket.socket) -> None:
@@ -94,32 +131,77 @@ def _tune_transfer_socket(sock: socket.socket) -> None:
             pass
 
 
-def _is_cgnat_ip(host: str) -> bool:
-    """100.64.0.0/10(运营商 CGNAT 段,Tailscale 用它分配虚拟 IP)。"""
-    parts = host.split(".")
-    if len(parts) != 4:
-        return False
+def _plain_ip(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse a numeric address while tolerating an IPv6 scope suffix."""
     try:
-        a, b = int(parts[0]), int(parts[1])
+        return ipaddress.ip_address(str(raw).split("%", 1)[0])
     except ValueError:
-        return False
-    return a == 100 and 64 <= b <= 127
+        return None
 
 
-def _cgnat_source_ip() -> str | None:
-    """本机 Tailscale 接口的 100.x 地址;Tailscale 不在线返回 None。"""
+def _is_tailnet_ip(host: str) -> bool:
+    address = _plain_ip(host)
+    return bool(address and (address in _TAILNET_V4 or address in _TAILNET_V6))
+
+
+def _is_cgnat_ip(host: str) -> bool:
+    """Backward-compatible IPv4 helper retained for callers and tests."""
+    address = _plain_ip(host)
+    return bool(isinstance(address, ipaddress.IPv4Address)
+                and address in _TAILNET_V4)
+
+
+def _valid_instance_id(value: object) -> bool:
+    text = str(value or "")
+    return len(text) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in text)
+
+
+def _resolve_endpoints(host: str, port: int) -> list[_ResolvedEndpoint]:
+    endpoints: list[_ResolvedEndpoint] = []
+    seen: set[tuple[int, str]] = set()
+    for af, socktype, proto, _canon, sockaddr in socket.getaddrinfo(
+            host, port, 0, socket.SOCK_STREAM):
+        address = str(sockaddr[0]).split("%", 1)[0]
+        key = (af, address)
+        if key in seen:
+            continue
+        seen.add(key)
+        endpoints.append(_ResolvedEndpoint(
+            af, socktype, proto, sockaddr, address))
+    # A directly routed/LAN endpoint wins over a Tailnet path when both exist.
+    return sorted(endpoints, key=lambda endpoint: endpoint.is_tailnet)
+
+
+def _resolved_addresses(hosts: list[str]) -> list[str]:
+    addresses: list[str] = []
+    for host in hosts:
+        try:
+            endpoints = _resolve_endpoints(host, 0)
+        except (socket.gaierror, OSError):
+            continue
+        for endpoint in endpoints:
+            if endpoint.address not in addresses:
+                addresses.append(endpoint.address)
+    return addresses
+
+
+def _tailnet_source_ip(family: int = socket.AF_INET) -> str | None:
+    """Return a local Tailnet address matching the destination family."""
     try:
         import psutil
-        for addrs in psutil.net_if_addrs().values():
+        interfaces = list(psutil.net_if_addrs().items())
+        # Prefer an explicitly named Tailscale adapter when the platform exposes one.
+        interfaces.sort(key=lambda item: 0 if "tailscale" in item[0].lower() else 1)
+        for _iface, addrs in interfaces:
             for addr in addrs:
-                if addr.family == socket.AF_INET and _is_cgnat_ip(addr.address):
-                    return addr.address
+                if addr.family == family and _is_tailnet_ip(addr.address):
+                    return str(addr.address).split("%", 1)[0]
     except ImportError:
         try:
             for *_ignored, sockaddr in socket.getaddrinfo(
-                    socket.gethostname(), None, socket.AF_INET):
-                if _is_cgnat_ip(sockaddr[0]):
-                    return sockaddr[0]
+                    socket.gethostname(), None, family):
+                if _is_tailnet_ip(sockaddr[0]):
+                    return str(sockaddr[0]).split("%", 1)[0]
         except (socket.gaierror, OSError):
             pass
     except OSError:
@@ -127,38 +209,38 @@ def _cgnat_source_ip() -> str | None:
     return None
 
 
+def _cgnat_source_ip() -> str | None:
+    """Backward-compatible name for the local Tailnet IPv4 address."""
+    return _tailnet_source_ip(socket.AF_INET)
+
+
 def _probe_connect(host: str, port: int, timeout: float) -> None:
-    """探活连接(连上即断,失败抛 OSError)。100.x(Tailscale)目标强制从
-    本机 Tailscale 接口出发,接口不在线直接判不可达——否则 connect 按
-    默认路由泄漏(被代理 TUN 假 accept / 进运营商 CGNAT),对端明明下线
-    探活却一直"成功",设备永远赖在列表里。"""
-    if _is_cgnat_ip(host):
-        src = _cgnat_source_ip()
-        if src is None:
-            raise OSError("Tailscale 接口不在线")
-        socket.create_connection((host, port), timeout=timeout,
-                                 source_address=(src, 0)).close()
-    else:
-        socket.create_connection((host, port), timeout=timeout).close()
+    """Compatibility wrapper: only a valid WHPC v2 response counts as alive."""
+    _probe_peer(host, port, timeout)
 
 
 def _connect_transfer_socket(host: str, port: int, timeout: float) -> socket.socket:
-    """按传输要求建立发送连接(缓冲在 connect 前设置，见 _tune_transfer_socket)。"""
+    """Resolve first, then bind Tailnet endpoints before connecting."""
     err: OSError | None = None
-    for af, socktype, proto, _c, sa in socket.getaddrinfo(
-            host, port, 0, socket.SOCK_STREAM):
+    try:
+        endpoints = _resolve_endpoints(host, port)
+    except socket.gaierror as exc:
+        raise OSError(f"无法解析地址 {host}") from exc
+    for endpoint in endpoints:
         sock = None
         try:
-            sock = socket.socket(af, socktype, proto)
+            sock = socket.socket(endpoint.family, endpoint.socktype, endpoint.proto)
             _tune_transfer_socket(sock)
-            # Tailscale 目标必须从 Tailscale 接口出发(见 _probe_connect)
-            if af == socket.AF_INET and _is_cgnat_ip(sa[0]):
-                src = _cgnat_source_ip()
+            if endpoint.is_tailnet:
+                src = _tailnet_source_ip(endpoint.family)
                 if src is None:
-                    raise OSError("Tailscale 接口不在线")
-                sock.bind((src, 0))
+                    raise _TailnetUnavailable("Tailscale 接口不在线")
+                if endpoint.family == socket.AF_INET6:
+                    sock.bind((src, 0, 0, 0))
+                else:
+                    sock.bind((src, 0))
             sock.settimeout(timeout)
-            sock.connect(sa)
+            sock.connect(endpoint.sockaddr)
             return sock
         except OSError as e:
             err = e
@@ -170,6 +252,47 @@ def _connect_transfer_socket(host: str, port: int, timeout: float) -> socket.soc
     raise err if err is not None else OSError(f"无法解析地址 {host}")
 
 
+def _probe_peer(host: str, port: int, timeout: float,
+                expected_instance_id: str = "") -> _ProbeResult:
+    sock = _connect_transfer_socket(host, port, timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(_CAP_MAGIC)
+        if _recv_exact(sock, 4) != _CAP_MAGIC:
+            raise OSError("目标不是新版墨洞设备")
+        size_bytes = _recv_exact(sock, 4)
+        if size_bytes is None:
+            raise OSError("WHPC 响应不完整")
+        body_size = struct.unpack("!I", size_bytes)[0]
+        if not 0 < body_size <= _MAX_HEADER:
+            raise OSError("WHPC 响应大小非法")
+        body = _recv_exact(sock, body_size)
+        if body is None:
+            raise OSError("WHPC 响应不完整")
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise OSError("WHPC 响应格式非法") from exc
+        instance_id = str(decoded.get("instance_id", "")).lower()
+        peer_name = str(decoded.get("peer_name", "")).strip()
+        caps = decoded.get("caps")
+        if (decoded.get("version") != _CAP_VERSION
+                or not _valid_instance_id(instance_id)
+                or not peer_name
+                or not isinstance(caps, list)
+                or any(not isinstance(cap, str) for cap in caps)):
+            raise OSError("目标不支持 WHPC v2")
+        if expected_instance_id and instance_id != expected_instance_id.lower():
+            raise _IdentityMismatch("设备身份已变化，请删除后重新添加")
+        connected = str(sock.getpeername()[0]).split("%", 1)[0]
+        return _ProbeResult(instance_id, peer_name, frozenset(caps), connected)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 # ---------- 配置 ----------
 @dataclass
 class P2PConfig:
@@ -179,9 +302,9 @@ class P2PConfig:
     secret: str = ""               # 保存的端到端加密口令(实际是否使用由 encryption_enabled 决定)
     enable_mdns: bool = True       # False = 只起 TCP 不碰 mDNS(测试用，手动注册对端)
     trusted_only: bool = False     # True = 只接受当前选中目标设备的连接，其余拒收
-    instance_id: str = ""          # 本机唯一实例 ID；持久化后同一设备重启不换服务名(见 P2PNode)
+    instance_id: str = ""          # 32 位本机唯一实例 ID；服务名只使用 8 位短后缀
     # 手动添加的设备(Tailscale/固定 IP 直连用)：mDNS 组播不穿虚拟网卡,
-    # 这些设备靠探测线程维持在线状态。元素: {"name": str, "host": str, "port": int}
+    # 这些设备靠探测线程维持在线状态。可选 instance_id 为首次信任绑定。
     manual_peers: list = field(default_factory=list)
     # None = 按旧配置兼容:有口令即启用;显式 False 可保留口令但暂时停用加密
     encryption_enabled: bool | None = None
@@ -189,8 +312,10 @@ class P2PConfig:
     def __post_init__(self):
         if not self.peer_name:
             self.peer_name = socket.gethostname()
-        if not self.instance_id:
-            self.instance_id = uuid.uuid4().hex[:8]
+        if not _valid_instance_id(self.instance_id):
+            self.instance_id = uuid.uuid4().hex
+        else:
+            self.instance_id = self.instance_id.lower()
         self.encryption_enabled = (
             bool(self.secret) if self.encryption_enabled is None
             else bool(self.encryption_enabled))
@@ -209,10 +334,13 @@ class PeerInfo:
     hosts        全部已知地址(多网卡/VPN 场景逐个尝试连接)
     service_name mDNS 完整服务名(唯一，用于离线事件精确匹配；手动注册可为空)
     """
-    __slots__ = ("name", "host", "port", "service_name", "hosts")
+    __slots__ = ("name", "host", "port", "service_name", "hosts",
+                 "instance_id", "capabilities", "manual")
 
     def __init__(self, name: str, host: str, port: int,
-                 service_name: str = "", hosts: list[str] | None = None):
+                 service_name: str = "", hosts: list[str] | None = None,
+                 instance_id: str = "", capabilities: set[str] | frozenset[str] | None = None,
+                 manual: bool = False):
         self.name = name
         self.host = host
         self.port = port
@@ -220,27 +348,15 @@ class PeerInfo:
         self.hosts = [h for h in (hosts or []) if h]
         if host and host not in self.hosts:
             self.hosts.insert(0, host)
+        self.instance_id = instance_id.lower()
+        self.capabilities = frozenset(capabilities or ())
+        self.manual = bool(manual)
 
     def __repr__(self):
         return f"PeerInfo({self.name!r}, {self.host}:{self.port})"
 
     def __str__(self):
         return f"{self.name} ({self.host})"
-
-    @property
-    def instance_id(self) -> str:
-        """从 service_name 提取 instance_id（最后 8 位十六进制）。
-        service_name 格式：{label}-{instance_id}._inkhole._tcp.local.，无 service_name 返回空。"""
-        if self.service_name and "-" in self.service_name:
-            # service_name 格式: "V2419A-8980894b._inkhole._tcp.local."
-            # 提取 "-" 后面到 "." 之前的部分
-            part = self.service_name.rsplit("-", 1)[-1]
-            # 去掉 "._inkhole._tcp.local." 后缀，只保留 instance_id
-            if "." in part:
-                return part.split(".", 1)[0]
-            return part
-        return ""
-
 
 def _service_label(name: str, instance_id: str) -> str:
     """mDNS 服务实例标签：显示名 + 实例 ID 后缀，保证局域网内唯一。
@@ -251,7 +367,7 @@ def _service_label(name: str, instance_id: str) -> str:
     label = name.replace(".", "-")
     raw = label.encode("utf-8")[:40]
     label = raw.decode("utf-8", errors="ignore")
-    return f"{label}-{instance_id}"
+    return f"{label}-{instance_id[:8]}"
 
 
 @dataclass(frozen=True)
@@ -588,7 +704,8 @@ class P2PNode:
                  on_status: Callable[[str], None] | None = None,
                  on_peers_changed: Callable[[], None] | None = None,
                  on_progress: Callable[[str, str, int, int], None] | None = None,
-                 on_transfer_end: Callable[[str, str, bool], None] | None = None):
+                 on_transfer_end: Callable[[str, str, bool], None] | None = None,
+                 on_manual_peer_verified: Callable[[], None] | None = None):
         self.cfg = cfg
         self.on_sent = on_sent
         self.on_received = on_received
@@ -596,12 +713,13 @@ class P2PNode:
         self.on_peers_changed = on_peers_changed
         self.on_progress = on_progress   # (kind:"send"/"recv", 文件名, 已传字节, 总字节)
         self.on_transfer_end = on_transfer_end  # (kind, 文件名, 是否完整完成)
+        self.on_manual_peer_verified = on_manual_peer_verified
 
         # 本节点唯一实例 ID：进服务名保证唯一(两台设备同名不再冲突)，
         # 进 TXT 属性用于"不发现自己"(比按显示名过滤可靠)。
         # 从 cfg 取(桌宠会持久化到 config.json)——同一设备重启用同一 ID，
         # 服务名不变，避免旧记录变成永不消失的"幽灵设备"。
-        self._instance_id = cfg.instance_id or uuid.uuid4().hex[:8]
+        self._instance_id = cfg.instance_id
 
         self._peers: dict[str, PeerInfo] = {}   # 显示名 -> PeerInfo
         self._lock = threading.Lock()
@@ -636,6 +754,9 @@ class P2PNode:
         self._probe_timeout = _PROBE_TIMEOUT
         self._probe_strikes = _PROBE_STRIKES
         self._probe_thread: threading.Thread | None = None
+        self._probe_wake = threading.Event()
+        self._pending_discovery_probes: dict[str, object] = {}
+        self._identity_errors: set[str] = set()
 
         if cfg.active_secret:
             try:
@@ -655,7 +776,7 @@ class P2PNode:
         # 1. 启动 TCP 监听
         try:
             self._start_tcp_server()
-        except OSError:
+        except OSError as exc:
             self._running = False
             if self._server_sock:
                 try:
@@ -664,15 +785,15 @@ class P2PNode:
                     pass
                 self._server_sock = None
             self._actual_port = 0
-            self._status("墨洞未开启：监听端口启动失败")
+            if self.cfg.listen_port:
+                self._status(
+                    f"墨洞未开启：固定监听端口 {self.cfg.listen_port} 不可用",
+                    str(exc))
+            else:
+                self._status("墨洞未开启：监听端口启动失败", str(exc))
             return
 
-        # 1.5 注册手动添加的设备(乐观加入;真离线的话探测线程 ~10s 内剔除,
-        #     回线后探测线程又会自动加回来——见 _probe_loop 末尾的兜底段)
-        for entry in list(self.cfg.manual_peers or []):
-            self._register_manual(entry)
-
-        # 2. 对端存活探测线程(mDNS goodbye 丢包/对端崩溃的兜底，见 _probe_loop)
+        # 2. 首轮立即验证手动设备；只有有效 WHPC v2 响应才会进入列表。
         self._probe_thread = threading.Thread(target=self._probe_loop, daemon=True)
         self._probe_thread.start()
 
@@ -691,11 +812,7 @@ class P2PNode:
         self._report_started()
 
     def _report_started(self) -> None:
-        if self.cfg.listen_port and self._actual_port != self.cfg.listen_port:
-            self._status(
-                f"墨洞已开启 · 端口 {self.cfg.listen_port} 被占用，当前端口 {self._actual_port}")
-        else:
-            self._status(f"墨洞已开启 · {self.cfg.peer_name}")
+        self._status(f"墨洞已开启 · {self.cfg.peer_name}")
 
     def _setup_mdns(self) -> None:
         """创建 Zeroconf 实例、注册本机服务、启动发现浏览器。
@@ -722,6 +839,7 @@ class P2PNode:
             properties={
                 b"peer_name": self.cfg.peer_name.encode("utf-8"),
                 b"instance_id": self._instance_id.encode("ascii"),
+                b"whpc": str(_CAP_VERSION).encode("ascii"),
                 b"caps": _FOLDER_KIND.encode("ascii"),
                 # 全部本机 IPv4:Android NSD 只解析出一个地址,而本机发出
                 # 连接的源 IP 可能是另一块网卡(VPN/TUN/多网卡)——对端的
@@ -761,6 +879,7 @@ class P2PNode:
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
         self._running = False
+        self._probe_wake.set()
         self.cancel_send()
         with self._mdns_lock:
             self._teardown_mdns()
@@ -810,17 +929,8 @@ class P2PNode:
         self._server_sock = make_socket()
 
         port = self.cfg.listen_port
-        # 统一交给 OS 分配(port=0)或绑定指定端口。不用手动扫端口范围——
-        # Windows 上 SO_REUSEADDR 允许多 socket 绑同一端口,手动扫描会给两个节点
-        # 分到同一个端口,导致只有一方能收到连接。
-        try:
-            self._server_sock.bind(("", port))
-        except OSError:
-            if not port:
-                raise
-            self._server_sock.close()
-            self._server_sock = make_socket()
-            self._server_sock.bind(("", 0))
+        # 固定端口是跨网配置的一部分。被占用时必须失败，不能静默换随机端口。
+        self._server_sock.bind(("", port))
 
         self._server_sock.listen(8)
         self._actual_port = self._server_sock.getsockname()[1]
@@ -851,7 +961,10 @@ class P2PNode:
             magic = _recv_exact(conn, 4)
             if magic == _CAP_MAGIC:
                 body = json.dumps(
-                    {"version": 1, "caps": [_FOLDER_KIND]},
+                    {"version": _CAP_VERSION,
+                     "caps": [_FOLDER_KIND],
+                     "instance_id": self._instance_id,
+                     "peer_name": self.cfg.peer_name},
                     separators=(",", ":"),
                 ).encode("utf-8")
                 conn.sendall(_CAP_MAGIC + struct.pack("!I", len(body)) + body)
@@ -863,7 +976,7 @@ class P2PNode:
             if self.cfg.trusted_only:
                 with self._lock:
                     sel = self._peers.get(self._selected_peer) if self._selected_peer else None
-                    allowed = set(sel.hosts) if sel else set()
+                    allowed = set(_resolved_addresses(sel.hosts)) if sel else set()
                 if addr[0] not in allowed:
                     self._status(f"已拒收 {addr[0]} 的传输（仅接收目标设备）")
                     try:
@@ -1049,37 +1162,20 @@ class P2PNode:
             return selected, self._peers.get(selected) if selected else None
 
     def _probe_peer_capabilities(self, peer: PeerInfo) -> set[str]:
-        """Actively probe capabilities so manual/Tailscale peers work without TXT."""
+        """Return cached verified capabilities, probing only injected/test peers."""
+        if peer.capabilities:
+            return set(peer.capabilities)
         hosts = sorted(peer.hosts or [peer.host],
-                       key=lambda host: 1 if _is_cgnat_ip(host) else 0)
+                       key=lambda host: 1 if _is_tailnet_ip(host) else 0)
         for host in hosts:
-            sock = None
             try:
-                sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
-                sock.settimeout(_CAP_TIMEOUT)
-                sock.sendall(_CAP_MAGIC)
-                if _recv_exact(sock, 4) != _CAP_MAGIC:
-                    return set()
-                size_bytes = _recv_exact(sock, 4)
-                if size_bytes is None:
-                    return set()
-                body_size = struct.unpack("!I", size_bytes)[0]
-                if not 0 < body_size <= _MAX_HEADER:
-                    return set()
-                body = _recv_exact(sock, body_size)
-                if body is None:
-                    return set()
-                decoded = json.loads(body.decode("utf-8"))
-                caps = decoded.get("caps", [])
-                return {str(cap) for cap in caps} if isinstance(caps, list) else set()
-            except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+                result = _probe_peer(host, peer.port, _CAP_TIMEOUT,
+                                     peer.instance_id)
+                peer.instance_id = result.instance_id
+                peer.capabilities = result.capabilities
+                return set(result.capabilities)
+            except OSError:
                 continue
-            finally:
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
         return set()
 
     def send_path(self, local_path: str,
@@ -1098,9 +1194,9 @@ class P2PNode:
         if _FOLDER_KIND in self._probe_peer_capabilities(peer):
             return self._send_folder_stream(local_path, peer, should_cancel)
 
-        # Old clients only understand a single WHPP file. Build the legacy ZIP in
-        # the queue worker (never the GUI thread), then clean it on every outcome.
-        self._status("对端版本较旧，正在兼容打包文件夹…")
+        # A peer without folder-v1 can still receive a folder as one ZIP file.
+        # Build it in the queue worker (never the GUI thread), then always clean up.
+        self._status("对端不支持文件夹流，正在打包文件夹…")
         zip_path = None
         try:
             zip_path = _zip_dir(local_path, should_cancel=should_cancel)
@@ -1161,7 +1257,7 @@ class P2PNode:
             sock = None
             last_err: OSError | None = None
             send_hosts = sorted(peer.hosts or [peer.host],
-                                key=lambda host: 1 if _is_cgnat_ip(host) else 0)
+                                key=lambda host: 1 if _is_tailnet_ip(host) else 0)
             for host in send_hosts:
                 try:
                     sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
@@ -1338,7 +1434,7 @@ class P2PNode:
             sock = None
             last_err: OSError | None = None
             send_hosts = sorted(peer.hosts or [peer.host],
-                                key=lambda h: 1 if _is_cgnat_ip(h) else 0)
+                                key=lambda h: 1 if _is_tailnet_ip(h) else 0)
             for host in send_hosts:
                 try:
                     sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
@@ -1471,7 +1567,9 @@ class P2PNode:
         self._status(f"目标: {name}" if name else "未选择目标")
 
     def _on_peer_added(self, name: str, host: str, port: int, service_name: str = "",
-                       hosts: list[str] | None = None) -> None:
+                       hosts: list[str] | None = None, instance_id: str = "",
+                       capabilities: set[str] | frozenset[str] | None = None,
+                       manual: bool = False) -> None:
         """mDNS 发现新节点时调用（由 _InkHoleListener 触发）。
 
         - 同一服务(service_name 相同)重复通告/地址变化：原地更新，不新增条目。
@@ -1484,8 +1582,12 @@ class P2PNode:
             if service_name:
                 for p in self._peers.values():
                     if p.service_name == service_name:
-                        fresh = PeerInfo(p.name, host, port, service_name, hosts)
+                        fresh = PeerInfo(p.name, host, port, service_name, hosts,
+                                         instance_id, capabilities, manual)
                         p.host, p.port, p.hosts = fresh.host, fresh.port, fresh.hosts
+                        p.instance_id = fresh.instance_id
+                        p.capabilities = fresh.capabilities
+                        p.manual = fresh.manual
                         display_name = p.name
                         updated = True
                         break
@@ -1495,7 +1597,9 @@ class P2PNode:
                 while display in self._peers and self._peers[display].service_name != service_name:
                     display = f"{name} ({n})"
                     n += 1
-                self._peers[display] = PeerInfo(display, host, port, service_name, hosts)
+                self._peers[display] = PeerInfo(
+                    display, host, port, service_name, hosts,
+                    instance_id, capabilities, manual)
                 display_name = display
 
             # 智能保留：若此设备的 service_name 匹配之前选中的，自动恢复选择
@@ -1533,6 +1637,8 @@ class P2PNode:
         显示名可能被去重加过后缀、或与服务名前缀不一致(TXT 里的 peer_name)，
         只有 service_name 能可靠对上离线事件，否则会留下永不消失的幽灵设备。
         """
+        with self._lock:
+            self._pending_discovery_probes.pop(service_name, None)
         display = None
         with self._lock:
             for n, p in self._peers.items():
@@ -1540,10 +1646,16 @@ class P2PNode:
                     display = n
                     break
         if display is None:
-            # 老版本对端/手动注册的条目：回退按服务名前缀解析显示名
+            # Directly injected/test peers may not carry a service key.
             suffix = "." + _SERVICE_TYPE
-            display = service_name[:-len(suffix)] if service_name.endswith(suffix) \
-                else service_name.split(".")[0]
+            fallback = (service_name[:-len(suffix)]
+                        if service_name.endswith(suffix)
+                        else service_name.split(".")[0])
+            with self._lock:
+                if fallback in self._peers and not self._peers[fallback].service_name:
+                    display = fallback
+        if display is None:
+            return
         self._on_peer_removed(display)
 
     # ---------- 手动设备(Tailscale/固定 IP 直连) ----------
@@ -1552,21 +1664,45 @@ class P2PNode:
         """手动设备的稳定标识,顶替 mDNS service_name 参与增删/探测去重。"""
         return f"manual|{entry['host']}|{int(entry['port'])}"
 
-    def _register_manual(self, entry: dict) -> None:
-        self._on_peer_added(str(entry.get("name") or entry["host"]),
-                            str(entry["host"]), int(entry["port"]),
-                            service_name=self._manual_key(entry))
+    def _bind_manual_identity(self, entry: dict, result: _ProbeResult) -> None:
+        pinned = str(entry.get("instance_id") or "").lower()
+        if pinned and pinned != result.instance_id:
+            raise _IdentityMismatch("设备身份已变化，请删除后重新添加")
+        if pinned:
+            return
+        entry["instance_id"] = result.instance_id
+        if self.on_manual_peer_verified:
+            try:
+                self.on_manual_peer_verified()
+            except Exception:
+                pass
+
+    def _register_manual(self, entry: dict, result: _ProbeResult) -> None:
+        configured_host = str(entry["host"])
+        addresses = _resolved_addresses([configured_host])
+        if result.connected_address not in addresses:
+            addresses.insert(0, result.connected_address)
+        self._on_peer_added(
+            str(entry.get("name") or result.peer_name or configured_host),
+            result.connected_address, int(entry["port"]),
+            service_name=self._manual_key(entry), hosts=addresses,
+            instance_id=result.instance_id, capabilities=result.capabilities,
+            manual=True)
 
     def add_manual_peer(self, name: str, host: str, port: int) -> None:
-        """新增(或更新)一台手动设备并立即注册。调用方负责持久化配置。"""
+        """新增或更新手动设备；有效 WHPC v2 响应后才进入在线列表。"""
         port = int(port)
+        existing = next((m for m in (self.cfg.manual_peers or [])
+                         if m["host"] == host and int(m["port"]) == port), None)
         entry = {"name": name, "host": host, "port": port}
+        if existing and _valid_instance_id(existing.get("instance_id")):
+            entry["instance_id"] = str(existing["instance_id"]).lower()
         self.cfg.manual_peers = [
             m for m in (self.cfg.manual_peers or [])
             if not (m["host"] == host and int(m["port"]) == port)]
         self.cfg.manual_peers.append(entry)
         if self._running:
-            self._register_manual(entry)
+            self._probe_wake.set()
 
     def remove_manual_peer(self, host: str, port: int) -> None:
         """删除手动设备:同时移出配置与在线列表。调用方负责持久化配置。"""
@@ -1575,6 +1711,7 @@ class P2PNode:
             m for m in (self.cfg.manual_peers or [])
             if not (m["host"] == host and int(m["port"]) == port)]
         key = f"manual|{host}|{port}"
+        self._identity_errors.discard(key)
         display = None
         with self._lock:
             for n, p in self._peers.items():
@@ -1583,62 +1720,121 @@ class P2PNode:
                     break
         if display is not None:
             self._on_peer_removed(display)
+        self._probe_wake.set()
+
+    def _probe_hosts(self, hosts: list[str], port: int, timeout: float,
+                     expected_instance_id: str = "") -> _ProbeResult:
+        last_error: OSError | None = None
+        tailnet_error: _TailnetUnavailable | None = None
+        for host in hosts:
+            try:
+                return _probe_peer(host, port, timeout, expected_instance_id)
+            except _IdentityMismatch:
+                raise
+            except _TailnetUnavailable as exc:
+                tailnet_error = exc
+            except OSError as exc:
+                last_error = exc
+        if tailnet_error is not None:
+            raise tailnet_error
+        raise last_error if last_error else OSError("目标设备没有可用地址")
+
+    def _verify_discovered_peer(self, name: str, hosts: list[str], port: int,
+                                service_name: str, instance_id: str) -> None:
+        """Verify mDNS metadata over WHPC before exposing a peer to the UI."""
+        if not _valid_instance_id(instance_id):
+            return
+        candidates = self._hosts_on_current_lan(hosts)
+        if not candidates:
+            return
+        token = object()
+        with self._lock:
+            if service_name in self._pending_discovery_probes:
+                return
+            self._pending_discovery_probes[service_name] = token
+
+        def worker() -> None:
+            try:
+                result = self._probe_hosts(
+                    candidates, port, self._probe_timeout, instance_id)
+                with self._lock:
+                    current = self._pending_discovery_probes.get(service_name)
+                if self._running and current is token:
+                    addresses = _resolved_addresses(candidates)
+                    if result.connected_address not in addresses:
+                        addresses.insert(0, result.connected_address)
+                    self._on_peer_added(
+                        name, result.connected_address, port, service_name,
+                        addresses, result.instance_id, result.capabilities, False)
+            except OSError:
+                pass
+            finally:
+                with self._lock:
+                    if self._pending_discovery_probes.get(service_name) is token:
+                        self._pending_discovery_probes.pop(service_name, None)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- 对端存活探测 ----------
     def _probe_loop(self) -> None:
-        """幽灵设备兜底：定期 TCP 探测已发现的对端，连不上的剔除。
-
-        mDNS 的离线通告(goodbye)走 UDP 组播，WiFi 下经常丢；对端崩溃/被
-        强杀更是根本不会发。只靠 remove_service 回调，幽灵设备要挂到 PTR
-        记录 TTL(默认 75 分钟)过期才消失。而对端进程一退监听端口就关了，
-        TCP connect 立刻失败——比等 mDNS 可靠得多。探测连上即断，接收端
-        读不到 magic 会静默丢弃这条空连接(见 _handle_connection)。
-        """
+        """WHPC v2 liveness loop for verified discovered and manual peers."""
         strikes: dict[str, int] = {}   # service_name(或显示名) -> 连续失败轮数
         while self._running:
-            time.sleep(self._probe_interval)
-            if not self._running:
-                break
             with self._lock:
-                targets = [(p.service_name or n, list(p.hosts), p.port, n)
+                targets = [(p.service_name or n, p, n)
                            for n, p in self._peers.items()]
+            manual_by_key = {
+                self._manual_key(entry): entry
+                for entry in list(self.cfg.manual_peers or [])
+            }
             seen = set()
             auto_removed = False
-            ts_ip = _cgnat_source_ip()
-            for key, hosts, port, display in targets:
+            for key, peer, display in targets:
                 seen.add(key)
-                is_manual = key.startswith("manual|")
-                # 本机 Tailscale 不在线:纯 CGNAT 地址的手动设备确定不可达,
-                # 立即剔除——确定性判断不烧 4 轮抖动容忍,关 Tailscale 后
-                # 跨网设备 5 秒内消失而不是挂半分多钟
-                if is_manual and ts_ip is None and hosts \
-                        and all(_is_cgnat_ip(h) for h in hosts):
-                    strikes.pop(key, None)
-                    self._on_peer_removed(display)
-                    continue
-                # 手动设备(Tailscale)探活给双倍超时:空闲后懒惰唤醒(打洞/DERP
-                # 建链)首次握手常超默认超时,太紧会把在线的跨网设备判死
+                entry = manual_by_key.get(key)
+                is_manual = entry is not None
+                hosts = (([str(entry["host"]), peer.host] + list(peer.hosts))
+                         if entry is not None
+                         else (self._hosts_on_current_lan(list(peer.hosts))
+                               if peer.service_name else list(peer.hosts)))
+                hosts = list(dict.fromkeys(hosts))
                 probe_timeout = (self._probe_timeout * 2
                                  if is_manual else self._probe_timeout)
-                alive = False
-                for host in hosts:
-                    try:
-                        _probe_connect(host, port, probe_timeout)
-                        alive = True
-                        break
-                    except OSError:
-                        continue
-                if alive:
+                expected = (str(entry.get("instance_id") or "")
+                            if entry is not None else peer.instance_id)
+                tailnet_unavailable = False
+                try:
+                    result = self._probe_hosts(hosts, peer.port, probe_timeout, expected)
+                    if entry is not None:
+                        self._bind_manual_identity(entry, result)
+                        addresses = _resolved_addresses([str(entry["host"])])
+                        if result.connected_address not in addresses:
+                            addresses.insert(0, result.connected_address)
+                        peer.host = result.connected_address
+                        peer.hosts = addresses
+                    peer.instance_id = result.instance_id
+                    peer.capabilities = result.capabilities
                     strikes.pop(key, None)
+                    self._identity_errors.discard(key)
                     continue
-                # 手动设备用双倍容忍:手机息屏时厂商省电会让 WiFi 短暂休眠,
-                # 探活偶发失败;阈值太急会造成"息屏就消失、亮屏又回来"的抖动
-                threshold = (self._probe_strikes * 2
-                             if key.startswith("manual|") else self._probe_strikes)
+                except _IdentityMismatch as exc:
+                    strikes.pop(key, None)
+                    report_error = key not in self._identity_errors
+                    if report_error:
+                        self._identity_errors.add(key)
+                    self._on_peer_removed(display)
+                    if report_error:
+                        self._status(f"{display} 身份验证失败", str(exc))
+                    continue
+                except OSError as exc:
+                    tailnet_unavailable = isinstance(exc, _TailnetUnavailable)
+                threshold = (1 if is_manual and tailnet_unavailable
+                             else self._probe_strikes * 2
+                             if is_manual else self._probe_strikes)
                 if strikes.get(key, 0) + 1 >= threshold:
                     strikes.pop(key, None)
                     self._on_peer_removed(display)
-                    if not key.startswith("manual|"):
+                    if not is_manual:
                         auto_removed = True
                 else:
                     strikes[key] = strikes.get(key, 0) + 1
@@ -1652,8 +1848,7 @@ class P2PNode:
                     target=lambda: self._rebuild_mdns("设备离线", announce=False),
                     daemon=True).start()
 
-            # 手动设备兜底:被判离线后不会有 mDNS 通告拉它回来,
-            # 每轮探测不在表里的手动设备,连得上就重新加入。
+            # Offline manual entries are verified before being exposed to the UI.
             with self._lock:
                 known = {p.service_name for p in self._peers.values()}
             for entry in list(self.cfg.manual_peers or []):
@@ -1663,11 +1858,23 @@ class P2PNode:
                 if key in known:
                     continue
                 try:
-                    _probe_connect(entry["host"], int(entry["port"]),
-                                   self._probe_timeout * 2)
+                    expected = str(entry.get("instance_id") or "")
+                    result = _probe_peer(str(entry["host"]), int(entry["port"]),
+                                         self._probe_timeout * 2, expected)
+                    self._bind_manual_identity(entry, result)
+                except _IdentityMismatch as exc:
+                    if key not in self._identity_errors:
+                        self._identity_errors.add(key)
+                        label = str(entry.get("name") or entry["host"])
+                        self._status(f"{label} 身份验证失败", str(exc))
+                    continue
                 except OSError:
                     continue
-                self._register_manual(entry)
+                self._identity_errors.discard(key)
+                self._register_manual(entry, result)
+
+            self._probe_wake.wait(self._probe_interval)
+            self._probe_wake.clear()
 
     # ---------- 网络变化监控 ----------
     def _net_monitor_loop(self) -> None:
@@ -1732,6 +1939,44 @@ class P2PNode:
             self._status("设备发现已重建")
 
     # ---------- 工具 ----------
+    def _local_lan_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        try:
+            import psutil
+            for iface, addrs in psutil.net_if_addrs().items():
+                if any(keyword in iface.lower()
+                       for keyword in _VIRTUAL_INTERFACE_KEYWORDS):
+                    continue
+                for addr in addrs:
+                    if addr.family not in (socket.AF_INET, socket.AF_INET6):
+                        continue
+                    raw = str(addr.address).split("%", 1)[0]
+                    parsed = _plain_ip(raw)
+                    if (parsed is None or parsed.is_loopback or parsed.is_link_local
+                            or _is_tailnet_ip(raw) or not addr.netmask):
+                        continue
+                    try:
+                        network = ipaddress.ip_network(
+                            f"{raw}/{addr.netmask}", strict=False)
+                    except ValueError:
+                        continue
+                    if network not in networks:
+                        networks.append(network)
+        except (ImportError, OSError):
+            pass
+        return networks
+
+    def _hosts_on_current_lan(self, hosts: list[str]) -> list[str]:
+        networks = self._local_lan_networks()
+        candidates: list[str] = []
+        for address in _resolved_addresses(hosts):
+            parsed = _plain_ip(address)
+            if parsed is None or parsed.is_loopback or _is_tailnet_ip(address):
+                continue
+            if not networks or any(parsed in network for network in networks):
+                candidates.append(address)
+        return candidates
+
     def _status(self, msg: str, detail: str = "") -> None:
         if detail:
             print(f"[P2P] {msg} | {detail}", flush=True)
@@ -1761,10 +2006,8 @@ class P2PNode:
         try:
             # 优先用 psutil 获取网卡详细信息，按名称过滤虚拟网卡
             import psutil
-            virtual_keywords = ("vmware", "virtualbox", "vbox", "hyper-v", "vethernet",
-                                "docker", "vmmem", "wsl")
             for iface, addrs in psutil.net_if_addrs().items():
-                if any(kw in iface.lower() for kw in virtual_keywords):
+                if any(kw in iface.lower() for kw in _VIRTUAL_INTERFACE_KEYWORDS):
                     continue  # 跳过虚拟网卡
                 for addr in addrs:
                     if addr.family == socket.AF_INET:
@@ -1815,13 +2058,11 @@ class _InkHoleListener:
             # 回退：从服务名 "MyPC._inkhole._tcp.local." 提取 "MyPC"
             peer_name = name.split(".")[0] if name else "unknown"
 
-        # 不添加自己：按实例 ID 判断(可靠)；老版本对端无 instance_id，
-        # 回退按显示名判断(与 v1.0.0 行为一致)
-        instance_id = props.get("instance_id", "")
-        if instance_id:
-            if instance_id == self._node._instance_id:
-                return
-        elif peer_name == self._node.cfg.peer_name:
+        instance_id = str(props.get("instance_id", "")).lower()
+        if (not _valid_instance_id(instance_id)
+                or str(props.get("whpc", "")) != str(_CAP_VERSION)):
+            return
+        if instance_id == self._node._instance_id:
             return
 
         addresses = info.parsed_addresses()
@@ -1835,8 +2076,8 @@ class _InkHoleListener:
             if all(a in local_ips for a in addresses):
                 return
 
-        self._node._on_peer_added(peer_name, addresses[0], info.port,
-                                  service_name=name, hosts=list(addresses))
+        self._node._verify_discovered_peer(
+            peer_name, list(addresses), info.port, name, instance_id)
 
     def add_service(self, zc, type_: str, name: str) -> None:
         self._upsert(zc, type_, name)

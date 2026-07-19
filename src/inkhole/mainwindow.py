@@ -14,6 +14,7 @@ mainwindow.py
 
 from __future__ import annotations
 import html
+import ipaddress
 import os
 import re
 import sys
@@ -394,8 +395,8 @@ def mask_manual_host_typing(text: str) -> str:
     当前段已 3 位、或再接一位就超过 255 时,自动补点开新段——
     连续输入 1001274626 会实时变成 100.127.46.26。
     """
-    if any(c.isalpha() for c in text):
-        return text   # 主机名(如 MagicDNS)不做掩码
+    if ":" in text or any(c.isalpha() for c in text):
+        return text   # IPv6 / 主机名(如 MagicDNS)不做 IPv4 掩码
     parts: list[str] = [""]
     for ch in text:
         if ch in ".。，, ":
@@ -414,7 +415,7 @@ def mask_manual_host_typing(text: str) -> str:
 def normalize_manual_host(raw: str) -> str | None:
     """手动添加设备的地址自动纠正。返回修正后的地址;非法/有歧义返回 None。
 
-    - 含字母按主机名放行(如 Tailscale MagicDNS 名),只去空白;
+    - IPv6 使用标准库校验，主机名按 DNS 标签规则校验;
     - 全角句号/逗号/空格当作分隔符(输入法常见误输);
     - 缺分隔符的数字段尝试拆分:100127.46.26 -> 100.127.46.26。
       只有全局唯一合法拆分才接受——有歧义宁可报错,绝不猜错 IP。
@@ -422,9 +423,25 @@ def normalize_manual_host(raw: str) -> str | None:
     s = (raw or "").strip()
     if not s:
         return None
+    if ":" in s:
+        if any(c.isspace() for c in s):
+            return None
+        try:
+            address = ipaddress.ip_address(s)
+        except ValueError:
+            return None
+        return str(address) if isinstance(address, ipaddress.IPv6Address) else None
     if any(c.isalpha() for c in s):
-        host = s.replace(" ", "")
-        return host or None
+        host = "".join(s.split()).rstrip(".")
+        if not host or len(host) > 253:
+            return None
+        labels = host.split(".")
+        if any(not label or len(label) > 63
+               or label.startswith("-") or label.endswith("-")
+               or any(not (char.isalnum() or char == "-") for char in label)
+               for label in labels):
+            return None
+        return host
     for sep in ("。", "，", ",", " "):
         s = s.replace(sep, ".")
     s = re.sub(r"\.+", ".", s).strip(".")
@@ -1813,7 +1830,8 @@ class MainWindow(QWidget):
             lbl.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11.5px;")
             return lbl
 
-        self._local_info_lbl = _info_line(f"本机：{cfg.peer_name}-{cfg.instance_id}")
+        self._local_info_lbl = _info_line(
+            f"本机：{cfg.peer_name}-{cfg.instance_id[:8]}")
         info_lay.addWidget(self._local_info_lbl)
         self._version_info_lbl = _info_line(f"版本：v{self._bridge.appVersion()}")
         info_lay.addWidget(self._version_info_lbl)
@@ -1824,7 +1842,8 @@ class MainWindow(QWidget):
         self._ed_name = OutlinedLineEdit("设备名称")
         self._ed_name.setMaxLength(40)
         self._ed_name.textChanged.connect(
-            lambda name: self._local_info_lbl.setText(f"本机：{name or cfg.peer_name}-{cfg.instance_id}")
+            lambda name: self._local_info_lbl.setText(
+                f"本机：{name or cfg.peer_name}-{cfg.instance_id[:8]}")
         )
         self._ed_inbox = OutlinedLineEdit("收件箱")
         self._ed_inbox.setReadOnly(True)
@@ -1889,7 +1908,7 @@ class MainWindow(QWidget):
         network_group, network_lay = _settings_group("跨网络配置")
         network_hint = QLabel(
             "跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），"
-            "并填写对方 Tailscale IP 与监听端口")
+            "并填写对方 Tailscale IP 或 MagicDNS 名称与监听端口")
         network_hint.setWordWrap(True)
         network_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
         network_lay.addWidget(network_hint)
@@ -1903,7 +1922,7 @@ class MainWindow(QWidget):
         manual_lay.setSpacing(8)
         self._manual_name = OutlinedLineEdit("备注（如 我的电脑，可选）")
         self._manual_name.setMinimumWidth(70)
-        self._manual_host = OutlinedLineEdit("对方 Tailscale IP")
+        self._manual_host = OutlinedLineEdit("Tailscale IP 或 MagicDNS 名称")
         self._manual_host.setMinimumWidth(90)
         self._manual_host.textEdited.connect(self._mask_manual_host)
         self._manual_port = OutlinedLineEdit("对方的监听端口")
@@ -2044,7 +2063,7 @@ class MainWindow(QWidget):
         self._cb_auto.setChecked(bool(self._ctl["is_autostart"]()))
         actual_port = (self._bridge.actualPort()
                        if hasattr(self._bridge, "actualPort") else cfg.listen_port)
-        self._local_info_lbl.setText(f"本机：{cfg.peer_name}-{cfg.instance_id}")
+        self._local_info_lbl.setText(f"本机：{cfg.peer_name}-{cfg.instance_id[:8]}")
         self._version_info_lbl.setText(f"版本：v{self._bridge.appVersion()}")
         self._port_info_lbl.setText(
             f"端口：{actual_port if actual_port else '未启动'}（建议自定义 1024-49151 固定端口）")
@@ -2090,7 +2109,7 @@ class MainWindow(QWidget):
             "窗口或墨洞图标。</p>"
             "<p style='margin:0 0 4px 0;'><b>跨网络</b></p>"
             "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备登录同一个 Tailscale 网络。"
-            "在设置中配置固定监听端口，然后填写对方的 Tailscale IP 和监听端口添加设备。"
+            "在设置中配置固定监听端口，然后填写对方的 Tailscale IP 或 MagicDNS 名称和监听端口添加设备。"
             "添加后，发送方式与局域网相同。</p>"
             "<p style='margin:0 0 4px 0;'><b>文件位置</b></p>"
             "<p style='margin:0; color:#B2BFBC;'>收到的文件保存在设置里的收件箱目录，也可以"
@@ -2207,19 +2226,35 @@ class MainWindow(QWidget):
         host = normalize_manual_host(raw)
         if host is None or not 1 <= port <= 65535:
             self._show_notice(
-                "手动设备", "Tailscale IP 无效，或对方监听端口不在 1-65535 范围内")
+                "手动设备", "Tailscale 地址无效，或对方监听端口不在 1-65535 范围内")
             return
         if host != raw.strip():
             self._manual_host.setText(host)   # 回显修正结果,用户可见实际用的地址
             self._on_status(f"已自动修正为 {host}")
         editing = self._editing_manual_index
+        preserved_instance = ""
+        if editing is not None and 0 <= editing < len(self._manual_draft):
+            previous = self._manual_draft[editing]
+            if (str(previous.get("host")) == host
+                    and int(previous.get("port")) == port):
+                preserved_instance = str(previous.get("instance_id") or "")
+        if not preserved_instance:
+            duplicate = next((entry for index, entry in enumerate(self._manual_draft)
+                              if index != editing
+                              and str(entry.get("host")) == host
+                              and int(entry.get("port")) == port), None)
+            if duplicate is not None:
+                preserved_instance = str(duplicate.get("instance_id") or "")
         draft = [entry for index, entry in enumerate(self._manual_draft)
                  if index != editing]
         draft = [entry for entry in draft
                  if not (str(entry.get("host")) == host
                          and int(entry.get("port")) == port)]
-        draft.append({"name": self._manual_name.text().strip(),
-                      "host": host, "port": port})
+        new_entry = {"name": self._manual_name.text().strip(),
+                     "host": host, "port": port}
+        if preserved_instance:
+            new_entry["instance_id"] = preserved_instance
+        draft.append(new_entry)
         self._manual_draft = draft
         self._reset_manual_editor()
         self._refresh_manual_list()
@@ -2328,7 +2363,7 @@ class MainWindow(QWidget):
         if peer.service_name.startswith("manual|"):
             subline = f"{peer.host}:{peer.port}"
         else:
-            subline = peer.instance_id or ""
+            subline = peer.instance_id[:8] if peer.instance_id else ""
         col.addWidget(name)
         if subline:
             host = QLabel(subline)

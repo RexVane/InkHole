@@ -207,7 +207,7 @@ class SendQueue:
 
     单工作线程按序发送；一批(队列清空)结束后回调 on_batch_done(成功数, 总数)，
     多文件时给用户一个聚合结果。文件与文件夹都只传原始路径，协议工作线程
-    决定采用 folder-v1 流式传输还是旧客户端 ZIP 回退，因此不会阻塞 GUI。
+    决定采用 folder-v1 流式传输还是 ZIP 回退，因此不会阻塞 GUI。
     纯标准库实现，不依赖 Qt，可单测。
     """
 
@@ -388,8 +388,12 @@ def _build_config(argv=None):
             m_port = int(m.get("port", 0))
             m_name = str(m.get("name", "")).strip()
             if m_host and 1 <= m_port <= 65535:
-                manual_peers.append({"name": m_name, "host": m_host,
-                                     "port": m_port})
+                entry = {"name": m_name, "host": m_host, "port": m_port}
+                m_instance = str(m.get("instance_id") or "").lower()
+                if (len(m_instance) == 32
+                        and all(ch in "0123456789abcdef" for ch in m_instance)):
+                    entry["instance_id"] = m_instance
+                manual_peers.append(entry)
         except (TypeError, ValueError, AttributeError):
             continue   # 配置文件被手改坏的条目直接丢弃
 
@@ -398,7 +402,7 @@ def _build_config(argv=None):
                     manual_peers=manual_peers,
                     encryption_enabled=encryption_enabled)
     # 首次运行(配置里还没有 instance_id)时生成一个并落盘，之后重启复用同一 ID
-    if not saved.get("instance_id"):
+    if str(saved.get("instance_id") or "").lower() != cfg.instance_id:
         _save_config(cfg)
     if any(a is not None for a in (args.inbox, args.port, args.name, args.secret)):
         _save_config(cfg)   # 显式 CLI 参数视为用户意图，记住
@@ -685,9 +689,9 @@ def main(argv=None) -> None:
                 else:
                     selected = bridge.node.selected_peer()
                     for peer in peers:
-                        # 显示设备名-完整instance_id，确保唯一标识
+                        # 显示设备名-实例 ID 短后缀；完整 ID 仅用于协议身份校验
                         marker = "●" if peer.name == selected else "○"
-                        suffix = f"-{peer.instance_id}" if peer.instance_id else ""
+                        suffix = f"-{peer.instance_id[:8]}" if peer.instance_id else ""
                         label = f"{marker} {peer.name}{suffix}"
                         act = peer_menu.addAction(label)
                         act.setCheckable(True)
@@ -802,6 +806,7 @@ def main(argv=None) -> None:
                     kind, name, done, total),
                 on_transfer_end=lambda kind, name, completed: self._on_transfer_end(
                     kind, name, completed),
+                on_manual_peer_verified=lambda: _save_config(self._lan_cfg),
             )
 
         def _on_send_busy_changed(self, busy: bool) -> None:
@@ -941,7 +946,7 @@ def main(argv=None) -> None:
         def _route_status(self, msg: str) -> None:
             """出错信息走 persistentHint(持续显示)，普通信息走 hint(2.2s 消失)。"""
             self._last_status = msg
-            if msg and ("失败" in msg or "无法" in msg):
+            if msg and ("失败" in msg or "无法" in msg or "未开启" in msg):
                 self.errorState.emit(msg)
             else:
                 self.errorState.emit("")  # 清除之前的错误
@@ -968,7 +973,7 @@ def main(argv=None) -> None:
 
         @Slot(result=int)
         def actualPort(self) -> int:
-            """当前节点实际监听端口；固定端口被占用时也返回回退后的端口。"""
+            """当前节点实际监听端口；未启动或固定端口不可用时返回 0。"""
             try:
                 return int(self.node.actual_port)
             except Exception:
@@ -1120,6 +1125,9 @@ def main(argv=None) -> None:
         @Slot("QVariantList", result=bool)
         def setManualPeers(self, peers: list) -> bool:
             """一次提交设置页的手动设备草稿，并同步当前节点。"""
+            old = [dict(entry) for entry in (self._lan_cfg.manual_peers or [])]
+            old_by_key = {(str(entry["host"]), int(entry["port"])): entry
+                          for entry in old}
             normalized: list[dict] = []
             positions: dict[tuple[str, int], int] = {}
             try:
@@ -1130,7 +1138,16 @@ def main(argv=None) -> None:
                     if not host or " " in host or not 1 <= port <= 65535:
                         return False
                     entry = {"name": name, "host": host, "port": port}
+                    instance_id = str(raw.get("instance_id") or "").lower()
                     key = (host, port)
+                    previous_id = str(
+                        old_by_key.get(key, {}).get("instance_id") or "").lower()
+                    # Existing endpoint identities are immutable here. Trust can only
+                    # be reset by deleting the entry and adding it again.
+                    candidate_id = previous_id or instance_id
+                    if (len(candidate_id) == 32
+                            and all(ch in "0123456789abcdef" for ch in candidate_id)):
+                        entry["instance_id"] = candidate_id
                     if key in positions:
                         normalized[positions[key]] = entry
                     else:
@@ -1139,16 +1156,13 @@ def main(argv=None) -> None:
             except (AttributeError, TypeError, ValueError):
                 return False
 
-            old = [dict(entry) for entry in (self._lan_cfg.manual_peers or [])]
             if old == normalized:
                 return True
-            old_by_key = {(str(entry["host"]), int(entry["port"])): entry
-                          for entry in old}
             new_by_key = {(entry["host"], entry["port"]): entry
                           for entry in normalized}
             if isinstance(self.node, P2PNode):
                 for key, entry in old_by_key.items():
-                    if key not in new_by_key or new_by_key[key] != entry:
+                    if key not in new_by_key:
                         self.node.remove_manual_peer(*key)
                 for key, entry in new_by_key.items():
                     if key not in old_by_key or old_by_key[key] != entry:
@@ -1160,7 +1174,7 @@ def main(argv=None) -> None:
 
         @Slot(str, str, int, result=bool)
         def addManualPeer(self, name: str, host: str, port: int) -> bool:
-            """添加手动设备并持久化。局域网模式下立即出现在设备列表。"""
+            """添加手动设备并持久化；验证成功后进入设备列表。"""
             host = (host or "").strip()
             name = (name or "").strip()
             try:

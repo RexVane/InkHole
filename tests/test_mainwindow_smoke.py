@@ -320,7 +320,7 @@ def test_settings_page_opens_and_populates(app):
     assert window._manual_port.text() == ""
     assert window._ed_name.labelText() == "设备名称"
     assert window._sp_port.labelText() == "本机监听端口（留空=自动，建议 1024-49151，如 41300）"
-    assert window._manual_host.labelText() == "对方 Tailscale IP"
+    assert window._manual_host.labelText() == "Tailscale IP 或 MagicDNS 名称"
     assert window._local_info_lbl.text().startswith("本机：SMOKE-")
     assert window._version_info_lbl.text() == "版本：v0.0.0"
     assert window._port_info_lbl.text() == "端口：43123（建议自定义 1024-49151 固定端口）"
@@ -431,8 +431,10 @@ def test_manual_peer_add_and_remove(app):
 def test_manual_peer_edit_and_cancel_are_non_destructive(app):
     """Editing a draft must not touch live config until main Save."""
     window, bridge = _make_window(app)
+    identity = "0123456789abcdef0123456789abcdef"
     bridge._manual = [
-        {"name": "旧备注", "host": "100.64.0.3", "port": 52130}]
+        {"name": "旧备注", "host": "100.64.0.3", "port": 52130,
+         "instance_id": identity}]
     window._open_settings()
     window._edit_manual_peer(0)
     assert bridge.manualPeers()[0]["name"] == "旧备注"
@@ -449,7 +451,8 @@ def test_manual_peer_edit_and_cancel_are_non_destructive(app):
     window._add_manual_peer()
     window._save_settings()
     assert bridge.manualPeers() == [
-        {"name": "新备注", "host": "100.64.0.3", "port": 52130}]
+        {"name": "新备注", "host": "100.64.0.3", "port": 52130,
+         "instance_id": identity}]
 
 
 def test_manual_peer_remove_is_draft_until_save(app):
@@ -473,7 +476,7 @@ def test_manual_peer_rejects_bad_input(app, monkeypatch):
     assert bridge.manualPeers() == []
     assert dialogs
     assert dialogs[-1].title_text == "手动设备"
-    assert "Tailscale IP 无效" in dialogs[-1].body_html
+    assert "Tailscale 地址无效" in dialogs[-1].body_html
 
 
 def test_explicit_zero_listen_port_is_rejected(app, monkeypatch):
@@ -619,9 +622,14 @@ def test_normalize_manual_host():
     assert fix("300.1.1.1") is None
     assert fix("1.2.3") is None      # 三段且无法拆分,补不成四段
     assert fix("") is None
+    # IPv6 使用标准解析，不进入 IPv4 自动分段
+    assert fix("fd7a:115c:a1e0::1") == "fd7a:115c:a1e0::1"
+    assert fix("2001:0:0::1") == "2001::1"
+    assert fix("fd7a:115c:a1e0::gg") is None
     # 主机名放行(Tailscale MagicDNS)
     assert fix("my-pc") == "my-pc"
     assert fix("my pc") == "mypc"
+    assert fix("https://my-pc") is None
 
 
 def test_mask_manual_host_typing():
@@ -633,6 +641,7 @@ def test_mask_manual_host_typing():
     # 全角句号/逗号即落点
     assert mask("100。127") == "100.127"
     assert mask("100，127") == "100.127"
+    assert mask("2001:0:0::1") == "2001:0:0::1"
     # 段没满不越权补点(46 之后等用户自己点或数字溢出)
     assert mask("100.127.46") == "100.127.46"
     # 段溢出自动断段:192.168.1 后打 5 并入(合法),打 999 会断

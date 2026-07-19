@@ -42,6 +42,33 @@ data class Peer(
     // 对端全部已知地址：桌面多网卡/VPN 场景发出连接的源 IP 可能不是解析到的
     // 那一个,「仅接收目标设备」按整个列表放行(来自 TXT ips / API34 hostAddresses)
     val hosts: List<String> = listOf(host),
+    val instanceId: String = "",
+    val capabilities: Set<String> = emptySet(),
+    val manual: Boolean = false,
+)
+
+private data class PeerProbeResult(
+    val instanceId: String,
+    val peerName: String,
+    val capabilities: Set<String>,
+    val connectedAddress: String,
+)
+
+private class IdentityMismatchException(message: String) : IOException(message)
+private class TailnetUnavailableException(message: String) : IOException(message)
+
+private data class ProbeOutcome(
+    val key: String,
+    val manual: Boolean,
+    val result: PeerProbeResult? = null,
+    val identityError: String? = null,
+    val tailnetUnavailable: Boolean = false,
+)
+
+private data class ManualProbeOutcome(
+    val peer: ManualPeer,
+    val result: PeerProbeResult? = null,
+    val identityError: String? = null,
 )
 
 /**
@@ -92,6 +119,7 @@ class InkHoleNode(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var nsdManager: NsdManager? = null
     private var serverSocket: ServerSocket? = null
+    private var tcpStartError: String? = null
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
     private val activeSendSocket = AtomicReference<Socket?>(null)
     private val activeSendInput = AtomicReference<InputStream?>(null)
@@ -105,14 +133,14 @@ class InkHoleNode(
     private val advertisedPeerName = ReceiveFiles.utf8Prefix(peerName, 200)
         .ifBlank { "Android" }
     private val requestedServiceName =
-        "${ReceiveFiles.utf8Prefix(advertisedPeerName.replace(".", "-"), 40)}-$instanceId"
+        "${ReceiveFiles.utf8Prefix(advertisedPeerName.replace(".", "-"), 40)}-${instanceId.take(8)}"
 
     private fun loadOrCreateInstanceId(ctx: Context): String {
         val prefs = ctx.getSharedPreferences("inkhole", Context.MODE_PRIVATE)
         prefs.getString("instance_id", null)
-            ?.takeIf { it.matches(Regex("[0-9a-fA-F]{8}")) }
+            ?.takeIf { it.matches(Regex("[0-9a-fA-F]{32}")) }
             ?.let { return it.lowercase() }
-        val id = UUID.randomUUID().toString().replace("-", "").take(8)
+        val id = UUID.randomUUID().toString().replace("-", "")
         prefs.edit().putString("instance_id", id).apply()
         return id
     }
@@ -130,8 +158,10 @@ class InkHoleNode(
     @Volatile private var registeredName: String? = null
 
     // 手动添加的设备(跨网/固定 IP 直连):没有 NSD 通告,靠探活循环维持状态
-    private val manualPeers: List<ManualPeer> =
-        ManualPeers.load(context.getSharedPreferences("inkhole", Context.MODE_PRIVATE))
+    private val manualPeers =
+        ManualPeers.load(context.getSharedPreferences("inkhole", Context.MODE_PRIVATE)).toMutableList()
+    private val manualPeersLock = Any()
+    private val identityErrors = java.util.Collections.synchronizedSet(HashSet<String>())
 
     // ---- 生命周期 ----
 
@@ -140,6 +170,17 @@ class InkHoleNode(
         running = true
         inboxDir.mkdirs()
         val tcpStarted = startTcpServer()
+        if (!tcpStarted) {
+            running = false
+            listener.onPeerChanged(emptyList())
+            val detail = tcpStartError?.takeIf { it.isNotBlank() }?.let { ": $it" }.orEmpty()
+            listener.onStatus(if (listenPort != 0) {
+                "墨洞未开启：固定监听端口 $listenPort 不可用$detail"
+            } else {
+                "墨洞未开启：监听端口启动失败$detail"
+            })
+            return
+        }
         try {
             nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
         } catch (e: Exception) {
@@ -175,14 +216,7 @@ class InkHoleNode(
         // 把当前列表主动推给 UI:服务被杀重启后 Activity 可能还挂着旧节点的
         // 设备列表,周围没有设备时不会再有 onPeerChanged 事件来纠正它。
         listener.onPeerChanged(getPeers())
-        listener.onStatus(
-            when {
-                !tcpStarted -> "墨洞未开启：监听端口启动失败"
-                listenPort != 0 && actualPort != listenPort ->
-                    "墨洞已开启 · 端口 $listenPort 被占用，当前端口 $actualPort"
-                else -> "墨洞已开启 · $peerName"
-            }
-        )
+        listener.onStatus("墨洞已开启 · $peerName")
     }
 
     /** 重启 NSD 发现(手动刷新按钮/自愈循环用)。stop 是异步的,稍等再启。 */
@@ -204,8 +238,37 @@ class InkHoleNode(
         }
     }
 
-    private fun registerManual(m: ManualPeer) {
-        addPeer(m.key, m.name.ifEmpty { m.host }, m.host, m.port)
+    private fun bindManualIdentity(m: ManualPeer, result: PeerProbeResult): ManualPeer? {
+        m.instanceId?.let { expected ->
+            if (expected != result.instanceId) {
+                throw IdentityMismatchException("设备身份已变化，请删除后重新添加")
+            }
+            return m
+        }
+        val bound = ManualPeers.pinIdentity(
+            context.getSharedPreferences("inkhole", Context.MODE_PRIVATE),
+            m,
+            result.instanceId,
+        ) ?: return null
+        if (bound.instanceId != result.instanceId) {
+            throw IdentityMismatchException("设备身份已变化，请删除后重新添加")
+        }
+        synchronized(manualPeersLock) {
+            val index = manualPeers.indexOfFirst { it.key == m.key }
+            if (index >= 0) {
+                manualPeers[index] = bound
+            }
+        }
+        return bound
+    }
+
+    private fun registerManual(m: ManualPeer, result: PeerProbeResult) {
+        val addresses = resolveHostAddresses(m.host).toMutableList()
+        if (result.connectedAddress !in addresses) addresses.add(0, result.connectedAddress)
+        addPeer(
+            m.key, m.name.ifEmpty { result.peerName }, result.connectedAddress, m.port,
+            addresses, result.instanceId, result.capabilities, manual = true,
+        )
     }
 
     /** 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留。
@@ -217,52 +280,62 @@ class InkHoleNode(
             val strikes = HashMap<String, Int>()
             while (running) {
                 // 获取当前所有已知对端的探活目标(key、hosts、port)
-                val targets = synchronized(peersLock) {
-                    peers.map { (key, peer) ->
-                        Triple(key, peer.hosts, peer.port)
-                    }
-                }
+                val targets = synchronized(peersLock) { peers.toList() }
+                val manualSnapshot = synchronized(manualPeersLock) { manualPeers.toList() }
+                val manualByKey = manualSnapshot.associateBy { it.key }
                 val lanLinks = currentLanLinks()
-                val tailscaleUp = tailscaleNetwork() != null
                 // 清理已不在列表的对端的失败计数
                 strikes.keys.retainAll(targets.map { it.first }.toSet())
 
                 // 设备级并行探活:串行时一台离线设备就按地址数×1.2s 拖慢一整轮,
                 // 多台离线时状态清理以分钟计,亮屏后旧设备迟迟不消失
-                val probed = targets.map { (key, hosts, port) ->
+                val probed = targets.map { (key, peer) ->
                     async {
-                        val isManual = key.startsWith("manual|")
-                        // 本机 Tailscale 不在线:纯 CGNAT 地址的手动设备确定不可达,
-                        // 返回 null 让外层立即剔除——确定性判断不烧 4 轮抖动容忍
-                        if (isManual && !tailscaleUp && hosts.isNotEmpty() &&
-                            hosts.all { isCgnatAddress(it) }) {
-                            return@async Triple(key, true, null as Boolean?)
+                        val manualPeer = manualByKey[key]
+                        val isManual = manualPeer != null
+                        val probeHosts = if (manualPeer != null) {
+                            (listOf(manualPeer.host, peer.host) + peer.hosts).distinct()
+                        } else {
+                            LanReachability.hostsOnCurrentLan(peer.hosts, lanLinks)
                         }
-                        // 自动发现条目必须仍可经当前 WiFi/以太网到达。Windows 通告里可能
-                        // 同时带 Tailscale 地址，不能用 VPN 兜底把已离开局域网的设备留在列表。
-                        val probeHosts = if (isManual) hosts
-                            else LanReachability.hostsOnCurrentLan(hosts, lanLinks)
                         val timeout = if (isManual) PROBE_TIMEOUT_MANUAL_MS
                             else LOST_PROBE_TIMEOUT_MS
-                        Triple(key, isManual,
-                            probeHosts.any { host -> probeAlive(host, port, timeout) } as Boolean?)
+                        val expected = manualPeer?.instanceId ?: peer.instanceId
+                        try {
+                            ProbeOutcome(key, isManual,
+                                result = probePeer(probeHosts, peer.port, timeout, expected))
+                        } catch (e: IdentityMismatchException) {
+                            ProbeOutcome(key, isManual, identityError = e.message)
+                        } catch (_: TailnetUnavailableException) {
+                            ProbeOutcome(key, isManual, tailnetUnavailable = true)
+                        } catch (_: Exception) {
+                            ProbeOutcome(key, isManual)
+                        }
                     }
                 }.awaitAll()
 
                 var autoRemovedThisRound = false
-                for ((key, isManual, alive) in probed) {
+                for (outcome in probed) {
                     if (!running) break
+                    val key = outcome.key
+                    val isManual = outcome.manual
                     val present = synchronized(peersLock) { peers.containsKey(key) }
                     if (!present) continue  // 已被其他逻辑移除,跳过
-                    if (alive == null) {
-                        // Tailscale 离线 → 跨网设备立即消失,不再挂 30 多秒
+                    if (outcome.identityError != null) {
                         strikes.remove(key)
                         removePeer(key)
+                        if (identityErrors.add(key)) {
+                            listener.onStatus("设备身份验证失败: ${outcome.identityError}")
+                        }
                         continue
                     }
-                    val threshold = if (isManual) PROBE_STRIKES_MANUAL else PROBE_STRIKES
+                    val threshold = when {
+                        isManual && outcome.tailnetUnavailable -> 1
+                        isManual -> PROBE_STRIKES_MANUAL
+                        else -> PROBE_STRIKES
+                    }
 
-                    if (!alive) {
+                    if (outcome.result == null) {
                         val s = (strikes[key] ?: 0) + 1
                         if (s >= threshold) {
                             strikes.remove(key)
@@ -273,6 +346,29 @@ class InkHoleNode(
                         }
                     } else {
                         strikes.remove(key)
+                        identityErrors.remove(key)
+                        synchronized(peersLock) {
+                            peers[key]?.let { current ->
+                                val result = outcome.result ?: return@let
+                                val addresses = if (isManual) {
+                                    val configured = manualByKey[key]
+                                    configured?.let {
+                                        resolveHostAddresses(it.host).toMutableList().apply {
+                                            if (result.connectedAddress !in this) {
+                                                add(0, result.connectedAddress)
+                                            }
+                                        }
+                                    }
+                                        ?: current.hosts
+                                } else current.hosts
+                                peers[key] = current.copy(
+                                    host = result.connectedAddress,
+                                    hosts = addresses.distinct(),
+                                    instanceId = result.instanceId,
+                                    capabilities = result.capabilities,
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -282,16 +378,43 @@ class InkHoleNode(
                 }
 
                 // 手动设备兜底:不在列表但能连上 → 加回(启动首轮的"验证后上线"同样走这里)
-                manualPeers.filter { m ->
+                manualSnapshot.filter { m ->
                     synchronized(peersLock) { !peers.containsKey(m.key) }
                 }.map { m ->
                     async {
-                        if (probeAlive(m.host, m.port, PROBE_TIMEOUT_MANUAL_MS)) m else null
+                        try {
+                            ManualProbeOutcome(
+                                m, result = probePeer(
+                                    listOf(m.host), m.port,
+                                    PROBE_TIMEOUT_MANUAL_MS, m.instanceId ?: ""))
+                        } catch (e: IdentityMismatchException) {
+                            ManualProbeOutcome(m, identityError = e.message)
+                        } catch (_: Exception) {
+                            ManualProbeOutcome(m)
+                        }
                     }
-                }.awaitAll().filterNotNull().forEach { m ->
+                }.awaitAll().forEach { outcome ->
                     if (!running) return@forEach
-                    strikes.remove(m.key)
-                    registerManual(m)
+                    val m = outcome.peer
+                    if (outcome.identityError != null) {
+                        if (identityErrors.add(m.key)) {
+                            listener.onStatus(
+                                "${m.name.ifEmpty { m.host }} 身份验证失败: ${outcome.identityError}")
+                        }
+                        return@forEach
+                    }
+                    val result = outcome.result ?: return@forEach
+                    try {
+                        val bound = bindManualIdentity(m, result) ?: return@forEach
+                        strikes.remove(m.key)
+                        identityErrors.remove(m.key)
+                        registerManual(bound, result)
+                    } catch (e: IdentityMismatchException) {
+                        if (identityErrors.add(m.key)) {
+                            listener.onStatus(
+                                "${m.name.ifEmpty { m.host }} 身份验证失败: ${e.message}")
+                        }
+                    }
                 }
 
                 // 间隔期可被 probeNow() 提前唤醒:回前台立即刷新在线状态
@@ -345,18 +468,12 @@ class InkHoleNode(
         }
 
     private fun startTcpServer(): Boolean {
+        tcpStartError = null
         val server = try {
-            try {
-                bindServer(listenPort)
-            } catch (e: IOException) {
-                if (listenPort != 0) {
-                    // 真被其他应用占用才回退自动分配(REUSEADDR 已排除自身重启的假占用)
-                    listener.onStatus("端口 $listenPort 被占用,已改用自动分配")
-                    bindServer(0)
-                } else throw e
-            }.also { actualPort = it.localPort }
+            bindServer(listenPort).also { actualPort = it.localPort }
         } catch (e: IOException) {
-            listener.onStatus("TCP 启动失败: ${e.message}")
+            actualPort = 0
+            tcpStartError = e.message
             return false
         }
         serverSocket = server
@@ -407,7 +524,7 @@ class InkHoleNode(
             // 存活探测空连接在 readMagic 处 EOF；WHPC 能力请求不进入传输流程。
             val magic = WHPP.readMagic(input)
             if (magic.contentEquals(WHPP.CAP_MAGIC)) {
-                WHPP.writeCapabilities(conn.getOutputStream())
+                WHPP.writeCapabilities(conn.getOutputStream(), instanceId, advertisedPeerName)
                 return
             }
             if (!magic.contentEquals(WHPP.MAGIC)) return
@@ -842,30 +959,20 @@ class InkHoleNode(
         val targets = (listOf(peer.host) + peer.hosts)
             .filter { it.isNotBlank() }
             .distinct()
-            .flatMap { host ->
-                try {
-                    InetAddress.getAllByName(host).mapNotNull { it.hostAddress }
-                        .ifEmpty { listOf(host) }
-                } catch (_: Exception) {
-                    listOf(host)
-                }
-            }
-            .distinct()
-            // 局域网/直连地址优先,Tailscale(100.x)殿后:同 WiFi 时对端通告里
-            // 若 100.x 排前面,先连它就会绕道 relay 把直连速度拖成几百 KB/s
-            .sortedBy { if (isCgnatAddress(it)) 1 else 0 }
-        for (host in targets) {
+            .flatMap(::resolveHostAddresses)
+            .let(TailnetAddress::order)
+        for (address in targets) {
             if (!running) throw IOException("墨洞节点已停止")
-            val socket = socketForHost(host)
+            val socket = socketForAddress(address)
             if (socket == null) {
-                lastError = IOException("Tailscale 未连接，无法到达 $host")
+                lastError = IOException("Tailscale 未连接，无法到达 $address")
                 continue
             }
             // 缓冲必须在 connect 前设置(窗口缩放在握手时协商),发送吞吐靠 sndbuf
             try { socket.sendBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
             try { socket.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
             try {
-                socket.connect(java.net.InetSocketAddress(host, peer.port), 15_000)
+                socket.connect(java.net.InetSocketAddress(address, peer.port), 15_000)
                 if (!running) {
                     socket.close()
                     throw IOException("墨洞节点已停止")
@@ -882,12 +989,7 @@ class InkHoleNode(
     private fun allowedSourceAddresses(peer: Peer): Set<String> {
         val allowed = LinkedHashSet<String>()
         for (host in listOf(peer.host) + peer.hosts) {
-            allowed.add(host)
-            try {
-                InetAddress.getAllByName(host).forEach { address ->
-                    address.hostAddress?.let { allowed.add(it) }
-                }
-            } catch (_: Exception) {}
+            allowed.addAll(resolveHostAddresses(host))
         }
         return allowed
     }
@@ -920,7 +1022,8 @@ class InkHoleNode(
     }
 
     private fun addPeer(serviceName: String, displayName: String, host: String, port: Int,
-                        hosts: List<String> = listOf(host)) {
+                        hosts: List<String> = listOf(host), instanceId: String = "",
+                        capabilities: Set<String> = emptySet(), manual: Boolean = false) {
         var added = false
         var finalName: String
         synchronized(peersLock) {
@@ -947,6 +1050,9 @@ class InkHoleNode(
                     host = host,
                     port = port,
                     hosts = hosts,
+                    instanceId = instanceId,
+                    capabilities = capabilities,
+                    manual = manual,
                 )
                 if (selectedPeer == existing.name && lastSelectedService == serviceName) {
                     selectedPeer = finalName
@@ -954,7 +1060,9 @@ class InkHoleNode(
             } else {
                 // 不同设备撞了显示名：给后来者加 " (2)" 后缀
                 finalName = uniqueName()
-                peers[serviceName] = Peer(finalName, host, port, serviceName, hosts)
+                peers[serviceName] = Peer(
+                    finalName, host, port, serviceName, hosts,
+                    instanceId, capabilities, manual)
                 added = true
             }
             // 智能保留：若此设备的 serviceName 匹配之前选中的，自动恢复选择
@@ -985,7 +1093,10 @@ class InkHoleNode(
                         ?: return@launch          // 已被别处移除，无需再探
                     val hosts = LanReachability.hostsOnCurrentLan(
                         (listOf(peer.host) + peer.hosts).distinct(), currentLanLinks())
-                    if (hosts.any { probeAlive(it, peer.port) }) return@launch  // 还活着，误报忽略
+                    try {
+                        probePeer(hosts, peer.port, LOST_PROBE_TIMEOUT_MS, peer.instanceId)
+                        return@launch  // 还活着，误报忽略
+                    } catch (_: Exception) {}
                     if (attempt < LOST_PROBE_ATTEMPTS - 1) delay(LOST_PROBE_INTERVAL_MS)
                 }
                 // 连续都失败：确认真离线
@@ -996,16 +1107,7 @@ class InkHoleNode(
         }
     }
 
-    /** CGNAT 段(100.64.0.0/10,Tailscale 分配的地址)的 IPv4 字面量。 */
-    private fun isCgnatAddress(host: String): Boolean {
-        val parts = host.split(".")
-        if (parts.size != 4) return false
-        val a = parts[0].toIntOrNull() ?: return false
-        val b = parts[1].toIntOrNull() ?: return false
-        return a == 100 && b in 64..127
-    }
-
-    /** 真正的 Tailscale 网络 = 持有 100.64/10 地址的 VPN 网络。不能只看
+    /** 真正的 Tailscale 网络 = 持有 Tailnet IPv4/IPv6 地址的 VPN 网络。不能只看
      *  TRANSPORT_VPN:Clash/Mihomo 等代理的 TUN 也是 VPN,且会对任意 TCP
      *  连接先本地假 accept——纯 connect 探活在它上面永远"成功"。 */
     private fun tailscaleNetwork(): Network? = try {
@@ -1015,19 +1117,33 @@ class InkHoleNode(
             manager.getNetworkCapabilities(network)
                 ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true &&
                 manager.getLinkProperties(network)?.linkAddresses.orEmpty().any { link ->
-                    link.address.hostAddress?.let { isCgnatAddress(it) } == true
+                    link.address.hostAddress?.let(TailnetAddress::isTailnet) == true
                 }
         }
     } catch (_: Exception) {
         null
     }
 
-    /** 为目标地址创建出站 socket。100.x(Tailscale)目标必须绑定真正的
+    private fun resolveHostAddresses(host: String): List<String> {
+        TailnetAddress.numericAddress(host)?.hostAddress?.let { return listOf(it) }
+        val addresses = LinkedHashSet<String>()
+        tailscaleNetwork()?.let { network ->
+            try {
+                network.getAllByName(host).mapNotNullTo(addresses) { it.hostAddress }
+            } catch (_: Exception) {}
+        }
+        try {
+            InetAddress.getAllByName(host).mapNotNullTo(addresses) { it.hostAddress }
+        } catch (_: Exception) {}
+        return TailnetAddress.order(addresses.toList())
+    }
+
+    /** 为数字目标地址创建出站 socket。Tailnet 目标必须绑定真正的
      *  Tailscale 网络:它不在时返回 null 直接判不可达。否则 connect 走
      *  默认路由——被代理 TUN 假 accept 或泄漏进运营商 CGNAT,表现为对端
      *  明明下线(甚至 Tailscale 都没开)探活却一直"成功",设备永远在列表。 */
-    private fun socketForHost(host: String): Socket? {
-        if (!isCgnatAddress(host)) return Socket()
+    private fun socketForAddress(address: String): Socket? {
+        if (!TailnetAddress.isTailnet(address)) return Socket()
         val vpn = tailscaleNetwork() ?: return null
         return try {
             vpn.socketFactory.createSocket()
@@ -1036,15 +1152,49 @@ class InkHoleNode(
         }
     }
 
-    private fun probeAlive(host: String, port: Int,
-                           timeoutMs: Int = LOST_PROBE_TIMEOUT_MS): Boolean {
-        val socket = socketForHost(host) ?: return false
-        return try {
-            socket.use { it.connect(java.net.InetSocketAddress(host, port), timeoutMs) }
-            true
-        } catch (_: Exception) {
-            false
+    private fun probePeer(hosts: List<String>, port: Int, timeoutMs: Int,
+                          expectedInstanceId: String = ""): PeerProbeResult {
+        var lastError: Exception? = null
+        var identityError: IdentityMismatchException? = null
+        var tailnetUnavailable: TailnetUnavailableException? = null
+        val targets = TailnetAddress.order(hosts.flatMap(::resolveHostAddresses))
+        for (address in targets) {
+            val socket = socketForAddress(address)
+            if (socket == null) {
+                tailnetUnavailable = TailnetUnavailableException(
+                    "Tailscale 未连接，无法到达 $address")
+                continue
+            }
+            try {
+                socket.use {
+                    it.connect(java.net.InetSocketAddress(address, port), timeoutMs)
+                    it.soTimeout = timeoutMs
+                    it.getOutputStream().apply {
+                        write(WHPP.CAP_MAGIC)
+                        flush()
+                    }
+                    val capabilities = WHPP.readCapabilities(it.getInputStream())
+                    if (expectedInstanceId.isNotEmpty() &&
+                        capabilities.instanceId != expectedInstanceId.lowercase()) {
+                        throw IdentityMismatchException(
+                            "设备身份已变化，请删除后重新添加")
+                    }
+                    return PeerProbeResult(
+                        capabilities.instanceId,
+                        capabilities.peerName,
+                        capabilities.capabilities,
+                        address,
+                    )
+                }
+            } catch (e: IdentityMismatchException) {
+                identityError = e
+            } catch (e: Exception) {
+                lastError = e
+            }
         }
+        identityError?.let { throw it }
+        tailnetUnavailable?.let { throw it }
+        throw (lastError ?: IOException("目标设备没有可用地址"))
     }
 
     // ---- NSD 注册 ----
@@ -1062,6 +1212,7 @@ class InkHoleNode(
             // 与桌面版 zeroconf 互通的 TXT 属性
             setAttribute("peer_name", advertisedPeerName)
             setAttribute("instance_id", instanceId)
+            setAttribute("whpc", WHPP.CAP_VERSION.toString())
             setAttribute("caps", WHPP.FOLDER_KIND)
         }
         registrationListener = object : NsdManager.RegistrationListener {
@@ -1152,8 +1303,9 @@ class InkHoleNode(
         }
         val host = resolvedHosts.firstOrNull() ?: return
         val attrs = try { info.attributes } catch (_: Exception) { emptyMap<String, ByteArray>() }
-        val txtInstanceId = attrs["instance_id"]?.toString(Charsets.UTF_8)
-        // 不添加自己：优先按实例 ID(可靠)；老版本对端无此属性，回退按注册名
+        val txtInstanceId = attrs["instance_id"]?.toString(Charsets.UTF_8)?.lowercase()
+            ?.takeIf { it.matches(Regex("[0-9a-f]{32}")) } ?: return
+        if (attrs["whpc"]?.toString(Charsets.UTF_8) != WHPP.CAP_VERSION.toString()) return
         if (txtInstanceId == instanceId) return
         val displayName = attrs["peer_name"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
             ?: discoveryName
@@ -1166,21 +1318,19 @@ class InkHoleNode(
         attrs["ips"]?.toString(Charsets.UTF_8)?.split(",")
             ?.map { it.trim() }?.filter { it.isNotEmpty() }?.let { hosts.addAll(it) }
         val hostList = hosts.toList()
-        // 已在列表的服务:直接同步地址与对端改名(存活由探活循环负责)
-        if (synchronized(peersLock) { peers.containsKey(discoveryName) }) {
-            addPeer(discoveryName, displayName, host, info.port, hostList)
-            return
-        }
-        // 新发现的服务先 TCP 验证再入列。系统 mDNS 缓存(Android 13+ 常驻缓存,
+        // 发现与更新都先做 WHPC v2 身份验证。系统 mDNS 缓存(Android 13+ 常驻缓存,
         // 对端崩溃/断网不发 goodbye 时记录可存活几十分钟)会在重启发现时立即
         // 回灌陈旧记录——探活循环刚剔除的下线设备下一秒又被 resolve"复活",
         // 表现为对端明明关了却一直显示在线。可达性标准与探活循环一致:仅认
         // 当前 WiFi/以太网可达的地址,不给 Tailscale 等 VPN 路径兜底的机会。
         scope.launch {
             val candidates = LanReachability.hostsOnCurrentLan(hostList, currentLanLinks())
-            if (candidates.any { probeAlive(it, info.port) } && running) {
-                addPeer(discoveryName, displayName, host, info.port, hostList)
-            }
+            val result = try {
+                probePeer(candidates, info.port, LOST_PROBE_TIMEOUT_MS, txtInstanceId)
+            } catch (_: Exception) { return@launch }
+            if (running) addPeer(
+                discoveryName, displayName, result.connectedAddress, info.port,
+                hostList, result.instanceId, result.capabilities, manual = false)
         }
     }
 

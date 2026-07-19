@@ -957,7 +957,7 @@ def test_persistent_instance_id():
         check("两次自动生成互不相同", c1.instance_id != c2.instance_id)
 
         # 指定 instance_id：原样保留
-        fixed = "abcd1234"
+        fixed = "abcd1234" * 4
         c3 = P2PConfig(inbox=tmpdir, peer_name="X", instance_id=fixed,
                        enable_mdns=False)
         check("指定的 instance_id 原样保留", c3.instance_id == fixed)

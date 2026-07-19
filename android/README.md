@@ -1,12 +1,14 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.4.3`），与 Windows/macOS 桌面端在同一局域网或 Tailscale 网络内互传文件。
+墨洞 Android 客户端（当前版本 `1.4.4`），与 Windows/macOS 桌面端在同一局域网或 Tailscale 网络内互传文件。
 
 ## 功能
 
 - 使用 Android NSD 发现 `_inkhole._tcp` 服务并手动选择发送目标。
-- **手动添加设备**（设置内填对方 Tailscale IP + 对方的监听端口）：跨网络直连，离线自动剔除、回线自动恢复。
-- 设备列表只显示当前真实在线的设备：新发现与手动设备均先 TCP 验证连通才入列，对端下线后不会因系统 mDNS 缓存"复活"；回到前台立即重新核对在线状态。Tailscale 设备（100.x）的探活与传输强制走真正的 Tailscale VPN 网络——Tailscale 未连接时直接判离线，不会被 Clash 等代理 TUN 的本地假 accept 或运营商 CGNAT 欺骗成"永远在线"。
+- **手动添加设备**（设置内填对方 Tailscale IP 或 MagicDNS 名称 + 对方监听端口）：跨网络传输，离线自动剔除、回线自动恢复。
+- 设备列表只显示通过 WHPC v2 身份与能力验证的在线设备；手动设备首次连接会固定身份，地址后来指向其他设备时拒绝重连。对端下线后不会因系统 mDNS 缓存"复活"，回到前台会立即重新核对在线状态。
+- Tailnet IPv4（`100.64.0.0/10`）和 IPv6（`fd7a:115c:a1e0::/48`）的探活与传输强制走真正的 Tailscale VPN 网络；Tailscale 未连接时直接判离线，不会回退到默认路由。能打洞时由两端直连，否则 Tailscale 可能通过加密 DERP 中继。
+- 固定监听端口不可用时节点启动失败并显示错误，不会自动改用随机端口。
 - 设置页顶部分行显示本机、版本和端口，并按设备设置、传输安全、跨网络配置分组；端到端加密使用独立开关控制，关闭时保留口令但不加密传输。
 - 用户界面统一使用「发送 / 接收」术语，精简未发现设备和选文件提示；本机端口旁提示建议自定义固定端口。
 - 首次打开自动显示简洁使用说明，区分局域网与 Tailscale 跨网络使用方式；设置中可随时重新查看。
@@ -42,7 +44,7 @@ cd android
 
 - mDNS 服务类型: `_inkhole._tcp`（Android NSD 格式，兼容桌面版 zeroconf）
 - WHPP 协议: `[4B "WHPP"] [4B header_len] [JSON header] [文件或 WHF1 文件夹流]`
-- WHPC 能力探测: 新客户端通告 `folder-v1`，旧客户端由发送方自动回退 ZIP。
+- WHPC v2 能力探测: 同时校验 32 位 `instance_id`、设备名和 `folder-v1` 能力。
 - AES-256-GCM 加密: PBKDF2-HMAC-SHA256 100k 迭代，格式与桌面版 crypto.py 一致
 
 当前 Python 端 CI 覆盖 WHPP/WHE1/WHE2 协议行为，Android APK 由独立工作流构建；Python/Kotlin 固定向量互通测试仍列在项目待办中。

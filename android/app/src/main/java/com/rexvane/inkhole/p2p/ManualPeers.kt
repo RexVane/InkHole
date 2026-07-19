@@ -6,7 +6,12 @@ import org.json.JSONObject
 
 /** 手动添加的设备(跨网/固定 IP 直连)。mDNS 组播不穿虚拟网卡(如 Tailscale)， */
 /** 这些设备由用户填 IP+端口登记，由探活循环维持在线状态。 */
-data class ManualPeer(val name: String, val host: String, val port: Int) {
+data class ManualPeer(
+    val name: String,
+    val host: String,
+    val port: Int,
+    val instanceId: String? = null,
+) {
     val key: String get() = "manual|$host|$port"
 }
 
@@ -14,37 +19,93 @@ object ManualPeers {
 
     private const val PREF_KEY = "manual_peers"
 
+    @Synchronized
     fun load(prefs: SharedPreferences): List<ManualPeer> {
-        val raw = prefs.getString(PREF_KEY, null) ?: return emptyList()
+        return decode(prefs.getString(PREF_KEY, null))
+    }
+
+    internal fun decode(raw: String?): List<ManualPeer> {
+        if (raw == null) return emptyList()
         return try {
             val arr = JSONArray(raw)
             (0 until arr.length()).mapNotNull { i ->
                 val o = arr.optJSONObject(i) ?: return@mapNotNull null
                 val host = normalizeHost(o.optString("host")) ?: return@mapNotNull null
                 val port = o.optInt("port")
+                val instanceId = o.optString("instance_id", "").lowercase()
+                    .takeIf { it.matches(Regex("[0-9a-f]{32}")) }
                 if (port !in 1..65535) null
-                else ManualPeer(o.optString("name").trim(), host, port)
+                else ManualPeer(o.optString("name").trim(), host, port, instanceId)
             }
         } catch (_: Exception) {
             emptyList()
         }
     }
 
+    @Synchronized
     fun save(prefs: SharedPreferences, list: List<ManualPeer>) {
+        prefs.edit().putString(PREF_KEY, encode(list)).apply()
+    }
+
+    /** Save a settings draft without allowing it to erase an identity pinned in the background. */
+    @Synchronized
+    fun savePreservingPinnedIdentities(
+        prefs: SharedPreferences,
+        drafts: List<ManualPeer>,
+    ): List<ManualPeer> {
+        val merged = preservePinnedIdentities(drafts, load(prefs))
+        save(prefs, merged)
+        return merged
+    }
+
+    /** Pin only the matching persisted peer, preserving concurrent edits to every other field. */
+    @Synchronized
+    fun pinIdentity(
+        prefs: SharedPreferences,
+        peer: ManualPeer,
+        instanceId: String,
+    ): ManualPeer? {
+        val persisted = load(prefs).toMutableList()
+        val index = persisted.indexOfFirst { it.key == peer.key }
+        if (index < 0) return null
+        val current = persisted[index]
+        if (current.instanceId != null) return current
+        val pinned = current.copy(instanceId = instanceId.lowercase())
+        persisted[index] = pinned
+        save(prefs, persisted)
+        return pinned
+    }
+
+    internal fun encode(list: List<ManualPeer>): String {
         val arr = JSONArray()
         list.forEach { m ->
-            arr.put(JSONObject().put("name", m.name).put("host", m.host).put("port", m.port))
+            arr.put(JSONObject().apply {
+                put("name", m.name)
+                put("host", m.host)
+                put("port", m.port)
+                m.instanceId?.let { put("instance_id", it) }
+            })
         }
-        prefs.edit().putString(PREF_KEY, arr.toString()).apply()
+        return arr.toString()
+    }
+
+    internal fun preservePinnedIdentities(
+        drafts: List<ManualPeer>,
+        persisted: List<ManualPeer>,
+    ): List<ManualPeer> = drafts.map { draft ->
+        val pinned = persisted.firstOrNull {
+            it.host == draft.host && it.port == draft.port
+        }?.instanceId
+        if (pinned != null) draft.copy(instanceId = pinned) else draft
     }
 
     /**
      * 输入时实时分段（经典 IP 输入框行为）：段满 3 位、或再接一位就超过 255
      * 时自动落点开新段——连续输入 1001274626 实时变成 100.127.46.26。
-     * 含字母(主机名)不做掩码；四段封顶，第四段满后的多余数字丢弃。
+     * IPv6 / 含字母的主机名不做掩码；四段封顶，第四段满后的多余数字丢弃。
      */
     fun maskTyping(text: String): String {
-        if (text.any { it.isLetter() }) return text
+        if (':' in text || text.any { it.isLetter() }) return text
         val parts = mutableListOf(StringBuilder())
         for (ch in text) {
             when {
@@ -69,13 +130,20 @@ object ManualPeers {
     /**
      * IP 输入自动纠正。与桌面端同一套规则：
      *  - 全角句号/逗号/空格视为分隔符（输入法常见误输）；
-     *  - 含字母则按主机名原样放行（如 Tailscale MagicDNS 名）；
+     *  - IPv6 使用标准地址解析校验；
+     *  - 含字母则按 DNS 主机名校验（如 Tailscale MagicDNS 名）；
      *  - 缺分隔符的数字段尝试唯一合法拆分：100127.46.26 -> 100.127.46.26；
      *  - 有歧义或非法返回 null。
      */
     fun normalizeHost(raw: String): String? {
         var s = raw.trim()
         if (s.isEmpty()) return null
+        if (':' in s) {
+            if (s.any { it.isWhitespace() }) return null
+            val address = TailnetAddress.numericAddress(s) ?: return null
+            if (address.address.size != 16) return null
+            return s.lowercase()
+        }
         if (s.any { it.isLetter() }) {
             val host = s.filterNot { it.isWhitespace() }.trimEnd('.')
             if (host.isEmpty() || host.length > 253) return null
@@ -85,7 +153,7 @@ object ManualPeers {
                         label.startsWith('-') || label.endsWith('-') ||
                         label.any { !it.isLetterOrDigit() && it != '-' }
                 }) return null
-            return host
+            return host.lowercase()
         }
         s = s.replace('。', '.').replace('，', '.').replace(',', '.').replace(' ', '.')
         s = s.replace(Regex("\\.+"), ".").trim('.')

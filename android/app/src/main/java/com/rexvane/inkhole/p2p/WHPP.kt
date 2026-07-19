@@ -5,6 +5,7 @@ import java.io.DataOutputStream
 import java.io.EOFException
 import java.io.InterruptedIOException
 import java.io.InputStream
+import java.io.IOException
 import java.io.OutputStream
 import org.json.JSONArray
 import org.json.JSONObject
@@ -13,6 +14,7 @@ import org.json.JSONObject
 object WHPP {
     val MAGIC = "WHPP".toByteArray(Charsets.US_ASCII)
     val CAP_MAGIC = "WHPC".toByteArray(Charsets.US_ASCII)
+    const val CAP_VERSION = 2
     const val FOLDER_KIND = "folder-v1"
     const val BUFFER_SIZE = 256 * 1024
     const val MAX_HEADER = 64 * 1024              // header 长度上限(来自网络，不可信)
@@ -29,6 +31,12 @@ object WHPP {
         val kind: String = "file",
         val plainSize: Long = size,
         val modifiedMs: Long = 0,
+    )
+
+    data class Capabilities(
+        val instanceId: String,
+        val peerName: String,
+        val capabilities: Set<String>,
     )
 
     /** 把 header JSON 序列化(与桌面版 Python 完全一致)。 */
@@ -121,11 +129,13 @@ object WHPP {
         DataInputStream(input).readFully(it)
     }
 
-    /** WHPC response: magic + JSON length + supported capabilities. */
-    fun writeCapabilities(out: OutputStream) {
+    /** WHPC v2 response: magic + JSON length + identity and capabilities. */
+    fun writeCapabilities(out: OutputStream, instanceId: String, peerName: String) {
         val body = JSONObject().apply {
-            put("version", 1)
+            put("version", CAP_VERSION)
             put("caps", JSONArray().put(FOLDER_KIND))
+            put("instance_id", instanceId)
+            put("peer_name", peerName)
         }.toString().toByteArray(Charsets.UTF_8)
         DataOutputStream(out).apply {
             write(CAP_MAGIC)
@@ -133,5 +143,33 @@ object WHPP {
             write(body)
             flush()
         }
+    }
+
+    fun readCapabilities(input: InputStream): Capabilities {
+        val din = DataInputStream(input)
+        val magic = ByteArray(4).also { din.readFully(it) }
+        if (!magic.contentEquals(CAP_MAGIC)) throw IOException("bad WHPC magic")
+        val bodySize = din.readInt()
+        if (bodySize <= 0 || bodySize > MAX_HEADER) throw IOException("bad WHPC length")
+        val body = ByteArray(bodySize).also { din.readFully(it) }
+        val json = try {
+            JSONObject(String(body, Charsets.UTF_8))
+        } catch (e: Exception) {
+            throw IOException("bad WHPC body", e)
+        }
+        val instanceId = json.optString("instance_id", "").lowercase()
+        val peerName = json.optString("peer_name", "").trim()
+        val capsJson = json.optJSONArray("caps") ?: throw IOException("missing WHPC caps")
+        if (json.optInt("version", 0) != CAP_VERSION ||
+            !instanceId.matches(Regex("[0-9a-f]{32}")) || peerName.isEmpty()) {
+            throw IOException("unsupported WHPC version")
+        }
+        val caps = LinkedHashSet<String>()
+        for (index in 0 until capsJson.length()) {
+            val value = capsJson.opt(index)
+            if (value !is String) throw IOException("bad WHPC capability")
+            caps.add(value)
+        }
+        return Capabilities(instanceId, peerName, caps)
     }
 }
