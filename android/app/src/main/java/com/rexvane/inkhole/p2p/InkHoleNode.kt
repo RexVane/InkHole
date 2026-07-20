@@ -19,6 +19,7 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
@@ -167,7 +168,7 @@ class InkHoleNode(
     private val peers = LinkedHashMap<String, Peer>()
     private val peersLock = Any()
     private val receiveFileLock = Any()
-    private val activeCheckpoints = ConcurrentHashMap.newKeySet<String>()
+    private val checkpointGate = CheckpointGate()
     private val outgoingStateLock = Any()
     private val trustedPeersLock = Any()
     private val trustedPeers = loadTrustedPeers()
@@ -231,7 +232,7 @@ class InkHoleNode(
         }
         groups.forEach { (transferId, artifacts) ->
             val newest = artifacts.maxOfOrNull(File::lastModified) ?: return@forEach
-            if (newest >= cutoff || transferId in activeCheckpoints) return@forEach
+            if (newest >= cutoff || checkpointGate.isActive(transferId)) return@forEach
             artifacts.forEach { artifact ->
                 if (artifact.isDirectory) artifact.deleteRecursively() else artifact.delete()
             }
@@ -712,8 +713,8 @@ class InkHoleNode(
             }
 
             checkpointId = header.transferId
-            if (!activeCheckpoints.add(checkpointId)) {
-                listener.onStatus("拒收 $safeName：同一传输正在进行")
+            if (!checkpointGate.acquire(checkpointId, RECV_IDLE_TIMEOUT_MS.toLong())) {
+                listener.onStatus("拒收 $safeName：等待前一次传输结束超时")
                 return
             }
             checkpointClaimed = true
@@ -925,7 +926,7 @@ class InkHoleNode(
                 } catch (_: IOException) {}
             }
             try { conn.close() } catch (_: IOException) {}
-            if (checkpointClaimed) activeCheckpoints.remove(checkpointId)
+            if (checkpointClaimed) checkpointGate.release(checkpointId)
             if (transferStarted) listener.onTransferEnded("recv", receivedName, ok)
         }
     }
@@ -1803,5 +1804,34 @@ class InkHoleNode(
             override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
         }
         nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+    }
+}
+
+internal class CheckpointGate {
+    private val monitor = Object()
+    private val active = HashSet<String>()
+
+    fun acquire(transferId: String, timeoutMillis: Long): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        synchronized(monitor) {
+            while (!active.add(transferId)) {
+                val remainingNanos = deadline - System.nanoTime()
+                if (remainingNanos <= 0) return false
+                monitor.wait(
+                    TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1),
+                )
+            }
+            return true
+        }
+    }
+
+    fun release(transferId: String) {
+        synchronized(monitor) {
+            if (active.remove(transferId)) monitor.notifyAll()
+        }
+    }
+
+    fun isActive(transferId: String): Boolean = synchronized(monitor) {
+        transferId in active
     }
 }

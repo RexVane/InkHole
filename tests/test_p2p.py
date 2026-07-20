@@ -38,6 +38,7 @@ import io
 # 把 src 加入 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import inkhole.p2p as p2p_module
 from inkhole.p2p import (P2PNode, P2PConfig, PeerInfo, _MAGIC,
                         _probe_peer, inbox_category_for, inbox_root_for)
 from inkhole.device_identity import (DeviceIdentity, receiver_message,
@@ -252,8 +253,19 @@ def test_encrypted_transfer_resumes_with_fresh_suffix_stream(tmp_path):
         node.stop()
 
 
-def test_lost_ack_retry_reuses_receipt_without_duplicate(tmp_path):
+def test_lost_ack_retry_reuses_receipt_without_duplicate(tmp_path, monkeypatch):
     payload = b"receipt-retry"
+    receipt_started = threading.Event()
+    release_receipt = threading.Event()
+    original_write_json = p2p_module._write_json_atomic
+
+    def delay_completion_receipt(path, value):
+        if path.endswith(".done.json"):
+            receipt_started.set()
+            assert release_receipt.wait(3)
+        original_write_json(path, value)
+
+    monkeypatch.setattr(p2p_module, "_write_json_atomic", delay_completion_receipt)
     node = P2PNode(P2PConfig(
         inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False))
     node.start()
@@ -264,17 +276,30 @@ def test_lost_ack_retry_reuses_receipt_without_duplicate(tmp_path):
         first.sendall(struct.pack("!Q", len(payload)) + payload)
         first.close()
         destination = tmp_path / "lost-ack.txt"
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and not destination.exists():
-            time.sleep(0.01)
+        assert receipt_started.wait(3)
         assert destination.read_bytes() == payload
 
-        with socket.create_connection(("127.0.0.1", node.actual_port), timeout=3) as retry:
-            assert begin_raw_v3(retry, header) == len(payload)
-            retry.sendall(struct.pack("!Q", 0))
-            assert recv_exact(retry, 33) == b"\x01" + bytes.fromhex(header["sha256"])
+        retry_result = []
+
+        def retry_transfer():
+            with socket.create_connection(
+                    ("127.0.0.1", node.actual_port), timeout=3) as retry:
+                retry_result.append(begin_raw_v3(retry, header))
+                retry.sendall(struct.pack("!Q", 0))
+                retry_result.append(recv_exact(retry, 33))
+
+        retry_thread = threading.Thread(target=retry_transfer)
+        retry_thread.start()
+        time.sleep(0.05)
+        assert retry_thread.is_alive()
+        release_receipt.set()
+        retry_thread.join(3)
+        assert not retry_thread.is_alive()
+        assert retry_result == [
+            len(payload), b"\x01" + bytes.fromhex(header["sha256"])]
         assert sorted(path.name for path in tmp_path.glob("lost-ack*")) == ["lost-ack.txt"]
     finally:
+        release_receipt.set()
         node.stop()
 
 

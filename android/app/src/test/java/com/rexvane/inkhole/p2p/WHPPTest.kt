@@ -5,6 +5,9 @@ import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.IOException
 import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -13,6 +16,28 @@ import org.junit.Test
 import org.json.JSONObject
 
 class WHPPTest {
+    @Test
+    fun duplicateCheckpointWaitsUntilActiveTransactionFinishes() {
+        val gate = CheckpointGate()
+        assertTrue(gate.acquire("transfer", 1_000))
+        val attempting = CountDownLatch(1)
+        val finished = CountDownLatch(1)
+        val acquired = AtomicBoolean(false)
+        val waiter = Thread {
+            attempting.countDown()
+            acquired.set(gate.acquire("transfer", 1_000))
+            finished.countDown()
+        }.apply { start() }
+
+        assertTrue(attempting.await(1, TimeUnit.SECONDS))
+        assertFalse(finished.await(100, TimeUnit.MILLISECONDS))
+        gate.release("transfer")
+        assertTrue(finished.await(1, TimeUnit.SECONDS))
+        assertTrue(acquired.get())
+        gate.release("transfer")
+        waiter.join(1_000)
+    }
+
     @Test
     fun completionReceiptDoesNotDependOnExportedPath() {
         val expected = JSONObject().apply {

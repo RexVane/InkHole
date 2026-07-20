@@ -1020,6 +1020,7 @@ class P2PNode:
         self._send_active = False
         self._send_cancelled = threading.Event()
         self._checkpoint_lock = threading.Lock()
+        self._checkpoint_ready = threading.Condition(self._checkpoint_lock)
         self._active_checkpoints: set[str] = set()
         self._outgoing_state_lock = threading.Lock()
         self._outgoing_state_path = os.path.join(
@@ -1415,10 +1416,14 @@ class P2PNode:
                 return
 
             checkpoint_id = transfer_id
-            with self._checkpoint_lock:
-                if checkpoint_id in self._active_checkpoints:
-                    self._status(f"拒收 {filename}：同一传输正在进行")
-                    return
+            checkpoint_deadline = time.monotonic() + _RECV_IDLE_TIMEOUT
+            with self._checkpoint_ready:
+                while checkpoint_id in self._active_checkpoints:
+                    remaining = checkpoint_deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._status(f"拒收 {filename}：等待前一次传输结束超时")
+                        return
+                    self._checkpoint_ready.wait(remaining)
                 self._active_checkpoints.add(checkpoint_id)
                 checkpoint_claimed = True
 
@@ -1636,8 +1641,9 @@ class P2PNode:
             except OSError:
                 pass
             if checkpoint_claimed:
-                with self._checkpoint_lock:
+                with self._checkpoint_ready:
                     self._active_checkpoints.discard(checkpoint_id)
+                    self._checkpoint_ready.notify_all()
             if transfer_started and self.on_transfer_end:
                 try:
                     self.on_transfer_end("recv", transfer_name, ok)
