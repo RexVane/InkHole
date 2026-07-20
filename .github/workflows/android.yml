@@ -37,6 +37,10 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: transport-core/go.mod
+          cache-dependency-path: transport-core/go.sum
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Install Android SDK components
         run: |
