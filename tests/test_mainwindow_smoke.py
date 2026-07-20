@@ -24,7 +24,7 @@ from PySide6.QtCore import QObject, QItemSelectionModel, Signal, Qt  # noqa: E40
 from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QBoxLayout, QDialog,
                                QDialogButtonBox, QFileDialog,
-                               QToolButton, QTreeView)  # noqa: E402
+                               QLabel, QToolButton, QTreeView)  # noqa: E402
 
 from inkhole.p2p import P2PConfig  # noqa: E402
 
@@ -259,6 +259,21 @@ def test_window_constructs_without_attribute_error(app):
     assert window._stack.count() == 2   # 主页 + 单一设置页
 
 
+def test_title_settings_is_compact_icon_button(app):
+    window, _ = _make_window(app)
+    button = window.findChild(QToolButton, "TitleSettings")
+    minimize = window.findChild(QToolButton, "Win")
+    close = window.findChild(QToolButton, "WinClose")
+
+    assert button is not None
+    assert button.text() == "⚙"
+    assert button.accessibleName() == "设置"
+    assert button.size() == minimize.size() == close.size()
+
+    button.click()
+    assert window._stack.currentIndex() == 1
+
+
 def test_home_hole_uses_prominent_preferred_size(app):
     window, _ = _make_window(app)
     window.resize(960, 640)
@@ -408,6 +423,12 @@ def test_settings_page_opens_and_populates(app):
     assert window._version_info_lbl.text() == "版本：v0.0.0"
     assert window._port_info_lbl.text() == "端口：43123（建议自定义 1024-49151 固定端口）"
     assert "IP" not in window._local_info_lbl.text()
+    section_titles = {
+        label.text() for group in window._settings_groups
+        for label in group.findChildren(QLabel)
+    }
+    assert "设备设置" in section_titles
+    assert "存储与分类" in section_titles
 
 
 def test_inbox_classification_settings_are_saved(app):
@@ -511,7 +532,7 @@ def test_settings_layout_reflows_on_narrow_windows(app):
 
     assert window._settings_columns.direction() == QBoxLayout.TopToBottom
     assert not window._settings_divider.isVisible()
-    assert len(window._settings_groups) == 5
+    assert len(window._settings_groups) == 6
 
     window.resize(960, 640)
     app.processEvents()

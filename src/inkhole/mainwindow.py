@@ -82,9 +82,13 @@ QPushButton#TitleAction {{ border: 1px solid {_EDGE}; background: rgba(255,255,2
                            color: {_TEXT_SECOND}; font-size: 12px; }}
 QPushButton#TitleAction:hover {{ background: rgba(255,255,255,20);
                                 color: {_TEXT}; border-color: rgba(255,255,255,35); }}
-QToolButton#Win, QToolButton#WinClose {{ border: none; background: transparent;
-                                        border-radius: 6px; padding: 0; }}
-QToolButton#Win:hover {{ background: rgba(255,255,255,20); }}
+QToolButton#TitleSettings, QToolButton#Win, QToolButton#WinClose {{
+    border: none; background: transparent; border-radius: 6px; padding: 0;
+}}
+QToolButton#TitleSettings {{ color: {_TEXT_SECOND}; font-size: 17px; }}
+QToolButton#TitleSettings:hover, QToolButton#Win:hover {{
+    background: rgba(255,255,255,20); color: {_TEXT};
+}}
 QToolButton#WinClose:hover {{ background: rgba(224,74,74,180); }}
 QToolButton#SettingsBack {{ border: 1px solid {_EDGE}; background: rgba(255,255,255,9);
                             border-radius: 8px; padding: 0; }}
@@ -1503,9 +1507,12 @@ class TitleBar(QWidget):
         lay.addLayout(brand)
         lay.addStretch(1)
 
-        b_settings = QPushButton("设置")
-        b_settings.setObjectName("TitleAction")
+        b_settings = QToolButton()
+        b_settings.setObjectName("TitleSettings")
+        b_settings.setText("⚙")
         b_settings.setToolTip("打开设置")
+        b_settings.setAccessibleName("设置")
+        b_settings.setFixedSize(36, 32)
         b_settings.setCursor(Qt.PointingHandCursor)
         b_settings.clicked.connect(window._open_settings)
         lay.addWidget(b_settings)
@@ -1953,7 +1960,7 @@ class MainWindow(QWidget):
             row_lay.addWidget(button, 0, Qt.AlignVCenter)
             return row, button, detail_lbl
 
-        # ========== 左列:设备设置 + 传输安全 + 跨网络配置 ==========
+        # ========== 左列:设备设置 + 存储与分类 + 传输安全 + 跨网络配置 ==========
         left_col = QVBoxLayout()
         left_col.setSpacing(12)
 
@@ -1987,6 +1994,11 @@ class MainWindow(QWidget):
             lambda name: self._local_info_lbl.setText(
                 f"本机：{name or cfg.peer_name}-{cfg.instance_id[:8]}")
         )
+        device_lay.addWidget(self._ed_name)
+        left_col.addWidget(device_group)
+
+        # ---- 2. 存储与分类 ----
+        storage_group, storage_lay = _settings_group("存储与分类")
         self._ed_inbox = OutlinedLineEdit("默认目录")
         self._ed_inbox.setReadOnly(True)
         b_browse = QPushButton("更换目录")
@@ -1995,19 +2007,18 @@ class MainWindow(QWidget):
         b_browse.setCursor(Qt.PointingHandCursor)
         b_browse.clicked.connect(self._choose_inbox)
 
-        device_lay.addWidget(self._ed_name)
         inbox_row = QWidget()
         inbox_lay = QHBoxLayout(inbox_row)
         inbox_lay.setContentsMargins(0, 0, 0, 0)
         inbox_lay.setSpacing(8)
         inbox_lay.addWidget(self._ed_inbox, 1)
         inbox_lay.addWidget(b_browse)
-        device_lay.addWidget(inbox_row)
+        storage_lay.addWidget(inbox_row)
 
         self._cb_auto_classify = QCheckBox("启用文件自动分类")
         self._cb_auto_classify.setToolTip(
             "图片和视频、压缩包、文件、文件夹分别保存到对应目录")
-        device_lay.addWidget(self._cb_auto_classify)
+        storage_lay.addWidget(self._cb_auto_classify)
         category_titles = {
             "media": "图片和视频",
             "archive": "压缩包",
@@ -2045,7 +2056,7 @@ class MainWindow(QWidget):
             category_lay.addWidget(category_edit, 1)
             category_lay.addWidget(category_button)
             category_lay.addWidget(reset_button)
-            device_lay.addWidget(category_row)
+            storage_lay.addWidget(category_row)
             self._inbox_category_fields[category] = category_edit
             self._inbox_category_browse[category] = category_button
             self._inbox_category_reset[category] = reset_button
@@ -2060,9 +2071,9 @@ class MainWindow(QWidget):
 
         self._set_category_controls_enabled = _set_category_controls_enabled
         self._cb_auto_classify.toggled.connect(_set_category_controls_enabled)
-        left_col.addWidget(device_group)
+        left_col.addWidget(storage_group)
 
-        # ---- 2. 传输安全 ----
+        # ---- 3. 传输安全 ----
         security_group, security_lay = _settings_group("传输安全")
         self._ed_secret = OutlinedLineEdit(
             "加密口令（两端一致）", "启用端到端加密后必填")
@@ -2109,7 +2120,7 @@ class MainWindow(QWidget):
         security_lay.addWidget(trusted_list)
         left_col.addWidget(security_group)
 
-        # ---- 3. 跨网络配置 ----
+        # ---- 4. 跨网络配置 ----
         network_group, network_lay = _settings_group("跨网络配置")
         network_lay.addWidget(_section_label("Tailscale"))
         network_hint = QLabel(
@@ -2271,7 +2282,7 @@ class MainWindow(QWidget):
         right_col = QVBoxLayout()
         right_col.setSpacing(12)
 
-        # ---- 4. 应用行为 ----
+        # ---- 5. 应用行为 ----
         behavior_group, behavior_lay = _settings_group("应用行为")
         pet_row, self._cb_pet = _toggle_row(
             "桌面挂件", "可拖动的墨洞图标,拖文件到上面发送")
@@ -2282,7 +2293,7 @@ class MainWindow(QWidget):
         behavior_lay.addWidget(autostart_row)
         right_col.addWidget(behavior_group)
 
-        # ---- 5. 帮助与更新 ----
+        # ---- 6. 帮助与更新 ----
         help_group, help_lay = _settings_group("帮助与更新")
         guide_row, _b_guide, _guide_detail = _action_row(
             "使用说明", "局域网 / 跨网络传输与文件位置", "查看说明",
