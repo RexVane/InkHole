@@ -11,7 +11,7 @@ p2p.py
 协议 (WHPP - InkHole P2P Protocol)：
   [4B magic "WHPP"] [4B header_len] [header_len B JSON] [size B 数据]
   普通文件直接承载字节；kind=folder-v1 时承载 WHF1 目录条目流。
-  WHPC v2 独立连接用于身份和能力探测。
+  WHPC v3 独立连接使用随机挑战验证设备身份和能力。
 
 使用：
   node = P2PNode(P2PConfig(inbox="~/inkhole"),
@@ -26,6 +26,8 @@ from __future__ import annotations
 import os
 import sys
 import json
+import hmac
+import hashlib
 import ipaddress
 import shutil
 import socket
@@ -39,29 +41,39 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .crypto import (encrypt, decrypt, is_encrypted, encrypt_chunks,
-                     chunked_wire_size, ChunkedDecryptor, CHUNK_SIZE)
+from .crypto import (encrypt_chunks, chunked_wire_size, ChunkedDecryptor,
+                     CHUNK_SIZE)
+from .device_identity import (DeviceIdentity, capability_message,
+                              public_fingerprint, receiver_message,
+                              transfer_message, verify)
 
 # ---------- 常量 ----------
 _SERVICE_TYPE = "_inkhole._tcp.local."
 _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
 _CAP_MAGIC = b"WHPC"      # capability probe; kept separate from file frames
-_CAP_VERSION = 2
+_CORE_MAGIC = b"IKCI"     # authenticated loopback ingress from transport core
+_CAP_VERSION = 3
+_PROTOCOL_VERSION = 3
 _FOLDER_MAGIC = b"WHF1"   # streamed folder payload magic
 _FOLDER_KIND = "folder-v1"
+_RELIABLE_KIND = "reliable-v3"
+_CAPABILITIES = (_FOLDER_KIND, _RELIABLE_KIND)
 _FOLDER_ENTRY = struct.Struct("!BIQQ")  # type, path bytes, file size, mtime ms
 _BUFFER = 256 * 1024      # 256KB 传输块，降低大文件跨网传输的 Python IO 调用开销
 _SOCKET_BUFFER = 4 * 1024 * 1024   # TCP 窗口上限:4MB @ RTT 200ms(DERP) ≈ 20MB/s,
                                    # @ RTT 60ms(WiFi 抖动) ≈ 66MB/s,高于链路真实能力
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
 _MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
-_MAX_WHE1_SIZE = 256 * 1024 * 1024 # WHE1 整块解密需全量进内存，超过此值拒收(防内存耗尽)
 _RECV_IDLE_TIMEOUT = 300           # 接收 socket 空闲超时(秒)，防半开连接永久占住线程
 _SEND_IO_TIMEOUT = 60              # 发送数据阶段单次 IO 超时(秒)
 _DISK_MARGIN = 256 * 1024 * 1024   # 收完文件后磁盘至少还要剩这么多才接收
 _ACK_OK = b"\x01"                  # 接收方回执：成功落盘
 _ACK_FAIL = b"\x00"                # 接收方回执：失败(中断/解密失败/写盘失败)
-_CHUNK_ENC_THRESHOLD = 32 * 1024 * 1024   # 加密文件超过此大小自动走 WHE2 分块(内存恒定)
+_RESUME = b"\x02"                  # 接收方回执：后跟 8B 已持久化明文偏移
+_DIGEST_SIZE = 32
+_MAX_IDENTITY_FIELD = 512
+_TRANSFER_RETRIES = 3
+_CHECKPOINT_MAX_AGE = 7 * 24 * 60 * 60
 _CONNECT_TIMEOUT = 10              # 单个地址的连接超时(多地址会逐个尝试)
 _DRAIN_CAP = 8 * 1024 * 1024       # 拒收时最多帮对端消化这么多字节(让回执可靠到达)
 _PROBE_INTERVAL = 5.0              # 对端存活探测间隔(秒)
@@ -74,6 +86,34 @@ _MAX_FOLDER_ENTRIES = 100_000       # 防恶意条目数耗尽 inode/内存
 _MAX_FOLDER_PATH = 4096             # 单条 UTF-8 相对路径字节上限
 _MAX_FOLDER_DEPTH = 128             # 防超深目录拖垮路径处理
 _PORTABLE_INVALID = '<>:"|?*'
+
+# 接收端的可选自动分类。类别名是配置文件中的稳定键，显示名称只用于
+# 默认子目录和设置界面，便于以后调整文案而不破坏已有配置。
+_INBOX_CATEGORY_MEDIA = "media"
+_INBOX_CATEGORY_ARCHIVE = "archive"
+_INBOX_CATEGORY_FILE = "file"
+_INBOX_CATEGORY_FOLDER = "folder"
+_INBOX_CATEGORIES = (
+    _INBOX_CATEGORY_MEDIA,
+    _INBOX_CATEGORY_ARCHIVE,
+    _INBOX_CATEGORY_FILE,
+    _INBOX_CATEGORY_FOLDER,
+)
+_INBOX_CATEGORY_LABELS = {
+    _INBOX_CATEGORY_MEDIA: "图片和视频",
+    _INBOX_CATEGORY_ARCHIVE: "压缩包",
+    _INBOX_CATEGORY_FILE: "文件",
+    _INBOX_CATEGORY_FOLDER: "文件夹",
+}
+_MEDIA_EXTENSIONS = {
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic",
+    "heif", "svg", "mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv",
+    "flv", "mpeg", "mpg", "3gp", "ts",
+}
+_ARCHIVE_EXTENSIONS = {
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "tbz", "tbz2",
+    "txz", "zst", "lz", "lz4", "cab", "iso", "dmg",
+}
 _WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
@@ -99,6 +139,10 @@ class _TailnetUnavailable(OSError):
     pass
 
 
+class _ReceiverRejected(OSError):
+    pass
+
+
 @dataclass(frozen=True)
 class _ResolvedEndpoint:
     family: int
@@ -118,6 +162,8 @@ class _ProbeResult:
     peer_name: str
     capabilities: frozenset[str]
     connected_address: str
+    public_key: str
+    fingerprint: str
 
 
 def _tune_transfer_socket(sock: socket.socket) -> None:
@@ -215,7 +261,7 @@ def _cgnat_source_ip() -> str | None:
 
 
 def _probe_connect(host: str, port: int, timeout: float) -> None:
-    """Compatibility wrapper: only a valid WHPC v2 response counts as alive."""
+    """Compatibility wrapper: only a valid WHPC v3 response counts as alive."""
     _probe_peer(host, port, timeout)
 
 
@@ -252,12 +298,31 @@ def _connect_transfer_socket(host: str, port: int, timeout: float) -> socket.soc
     raise err if err is not None else OSError(f"无法解析地址 {host}")
 
 
+def _connect_peer_socket(peer: "PeerInfo", host: str, timeout: float) -> socket.socket:
+    """Connect to a peer and authenticate loopback transport endpoints."""
+    sock = _connect_transfer_socket(host, peer.port, timeout)
+    if peer.endpoint_token:
+        try:
+            token = peer.endpoint_token.encode("ascii")
+        except UnicodeEncodeError as exc:
+            sock.close()
+            raise OSError("跨网端点令牌无效") from exc
+        try:
+            sock.sendall(b"IKAT" + token)
+        except OSError:
+            sock.close()
+            raise
+    return sock
+
+
 def _probe_peer(host: str, port: int, timeout: float,
-                expected_instance_id: str = "") -> _ProbeResult:
+                expected_instance_id: str = "",
+                expected_fingerprint: str = "") -> _ProbeResult:
     sock = _connect_transfer_socket(host, port, timeout)
     try:
         sock.settimeout(timeout)
-        sock.sendall(_CAP_MAGIC)
+        nonce = os.urandom(32)
+        sock.sendall(_CAP_MAGIC + nonce)
         if _recv_exact(sock, 4) != _CAP_MAGIC:
             raise OSError("目标不是新版墨洞设备")
         size_bytes = _recv_exact(sock, 4)
@@ -273,19 +338,34 @@ def _probe_peer(host: str, port: int, timeout: float,
             decoded = json.loads(body.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise OSError("WHPC 响应格式非法") from exc
+        if not isinstance(decoded, dict):
+            raise OSError("WHPC 响应格式非法")
         instance_id = str(decoded.get("instance_id", "")).lower()
         peer_name = str(decoded.get("peer_name", "")).strip()
+        public_key = str(decoded.get("public_key", ""))
+        signature = str(decoded.get("signature", ""))
         caps = decoded.get("caps")
         if (decoded.get("version") != _CAP_VERSION
                 or not _valid_instance_id(instance_id)
                 or not peer_name
                 or not isinstance(caps, list)
                 or any(not isinstance(cap, str) for cap in caps)):
-            raise OSError("目标不支持 WHPC v2")
+            raise OSError("目标不支持 WHPC v3")
+        try:
+            fingerprint = public_fingerprint(public_key)
+        except ValueError as exc:
+            raise OSError("设备公钥无效") from exc
+        if not verify(public_key, capability_message(
+                nonce, instance_id, peer_name, _CAP_VERSION, caps), signature):
+            raise _IdentityMismatch("设备身份签名无效")
         if expected_instance_id and instance_id != expected_instance_id.lower():
             raise _IdentityMismatch("设备身份已变化，请删除后重新添加")
+        if (expected_fingerprint
+                and fingerprint != expected_fingerprint.lower()):
+            raise _IdentityMismatch("设备密钥已变化，请撤销信任后重新配对")
         connected = str(sock.getpeername()[0]).split("%", 1)[0]
-        return _ProbeResult(instance_id, peer_name, frozenset(caps), connected)
+        return _ProbeResult(instance_id, peer_name, frozenset(caps), connected,
+                            public_key, fingerprint)
     finally:
         try:
             sock.close()
@@ -297,6 +377,9 @@ def _probe_peer(host: str, port: int, timeout: float,
 @dataclass
 class P2PConfig:
     inbox: str = "received"        # 收件箱：收到的文件落在这里
+    inbox_auto_classify: bool = False
+    # 自动分类开启时各类别的目标目录；空值使用 inbox 下的默认中文子目录。
+    inbox_category_dirs: dict = field(default_factory=dict)
     listen_port: int = 0           # TCP 监听端口；0 = 操作系统自动分配
     peer_name: str = ""            # 本机显示名；空则用 hostname
     secret: str = ""               # 保存的端到端加密口令(实际是否使用由 encryption_enabled 决定)
@@ -308,6 +391,14 @@ class P2PConfig:
     manual_peers: list = field(default_factory=list)
     # None = 按旧配置兼容:有口令即启用;显式 False 可保留口令但暂时停用加密
     encryption_enabled: bool | None = None
+    # Runtime-only capability used by the local Go transport core. It is never
+    # advertised or persisted and authenticates loopback-forwarded WHPP frames.
+    core_ingress_token: str = ""
+    # Production callers load this PKCS#8 key from the OS credential store.
+    # Empty values generate an in-memory identity for tests and headless use.
+    identity_private_key: str = ""
+    # Public fingerprints are not secrets. They persist explicit device trust.
+    trusted_peers: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.peer_name:
@@ -319,11 +410,66 @@ class P2PConfig:
         self.encryption_enabled = (
             bool(self.secret) if self.encryption_enabled is None
             else bool(self.encryption_enabled))
+        raw_category_dirs = (self.inbox_category_dirs
+                             if isinstance(self.inbox_category_dirs, dict) else {})
+        self.inbox_category_dirs = {
+            category: str(raw_category_dirs.get(category) or "").strip()
+            for category in _INBOX_CATEGORIES
+        }
+        self.trusted_peers = {
+            str(instance).lower(): str(fingerprint).lower()
+            for instance, fingerprint in dict(self.trusted_peers or {}).items()
+            if (_valid_instance_id(instance)
+                and _valid_sha256(str(fingerprint).lower()))
+        }
 
     @property
     def active_secret(self) -> str:
         """Return the secret currently allowed to protect wire data."""
         return self.secret if self.encryption_enabled else ""
+
+
+def inbox_category_for(filename: str, kind: str = "file") -> str:
+    """Return the stable automatic-classification key for one top-level item."""
+    if kind == _FOLDER_KIND:
+        return _INBOX_CATEGORY_FOLDER
+    extension = os.path.splitext(str(filename).lower())[1].lstrip(".")
+    if extension in _MEDIA_EXTENSIONS:
+        return _INBOX_CATEGORY_MEDIA
+    if extension in _ARCHIVE_EXTENSIONS:
+        return _INBOX_CATEGORY_ARCHIVE
+    return _INBOX_CATEGORY_FILE
+
+
+def inbox_root_for(cfg: P2PConfig, filename: str, kind: str = "file") -> str:
+    """Resolve the receive root before any temporary data is written."""
+    if not cfg.inbox_auto_classify:
+        return cfg.inbox
+    category = inbox_category_for(filename, kind)
+    return _inbox_category_root(cfg, category)
+
+
+def _inbox_category_root(cfg: P2PConfig, category: str) -> str:
+    configured = cfg.inbox_category_dirs.get(category, "")
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    return os.path.join(cfg.inbox, _INBOX_CATEGORY_LABELS[category])
+
+
+def inbox_roots(cfg: P2PConfig) -> list[str]:
+    """Return all roots that may contain receive checkpoints."""
+    roots = [cfg.inbox]
+    if cfg.inbox_auto_classify:
+        roots.extend(_inbox_category_root(cfg, category)
+                     for category in _INBOX_CATEGORIES)
+    result = []
+    seen = set()
+    for root in roots:
+        normalized = os.path.abspath(os.path.expanduser(root))
+        if normalized not in seen:
+            result.append(root)
+            seen.add(normalized)
+    return result
 
 
 class PeerInfo:
@@ -335,12 +481,15 @@ class PeerInfo:
     service_name mDNS 完整服务名(唯一，用于离线事件精确匹配；手动注册可为空)
     """
     __slots__ = ("name", "host", "port", "service_name", "hosts",
-                 "instance_id", "capabilities", "manual")
+                 "instance_id", "capabilities", "manual", "transport",
+                 "endpoint_token", "public_key", "identity_fingerprint")
 
     def __init__(self, name: str, host: str, port: int,
                  service_name: str = "", hosts: list[str] | None = None,
                  instance_id: str = "", capabilities: set[str] | frozenset[str] | None = None,
-                 manual: bool = False):
+                 manual: bool = False, transport: str = "",
+                 endpoint_token: str = "", public_key: str = "",
+                 identity_fingerprint: str = ""):
         self.name = name
         self.host = host
         self.port = port
@@ -351,6 +500,10 @@ class PeerInfo:
         self.instance_id = instance_id.lower()
         self.capabilities = frozenset(capabilities or ())
         self.manual = bool(manual)
+        self.transport = str(transport or ("tailscale" if manual else "lan"))
+        self.endpoint_token = str(endpoint_token or "")
+        self.public_key = str(public_key or "")
+        self.identity_fingerprint = str(identity_fingerprint or "").lower()
 
     def __repr__(self):
         return f"PeerInfo({self.name!r}, {self.host}:{self.port})"
@@ -533,6 +686,116 @@ class _FolderPayloadReader:
         self.close()
 
 
+class _ExactFileReader:
+    """Expose a completed plaintext checkpoint to the WHF1 parser."""
+
+    def __init__(self, path: str, size: int):
+        self._source = open(path, "rb")
+        self._size = size
+        self._read = 0
+
+    def read_exact(self, size: int) -> bytes:
+        if size < 0 or self._read + size > self._size:
+            raise EOFError("文件夹数据超出声明大小")
+        data = self._source.read(size)
+        if len(data) != size:
+            raise EOFError("文件夹数据不完整")
+        self._read += size
+        return data
+
+    def copy_exact(self, output, size: int) -> None:
+        remaining = size
+        while remaining:
+            chunk = self.read_exact(min(_BUFFER, remaining))
+            output.write(chunk)
+            remaining -= len(chunk)
+
+    def finish(self) -> None:
+        if self._read != self._size or self._source.read(1):
+            raise ValueError("文件夹数据大小不一致")
+
+    def close(self) -> None:
+        self._source.close()
+
+
+class _ProgressReader:
+    """Count plaintext reads so resumed and encrypted sends report one scale."""
+
+    def __init__(self, source, progress, offset: int):
+        self._source = source
+        self._progress = progress
+        self._done = offset
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._source.read(size)
+        self._done += len(data)
+        self._progress.update(self._done)
+        return data
+
+
+def _discard_exact(source, size: int) -> None:
+    remaining = size
+    while remaining:
+        chunk = source.read(min(_BUFFER, remaining))
+        if not chunk:
+            raise OSError("续传源数据不完整")
+        remaining -= len(chunk)
+
+
+def _sha256_stream(source, should_cancel=None) -> str:
+    digest = hashlib.sha256()
+    while True:
+        if should_cancel and should_cancel():
+            raise _SendCancelled()
+        chunk = source.read(_BUFFER)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
+def _sha256_file(path: str, should_cancel=None) -> str:
+    with open(path, "rb") as source:
+        return _sha256_stream(source, should_cancel)
+
+
+def _transfer_id(kind: str, name: str, plain_size: int, digest: str) -> str:
+    identity = json.dumps(
+        ["WHPP3", kind, name, plain_size, digest],
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def _valid_sha256(value: object) -> bool:
+    text = str(value or "")
+    return len(text) == 64 and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _load_json_file(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as source:
+            value = json.load(source)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_json_atomic(path: str, value: dict) -> None:
+    temporary = path + f".{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as output:
+            json.dump(value, output, ensure_ascii=False, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+
+
 class _FolderWireReader:
     """Expose an exact WHF1 plaintext stream from clear or WHE2 wire data."""
 
@@ -625,7 +888,7 @@ def _apply_mtime(path: str, mtime_ms: int) -> None:
         pass
 
 
-def _receive_folder_stream(reader: _FolderWireReader, staging: str) -> None:
+def _receive_folder_stream(reader, staging: str) -> None:
     if reader.read_exact(4) != _FOLDER_MAGIC:
         raise ValueError("文件夹流标识非法")
     entry_count = struct.unpack("!I", reader.read_exact(4))[0]
@@ -705,7 +968,8 @@ class P2PNode:
                  on_peers_changed: Callable[[], None] | None = None,
                  on_progress: Callable[[str, str, int, int], None] | None = None,
                  on_transfer_end: Callable[[str, str, bool], None] | None = None,
-                 on_manual_peer_verified: Callable[[], None] | None = None):
+                 on_manual_peer_verified: Callable[[], None] | None = None,
+                 on_trust_changed: Callable[[], None] | None = None):
         self.cfg = cfg
         self.on_sent = on_sent
         self.on_received = on_received
@@ -714,12 +978,19 @@ class P2PNode:
         self.on_progress = on_progress   # (kind:"send"/"recv", 文件名, 已传字节, 总字节)
         self.on_transfer_end = on_transfer_end  # (kind, 文件名, 是否完整完成)
         self.on_manual_peer_verified = on_manual_peer_verified
+        self.on_trust_changed = on_trust_changed
 
         # 本节点唯一实例 ID：进服务名保证唯一(两台设备同名不再冲突)，
         # 进 TXT 属性用于"不发现自己"(比按显示名过滤可靠)。
         # 从 cfg 取(桌宠会持久化到 config.json)——同一设备重启用同一 ID，
         # 服务名不变，避免旧记录变成永不消失的"幽灵设备"。
         self._instance_id = cfg.instance_id
+        try:
+            self._identity = DeviceIdentity.from_private_key(
+                cfg.identity_private_key)
+        except (ValueError, TypeError):
+            self._identity = DeviceIdentity.generate()
+            cfg.identity_private_key = self._identity.export_private_key()
 
         self._peers: dict[str, PeerInfo] = {}   # 显示名 -> PeerInfo
         self._lock = threading.Lock()
@@ -748,6 +1019,11 @@ class P2PNode:
         self._active_send_sock: socket.socket | None = None
         self._send_active = False
         self._send_cancelled = threading.Event()
+        self._checkpoint_lock = threading.Lock()
+        self._active_checkpoints: set[str] = set()
+        self._outgoing_state_lock = threading.Lock()
+        self._outgoing_state_path = os.path.join(
+            self.cfg.inbox, ".inkhole-outgoing.json")
 
         # 对端存活探测(幽灵设备兜底)；参数做成实例属性主要为了测试提速
         self._probe_interval = _PROBE_INTERVAL
@@ -764,7 +1040,74 @@ class P2PNode:
             except ImportError:
                 raise SystemExit("端到端加密(--secret)需要 cryptography 库：pip install cryptography")
 
-        os.makedirs(self.cfg.inbox, exist_ok=True)
+        for root in inbox_roots(self.cfg):
+            os.makedirs(root, exist_ok=True)
+        self._cleanup_transfer_artifacts()
+
+    def _cleanup_transfer_artifacts(self) -> None:
+        """Remove abandoned WHPP checkpoints and receipts after seven days."""
+        cutoff = time.time() - _CHECKPOINT_MAX_AGE
+        groups: dict[str, list[str]] = {}
+        for inbox_root in inbox_roots(self.cfg):
+            try:
+                names = os.listdir(inbox_root)
+            except OSError:
+                continue
+            for name in names:
+                if (not name.startswith(".inkhole-")
+                        or name == ".inkhole-outgoing.json"):
+                    continue
+                path = os.path.join(inbox_root, name)
+                suffix = name[len(".inkhole-"):]
+                transfer_id = suffix.split(".", 1)[0]
+                if _valid_sha256(transfer_id):
+                    groups.setdefault(transfer_id, []).append(path)
+                    continue
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        if os.path.isdir(path):
+                            shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            os.remove(path)
+                except OSError:
+                    pass
+        for transfer_id, paths in groups.items():
+            try:
+                newest = max(os.path.getmtime(path) for path in paths)
+            except (OSError, ValueError):
+                continue
+            if newest >= cutoff:
+                continue
+            with self._checkpoint_lock:
+                if transfer_id in self._active_checkpoints:
+                    continue
+            for path in paths:
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        os.remove(path)
+                except OSError:
+                    pass
+
+        with self._outgoing_state_lock:
+            state = _load_json_file(self._outgoing_state_path)
+            fresh = {}
+            for key, value in state.items():
+                try:
+                    updated_at = int(value.get("updated_at", 0) or 0)
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    continue
+                if updated_at >= cutoff:
+                    fresh[key] = value
+            if fresh != state:
+                if fresh:
+                    _write_json_atomic(self._outgoing_state_path, fresh)
+                else:
+                    try:
+                        os.remove(self._outgoing_state_path)
+                    except FileNotFoundError:
+                        pass
 
     # ---------- 生命周期 ----------
     def start(self) -> None:
@@ -793,7 +1136,7 @@ class P2PNode:
                 self._status("墨洞未开启：监听端口启动失败", str(exc))
             return
 
-        # 2. 首轮立即验证手动设备；只有有效 WHPC v2 响应才会进入列表。
+        # 2. 首轮立即验证手动设备；只有有效 WHPC v3 响应才会进入列表。
         self._probe_thread = threading.Thread(target=self._probe_loop, daemon=True)
         self._probe_thread.start()
 
@@ -841,6 +1184,7 @@ class P2PNode:
                 b"instance_id": self._instance_id.encode("ascii"),
                 b"whpc": str(_CAP_VERSION).encode("ascii"),
                 b"caps": _FOLDER_KIND.encode("ascii"),
+                b"identity": self._identity.fingerprint.encode("ascii"),
                 # 全部本机 IPv4:Android NSD 只解析出一个地址,而本机发出
                 # 连接的源 IP 可能是另一块网卡(VPN/TUN/多网卡)——对端的
                 # "仅接收目标设备"需要完整列表才能正确放行
@@ -948,43 +1292,48 @@ class P2PNode:
             threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True).start()
 
     def _handle_connection(self, conn: socket.socket, addr) -> None:
-        """Receive one WHPP file or one atomic WHF1 folder transaction."""
-        part_path = None
-        folder_part_path = None
-        want_ack = False
+        """Receive one resumable WHPP v3 plaintext transaction."""
+        part_path = ""
+        meta_path = ""
+        folder_staging = ""
+        checkpoint_id = ""
+        checkpoint_claimed = False
+        ack_sent = False
         ok = False
         transfer_name = ""
         transfer_started = False
+        core_authenticated = False
         try:
             conn.settimeout(_RECV_IDLE_TIMEOUT)
             # Probe connections that close before sending four bytes remain silent.
             magic = _recv_exact(conn, 4)
+            if magic == _CORE_MAGIC:
+                expected = self.cfg.core_ingress_token.encode("ascii")
+                supplied = _recv_exact(conn, len(expected)) if expected else None
+                if not supplied or not hmac.compare_digest(supplied, expected):
+                    return
+                core_authenticated = True
+                magic = _recv_exact(conn, 4)
             if magic == _CAP_MAGIC:
+                nonce = _recv_exact(conn, 32)
+                if nonce is None:
+                    return
+                signature = self._identity.sign(capability_message(
+                    nonce, self._instance_id, self.cfg.peer_name,
+                    _CAP_VERSION, _CAPABILITIES))
                 body = json.dumps(
                     {"version": _CAP_VERSION,
-                     "caps": [_FOLDER_KIND],
+                     "caps": list(_CAPABILITIES),
                      "instance_id": self._instance_id,
-                     "peer_name": self.cfg.peer_name},
+                     "peer_name": self.cfg.peer_name,
+                     "public_key": self._identity.public_key,
+                     "signature": signature},
                     separators=(",", ":"),
                 ).encode("utf-8")
                 conn.sendall(_CAP_MAGIC + struct.pack("!I", len(body)) + body)
                 return
             if magic != _MAGIC:
                 return
-
-            # 仅接收目标设备：来源 IP 不是当前选中设备的地址就拒收
-            if self.cfg.trusted_only:
-                with self._lock:
-                    sel = self._peers.get(self._selected_peer) if self._selected_peer else None
-                    allowed = set(_resolved_addresses(sel.hosts)) if sel else set()
-                if addr[0] not in allowed:
-                    self._status(f"已拒收 {addr[0]} 的传输（仅接收目标设备）")
-                    try:
-                        conn.sendall(_ACK_FAIL)
-                    except OSError:
-                        pass
-                    _drain(conn, _DRAIN_CAP)
-                    return
 
             hdr_len_bytes = _recv_exact(conn, 4)
             if not hdr_len_bytes:
@@ -998,157 +1347,290 @@ class P2PNode:
             header = json.loads(hdr_bytes.decode("utf-8"))
 
             filename = _safe_filename(str(header.get("filename", "")))
-            size = header.get("size", 0)
+            version = header.get("version")
+            plain_size = header.get("plain_size")
+            transfer_id = str(header.get("transfer_id") or "").lower()
+            expected_digest = str(header.get("sha256") or "").lower()
+            sender_instance_id = str(
+                header.get("sender_instance_id") or "").lower()
+            sender_public_key = str(header.get("sender_public_key") or "")
             encrypted = bool(header.get("encrypted", False))
             enc_mode = str(header.get("enc_mode", ""))
-            want_ack = bool(header.get("want_ack", False))
             kind = str(header.get("kind", "file"))
             is_folder = kind == _FOLDER_KIND
-            if kind not in ("", "file", _FOLDER_KIND):
+            target_root = inbox_root_for(self.cfg, filename, kind)
+            modified_ms = header.get("mtime_ms", 0)
+            if version != _PROTOCOL_VERSION or not bool(header.get("want_ack", False)):
+                self._status(f"拒收 {filename}：需要 WHPP v3")
+                return
+            if kind not in ("file", _FOLDER_KIND):
                 self._status(f"拒收 {filename}：不支持的传输类型")
                 return
-
-            size_limit = chunked_wire_size(_MAX_FILE_SIZE) if is_folder else _MAX_FILE_SIZE
-            if (isinstance(size, bool) or not isinstance(size, int)
-                    or not 0 <= size <= size_limit):
+            if (isinstance(plain_size, bool) or not isinstance(plain_size, int)
+                    or not 0 <= plain_size <= _MAX_FILE_SIZE
+                    or (is_folder and plain_size < 8)):
                 self._status(f"拒收 {filename}：文件大小非法")
                 return
-
-            plain_size = size
-            modified_ms = 0
-            if is_folder:
-                plain_size = header.get("plain_size", -1)
-                modified_ms = header.get("mtime_ms", 0)
-                if (isinstance(plain_size, bool) or not isinstance(plain_size, int)
-                        or not 8 <= plain_size <= _MAX_FILE_SIZE):
-                    self._status(f"拒收 {filename}：文件夹大小非法")
-                    return
-                if (isinstance(modified_ms, bool) or not isinstance(modified_ms, int)
-                        or not 0 <= modified_ms <= 0xFFFFFFFFFFFFFFFF):
-                    self._status(f"拒收 {filename}：文件夹时间非法")
-                    return
-                if encrypted:
-                    if enc_mode != "chunked" or size != chunked_wire_size(plain_size):
-                        self._status(f"拒收 {filename}：文件夹加密声明非法")
-                        return
-                elif size != plain_size:
-                    self._status(f"拒收 {filename}：文件夹大小声明不一致")
-                    return
-
-            storage_size = plain_size if is_folder else size
+            if (not _valid_sha256(transfer_id)
+                    or not _valid_sha256(expected_digest)):
+                self._status(f"拒收 {filename}：传输标识或摘要非法")
+                return
+            if not _valid_instance_id(sender_instance_id):
+                self._status(f"拒收 {filename}：发送设备身份非法")
+                return
             try:
-                if storage_size + _DISK_MARGIN > shutil.disk_usage(self.cfg.inbox).free:
-                    self._status(f"拒收 {filename}：磁盘空间不足")
-                    _drain(conn, min(size, _DRAIN_CAP))
+                sender_fingerprint = public_fingerprint(sender_public_key)
+            except ValueError:
+                self._status(f"拒收 {filename}：发送设备公钥非法")
+                return
+            if self.cfg.trusted_only and not core_authenticated:
+                with self._lock:
+                    selected = (self._peers.get(self._selected_peer)
+                                if self._selected_peer else None)
+                pinned = self.cfg.trusted_peers.get(sender_instance_id, "")
+                if (selected is None or selected.instance_id != sender_instance_id
+                        or not pinned
+                        or not hmac.compare_digest(pinned, sender_fingerprint)):
+                    self._status(
+                        f"已拒收 {addr[0]} 的传输（发送设备未配对或不是当前目标）")
+                    try:
+                        conn.sendall(_ACK_FAIL)
+                    except OSError:
+                        pass
                     return
-            except OSError:
-                pass
+            if (isinstance(modified_ms, bool) or not isinstance(modified_ms, int)
+                    or not 0 <= modified_ms <= 0xFFFFFFFFFFFFFFFF):
+                self._status(f"拒收 {filename}：修改时间非法")
+                return
+            if encrypted and enc_mode != "chunked":
+                self._status(f"拒收 {filename}：加密格式不支持续传")
+                return
+            try:
+                os.makedirs(target_root, exist_ok=True)
+                if plain_size + _DISK_MARGIN > shutil.disk_usage(target_root).free:
+                    self._status(f"拒收 {filename}：磁盘空间不足")
+                    return
+            except OSError as exc:
+                self._status(f"拒收 {filename}：无法使用收件箱目录 ({exc})")
+                return
             if encrypted and not self.cfg.active_secret:
                 self._status(f"拒收 {filename}：对方启用了加密，本机未设口令")
-                _drain(conn, min(size, _DRAIN_CAP))
-                return
-            if encrypted and enc_mode == "chunked" and size < 32:
-                self._status(f"拒收 {filename}：加密流大小非法")
-                return
-            if encrypted and enc_mode != "chunked" and size > _MAX_WHE1_SIZE:
-                self._status(f"拒收 {filename}：整块加密文件过大")
-                _drain(conn, _DRAIN_CAP)
                 return
 
-            progress = _Progress(self.on_progress, "recv", filename, size)
+            checkpoint_id = transfer_id
+            with self._checkpoint_lock:
+                if checkpoint_id in self._active_checkpoints:
+                    self._status(f"拒收 {filename}：同一传输正在进行")
+                    return
+                self._active_checkpoints.add(checkpoint_id)
+                checkpoint_claimed = True
+
+            checkpoint_base = os.path.join(target_root, f".inkhole-{transfer_id}")
+            part_path = checkpoint_base + ".part"
+            meta_path = checkpoint_base + ".json"
+            done_path = checkpoint_base + ".done.json"
+            metadata = {
+                "version": _PROTOCOL_VERSION,
+                "filename": filename,
+                "plain_size": plain_size,
+                "sha256": expected_digest,
+                "kind": kind,
+                "mtime_ms": modified_ms,
+                "sender_instance_id": sender_instance_id,
+                "sender_fingerprint": sender_fingerprint,
+            }
+
+            def authenticate_sender(offset: int, nonce: bytes) -> None:
+                length_bytes = _recv_exact(conn, 2)
+                if length_bytes is None:
+                    raise EOFError("发送设备签名缺失")
+                signature_size = struct.unpack("!H", length_bytes)[0]
+                if not 0 < signature_size <= 256:
+                    raise ValueError("发送设备签名大小非法")
+                signature = _recv_exact(conn, signature_size)
+                if signature is None or not verify(
+                        sender_public_key, transfer_message(nonce, header, offset),
+                        signature.decode("ascii", errors="ignore")):
+                    raise ValueError("发送设备身份签名无效")
+
+            def send_receiver_challenge(offset: int) -> bytes:
+                nonce = os.urandom(32)
+                public_key = self._identity.public_key.encode("ascii")
+                signature = self._identity.sign(receiver_message(
+                    nonce, header, offset, self._instance_id)).encode("ascii")
+                if (len(public_key) > _MAX_IDENTITY_FIELD
+                        or len(signature) > _MAX_IDENTITY_FIELD):
+                    raise ValueError("接收设备身份字段过大")
+                conn.sendall(b"".join((
+                    _RESUME, struct.pack("!Q", offset), nonce,
+                    self._instance_id.encode("ascii"),
+                    struct.pack("!H", len(public_key)), public_key,
+                    struct.pack("!H", len(signature)), signature,
+                )))
+                return nonce
+
+            completed = _load_json_file(done_path)
+            completed_path = str(completed.get("path") or "")
+            if (all(completed.get(key) == value for key, value in metadata.items())
+                    and completed_path and os.path.exists(completed_path)):
+                nonce = send_receiver_challenge(plain_size)
+                authenticate_sender(plain_size, nonce)
+                body_size = _recv_exact(conn, 8)
+                if body_size is None or struct.unpack("!Q", body_size)[0] != 0:
+                    raise ValueError("已完成传输仍收到数据")
+                conn.sendall(_ACK_OK + bytes.fromhex(expected_digest))
+                ack_sent = True
+                ok = True
+                return
+
+            existing = _load_json_file(meta_path)
+            if existing != metadata:
+                for stale in (part_path, meta_path):
+                    try:
+                        os.remove(stale)
+                    except FileNotFoundError:
+                        pass
+                _write_json_atomic(meta_path, metadata)
+            offset = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+            if offset > plain_size:
+                os.remove(part_path)
+                offset = 0
+
+            progress = _Progress(self.on_progress, "recv", filename, plain_size)
             transfer_name = filename
             transfer_started = True
+            progress.update(offset)
+            nonce = send_receiver_challenge(offset)
+            authenticate_sender(offset, nonce)
+            body_size_bytes = _recv_exact(conn, 8)
+            if body_size_bytes is None:
+                raise EOFError("续传数据长度缺失")
+            body_size = struct.unpack("!Q", body_size_bytes)[0]
+            remaining_plain = plain_size - offset
+            expected_wire = (chunked_wire_size(remaining_plain)
+                             if encrypted and remaining_plain else remaining_plain)
+            if body_size != expected_wire:
+                raise ValueError("续传数据长度不一致")
 
-            if is_folder:
-                folder_part_path = os.path.join(
-                    self.cfg.inbox, f".inkhole-{uuid.uuid4().hex}.folder.part")
-                os.mkdir(folder_part_path)
-                reader = _FolderWireReader(
-                    conn, size, plain_size, self.cfg.active_secret, encrypted, progress)
-                _receive_folder_stream(reader, folder_part_path)
-                _apply_mtime(folder_part_path, modified_ms)
-                with self._lock:
-                    dst = _unique_directory_path(self.cfg.inbox, filename)
-                    os.replace(folder_part_path, dst)
-                folder_part_path = None
-            else:
-                dst = _unique_path(self.cfg.inbox, filename)
-                part_path = dst + f".{uuid.uuid4().hex[:8]}.part"
-                if encrypted and enc_mode == "chunked":
-                    hdr32 = _recv_exact(conn, 32)
-                    if hdr32 is None:
-                        raise EOFError("加密流头不完整")
-                    decryptor = ChunkedDecryptor(self.cfg.active_secret, hdr32)
-                    consumed = 32
-                    progress.update(consumed)
-                    with open(part_path, "wb") as output:
-                        while consumed < size:
-                            len_bytes = _recv_exact(conn, 4)
-                            if len_bytes is None:
-                                raise EOFError("加密文件数据不完整")
-                            ct_len = struct.unpack("!I", len_bytes)[0]
-                            if (not 16 <= ct_len <= CHUNK_SIZE + 16
-                                    or consumed + 4 + ct_len > size):
-                                raise ValueError("加密文件分块非法")
-                            ciphertext = _recv_exact(conn, ct_len)
+            if remaining_plain:
+                with open(part_path, "ab") as output:
+                    appended = 0
+                    if encrypted:
+                        hdr32 = _recv_exact(conn, 32)
+                        if hdr32 is None:
+                            raise EOFError("加密流头不完整")
+                        decryptor = ChunkedDecryptor(self.cfg.active_secret, hdr32)
+                        consumed = 32
+                        while consumed < body_size:
+                            length_bytes = _recv_exact(conn, 4)
+                            if length_bytes is None:
+                                raise EOFError("加密数据不完整")
+                            ciphertext_size = struct.unpack("!I", length_bytes)[0]
+                            if (not 16 <= ciphertext_size <= CHUNK_SIZE + 16
+                                    or consumed + 4 + ciphertext_size > body_size):
+                                raise ValueError("加密分块非法")
+                            ciphertext = _recv_exact(conn, ciphertext_size)
                             if ciphertext is None:
-                                raise EOFError("加密文件数据不完整")
+                                raise EOFError("加密数据不完整")
                             plain = decryptor.decrypt_chunk(ciphertext)
                             if plain is None:
                                 raise ValueError("解密失败（两端口令不一致？）")
+                            if appended + len(plain) > remaining_plain:
+                                raise ValueError("解密数据超过声明大小")
                             output.write(plain)
-                            consumed += 4 + ct_len
-                            progress.update(consumed)
-                    if consumed != size:
-                        raise EOFError("加密文件数据不完整")
-                else:
-                    remaining = size
-                    with open(part_path, "wb") as output:
-                        while remaining > 0:
-                            chunk = conn.recv(min(_BUFFER, remaining))
+                            appended += len(plain)
+                            consumed += 4 + ciphertext_size
+                            progress.update(offset + appended)
+                        if consumed != body_size or appended != remaining_plain:
+                            raise EOFError("加密数据不完整")
+                    else:
+                        while appended < remaining_plain:
+                            chunk = conn.recv(min(_BUFFER, remaining_plain - appended))
                             if not chunk:
                                 raise EOFError("文件数据不完整")
                             output.write(chunk)
-                            remaining -= len(chunk)
-                            progress.update(size - remaining)
-                    if encrypted:
-                        with open(part_path, "rb") as source:
-                            plain = decrypt(self.cfg.active_secret, source.read())
-                        if plain is None:
-                            raise ValueError("解密失败（两端口令不一致？）")
-                        with open(part_path, "wb") as output:
-                            output.write(plain)
+                            appended += len(chunk)
+                            progress.update(offset + appended)
+                    output.flush()
+                    os.fsync(output.fileno())
+            elif not os.path.exists(part_path):
+                with open(part_path, "xb") as output:
+                    output.flush()
+                    os.fsync(output.fileno())
 
+            if not os.path.isfile(part_path) or os.path.getsize(part_path) != plain_size:
+                raise EOFError("文件数据不完整")
+            actual_digest = _sha256_file(part_path)
+            if not hmac.compare_digest(actual_digest, expected_digest):
+                try:
+                    os.remove(part_path)
+                finally:
+                    try:
+                        os.remove(meta_path)
+                    except FileNotFoundError:
+                        pass
+                raise ValueError("文件 SHA-256 校验失败，已丢弃检查点")
+
+            if is_folder:
+                folder_staging = os.path.join(
+                    target_root, f".inkhole-{uuid.uuid4().hex}.folder.part")
+                os.mkdir(folder_staging)
+                reader = _ExactFileReader(part_path, plain_size)
+                try:
+                    _receive_folder_stream(reader, folder_staging)
+                except Exception:
+                    for invalid in (part_path, meta_path):
+                        try:
+                            os.remove(invalid)
+                        except FileNotFoundError:
+                            pass
+                    raise
+                finally:
+                    reader.close()
+                _apply_mtime(folder_staging, modified_ms)
                 with self._lock:
-                    dst = _unique_path(self.cfg.inbox, filename)
+                    dst = _unique_directory_path(target_root, filename)
+                    os.replace(folder_staging, dst)
+                folder_staging = ""
+                os.remove(part_path)
+            else:
+                with self._lock:
+                    dst = _unique_path(target_root, filename)
                     os.replace(part_path, dst)
-                part_path = None
 
+            receipt = dict(metadata)
+            receipt["path"] = dst
+            receipt["completed_at"] = int(time.time())
+            _write_json_atomic(done_path, receipt)
+            try:
+                os.remove(meta_path)
+            except FileNotFoundError:
+                pass
+            conn.sendall(_ACK_OK + bytes.fromhex(expected_digest))
+            ack_sent = True
             ok = True
             if self.on_received:
                 self.on_received(dst)
-            self._status(f"已接收：{os.path.basename(dst)}")
+            self._status(f"已接收并校验：{os.path.basename(dst)}")
         except (EOFError, ConnectionResetError, ConnectionAbortedError):
-            self._status(f"接收中断：{transfer_name or '未知文件'}")
+            self._status(f"接收中断，已保留续传进度：{transfer_name or '未知文件'}")
         except Exception as e:
             self._status("接收失败", str(e))
         finally:
-            if part_path and os.path.exists(part_path):
+            if folder_staging:
+                shutil.rmtree(folder_staging, ignore_errors=True)
+            if transfer_started and not ack_sent:
                 try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
-            if folder_part_path:
-                shutil.rmtree(folder_part_path, ignore_errors=True)
-            if want_ack:
-                try:
-                    conn.sendall(_ACK_OK if ok else _ACK_FAIL)
+                    conn.sendall(_ACK_FAIL)
                 except OSError:
                     pass
             try:
                 conn.close()
             except OSError:
                 pass
+            if checkpoint_claimed:
+                with self._checkpoint_lock:
+                    self._active_checkpoints.discard(checkpoint_id)
             if transfer_started and self.on_transfer_end:
                 try:
                     self.on_transfer_end("recv", transfer_name, ok)
@@ -1163,20 +1645,36 @@ class P2PNode:
 
     def _probe_peer_capabilities(self, peer: PeerInfo) -> set[str]:
         """Return cached verified capabilities, probing only injected/test peers."""
-        if peer.capabilities:
+        if peer.capabilities and peer.identity_fingerprint:
             return set(peer.capabilities)
         hosts = sorted(peer.hosts or [peer.host],
                        key=lambda host: 1 if _is_tailnet_ip(host) else 0)
         for host in hosts:
             try:
                 result = _probe_peer(host, peer.port, _CAP_TIMEOUT,
-                                     peer.instance_id)
+                                     peer.instance_id,
+                                     self.cfg.trusted_peers.get(peer.instance_id, ""))
                 peer.instance_id = result.instance_id
                 peer.capabilities = result.capabilities
+                peer.public_key = result.public_key
+                peer.identity_fingerprint = result.fingerprint
                 return set(result.capabilities)
             except OSError:
                 continue
         return set()
+
+    def _ensure_receiver_identity(self, peer: PeerInfo) -> None:
+        """Direct transports require a verified receiver pin before data is sent."""
+        if peer.transport not in {"lan", "tailscale"}:
+            return
+        expected = (peer.identity_fingerprint
+                    or self.cfg.trusted_peers.get(peer.instance_id, ""))
+        if not peer.instance_id or not expected:
+            self._probe_peer_capabilities(peer)
+            expected = (peer.identity_fingerprint
+                        or self.cfg.trusted_peers.get(peer.instance_id, ""))
+        if not peer.instance_id or not expected:
+            raise OSError("接收设备身份尚未验证")
 
     def send_path(self, local_path: str,
                   should_cancel: Callable[[], bool] | None = None) -> bool:
@@ -1211,6 +1709,205 @@ class P2PNode:
             if zip_path:
                 shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
 
+    def _connect_for_transfer(self, peer: PeerInfo) -> socket.socket:
+        last_error: OSError | None = None
+        hosts = sorted(peer.hosts or [peer.host],
+                       key=lambda host: 1 if _is_tailnet_ip(host) else 0)
+        for host in hosts:
+            try:
+                return _connect_peer_socket(peer, host, _CONNECT_TIMEOUT)
+            except OSError as exc:
+                last_error = exc
+        raise last_error if last_error else OSError("无可用地址")
+
+    def _outgoing_transfer(self, peer: PeerInfo, local_path: str, kind: str,
+                           name: str, plain_size: int, digest: str) -> tuple[str, str]:
+        key_data = json.dumps([
+            os.path.abspath(local_path), kind, name, plain_size, digest,
+            peer.instance_id or f"{peer.host}:{peer.port}",
+        ], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        key = hashlib.sha256(key_data).hexdigest()
+        with self._outgoing_state_lock:
+            state = _load_json_file(self._outgoing_state_path)
+            record = state.get(key) if isinstance(state.get(key), dict) else {}
+            transfer_id = str(record.get("transfer_id") or "").lower()
+            if not _valid_sha256(transfer_id):
+                transfer_id = hashlib.sha256(os.urandom(32)).hexdigest()
+            state[key] = {"transfer_id": transfer_id, "updated_at": int(time.time())}
+            _write_json_atomic(self._outgoing_state_path, state)
+        return key, transfer_id
+
+    def _complete_outgoing_transfer(self, key: str) -> None:
+        with self._outgoing_state_lock:
+            state = _load_json_file(self._outgoing_state_path)
+            if key not in state:
+                return
+            state.pop(key, None)
+            if state:
+                _write_json_atomic(self._outgoing_state_path, state)
+            else:
+                try:
+                    os.remove(self._outgoing_state_path)
+                except FileNotFoundError:
+                    pass
+
+    def _send_resumable_payload(self, peer: PeerInfo, header_dict: dict,
+                                source_factory, cancellation_requested,
+                                progress) -> bool:
+        header_dict = dict(header_dict)
+        header_dict["sender_instance_id"] = self._instance_id
+        header_dict["sender_public_key"] = self._identity.public_key
+        header = json.dumps(
+            header_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        plain_size = int(header_dict["plain_size"])
+        encrypted = bool(header_dict["encrypted"])
+        expected_digest = str(header_dict["sha256"])
+        last_error: Exception | None = None
+
+        self._ensure_receiver_identity(peer)
+
+        for attempt in range(_TRANSFER_RETRIES):
+            if cancellation_requested():
+                raise _SendCancelled()
+            sock = None
+            try:
+                sock = self._connect_for_transfer(peer)
+                with self._send_state_lock:
+                    self._active_send_sock = sock
+                sock.settimeout(_SEND_IO_TIMEOUT)
+                sock.sendall(_MAGIC + struct.pack("!I", len(header)) + header)
+
+                marker = _recv_exact_cancellable(
+                    sock, 1, cancellation_requested, _SEND_IO_TIMEOUT)
+                if marker == _ACK_FAIL:
+                    raise _ReceiverRejected("接收方拒绝了传输")
+                if marker != _RESUME:
+                    raise OSError("接收方未返回 WHPP v3 续传状态")
+                offset_bytes = _recv_exact_cancellable(
+                    sock, 8, cancellation_requested, _SEND_IO_TIMEOUT)
+                if offset_bytes is None:
+                    raise OSError("接收方续传状态不完整")
+                offset = struct.unpack("!Q", offset_bytes)[0]
+                if offset > plain_size:
+                    raise OSError("接收方续传偏移非法")
+                nonce = _recv_exact_cancellable(
+                    sock, 32, cancellation_requested, _SEND_IO_TIMEOUT)
+                if nonce is None:
+                    raise OSError("接收方身份挑战不完整")
+                receiver_instance_raw = _recv_exact_cancellable(
+                    sock, 32, cancellation_requested, _SEND_IO_TIMEOUT)
+                if receiver_instance_raw is None:
+                    raise OSError("接收设备实例标识不完整")
+                try:
+                    receiver_instance_id = receiver_instance_raw.decode("ascii").lower()
+                except UnicodeDecodeError as exc:
+                    raise OSError("接收设备实例标识无效") from exc
+                public_size_raw = _recv_exact_cancellable(
+                    sock, 2, cancellation_requested, _SEND_IO_TIMEOUT)
+                if public_size_raw is None:
+                    raise OSError("接收设备公钥不完整")
+                public_size = struct.unpack("!H", public_size_raw)[0]
+                if not 0 < public_size <= _MAX_IDENTITY_FIELD:
+                    raise OSError("接收设备公钥大小非法")
+                receiver_public_raw = _recv_exact_cancellable(
+                    sock, public_size, cancellation_requested, _SEND_IO_TIMEOUT)
+                signature_size_raw = _recv_exact_cancellable(
+                    sock, 2, cancellation_requested, _SEND_IO_TIMEOUT)
+                if receiver_public_raw is None or signature_size_raw is None:
+                    raise OSError("接收设备身份响应不完整")
+                signature_size = struct.unpack("!H", signature_size_raw)[0]
+                if not 0 < signature_size <= _MAX_IDENTITY_FIELD:
+                    raise OSError("接收设备签名大小非法")
+                receiver_signature_raw = _recv_exact_cancellable(
+                    sock, signature_size, cancellation_requested, _SEND_IO_TIMEOUT)
+                if receiver_signature_raw is None:
+                    raise OSError("接收设备签名不完整")
+                try:
+                    receiver_public = receiver_public_raw.decode("ascii")
+                    receiver_signature = receiver_signature_raw.decode("ascii")
+                    receiver_fingerprint = public_fingerprint(receiver_public)
+                except (UnicodeDecodeError, ValueError) as exc:
+                    raise OSError("接收设备身份响应无效") from exc
+                expected_fingerprint = (peer.identity_fingerprint
+                                        or self.cfg.trusted_peers.get(
+                                            peer.instance_id, ""))
+                if (not _valid_instance_id(receiver_instance_id)
+                        or (peer.instance_id
+                            and receiver_instance_id != peer.instance_id)
+                        or (expected_fingerprint and not hmac.compare_digest(
+                            receiver_fingerprint, expected_fingerprint))
+                        or not verify(receiver_public, receiver_message(
+                            nonce, header_dict, offset, receiver_instance_id),
+                            receiver_signature)):
+                    raise OSError("接收设备身份验证失败")
+                signature = self._identity.sign(
+                    transfer_message(nonce, header_dict, offset)).encode("ascii")
+                sock.sendall(struct.pack("!H", len(signature)) + signature)
+                if offset:
+                    percent = offset * 100 // max(1, plain_size)
+                    self._status(f"正在续传 {header_dict['filename']} · {percent}%")
+                progress.update(offset)
+
+                remaining = plain_size - offset
+                wire_size = (chunked_wire_size(remaining)
+                             if encrypted and remaining else remaining)
+                sock.sendall(struct.pack("!Q", wire_size))
+                if remaining:
+                    with source_factory(offset) as raw_source:
+                        source = _ProgressReader(raw_source, progress, offset)
+                        if encrypted:
+                            sent = 0
+                            for blob in encrypt_chunks(self.cfg.active_secret, source):
+                                if cancellation_requested():
+                                    raise _SendCancelled()
+                                sock.sendall(blob)
+                                sent += len(blob)
+                            if sent != wire_size:
+                                raise OSError("加密发送大小不一致")
+                        else:
+                            sent = 0
+                            while sent < remaining:
+                                if cancellation_requested():
+                                    raise _SendCancelled()
+                                chunk = source.read(min(_BUFFER, remaining - sent))
+                                if not chunk:
+                                    raise OSError("发送源数据不完整")
+                                sock.sendall(chunk)
+                                sent += len(chunk)
+
+                sock.settimeout(_RECV_IDLE_TIMEOUT)
+                ack = _recv_exact_cancellable(
+                    sock, 1, cancellation_requested, _RECV_IDLE_TIMEOUT)
+                if ack == _ACK_FAIL:
+                    raise _ReceiverRejected("接收方校验或落盘失败")
+                if ack != _ACK_OK:
+                    raise OSError("未收到接收成功回执")
+                received_digest = _recv_exact_cancellable(
+                    sock, _DIGEST_SIZE, cancellation_requested, _SEND_IO_TIMEOUT)
+                if (received_digest is None
+                        or not hmac.compare_digest(received_digest.hex(), expected_digest)):
+                    raise OSError("接收方 SHA-256 回执不一致")
+                return True
+            except (_ReceiverRejected, _SendCancelled):
+                raise
+            except (ConnectionError, EOFError, socket.timeout, OSError) as exc:
+                last_error = exc
+                if cancellation_requested():
+                    raise _SendCancelled() from exc
+                if attempt + 1 < _TRANSFER_RETRIES:
+                    self._status(f"连接中断，正在恢复传输（{attempt + 2}/{_TRANSFER_RETRIES}）")
+                    time.sleep(0.5 * (attempt + 1))
+            finally:
+                with self._send_state_lock:
+                    if self._active_send_sock is sock:
+                        self._active_send_sock = None
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        raise last_error if last_error else OSError("传输连接失败")
+
     def _send_folder_stream(self, local_path: str, peer: PeerInfo,
                             should_cancel: Callable[[], bool] | None) -> bool:
         name = os.path.basename(os.path.abspath(local_path)) or "folder"
@@ -1232,119 +1929,55 @@ class P2PNode:
             self._active_send_sock = None
         try:
             _portable_path_parts(name)
-            self._status(f"正在扫描文件夹：{name}")
+            self._status(f"正在扫描并校验文件夹：{name}")
             manifest = _scan_folder(local_path, cancellation_requested)
-            if cancellation_requested():
-                raise _SendCancelled()
-            secret = self.cfg.active_secret
-            encrypted = bool(secret)
-            wire_size = (chunked_wire_size(manifest.plain_size)
-                         if encrypted else manifest.plain_size)
-            header_dict = {
+            with _FolderPayloadReader(manifest) as source:
+                digest = _sha256_stream(source, cancellation_requested)
+            outgoing_key, transfer_id = self._outgoing_transfer(
+                peer, local_path, _FOLDER_KIND, name, manifest.plain_size, digest)
+            encrypted = bool(self.cfg.active_secret)
+            header = {
+                "version": _PROTOCOL_VERSION,
                 "filename": name,
-                "size": wire_size,
                 "plain_size": manifest.plain_size,
+                "transfer_id": transfer_id,
+                "sha256": digest,
                 "kind": _FOLDER_KIND,
                 "mtime_ms": manifest.root_mtime_ms,
                 "encrypted": encrypted,
                 "want_ack": True,
             }
             if encrypted:
-                header_dict["enc_mode"] = "chunked"
-            header = json.dumps(header_dict, separators=(",", ":")).encode("utf-8")
-            progress = _Progress(self.on_progress, "send", name, wire_size)
+                header["enc_mode"] = "chunked"
 
-            sock = None
-            last_err: OSError | None = None
-            send_hosts = sorted(peer.hosts or [peer.host],
-                                key=lambda host: 1 if _is_tailnet_ip(host) else 0)
-            for host in send_hosts:
+            def source_factory(offset: int):
+                source = _FolderPayloadReader(manifest)
                 try:
-                    sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
-                    break
-                except OSError as exc:
-                    last_err = exc
-            if sock is None:
-                raise last_err if last_err else OSError("无可用地址")
+                    _discard_exact(source, offset)
+                    return source
+                except Exception:
+                    source.close()
+                    raise
 
-            try:
-                with self._send_state_lock:
-                    self._active_send_sock = sock
-                if cancellation_requested():
-                    raise _SendCancelled()
-                sock.settimeout(_SEND_IO_TIMEOUT)
-                sock.sendall(_MAGIC)
-                sock.sendall(struct.pack("!I", len(header)))
-                sock.sendall(header)
-
-                sent = 0
-                with _FolderPayloadReader(manifest) as source:
-                    if encrypted:
-                        for blob in encrypt_chunks(secret, source):
-                            if cancellation_requested():
-                                raise _SendCancelled()
-                            sock.sendall(blob)
-                            sent += len(blob)
-                            progress.update(sent)
-                    else:
-                        while sent < manifest.plain_size:
-                            if cancellation_requested():
-                                raise _SendCancelled()
-                            chunk = source.read(min(_BUFFER, manifest.plain_size - sent))
-                            if not chunk:
-                                raise OSError("文件夹读取不完整")
-                            sock.sendall(chunk)
-                            sent += len(chunk)
-                            progress.update(sent)
-                if sent != wire_size:
-                    raise OSError("文件夹发送大小不一致")
-
-                sock.settimeout(60)
-                try:
-                    response = sock.recv(1)
-                except socket.timeout:
-                    # Android may still be publishing a very large folder to
-                    # MediaStore after the private atomic commit.
-                    if cancellation_requested():
-                        raise _SendCancelled()
-                    response = _ACK_OK
-                except OSError:
-                    if cancellation_requested():
-                        raise _SendCancelled()
-                    response = b""
-                # folder-v1 was capability-negotiated, so EOF or reset cannot
-                # be treated as the legacy client's implicit success signal.
-                if response != _ACK_OK:
-                    self._status(f"{peer.name} 接收失败（口令不一致、路径或存储问题）")
-                    return False
-            finally:
-                with self._send_state_lock:
-                    if self._active_send_sock is sock:
-                        self._active_send_sock = None
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-
-            completed = True
+            progress = _Progress(self.on_progress, "send", name, manifest.plain_size)
+            completed = self._send_resumable_payload(
+                peer, header, source_factory, cancellation_requested, progress)
+            self._complete_outgoing_transfer(outgoing_key)
             if self.on_sent:
                 self.on_sent(name)
-            self._status(f"已发送：{name}")
+            self._status(f"已发送并校验：{name}")
             return True
         except _SendCancelled:
             self._status(f"已取消发送：{name}")
             return False
-        except (ConnectionRefusedError, socket.timeout, OSError, ValueError) as exc:
-            if cancellation_requested():
-                self._status(f"已取消发送：{name}")
-            else:
-                self._status("发送失败", str(exc))
+        except _ReceiverRejected as exc:
+            self._status(f"{peer.name} 接收失败", str(exc))
             return False
         except Exception as exc:
             if cancellation_requested():
                 self._status(f"已取消发送：{name}")
             else:
-                self._status("发送失败", str(exc))
+                self._status("文件夹发送失败", str(exc))
             return False
         finally:
             with self._send_state_lock:
@@ -1359,18 +1992,12 @@ class P2PNode:
 
     def send_file(self, local_path: str,
                   should_cancel: Callable[[], bool] | None = None) -> bool:
-        """把文件直接发给选中的对端。成功返回 True。
-
-        header 带 want_ack：新版接收方处理完回 1 字节回执，落盘失败能被
-        发送方感知；老版接收方(v1.0.0)读完数据直接关连接，按成功处理。
-        """
+        """Send one file with resumable checkpoints and verified completion."""
         if not os.path.isfile(local_path):
             self._status("文件不存在")
             return False
 
-        with self._lock:
-            selected = self._selected_peer
-            peer = self._peers.get(selected) if selected else None
+        selected, peer = self._selected_send_peer()
         if not peer:
             self._status("目标设备已离线" if selected else "请先选择目标设备")
             return False
@@ -1393,139 +2020,50 @@ class P2PNode:
             self._send_active = True
             self._active_send_sock = None
         try:
-            if cancellation_requested():
-                raise _SendCancelled()
             plain_size = os.path.getsize(local_path)
-            enc_mode = ""
-            data = None
-            secret = self.cfg.active_secret
-            if secret and plain_size > _CHUNK_ENC_THRESHOLD:
-                # 大文件走 WHE2 分块流式加密：内存峰值 4MB，不再整块读入
-                encrypted = True
-                enc_mode = "chunked"
-                file_size = chunked_wire_size(plain_size)
-            elif secret:
-                # 小文件保持 WHE1 整块(与所有旧版本互通)
-                with open(local_path, "rb") as f:
-                    data = encrypt(secret, f.read())
-                if cancellation_requested():
-                    raise _SendCancelled()
-                encrypted = True
-                file_size = len(data)
-            else:
-                encrypted = False
-                file_size = plain_size
-
-            hdr = {
+            self._status(f"正在校验：{name}")
+            digest = _sha256_file(local_path, cancellation_requested)
+            outgoing_key, transfer_id = self._outgoing_transfer(
+                peer, local_path, "file", name, plain_size, digest)
+            encrypted = bool(self.cfg.active_secret)
+            header = {
+                "version": _PROTOCOL_VERSION,
                 "filename": name,
-                "size": file_size,
+                "plain_size": plain_size,
+                "transfer_id": transfer_id,
+                "sha256": digest,
+                "kind": "file",
+                "mtime_ms": max(0, int(os.path.getmtime(local_path) * 1000)),
                 "encrypted": encrypted,
                 "want_ack": True,
             }
-            if enc_mode:
-                hdr["enc_mode"] = enc_mode
-            header = json.dumps(hdr).encode("utf-8")
+            if encrypted:
+                header["enc_mode"] = "chunked"
 
-            progress = _Progress(self.on_progress, "send", name, file_size)
+            def source_factory(offset: int):
+                source = open(local_path, "rb")
+                source.seek(offset)
+                return source
 
-            # 多网卡/VPN 场景：逐个地址尝试，先通先用。局域网/直连地址优先,
-            # Tailscale(100.x)殿后——同 WiFi 时若先连 100.x 会绕道 relay,
-            # 把直连速度拖成几百 KB/s
-            sock = None
-            last_err: OSError | None = None
-            send_hosts = sorted(peer.hosts or [peer.host],
-                                key=lambda h: 1 if _is_tailnet_ip(h) else 0)
-            for host in send_hosts:
-                try:
-                    sock = _connect_transfer_socket(host, peer.port, _CONNECT_TIMEOUT)
-                    break
-                except OSError as e:
-                    last_err = e
-            if sock is None:
-                raise last_err if last_err else OSError("无可用地址")
-
-            try:
-                with self._send_state_lock:
-                    self._active_send_sock = sock
-                if cancellation_requested():
-                    raise _SendCancelled()
-                # create_connection 的 10s 连接超时会留在 socket 上，数据阶段
-                # 放宽到 60s——接收方磁盘偶发卡顿不该被误判成发送失败
-                sock.settimeout(_SEND_IO_TIMEOUT)
-                sock.sendall(_MAGIC)
-                sock.sendall(struct.pack("!I", len(header)))
-                sock.sendall(header)
-
-                sent = 0
-                if enc_mode == "chunked":
-                    # 边读边加密边发，恒定内存
-                    with open(local_path, "rb") as f:
-                        for blob in encrypt_chunks(secret, f):
-                            if cancellation_requested():
-                                raise _SendCancelled()
-                            sock.sendall(blob)
-                            sent += len(blob)
-                            progress.update(sent)
-                elif data is not None:
-                    # 加密数据已在内存，分块发送
-                    while sent < len(data):
-                        if cancellation_requested():
-                            raise _SendCancelled()
-                        sock.sendall(data[sent:sent + _BUFFER])
-                        sent = min(sent + _BUFFER, len(data))
-                        progress.update(sent)
-                else:
-                    # 明文：流式从磁盘读
-                    with open(local_path, "rb") as f:
-                        while True:
-                            if cancellation_requested():
-                                raise _SendCancelled()
-                            chunk = f.read(_BUFFER)
-                            if not chunk:
-                                break
-                            sock.sendall(chunk)
-                            sent += len(chunk)
-                            progress.update(sent)
-
-                # 等接收方回执。老版本对端读完即关连接 -> recv 返回 b""，按成功；
-                # 超时(对端解密大文件等)也不误报失败。
-                sock.settimeout(60)
-                try:
-                    resp = sock.recv(1)
-                except (socket.timeout, OSError):
-                    if cancellation_requested():
-                        raise _SendCancelled()
-                    resp = b""
-                if resp == _ACK_FAIL:
-                    self._status(f"{peer.name} 接收失败（口令不一致、被拒收或存储问题）")
-                    return False
-            finally:
-                with self._send_state_lock:
-                    if self._active_send_sock is sock:
-                        self._active_send_sock = None
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-            completed = True
+            progress = _Progress(self.on_progress, "send", name, plain_size)
+            completed = self._send_resumable_payload(
+                peer, header, source_factory, cancellation_requested, progress)
+            self._complete_outgoing_transfer(outgoing_key)
             if self.on_sent:
                 self.on_sent(name)
-            self._status(f"已发送：{name}")
+            self._status(f"已发送并校验：{name}")
             return True
         except _SendCancelled:
             self._status(f"已取消发送：{name}")
             return False
-        except (ConnectionRefusedError, socket.timeout, OSError) as e:
-            if cancellation_requested():
-                self._status(f"已取消发送：{name}")
-            else:
-                self._status("发送失败", str(e))
+        except _ReceiverRejected as exc:
+            self._status(f"{peer.name} 接收失败", str(exc))
             return False
-        except Exception as e:
+        except Exception as exc:
             if cancellation_requested():
                 self._status(f"已取消发送：{name}")
             else:
-                self._status("发送失败", str(e))
+                self._status("发送失败", str(exc))
             return False
         finally:
             with self._send_state_lock:
@@ -1555,21 +2093,49 @@ class P2PNode:
             return self._selected_peer
 
     def select_peer(self, name: str | None) -> None:
-        """选择发送目标。传 None 取消选择。"""
+        """选择发送目标，并固定已验证的设备公钥指纹。"""
+        trust_changed = False
         with self._lock:
             if name is None:
                 self._selected_peer = None
                 self._last_selected_service = None
             elif name in self._peers:
                 self._selected_peer = name
+                peer = self._peers[name]
                 # 智能保留：记住 service_name，离线后重新上线能自动恢复选中
-                self._last_selected_service = self._peers[name].service_name
+                self._last_selected_service = peer.service_name
+                if (peer.instance_id and peer.identity_fingerprint
+                        and self.cfg.trusted_peers.get(peer.instance_id)
+                        != peer.identity_fingerprint):
+                    self.cfg.trusted_peers[peer.instance_id] = peer.identity_fingerprint
+                    trust_changed = True
+        if trust_changed and self.on_trust_changed:
+            try:
+                self.on_trust_changed()
+            except Exception:
+                pass
         self._status(f"目标: {name}" if name else "未选择目标")
+
+    def trusted_devices(self) -> dict[str, str]:
+        """Return a copy of the persistent instance-id to fingerprint pins."""
+        return dict(self.cfg.trusted_peers)
+
+    def revoke_trust(self, instance_id: str) -> bool:
+        """Revoke one device pin; the device must be selected again to pair."""
+        removed = self.cfg.trusted_peers.pop(str(instance_id).lower(), None) is not None
+        if removed and self.on_trust_changed:
+            try:
+                self.on_trust_changed()
+            except Exception:
+                pass
+        return removed
 
     def _on_peer_added(self, name: str, host: str, port: int, service_name: str = "",
                        hosts: list[str] | None = None, instance_id: str = "",
                        capabilities: set[str] | frozenset[str] | None = None,
-                       manual: bool = False) -> None:
+                       manual: bool = False, transport: str = "",
+                       endpoint_token: str = "", public_key: str = "",
+                       identity_fingerprint: str = "") -> None:
         """mDNS 发现新节点时调用（由 _InkHoleListener 触发）。
 
         - 同一服务(service_name 相同)重复通告/地址变化：原地更新，不新增条目。
@@ -1583,11 +2149,17 @@ class P2PNode:
                 for p in self._peers.values():
                     if p.service_name == service_name:
                         fresh = PeerInfo(p.name, host, port, service_name, hosts,
-                                         instance_id, capabilities, manual)
+                                         instance_id, capabilities, manual,
+                                         transport, endpoint_token, public_key,
+                                         identity_fingerprint)
                         p.host, p.port, p.hosts = fresh.host, fresh.port, fresh.hosts
                         p.instance_id = fresh.instance_id
                         p.capabilities = fresh.capabilities
                         p.manual = fresh.manual
+                        p.transport = fresh.transport
+                        p.endpoint_token = fresh.endpoint_token
+                        p.public_key = fresh.public_key
+                        p.identity_fingerprint = fresh.identity_fingerprint
                         display_name = p.name
                         updated = True
                         break
@@ -1599,7 +2171,8 @@ class P2PNode:
                     n += 1
                 self._peers[display] = PeerInfo(
                     display, host, port, service_name, hosts,
-                    instance_id, capabilities, manual)
+                    instance_id, capabilities, manual, transport,
+                    endpoint_token, public_key, identity_fingerprint)
                 display_name = display
 
             # 智能保留：若此设备的 service_name 匹配之前选中的，自动恢复选择
@@ -1630,6 +2203,38 @@ class P2PNode:
 
         if self.on_peers_changed:
             self.on_peers_changed()
+
+    # ---------- 外部传输核心端点（短码 / SSH） ----------
+    def upsert_external_peer(self, peer_id: str, name: str, host: str, port: int,
+                             transport: str, endpoint_token: str,
+                             instance_id: str = "") -> str:
+        """Expose one authenticated loopback endpoint as a normal WHPP peer."""
+        peer_id = str(peer_id).strip()
+        transport = str(transport).strip().lower()
+        if not peer_id or transport not in {"wormhole", "ssh"}:
+            raise ValueError("跨网设备标识或通道无效")
+        if host not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError("跨网核心端点必须位于本机")
+        port = int(port)
+        if not 1 <= port <= 65535 or not endpoint_token:
+            raise ValueError("跨网核心端点无效")
+        service_name = f"external|{transport}|{peer_id}"
+        self._on_peer_added(
+            str(name).strip() or ("一次性接收端" if transport == "wormhole" else "SSH 设备"),
+            host, port, service_name=service_name, hosts=[host],
+            instance_id=str(instance_id).lower(), capabilities={_FOLDER_KIND},
+            manual=True, transport=transport, endpoint_token=endpoint_token)
+        with self._lock:
+            return next((peer.name for peer in self._peers.values()
+                         if peer.service_name == service_name), "")
+
+    def remove_external_peer(self, peer_id: str, transport: str) -> None:
+        service_name = f"external|{str(transport).strip().lower()}|{str(peer_id).strip()}"
+        with self._lock:
+            display = next((name for name, peer in self._peers.items()
+                            if peer.service_name == service_name), None)
+        if display:
+            self._on_peer_removed(display)
 
     def _on_peer_removed_by_service(self, service_name: str) -> None:
         """mDNS 节点离线时调用：按唯一服务名精确匹配，找不到再回退按名字解析。
@@ -1669,6 +2274,9 @@ class P2PNode:
         if pinned and pinned != result.instance_id:
             raise _IdentityMismatch("设备身份已变化，请删除后重新添加")
         if pinned:
+            trusted = self.cfg.trusted_peers.get(pinned, "")
+            if trusted and trusted != result.fingerprint:
+                raise _IdentityMismatch("设备密钥已变化，请撤销信任后重新配对")
             return
         entry["instance_id"] = result.instance_id
         if self.on_manual_peer_verified:
@@ -1687,10 +2295,11 @@ class P2PNode:
             result.connected_address, int(entry["port"]),
             service_name=self._manual_key(entry), hosts=addresses,
             instance_id=result.instance_id, capabilities=result.capabilities,
-            manual=True)
+            manual=True, public_key=result.public_key,
+            identity_fingerprint=result.fingerprint)
 
     def add_manual_peer(self, name: str, host: str, port: int) -> None:
-        """新增或更新手动设备；有效 WHPC v2 响应后才进入在线列表。"""
+        """新增或更新手动设备；有效 WHPC v3 响应后才进入在线列表。"""
         port = int(port)
         existing = next((m for m in (self.cfg.manual_peers or [])
                          if m["host"] == host and int(m["port"]) == port), None)
@@ -1723,12 +2332,14 @@ class P2PNode:
         self._probe_wake.set()
 
     def _probe_hosts(self, hosts: list[str], port: int, timeout: float,
-                     expected_instance_id: str = "") -> _ProbeResult:
+                     expected_instance_id: str = "",
+                     expected_fingerprint: str = "") -> _ProbeResult:
         last_error: OSError | None = None
         tailnet_error: _TailnetUnavailable | None = None
         for host in hosts:
             try:
-                return _probe_peer(host, port, timeout, expected_instance_id)
+                return _probe_peer(host, port, timeout, expected_instance_id,
+                                   expected_fingerprint)
             except _IdentityMismatch:
                 raise
             except _TailnetUnavailable as exc:
@@ -1756,7 +2367,8 @@ class P2PNode:
         def worker() -> None:
             try:
                 result = self._probe_hosts(
-                    candidates, port, self._probe_timeout, instance_id)
+                    candidates, port, self._probe_timeout, instance_id,
+                    self.cfg.trusted_peers.get(instance_id, ""))
                 with self._lock:
                     current = self._pending_discovery_probes.get(service_name)
                 if self._running and current is token:
@@ -1765,7 +2377,9 @@ class P2PNode:
                         addresses.insert(0, result.connected_address)
                     self._on_peer_added(
                         name, result.connected_address, port, service_name,
-                        addresses, result.instance_id, result.capabilities, False)
+                        addresses, result.instance_id, result.capabilities, False,
+                        public_key=result.public_key,
+                        identity_fingerprint=result.fingerprint)
             except OSError:
                 pass
             finally:
@@ -1777,7 +2391,7 @@ class P2PNode:
 
     # ---------- 对端存活探测 ----------
     def _probe_loop(self) -> None:
-        """WHPC v2 liveness loop for verified discovered and manual peers."""
+        """WHPC v3 liveness loop for verified discovered and manual peers."""
         strikes: dict[str, int] = {}   # service_name(或显示名) -> 连续失败轮数
         while self._running:
             with self._lock:
@@ -1804,7 +2418,9 @@ class P2PNode:
                             if entry is not None else peer.instance_id)
                 tailnet_unavailable = False
                 try:
-                    result = self._probe_hosts(hosts, peer.port, probe_timeout, expected)
+                    result = self._probe_hosts(
+                        hosts, peer.port, probe_timeout, expected,
+                        self.cfg.trusted_peers.get(expected, ""))
                     if entry is not None:
                         self._bind_manual_identity(entry, result)
                         addresses = _resolved_addresses([str(entry["host"])])
@@ -1814,6 +2430,8 @@ class P2PNode:
                         peer.hosts = addresses
                     peer.instance_id = result.instance_id
                     peer.capabilities = result.capabilities
+                    peer.public_key = result.public_key
+                    peer.identity_fingerprint = result.fingerprint
                     strikes.pop(key, None)
                     self._identity_errors.discard(key)
                     continue
@@ -1860,7 +2478,8 @@ class P2PNode:
                 try:
                     expected = str(entry.get("instance_id") or "")
                     result = _probe_peer(str(entry["host"]), int(entry["port"]),
-                                         self._probe_timeout * 2, expected)
+                                         self._probe_timeout * 2, expected,
+                                         self.cfg.trusted_peers.get(expected, ""))
                     self._bind_manual_identity(entry, result)
                 except _IdentityMismatch as exc:
                     if key not in self._identity_errors:
@@ -2188,6 +2807,28 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
             return None
         buf += chunk
     return buf
+
+
+def _recv_exact_cancellable(sock: socket.socket, n: int, should_cancel,
+                            timeout: float) -> bytes | None:
+    """Read a control frame while guaranteeing prompt cross-thread cancel."""
+    deadline = time.monotonic() + timeout
+    data = bytearray()
+    while len(data) < n:
+        if should_cancel():
+            raise _SendCancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout()
+        try:
+            sock.settimeout(min(0.5, remaining))
+            chunk = sock.recv(n - len(data))
+        except socket.timeout:
+            continue
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
 
 
 def _drain(sock: socket.socket, n: int) -> None:

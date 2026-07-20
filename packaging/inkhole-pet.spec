@@ -24,23 +24,41 @@
     未装时选择器回退 Qt 版本,Spaces 增强自动跳过。
 """
 import os
+import re
 import sys
 
 PROJ = os.path.abspath(os.path.join(SPECPATH, ".."))
 SRC = os.path.join(PROJ, "src")
 QML = os.path.join(SRC, "inkhole", "inkhole.qml")
+CORE_NAME = "inkhole-core.exe" if sys.platform == "win32" else "inkhole-core"
+CORE_BINARY = os.path.join(PROJ, "transport-core", "bin", CORE_NAME)
 ICON_ICO = os.path.join(PROJ, "assets", "inkhole.ico")
 ICON_ICNS = os.path.join(PROJ, "assets", "inkhole.icns")
 APP_ICON = ICON_ICNS if sys.platform == "darwin" else ICON_ICO
+CODESIGN_IDENTITY = os.environ.get("MACOS_SIGNING_IDENTITY") or None
+with open(os.path.join(PROJ, "pyproject.toml"), encoding="utf-8") as version_file:
+    version_match = re.search(
+        r'^version\s*=\s*"([^"]+)"', version_file.read(), re.MULTILINE)
+if version_match is None:
+    raise SystemExit("Unable to read the application version from pyproject.toml")
+APP_VERSION = version_match.group(1)
+
+if not os.path.isfile(CORE_BINARY):
+    raise SystemExit(
+        f"Missing {CORE_BINARY}; run the platform build script so the shared "
+        "transport core is compiled before PyInstaller.")
 
 datas = [(QML, "inkhole")]
 hiddenimports = [
-    "inkhole.p2p", "inkhole.branding", "inkhole.macos",
-    "zeroconf", "psutil",
+    "inkhole.p2p", "inkhole.branding", "inkhole.macos", "inkhole.transport",
+    "inkhole.secret_store", "inkhole.device_identity", "zeroconf", "psutil", "keyring", "qrcode",
+    "PIL.Image",
 ]
 if sys.platform == "darwin":
     # AppKit provides the native mixed file/folder NSOpenPanel on macOS.
-    hiddenimports.extend(["AppKit", "Foundation"])
+    hiddenimports.extend(["AppKit", "Foundation", "keyring.backends.macOS"])
+elif sys.platform == "win32":
+    hiddenimports.append("keyring.backends.Windows")
 
 # 排除明显用不到的重型 Qt 模块，降低发布包体积
 excluded = [
@@ -56,7 +74,7 @@ excluded = [
 a = Analysis(
     [os.path.join(SPECPATH, "pet_entry.py")],
     pathex=[SRC],
-    binaries=[],
+    binaries=[(CORE_BINARY, ".")],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -115,7 +133,7 @@ if sys.platform == "darwin":
         disable_windowed_traceback=False,
         argv_emulation=False,
         target_arch=None,
-        codesign_identity=None,
+        codesign_identity=CODESIGN_IDENTITY,
         entitlements_file=None,
         icon=ICON_ICNS,
     )
@@ -135,6 +153,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "墨洞桌宠",
             "CFBundleDisplayName": "墨洞桌宠",
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
             "CFBundleAllowMixedLocalizations": True,
             "CFBundleDevelopmentRegion": "zh-Hans",
             "CFBundleLocalizations": ["zh-Hans", "en"],
@@ -156,7 +176,7 @@ else:
         disable_windowed_traceback=False,
         argv_emulation=False,
         target_arch=None,
-        codesign_identity=None,
+        codesign_identity=CODESIGN_IDENTITY,
         entitlements_file=None,
         icon=APP_ICON,
     )

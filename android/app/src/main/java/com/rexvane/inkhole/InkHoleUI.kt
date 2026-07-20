@@ -29,9 +29,11 @@ import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.Computer
+import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Smartphone
+import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -214,10 +216,11 @@ fun MainScreen(
     onOpenFile: (ReceivedFile) -> Unit,
     onClearHistory: () -> Unit,
     onRefreshClick: () -> Unit = {},
+    onCrossNetworkClick: () -> Unit = {},
     onSettingsClick: () -> Unit,
 ) {
     Scaffold(
-        topBar = { InkTopBar(onRefreshClick, onSettingsClick) },
+        topBar = { InkTopBar(onRefreshClick, onCrossNetworkClick, onSettingsClick) },
         containerColor = BgDark,
     ) { padding ->
         BoxWithConstraints(
@@ -349,7 +352,11 @@ fun MainScreen(
 // ==================== 子组件 ====================
 
 @Composable
-private fun InkTopBar(onRefreshClick: () -> Unit, onSettingsClick: () -> Unit) {
+private fun InkTopBar(
+    onRefreshClick: () -> Unit,
+    onCrossNetworkClick: () -> Unit,
+    onSettingsClick: () -> Unit,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -362,6 +369,9 @@ private fun InkTopBar(onRefreshClick: () -> Unit, onSettingsClick: () -> Unit) {
         Spacer(Modifier.weight(1f))
         IconButton(onClick = onRefreshClick) {
             Icon(Icons.Default.Refresh, contentDescription = "重新搜索设备", tint = TextSecondary)
+        }
+        IconButton(onClick = onCrossNetworkClick) {
+            Icon(Icons.Outlined.Public, contentDescription = "跨网络传输", tint = TextSecondary)
         }
         IconButton(onClick = onSettingsClick) {
             Icon(Icons.Default.Settings, contentDescription = "设置", tint = TextSecondary)
@@ -394,7 +404,9 @@ private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
-            if (looksLikePhone(peer.name)) Icons.Outlined.Smartphone else Icons.Outlined.Computer,
+            if (peer.transport in setOf("wormhole", "ssh")) Icons.Outlined.Cloud
+            else if (looksLikePhone(peer.name)) Icons.Outlined.Smartphone
+            else Icons.Outlined.Computer,
             contentDescription = null,
             tint = if (selected) Teal else TextSecondary,
             modifier = Modifier.size(16.dp),
@@ -409,10 +421,11 @@ private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
             // 第二行:手动设备显示 IP(备注在上、IP 在下);自动发现设备显示实例 ID
-            val subline = if (peer.serviceName.startsWith("manual|")) {
-                "${peer.host}:${peer.port}"
-            } else {
-                peer.serviceName.takeIf { it.contains("-") }
+            val subline = when (peer.transport) {
+                "wormhole" -> "一次性短码"
+                "ssh" -> "SSH 中继"
+                "tailscale" -> "${peer.host}:${peer.port}"
+                else -> peer.serviceName.takeIf { it.contains("-") }
                     ?.substringAfterLast("-")
                     ?.substringBefore(".")
                     ?: ""

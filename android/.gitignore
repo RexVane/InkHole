@@ -7,4 +7,6 @@
 /captures
 .externalNativeBuild
 .cxx
+/app/libs/transportcore.aar
+/app/libs/transportcore-sources.jar
 local.properties

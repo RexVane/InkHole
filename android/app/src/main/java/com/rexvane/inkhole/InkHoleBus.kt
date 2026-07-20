@@ -6,6 +6,7 @@ import android.net.Uri
 import com.rexvane.inkhole.p2p.Peer
 import com.rexvane.inkhole.p2p.InkHoleListener
 import com.rexvane.inkhole.p2p.InkHoleNode
+import com.rexvane.inkhole.transport.TransportEventListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
@@ -31,6 +32,11 @@ object InkHoleBus {
     @SuppressLint("StaticFieldLeak")
     @Volatile var node: InkHoleNode? = null
     @Volatile var uiListener: InkHoleListener? = null
+    @Volatile private var transportListener: TransportEventListener? = null
+
+    private data class PendingTransportEvent(val event: String, val data: String)
+    private val pendingTransportEvents = ArrayDeque<PendingTransportEvent>()
+    private const val MAX_PENDING_TRANSPORT_EVENTS = 32
 
     // 最近状态缓存：Activity 重建时恢复 UI 用
     @Volatile var lastPeers: List<Peer> = emptyList()
@@ -38,6 +44,39 @@ object InkHoleBus {
     // 设置变更重建节点时暂存选中目标的 serviceName，新节点起来后自动恢复选中
     @Volatile var pendingSelectedService: String? = null
     val receivedFiles = CopyOnWriteArrayList<ReceivedFile>()   // 最新的在最前
+
+    /**
+     * TransportManager belongs to the foreground service, while the Activity can disappear
+     * briefly during rotation or while the app is backgrounded. Retain the small control
+     * events so a ready tunnel or receive offer cannot be lost between Activity instances.
+     */
+    @Synchronized
+    fun attachTransportListener(listener: TransportEventListener) {
+        transportListener = listener
+        val replay = pendingTransportEvents.toList()
+        pendingTransportEvents.clear()
+        replay.forEach { pending ->
+            listener.onTransportEvent(pending.event, JSONObject(pending.data))
+        }
+    }
+
+    @Synchronized
+    fun detachTransportListener(listener: TransportEventListener) {
+        if (transportListener === listener) transportListener = null
+    }
+
+    @Synchronized
+    fun dispatchTransportEvent(event: String, data: JSONObject) {
+        val current = transportListener
+        if (current != null) {
+            current.onTransportEvent(event, JSONObject(data.toString()))
+            return
+        }
+        if (pendingTransportEvents.size >= MAX_PENDING_TRANSPORT_EVENTS) {
+            pendingTransportEvents.removeFirst()
+        }
+        pendingTransportEvents.addLast(PendingTransportEvent(event, data.toString()))
+    }
 
     private const val HISTORY_KEY = "history"
     private const val HISTORY_MAX = 50

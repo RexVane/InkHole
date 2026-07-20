@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - "android/**"
+      - "transport-core/**"
+      - ".github/workflows/android.yml"
     tags:
       - "v*"
 
@@ -29,9 +31,18 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: transport-core/go.mod
+
       - name: Install Android SDK components
         run: |
-          yes | sdkmanager "platforms;android-34" "build-tools;34.0.0" || true
+          yes | sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
@@ -40,6 +51,12 @@ jobs:
 
       - name: Create local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+
+      - name: Build shared transport AAR
+        working-directory: transport-core
+        run: |
+          make init-gomobile
+          make build-android
 
       # 有发布签名 secret 时解出 keystore,构建固定签名的 release APK;
       # 否则(如 fork 无 secret)回退 debug 包,保证 CI 仍能跑通。

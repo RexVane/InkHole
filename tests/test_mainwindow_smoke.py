@@ -24,7 +24,7 @@ from PySide6.QtCore import QObject, QItemSelectionModel, Signal, Qt  # noqa: E40
 from PySide6.QtGui import QPalette  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QBoxLayout, QDialog,
                                QDialogButtonBox, QFileDialog,
-                               QTreeView)  # noqa: E402
+                               QToolButton, QTreeView)  # noqa: E402
 
 from inkhole.p2p import P2PConfig  # noqa: E402
 
@@ -39,6 +39,7 @@ class _FakeNode:
     def __init__(self):
         self.cfg = P2PConfig(inbox="_smoke_inbox", peer_name="SMOKE")
         self._selected = None
+        self._trusted = {}
 
     def peers(self):
         return []
@@ -48,6 +49,12 @@ class _FakeNode:
 
     def select_peer(self, name):
         self._selected = name
+
+    def trusted_devices(self):
+        return dict(self._trusted)
+
+    def revoke_trust(self, instance_id):
+        return self._trusted.pop(instance_id, None) is not None
 
 
 class FakeBridge(QObject):
@@ -62,6 +69,7 @@ class FakeBridge(QObject):
     progressCleared = Signal()
     sendStateChanged = Signal(bool)
     updateCheckFinished = Signal(bool, str, str, str)
+    transportEvent = Signal(str, object)
 
     def __init__(self):
         super().__init__()
@@ -70,7 +78,32 @@ class FakeBridge(QObject):
         self.opened_paths = []
         self.dropped_paths = []
         self.applied_settings = None
+        self.inbox_classification = None
         self.cancel_calls = 0
+        self.transport_calls = []
+        self._cross_network = {
+            "wormhole": {"rendezvous_url": "", "transit_relay": ""},
+            "ssh": {
+                "enabled": False,
+                "profile": {
+                    "id": "smoke-profile",
+                    "host": "",
+                    "port": 22,
+                    "user": "",
+                    "private_key_mode": "file",
+                    "private_key_path": "",
+                    "private_key_label": "",
+                    "host_key_sha256": "",
+                    "has_pasted_key": False,
+                    "has_passphrase": False,
+                },
+                "remote_port": 0,
+                "peers": [],
+            },
+            "core_available": True,
+            "core_error": "",
+            "secure_store_available": True,
+        }
 
     # ---- query surface used by the window ----
     def lanConfig(self):
@@ -85,6 +118,11 @@ class FakeBridge(QObject):
 
     def setInbox(self, directory):
         self.node.cfg.inbox = directory
+
+    def setInboxClassification(self, enabled, directories):
+        self.node.cfg.inbox_auto_classify = bool(enabled)
+        self.node.cfg.inbox_category_dirs = dict(directories)
+        self.inbox_classification = (bool(enabled), dict(directories))
 
     def openInbox(self):
         pass
@@ -148,6 +186,46 @@ class FakeBridge(QObject):
     def removeManualPeer(self, host, port):
         self._manual = [m for m in self._manual
                         if not (m["host"] == host and m["port"] == int(port))]
+
+    # ---- 一次性短码与 SSH 中继 ----
+    def crossNetworkConfig(self):
+        import copy
+        return copy.deepcopy(self._cross_network)
+
+    def saveCrossNetworkConfig(self, wormhole, ssh, pasted_key, passphrase):
+        self.transport_calls.append(
+            ("save", wormhole, ssh, pasted_key, passphrase))
+        self._cross_network["wormhole"] = dict(wormhole)
+        self._cross_network["ssh"] = dict(ssh)
+        return True
+
+    def checkSSHProfile(self, settings, pasted_key, passphrase):
+        self.transport_calls.append(
+            ("ssh.check", settings, pasted_key, passphrase))
+
+    def createSSHPairing(self):
+        self.transport_calls.append(("ssh.pair.create",))
+
+    def joinSSHPairing(self, code):
+        self.transport_calls.append(("ssh.pair.join", code))
+
+    def removeSSHPeer(self, instance_id):
+        self.transport_calls.append(("ssh.peer.remove", instance_id))
+
+    def startOneTimeSend(self, paths):
+        self.transport_calls.append(("wormhole.create", list(paths)))
+
+    def joinOneTime(self, code):
+        self.transport_calls.append(("wormhole.join", code))
+
+    def acceptOneTime(self, session_id):
+        self.transport_calls.append(("wormhole.accept", session_id))
+
+    def rejectOneTime(self, session_id):
+        self.transport_calls.append(("wormhole.reject", session_id))
+
+    def cancelTransportSession(self, session_id):
+        self.transport_calls.append(("session.cancel", session_id))
 
 
 def _make_window(app):
@@ -319,12 +397,62 @@ def test_settings_page_opens_and_populates(app):
     assert window._manual_host.text() == ""
     assert window._manual_port.text() == ""
     assert window._ed_name.labelText() == "设备名称"
+    assert window._ed_inbox.labelText() == "默认目录"
+    assert all(
+        field.labelText().endswith("目录（留空=默认目录）")
+        for field in window._inbox_category_fields.values()
+    )
     assert window._sp_port.labelText() == "本机监听端口（留空=自动，建议 1024-49151，如 41300）"
     assert window._manual_host.labelText() == "Tailscale IP 或 MagicDNS 名称"
     assert window._local_info_lbl.text().startswith("本机：SMOKE-")
     assert window._version_info_lbl.text() == "版本：v0.0.0"
     assert window._port_info_lbl.text() == "端口：43123（建议自定义 1024-49151 固定端口）"
     assert "IP" not in window._local_info_lbl.text()
+
+
+def test_inbox_classification_settings_are_saved(app):
+    window, bridge = _make_window(app)
+    window._open_settings()
+    window._cb_auto_classify.setChecked(True)
+    window._inbox_category_fields["media"].setText("/tmp/InkHole-media")
+
+    window._save_settings()
+
+    assert bridge.inbox_classification is not None
+    enabled, directories = bridge.inbox_classification
+    assert enabled is True
+    assert directories["media"] == "/tmp/InkHole-media"
+    assert set(directories) == {"media", "archive", "file", "folder"}
+
+
+def test_settings_lists_and_revokes_trusted_device(app):
+    window, bridge = _make_window(app)
+    instance_id = "0123456789abcdef0123456789abcdef"
+    bridge.node._trusted[instance_id] = "ab" * 32
+    window._open_settings()
+    app.processEvents()
+
+    assert window._trusted_list_lay.count() == 1
+    row = window._trusted_list_lay.itemAt(0).widget()
+    revoke_buttons = row.findChildren(QToolButton)
+    assert len(revoke_buttons) == 1
+    assert revoke_buttons[0].toolTip() == "撤销设备信任"
+
+    revoke_buttons[0].click()
+    app.processEvents()
+    assert bridge.node.trusted_devices() == {}
+    assert window._trusted_list_lay.itemAt(0).widget().text() == "尚未配对设备"
+
+
+def test_ssh_key_editor_uses_compact_height_for_each_mode(app):
+    window, _ = _make_window(app)
+    window._open_settings()
+
+    assert window._ssh_key_stack.height() == 48
+    window._set_ssh_key_mode("paste")
+    assert window._ssh_key_stack.height() == 96
+    window._set_ssh_key_mode("file")
+    assert window._ssh_key_stack.height() == 48
 
 
 def test_encryption_toggle_controls_password_and_preserves_it(app):

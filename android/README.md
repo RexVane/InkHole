@@ -1,19 +1,24 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.4.4`），与 Windows/macOS 桌面端在同一局域网或 Tailscale 网络内互传文件。
+墨洞 Android 客户端（当前版本 `1.5.0`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
 
 ## 功能
 
 - 使用 Android NSD 发现 `_inkhole._tcp` 服务并手动选择发送目标。
 - **手动添加设备**（设置内填对方 Tailscale IP 或 MagicDNS 名称 + 对方监听端口）：跨网络传输，离线自动剔除、回线自动恢复。
-- 设备列表只显示通过 WHPC v2 身份与能力验证的在线设备；手动设备首次连接会固定身份，地址后来指向其他设备时拒绝重连。对端下线后不会因系统 mDNS 缓存"复活"，回到前台会立即重新核对在线状态。
+- **一次性短码**：选择多个文件后生成 PAKE 安全短码和二维码；接收端先确认设备、数量、大小与名称摘要，再建立 Magic Wormhole 加密会话。文件继续使用 WHPP，不走依赖自带的 ZIP 传输。
+- 短码服务会优先直连，无法直连时使用加密 Transit；如果 Android 系统配置了 HTTP 代理，跨网核心会自动继承该代理，不需要把代理口令写进墨洞配置。
+- **SSH VPS 中继**：填写 VPS、端口和用户名，选择私钥文件或粘贴已有私钥；验证主机指纹后启用。设备通过一次性 PAKE 配对码交换 Noise 身份，长期出现在发送目标列表中。
+- **安全存储**：共享传输口令、粘贴私钥、私钥口令和 Noise 私钥由 Android Keystore 加密；旧版 `SharedPreferences` 明文口令会自动迁移并清除。文件模式只保存持久化 SAF URI，不提供 SSH 密钥生成功能。
+- 设备列表只显示通过 WHPC v3 身份与能力验证的在线设备；手动设备首次连接会固定身份，地址后来指向其他设备时拒绝重连。对端下线后不会因系统 mDNS 缓存"复活"，回到前台会立即重新核对在线状态。
 - Tailnet IPv4（`100.64.0.0/10`）和 IPv6（`fd7a:115c:a1e0::/48`）的探活与传输强制走真正的 Tailscale VPN 网络；Tailscale 未连接时直接判离线，不会回退到默认路由。能打洞时由两端直连，否则 Tailscale 可能通过加密 DERP 中继。
 - 固定监听端口不可用时节点启动失败并显示错误，不会自动改用随机端口。
-- 设置页顶部分行显示本机、版本和端口，并按设备设置、传输安全、跨网络配置分组；端到端加密使用独立开关控制，关闭时保留口令但不加密传输。
+- 设置页顶部分行显示本机、版本和端口，并按设备设置、传输安全、跨网络配置分组；跨网络配置包含 Tailscale、一次性短码和 SSH 中继三个页签。
+- 设置页显示已固定设备的完整公钥指纹，并可随时撤销信任；重新选择设备后才会再次固定。
 - 用户界面统一使用「发送 / 接收」术语，精简未发现设备和选文件提示；本机端口旁提示建议自定义固定端口。
 - 首次打开自动显示简洁使用说明，区分局域网与 Tailscale 跨网络使用方式；设置中可随时重新查看。
 - Jetpack Compose 主界面、系统文件选择器和最近接收历史。
-- 发送中可随时取消；双方立即清除进度，接收端自动删除未完成文件。
+- 发送中可随时取消；双方立即清除进度，接收端只保留不可见的续传检查点，不会导出未完成文件。
 - 已知大小的 `content://` 文件直接流式发送，不再为大文件完整复制一份缓存；传输状态显示实时速度。
 - GB 级大文件高速传输：TCP 窗口缓冲在建立连接前按 4MB 协商（设晚了会被钉死在小窗口），收完导出到下载目录使用 1MB 缓冲复制。
 - 传输状态栏百分比与实时速度前置并支持两行显示，长文件名只截断名字、不遮挡速度。
@@ -22,17 +27,24 @@
 - 接收文件导出到系统 `Download/InkHole`，文件夹保留相对目录结构并直接可用；Android 10+ 无法可靠创建完全空的公共目录，因此空目录会被忽略。
 - 设置内检查更新并应用内下载安装新 APK；更新弹窗显示当前/最新版本、可用状态和最多 4 条简洁版本变化（发布 APK 使用固定发布签名）。
 - 与桌面端同款品牌图标（自适应 + Android 13 单色图标 + 通知小图标）。
-- 兼容桌面端明文、WHE1 整块加密、WHE2 分块加密和 ACK 回执；支持 WHPC 能力协商与 WHF1 流式文件夹接收，不需要先收 ZIP 再解压。
+- 使用 WHPP v3 明文或 WHE2 分块加密传输，并强制校验 ACK 与 SHA-256；支持 WHPC 能力协商与 WHF1 流式文件夹接收，不需要先收 ZIP 再解压。
+- 明文、WHE2 加密、普通文件和 WHF1 文件夹均支持跨断网与进程重启续传；检查点、完成回执和暂存数据最多保留 7 天。
 
 ## 构建
 
-1. 用 Android Studio (或 IntelliJ IDEA + Android 插件) 打开 `android/` 目录
-2. 等待 Gradle 同步和 SDK 自动下载
-3. 点 Run 构建 APK 并安装到手机
+1. 安装 Go 1.25+、Java 17、Android SDK 34 和 NDK `27.2.12479018`
+2. 在仓库根目录的 `transport-core/` 生成 gomobile AAR
+3. 用 Android Studio 打开 `android/`，或使用命令行构建 APK
 
 也可以使用命令行：
 
 ```bash
+cd transport-core
+make init-gomobile
+ANDROID_HOME=/path/to/android-sdk \
+ANDROID_NDK_HOME=/path/to/android-sdk/ndk/27.2.12479018 \
+make build-android
+
 cd android
 ./gradlew assembleDebug
 # android/app/build/outputs/apk/debug/app-debug.apk
@@ -44,10 +56,13 @@ cd android
 
 - mDNS 服务类型: `_inkhole._tcp`（Android NSD 格式，兼容桌面版 zeroconf）
 - WHPP 协议: `[4B "WHPP"] [4B header_len] [JSON header] [文件或 WHF1 文件夹流]`
-- WHPC v2 能力探测: 同时校验 32 位 `instance_id`、设备名和 `folder-v1` 能力。
+- WHPC v3 能力探测：同时校验随机挑战、设备公钥签名、32 位 `instance_id`、设备名和协议能力。
 - AES-256-GCM 加密: PBKDF2-HMAC-SHA256 100k 迭代，格式与桌面版 crypto.py 一致
+- 共享核心入口认证: 本机发送端点先发 `IKAT + 会话令牌`，核心回注接收节点先发 `IKCI + 节点令牌`。
+- Magic Wormhole AppID: `com.rexvane.inkhole/transport-v1`。
+- SSH 配对 AppID: `com.rexvane.inkhole/ssh-pair-v1`；数据通道使用 Noise IK 和 yamux。
 
-当前 Python 端 CI 覆盖 WHPP/WHE1/WHE2 协议行为，Android APK 由独立工作流构建；Python/Kotlin 固定向量互通测试仍列在项目待办中。
+Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 单元测试覆盖协议、加密原语、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。
 
 ## 权限
 

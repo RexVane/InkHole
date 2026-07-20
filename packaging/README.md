@@ -29,6 +29,30 @@ bash build-mac.sh
 # 产物:packaging/dist/InkHolePet.app
 ```
 
+## 正式签名
+
+`.github/workflows/package.yml` 在配置证书后执行完整发布链：Windows 主程序与
+`inkhole-core.exe` 使用 Authenticode + RFC 3161 时间戳；macOS `.app` 使用
+Developer ID hardened runtime 签名、Apple notarization 与 stapling。两个 ZIP 都会生成并
+macOS ZIP 上传同名 `.sha256`；Windows ZIP 上传同名、带 Authenticode 签名的
+`.sha256.ps1`。Windows 应用内更新会校验 ZIP 的 SHA-256，并要求当前 EXE、候选
+EXE 和校验清单使用同一发布证书。
+
+仓库需要配置以下 GitHub Actions secrets：
+
+| Secret | 用途 |
+|---|---|
+| `WINDOWS_CERTIFICATE_BASE64` | PFX 文件的 Base64 |
+| `WINDOWS_CERTIFICATE_PASSWORD` | PFX 密码 |
+| `MACOS_CERTIFICATE_BASE64` | Developer ID `.p12` 的 Base64 |
+| `MACOS_CERTIFICATE_PASSWORD` | `.p12` 密码 |
+| `MACOS_SIGNING_IDENTITY` | `Developer ID Application: ...` 完整名称 |
+| `APPLE_ID` | notarization Apple ID |
+| `APPLE_APP_SPECIFIC_PASSWORD` | Apple app-specific password |
+| `APPLE_TEAM_ID` | Apple Developer Team ID |
+
+证书 secret 未配置时工作流仍可构建测试产物，但该产物不应作为正式 Release 发布。
+
 依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。生成品牌图标时另需 `Pillow`；macOS 使用 `pyobjc-framework-Cocoa` 提供原生文件/文件夹混选和「挂件常驻所有桌面」，缺少时选择器回退 Qt 版本且跳过 Spaces 增强。
 
 桌面任务栏、托盘、Windows 可执行文件和 macOS app bundle 使用同一双弧墨洞图标。修改 `src/inkhole/branding.py` 后安装 Pillow，并运行 `python packaging/generate-icons.py`，再提交 `assets/inkhole.png`、`.ico` 和 `.icns`。

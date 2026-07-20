@@ -161,6 +161,7 @@ internal object WHF1 {
             } else {
                 fileKeys += collisionKey
                 val parent = target.parentFile
+                    ?: throw IllegalArgumentException("folder file has no parent")
                 if (!parent.isDirectory && !parent.mkdirs()) {
                     throw IllegalArgumentException("cannot create folder parent")
                 }

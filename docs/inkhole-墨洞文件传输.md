@@ -1,200 +1,136 @@
 # 墨洞文件传输（InkHole）
 
-> P2P 点对点文件传输：在桌面主窗口、墨洞桌宠或 Android 端选择设备发送，文件直接出现在另一台设备上。局域网自动发现，跨网络可配合 Tailscale 手动直连，无需自建服务器。
+版本：`1.5.0`
 
-## 这是什么
+墨洞是 Windows、macOS 和 Android 之间的文件互传工具。局域网内使用
+mDNS 自动发现和 TCP 直连；跨网络保留 Tailscale，并提供 Magic Wormhole
+一次性短码和自有 SSH VPS 长期中继。应用没有墨洞云盘，文件不会先上传到
+墨洞服务器。
 
-一个面向可信网络的文件互传通道。两台设备连同一个 WiFi/路由器，各自启动墨洞后，mDNS 自动发现对端，文件通过 TCP 直连传输——不经过任何中转服务器。
+## 传输方式
 
-不在同一网络时，桌面端可在设置里**手动添加设备**（填对方 IP 与监听端口直连）。配合 [Tailscale](https://tailscale.com) 等虚拟局域网：两台电脑登录同一 Tailscale 账号、互填对方的 `100.x` 虚拟 IP，即可像局域网一样异地互传。
+| 方式 | 适合场景 | 连接寿命 | 用户需要准备 |
+| --- | --- | --- | --- |
+| 局域网 mDNS | 同一 WiFi/路由器 | 临时 | 两端打开墨洞 |
+| Tailscale | 自己的固定设备 | 长期 | 两端登录同一 Tailnet，填对方地址和端口 |
+| Magic Wormhole 短码 | 临时给另一台设备发送 | 一次 | 发送端生成码，接收端输入或扫描二维码 |
+| SSH VPS 中继 | 固定设备长期互传 | 长期 | 自有 VPS、SSH 用户和已有私钥 |
 
-桌面端体验：**在主窗口选择目标 → 点击选择发送内容或拖入窗口 → 墨洞显示传输进度 → 对端内容落入收件箱**。桌宠仍可作为常驻桌面的快捷拖放入口。
+## 一次性短码
 
-## Windows 主窗口
+发送端在“跨网络传输”中选择文件，墨洞向 Magic Wormhole 会合服务申请一
+个一次性代码。代码通常形如：
 
-![InkHole Windows desktop UI](assets/inkhole-windows.png)
-
-- 默认尺寸 `960×640`，最小尺寸 `800×580`。
-- 左侧发送工作区保持目标设备、墨洞动画、文件选择和状态反馈位置稳定。
-- 右侧信息栏显示附近设备和最近接收，长名称使用省略号并保留完整 tooltip。
-- 设置在同一窗口内切换；设备卡片、开关、页面、拖拽和状态反馈使用 150-180ms 短时缓动。
-- 墨洞使用时间驱动的 60fps 动画，主窗口隐藏或切换到设置页后自动暂停，避免托盘驻留时持续占用 CPU。
-
-## 原理与架构
-
-墨洞分为两层：底层是 P2P 引擎（mDNS 发现 + TCP 直连），上层是桌面主窗口/桌宠与 Android UI。界面只通过 Bridge 信号和回调使用引擎，传输逻辑不依赖 GUI。
-
-```
-   电脑A                                      电脑B
-┌──────────────┐    mDNS 自动发现     ┌──────────────┐
-│ 墨洞应用/桌宠   │ ──────────────────> │ 墨洞应用/桌宠   │
-│  (选择/拖入)   │    TCP 直连传输      │  (收到文件)    │
-│  (进度反馈)    │ ──────────────────> │  (接收记录)    │
-│              │    WHPP 协议         │              │
-│ 收件箱出现    │ <────────────────── │  拖入文件     │
-└──────────────┘    双向互传           └──────────────┘
+```text
+7-reproduce-freedom
 ```
 
-- **mDNS 发现**：每个墨洞启动后注册 `_inkhole._tcp.local.` 服务（zeroconf），同时浏览局域网内的同名服务。发现对端后自动加入设备列表，由用户在主窗口或桌宠菜单手动选择发送目标。
-- **手动添加设备**：mDNS 组播不穿虚拟网卡/跨网段——设置里填对方 IP 与监听端口即可直连登记。手动设备与自动发现设备同列显示；离线由探测线程剔除，回线后自动恢复（无 mDNS 通告，靠探测兜底）。
-- **存活探测**：mDNS 的离线通告在 WiFi 下常丢包、对端崩溃时根本不发。引擎每 10 秒对已发现设备做一次轻量 TCP 探活，连续 2 轮连不上就把它从列表剔除——对端退出后设备列表及时刷新，不留幽灵设备。
-- **TCP 直连**：发送文件时直接连接对端的 TCP 端口，走 WHPP 协议（magic + JSON 头 + 文件数据），不经过任何中转。
-- **设备选择**：主窗口右侧列出已发现设备，点击卡片选择或取消目标；桌宠右键菜单也保留发送目标入口。对端离线时选中被清空（不自动切换），需重新选择。
-- **端到端加密**（可选）：Windows、macOS、Android 设置页均有独立开关；开启并设置相同口令后使用 AES-256-GCM，文件在发送方加密、接收方解密。关闭时保留口令，但传输为明文。
-- **接收防御**：桌面端清洗 basename、Windows 非法字符和 NTFS ADS，拒绝非法 size 与磁盘空间不足的传输；完整写入临时文件后才原子落盘，桌面同名文件自动加后缀。
+数字是会合服务分配的 mailbox 编号，后面的英文词组是 PAKE 密码组件。
+英文不是系统语言设置造成的，也不应翻译；接收端必须原样输入。用户界面
+使用中文“短码”，二维码内容使用墨洞自己的 URI：
 
-模块位置：
-
-```
-src/inkhole/
-├── p2p.py        P2P 引擎(mDNS 发现 + 手动设备 + TCP 直连 + WHE2 分块加密)——纯后台, 已自动化测试
-├── crypto.py     端到端加密(AES-256-GCM，WHE1 整块 / WHE2 分块流)
-├── pet.py        应用生命周期、桌宠挂件、配置持久化与发送队列
-├── mainwindow.py QtWidgets 桌面主窗口、设置页、进度与交互动效
-├── branding.py   品牌图标绘制(托盘/任务栏与 assets 图标共用)
-├── inkhole.qml   墨洞视觉与动画(吸积弧/进度环/碎片吞吐)
-├── __init__.py
-└── __main__.py   入口(python -m inkhole 启动桌宠)
-tests/test_p2p.py             P2P 引擎端到端测试
-tests/test_manual_peers.py    手动添加设备(直连/探活恢复/配置同步)
-tests/test_mainwindow_smoke.py 主窗口离屏冒烟(bridge 契约)
-android/app/src/main/java/com/rexvane/inkhole/
-├── p2p/InkHoleNode.kt  Android P2P 引擎(NSD + TCP)
-├── p2p/Crypto.kt       加密(与桌面版逐字节兼容)
-├── p2p/WHPP.kt         协议常量与读写
-├── InkHoleService.kt   前台服务(P2P 节点生命周期)
-├── MainActivity.kt     主 UI(Jetpack Compose)
-└── InkHoleUI.kt        Compose UI 组件
+```text
+inkhole://receive?code=7-reproduce-freedom
 ```
 
-## 准备：两台电脑连同一局域网
+接收端输入代码后，发送端先公布设备名、文件数量、总大小和名称摘要。接收
+端确认后才接受通道。代码只使用一次，默认十分钟超时；会合服务只负责让
+两端找到彼此，不接触文件明文。两端优先尝试直连，失败时使用加密 Transit
+中继。桌面端自动继承系统 HTTP 代理，Android 自动继承当前网络的 HTTP
+代理（如果系统配置了代理）。
 
-两台电脑连同一个 WiFi/路由器即可，不需要任何服务器。
+Magic Wormhole 的 PAKE 只负责建立加密隧道。墨洞不会调用其自带的 ZIP 文件
+传输流程：通道建立后使用 yamux 复用多个独立流，每个文件或目录流继续承载
+WHPP/WHF1，因此多文件不需要先合成 ZIP，也不在中继落盘。
 
-装依赖（只需一次）：
+## SSH VPS 中继
+
+VPS 只需要运行标准 SSH 服务并允许 TCP forwarding，不需要安装墨洞服务、
+数据库或对象存储。两端填写：
+
+- VPS 公网 IP 或域名；
+- SSH 端口（通常为 `22`）；
+- SSH 用户名；
+- 已有 SSH 私钥文件，或直接粘贴已有私钥。
+
+墨洞不会生成 SSH 密钥。首次连接先显示服务器主机指纹，用户确认后才固定
+该指纹。应用在 VPS 回环地址申请反向端口，端口不会绑定公网网卡。然后一端
+生成 SSH 配对码，另一端输入或扫描该码；配对码通过
+`com.rexvane.inkhole/ssh-pair-v1` 下的 SPAKE2 认证，交换设备名和固定 Noise
+公钥。配对成功后设备保存到列表，SSH 断线会自动重连。
+
+共享传输口令、私钥、私钥口令和 Noise 私钥不写普通配置：桌面使用系统凭据存储，
+Android 使用 Keystore 加密存储。旧版明文共享口令首次启动时自动迁移并清除；
+文件模式只保存 SAF URI 或路径，使用时再读取。
+默认开启 Noise 外层端到端加密；若用户关闭该选项，SSH 链路仍然加密，但
+VPS 管理员可能看到转发内容和元数据。
+
+## 共享核心
+
+```text
+Windows/macOS UI -> JSON sidecar -> transport-core -> 已认证 loopback 端点
+Android UI       -> gomobile AAR -> transport-core -> 已认证 loopback 端点
+```
+
+`transport-core` 负责 Magic Wormhole、SSH 反向转发、SPAKE2、Noise IK 和
+yamux。每个跨网会话都映射为本机回环端点：
+
+- 发送端连接端点前发送 `IKAT + 随机能力令牌`；
+- 核心向接收节点回注前发送 `IKCI + 节点令牌`；
+- 令牌只存在于进程内，不广播、不持久化。
+
+这样 Python 和 Kotlin 仍然只处理同一套 WHPP/WHF1 字节协议，局域网、
+Tailscale、短码和 SSH 的文件名、目录结构、强制 ACK/SHA-256、断点续传、
+进度、取消与原子落盘行为保持一致。
+
+## 安全与限制
+
+- WHPP v3 会校验发送设备的 ECDSA 签名，但局域网默认不要求该设备已被信任；
+  公共 WiFi 应开启“仅接收目标设备”。首次选择设备会固定公钥指纹，设置页
+  可以查看并撤销。
+- Magic Wormhole 会合服务和 Transit 只看到加密会话元数据，不保存文件。
+- Tailscale 无法点对点时可能经过 DERP 加密中继；SSH 模式由用户自己的 VPS
+  转发流量。
+- Android 前台服务持有 WiFiLock，锁屏后仍保持监听；系统厂商若强行停止应用，
+  设备自然会离线，服务下次启动会恢复。
+- Android 10+ 导出到 `Download/InkHole`。受 Scoped Storage 限制，完全空的
+  目录不能可靠创建；包含文件的目录结构会保留。
+
+## 构建与验证
+
+桌面依赖：
 
 ```bash
-pip install PySide6 zeroconf cryptography psutil
-# macOS 另需（挂件常驻所有桌面，可选）：
-pip install pyobjc-framework-Cocoa
+pip install -e ".[gui,test]"
 ```
 
-## 跨网络：配合 Tailscale 手动直连
-
-两台电脑不在同一网络（异地/公司-家里）时：
-
-1. 两台电脑都安装 [Tailscale](https://tailscale.com) 并登录**同一账号**（免费），每台获得一个固定 `100.x.x.x` 虚拟 IP；
-2. 两台电脑的墨洞：设置 → 监听端口改为固定值（建议 1024-49151，如 `41300`）→ 保存；
-3. 墨洞：设置 → **手动添加设备** → 填对方的 Tailscale IP 与端口 → 添加（两边互填则双向可发）。
-
-之后两端 Tailscale 在线时打开墨洞即可互见互传；对方离线设备自动消失，回线后几秒内自动恢复。
-
-## 启动步骤
-
-**两台电脑各启动一个墨洞：**
+共享核心：
 
 ```bash
-# 电脑 A
-PYTHONPATH=src python3 -m inkhole.pet
-
-# 电脑 B（可指定显示名，对端设备列表里看到的就是这个名字）
-PYTHONPATH=src python3 -m inkhole.pet --name 我的Mac
+cd transport-core
+make test
+make build-desktop
 ```
 
-启动后会显示桌面主窗口；桌宠挂件是否显示由应用内设置控制。
-
-**传文件：**
-
-1. 在主窗口右侧选择对端设备（发现设备不自动选中，需手动选择）。
-2. 点击「选择发送内容」里的文件/文件夹入口，或把文件/文件夹拖入窗口。新客户端之间直接流式发送目录，对端收到即可使用；旧客户端自动回退为同名 ZIP。
-3. 墨洞外圈显示传输进度，接收方落盘并返回 ACK 后才报告成功。
-
-- 使用桌宠时，也可以从右键菜单选择目标后直接拖入文件。
-- 拖动挂件可挪到桌面任意位置；松手靠近边缘会自动吸附收起。
-
-## 收件箱在哪 / 怎么改
-
-默认收件箱：Windows `桌面\inkhole\`（自动识别 OneDrive 重定向），macOS `~/Documents/inkhole/`，其他 `~/InkHole/收件箱/`。
-
-在主窗口「设置」中点击收件箱旁的「更换目录」即可修改。也可以通过命令行覆盖：
+Android AAR 和 APK：
 
 ```bash
-PYTHONPATH=src python3 -m inkhole.pet --inbox ~/Desktop
+cd transport-core
+make init-gomobile
+make build-android
+cd ../android
+./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
-## 没有图形界面？用命令行版
+根目录 `make test` 会依次运行 Python 桌面测试和 Go 共享核心 race 测试。
+Android CI 会在干净环境安装固定版本的 NDK，现场生成 AAR，再运行单测、Lint
+和 APK 构建。第三方依赖和本地 `wormhole-william` fork 见
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)。
 
-P2P 引擎本身不依赖 GUI。可以用命令行版：监视一个"发送文件夹"，放进去的文件自动发给已发现的对端；收到的文件落入收件箱。
+## 名称说明
 
-```bash
-PYTHONPATH=src python3 -m inkhole.p2p \
-    --inbox ~/InkHole/收件箱 --outbox ~/InkHole/发件箱
-```
-
-把文件丢进 `发件箱` 就会自动发送；对端的文件会自动出现在 `收件箱`。
-
-## 启动参数
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `--inbox` | 收件箱目录 | 随平台（Win: `桌面\inkhole`，Mac: `~/Documents/inkhole`） |
-| `--port` | P2P 监听端口（0 = 操作系统自动分配） | `0` |
-| `--name` | 本机显示名（对端设备列表里看到的名字） | 主机名 |
-| `--secret 口令` | 端到端文件加密（两台电脑口令必须一致） | 关 |
-| `--size 像素` | 挂件边长（仅 pet）；0 = 随系统自适应 | `0` |
-
-## 加密
-
-| 层 | 开关 | 防什么 | 原理 |
-|----|------|--------|------|
-| **端到端文件加密** | 三端设置页独立开关，或两台电脑 `--secret '口令'` | 网络窃听 | AES-256-GCM，密钥由口令经 PBKDF2-HMAC-SHA256 派生（10 万次迭代）；传输全程只见密文 |
-
-```bash
-# 两台电脑都加同一口令
-PYTHONPATH=src python3 -m inkhole.pet --secret '两边一致的口令'
-```
-
-注意：
-
-- 端到端加密需要 `pip install cryptography`。
-- 两边 `--secret` 不一致时接收方拒绝落盘并返回失败 ACK，发送端提示接收失败。
-- 设置页关闭加密开关时不会删除已保存口令，但发送数据不再加密。
-
-## 开机自启
-
-主窗口「设置」→「开机自启」，开启后电脑登录时自动启动墨洞。
-
-- **Windows**：在 `~/inkhole-startup.bat` 生成启动脚本，注册到注册表 `HKCU\...\Run`
-- **macOS**：在 `~/Library/LaunchAgents/` 生成 LaunchAgent plist
-- **Linux**：在 `~/.config/autostart/` 生成 .desktop 文件
-
-设备名、口令、收件箱等保存在应用配置中；自启脚本和注册表项不写入明文口令，取消开关时自动清理。
-
-## 检查更新与应用内更新
-
-主窗口「设置」→「应用行为」→「检查更新」，显示当前版本并查询 GitHub 最新 Release：
-
-- **已是最新**：桌面弹提示、Android 弹 Toast 明确告知「已是最新版本」。
-- **有新版**：Windows 打包版可在应用内直接下载新版 zip，自动覆盖并重启（源码运行时改为打开下载页）；Android 在应用内下载新 APK 并拉起系统安装器覆盖安装。
-- 检查走 GitHub API，匿名请求按出口 IP 限流（挂代理时易触发 403），失败会自动回退解析 `releases/latest` 的重定向拿版本号，双端一致。
-- Android 发布 APK 使用固定发布签名（CI 从密钥库签名），保证每次构建签名一致、可覆盖安装。
-
-## 常见问题
-
-**支持什么格式？** 全部。普通文件按 TCP 二进制流逐字节搬运；文件夹使用 WHF1 条目流，不生成中间 ZIP，保留相对路径并在校验完成后原子落盘。旧客户端自动回退 ZIP。Python 桌面接收端遇到同名文件或文件夹会自动加 " (2)" 后缀。
-
-**Android 会保留空目录吗？** 有文件的目录结构会完整保留。Android 10+ 的公共 Downloads 由 MediaStore 管理，无法可靠创建完全空的目录，因此空目录会被忽略；普通文件和非空子目录不受影响。
-
-**网络要求？** 局域网互传：两台设备连同一 WiFi/路由器即可,mDNS 是局域网广播协议,不需要公网 IP、不需要端口映射。跨网络互传：配合 Tailscale 等虚拟局域网(两端登录同一账号),在设置里手动添加对方虚拟 IP 与固定监听端口即可。
-
-**会一直监视吗？** 墨洞应用运行期间持续 mDNS 广播和 TCP 监听；从托盘退出后一切停止。只有用户主动选择或拖入的文件才会发送。
-
-**多台设备怎么办？** 主窗口「附近设备」列出所有已发现的墨洞设备，点击要发送的目标。每次只发给选中的那一台。
-
-## 测试
-
-```bash
-PYTHONPATH=src QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q
-```
-
-覆盖 P2P 文件与 WHF1 文件夹端到端传输、WHE1/WHE2 加密、WHPC 能力协商、旧版 ZIP 回退、取消与进度、路径安全和原子落盘；另覆盖手动设备在线状态、桌面主窗口、混合内容选择与设置页。当前 Python 测试为 `67 passed`，Android 协议与存储测试及 Lint 独立执行。
+`Magic Wormhole` 和 `wormhole-william` 是已有开源项目名称，不是墨洞的自创
+命名。墨洞自己的标识包括应用名称 InkHole/墨洞、专用 AppID
+`com.rexvane.inkhole/transport-v1`、`inkhole://` 深链、共享传输核心，以及
+WHPP/WHF1 文件流实现。`wormhole-william` 的本地源码仅用于建立原始加密隧道、
+代理和连接可靠性修复；其上游许可证仍保留在 `transport-core/third_party/`。

@@ -4,21 +4,24 @@
 [![Android APK](https://github.com/RexVane/InkHole/actions/workflows/android.yml/badge.svg)](https://github.com/RexVane/InkHole/actions/workflows/android.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> P2P 文件传输：在桌面主窗口、墨洞桌宠或手机端选择设备并发送，文件直接出现在对端设备上。局域网自动发现，跨网络可配合 Tailscale 手动直连。无需自建服务器。
+> 跨平台文件传输：局域网自动发现，跨网络支持 Tailscale、Magic Wormhole 一次性短码和自有 SSH VPS 中继。Windows、macOS、Android 共用文件协议。
 
-两台设备连同一个 WiFi，各开一个墨洞，mDNS 自动发现彼此，拖文件进去就 TCP 直连传过去。不在同一网络时，可在设置中**手动添加设备**（填对方 IP 或 MagicDNS 名称与端口，配合 [Tailscale](https://tailscale.com) 等虚拟局域网即可跨网传输）。支持端到端加密（大文件分块流式）、传输回执与进度、手动选目标设备、开机自启。Windows / macOS / Android 三平台互通。
+两台设备在同一个 WiFi 时，mDNS 自动发现后直接传输。不在同一网络时，可以用 Tailscale 建立长期直连、生成一次性安全短码，或让固定设备通过自己的 SSH VPS 会合。文件不会上传到墨洞云盘；三端继续使用 WHPP/WHF1 流式传输、ACK、进度、取消和原子落盘。
 
 ## Quick Start
 
 ```bash
-# 1. 装依赖
-pip install PySide6 zeroconf cryptography psutil
+# 1. 装桌面依赖
+pip install -e ".[gui]"
 
-# 2. 两台电脑各跑一个
+# 2. 编译跨网共享核心（局域网模式不依赖它）
+cd transport-core && make build-desktop && cd ..
+
+# 3. 两台电脑各跑一个
 PYTHONPATH=src python -m inkhole.pet
 PYTHONPATH=src python -m inkhole.pet --name 我的Mac
 
-# 3. 在主窗口选择目标设备 → 点击选择发送内容或直接拖入 → 传过去
+# 4. 选择目标设备，点击选择发送内容或直接拖入
 ```
 
 也可以直接 `python -m inkhole`（等价于启动桌宠）。
@@ -40,26 +43,32 @@ Windows 主窗口采用双栏工作台布局：左侧固定为发送目标、墨
 ## Features
 
 - **mDNS 自动发现**：注册 `_inkhole._tcp.local.` 服务，局域网内自动发现其他墨洞设备；服务名带唯一实例 ID，两台同名设备不冲突；宣告本机物理网卡地址（自动过滤 VMware/VirtualBox/Hyper-V 等虚拟网卡与 169.254 链路本地地址），开 VPN/多网卡也能连上
-- **手动添加设备（跨网络直连）**：自动发现不可用时，在设置里填对方 IP 或 MagicDNS 名称与监听端口（桌面与 Android 均支持）；对端通过 WHPC v2 验证后才显示，首次连接会固定设备身份，地址后来指向其他设备时会拒绝连接；设备离线自动移出列表、回线自动恢复
+- **手动添加设备（跨网络直连）**：自动发现不可用时，在设置里填对方 IP 或 MagicDNS 名称与监听端口（桌面与 Android 均支持）；对端通过 WHPC v3 验证后才显示，首次连接会固定设备身份，地址后来指向其他设备时会拒绝连接；设备离线自动移出列表、回线自动恢复
+- **一次性短码**：发送端选择内容后生成 Magic Wormhole PAKE 短码和二维码；接收端先确认设备与内容摘要，再建立端到端加密会话。多文件在同一会话上使用 yamux 独立流，不使用 Magic Wormhole ZIP 传输
+- **SSH VPS 中继**：两端只需填写 VPS、SSH 用户并选择或粘贴已有私钥；反向端口仅绑定 VPS 回环地址，PAKE 配对后固定 Noise 身份并默认启用外层端到端加密。VPS 不安装墨洞服务，也不保存文件
+- **三端共享传输核心**：Windows/macOS 使用 Go sidecar，Android 使用同源 gomobile AAR；Magic Wormhole、SSH、PAKE、Noise 和 yamux 行为保持一致
 - **应用内主界面**：深色双栏工作台——稳定的发送区、设备列表、最近接收、应用内设置页和自适应长文本；桌面设置保留双栏布局并采用 Android 同款浮动标签输入框与圆角模态面板，桌宠挂件保留为可开关选项
-- **TCP 传输**：WHPP 协议（magic + JSON 头 + 文件/文件夹数据 + 1 字节回执）；局域网直接连接，Tailscale 跨网路径由 Tailscale 负责
-- **传输回执（ACK）**：接收方落盘成功才算发送成功——对端解密失败、磁盘满、被拒收，发送方都能感知
+- **TCP 传输**：WHPP v3 协议（magic + JSON 头 + 文件/文件夹数据 + ACK 与 SHA-256 回执）；局域网直接连接，Tailscale 跨网路径由 Tailscale 负责
+- **传输回执（ACK）**：发送正文前先验证目标设备对本次 header、偏移和随机数的签名；只有同一连接上的接收方原子落盘并返回 `ACK_OK + SHA-256` 才算发送成功，超时、断连、EOF、校验失败、磁盘满和拒收都会明确失败
+- **断点续传**：明文、WHE2 加密、普通文件和 WHF1 文件夹都使用持久化 `transfer_id` 与接收偏移；断网、切换网络或进程重启后继续传输，隐藏检查点和完成回执保留最多 7 天
 - **传输进度与速度**：主窗口、桌宠和 Android 端均显示墨洞进度环与实时 KB/s、MB/s；传输完成、失败或中断都会可靠清除进度
-- **取消发送**：Windows 与 Android 发送中均可取消当前文件并清空等待队列；对端立即结束进度，未完成的 `.part` 文件自动删除
-- **端到端加密**：Windows、macOS、Android 设置页均提供独立开关；关闭时保留口令但传输为明文。启用后使用 AES-256-GCM，超过 32MB 的文件自动切换 4MB 分块流式加密（WHE2），内存峰值恒定，块序号防篡改/防重排
+- **取消发送**：Windows、macOS 与 Android 发送中均可取消当前文件并清空等待队列；对端立即结束进度，未完成内容只保留为不可见的续传检查点，不会成为正式文件
+- **端到端加密**：Windows、macOS、Android 设置页均提供独立开关；关闭时保留口令但传输为明文。启用后统一使用 4MB 分块 AES-256-GCM（WHE2），续传会生成新的随机数流；内存峰值恒定，块序号防篡改/防重排
 - **发送队列**：一次拖入多个文件或文件夹会按序发送，完成后聚合报告"已发送 k/N 项"
 - **大文件夹流式传输**：桌面端直接发送 WHF1 目录条目流，不预先生成 ZIP，也不把整个文件夹读进内存；对端完整保留目录结构并直接得到可用文件夹。接收方先写隐藏暂存目录，校验完成后原子落盘；不支持 `folder-v1` 的对端回退为 ZIP
 - **Android 目录导出**：Android 10+ 将文件逐项导出到 `Download/InkHole/<文件夹名>/` 并保留相对路径；受 Scoped Storage 限制，完全空的目录无法可靠创建，会被忽略（普通文件和非空子目录不受影响）
-- **仅接收目标设备**：可选开关，拦掉局域网里陌生设备发来的文件
+- **设备身份与信任**：WHPC 探测和 WHPP 传输都使用 ECDSA P-256 签名随机挑战；选择设备后固定其公钥指纹，设置页可查看和撤销。开启“仅接收目标设备”后，只接受当前选中且指纹匹配的设备
 - **检查更新 / 应用内更新**：设置页显示当前版本并可一键检查 GitHub 最新版；双端使用圆角面板显示新版本状态与简洁变化摘要；Windows 打包版可直接在应用内下载覆盖并自动重启，Android 可在设置内下载安装新 APK，无需手动去 Releases 下载再删旧版
-- **设置持久化**：设备名/加密开关/口令/收件箱改一次就记住（桌面 `config.json`，Android `SharedPreferences`），双击 exe 无需命令行参数
+- **设置持久化**：设备名、加密开关和目录等非敏感设置写入普通配置；共享传输口令由桌面系统凭据库或 Android Keystore 加密保存，旧版明文配置会在首次启动时自动迁移并清除
 - **墨洞桌宠**：PySide6 + QML——墨黑核心、青色吸积弧缓慢旋转、呼吸光晕；发送时碎裂动画 / 接收时拼合动画；贴边自动收起
 - **Android 前台服务**：锁屏/切后台持续接收；收到的文件进系统 `Download/InkHole`（文件管理器可见）并发通知，点击直接打开；接收历史持久化
 - **系统分享入口**：手机上任意 App 分享 → 墨洞，选中设备即发送，支持多选；已知大小的大文件直接从 `content://` 流式传输，不再完整复制到缓存
 - **开机自启**：在应用内设置页切换，Windows 注册表 / macOS LaunchAgent / Linux .desktop（不含明文口令）
 - **接收防御**：文件名 basename 裁剪与文件夹逐级路径校验防 `../` 穿越；拒绝绝对路径、符号链接、特殊文件和跨平台大小写重名；size 合法性校验 + 磁盘余量检查；半截文件/文件夹绝不落盘
 
-## 跨网络传输（配合 Tailscale）
+## 跨网络传输
+
+### Tailscale 长期直连
 
 不在同一个 WiFi 下（异地/公司-家里）时，推荐配合 [Tailscale](https://tailscale.com)（免费）：
 
@@ -69,14 +78,25 @@ Windows 主窗口采用双栏工作台布局：左侧固定为发送目标、墨
 
 保存固定端口时，如果端口已被占用，墨洞会停止节点并明确报错，不会偷偷换成随机端口。之后只要两端 Tailscale 在线，打开墨洞即可互见互传；能打洞直连时速度取决于两边网络，无法直连时 Tailscale 可能自动通过加密 DERP 中继。设备离线会自动从列表消失，回线后几秒内自动恢复。
 
+### 一次性短码
+
+发送端打开“跨网络传输”，选择一个或多个文件并生成短码。接收端输入短码或扫描二维码，核对发送设备与内容摘要后确认接收。短码只使用一次，默认十分钟失效；配对服务和传输中继无法读取文件内容。
+
+### SSH VPS 长期中继
+
+VPS 只需运行 SSH，并允许 TCP forwarding。两端填写 VPS 地址、SSH 端口、用户名，选择私钥文件或粘贴已有私钥，验证并固定主机指纹后启用中继。任意一端生成配对码，另一端输入后即可成为长期设备。远端端口自动选择并仅绑定 `127.0.0.1`，无需额外开放公网端口。
+
+详细设计、安全边界和命名说明见 [跨网络传输方案](docs/跨网络传输方案.md)。
+
 ## 安全模型（请阅读）
 
 墨洞面向**可信局域网**（家里/自己的路由器）设计：
 
-- **默认接收无发送方认证**：同一网络里任何运行墨洞协议的人都可以向你的收件箱发送文件。公共 WiFi 建议在设置页开启**「仅接收目标设备」**，或开启端到端加密并设置口令。
+- **默认不要求预先信任**：WHPP v3 会验证发送方设备签名，但默认仍接受任意拥有有效墨洞设备身份的发送方。公共 WiFi 建议在设置页开启**「仅接收目标设备」**；首次选择目标会固定公钥指纹，可随时在信任列表撤销。
 - **口令的双重作用**：端到端加密开关启用时，口令保证文件内容端到端加密；口令不一致的文件会被拒收并回执失败——同时起到"只接收知道口令的设备"的准认证作用。关闭开关会保留口令，但发送内容为明文。
-- **口令明文存储在本机配置**（桌面 `config.json` / Android `SharedPreferences`），与浏览器记住密码同级别；它不会进开机自启脚本或注册表。
-- 墨洞本身没有应用层中转或云端存储：局域网内走 TCP 直连；配合 Tailscale 跨网时，流量位于 WireGuard 加密隧道中，无法打洞直连时可能由 Tailscale 的 DERP 服务器中继密文。
+- **敏感信息不写普通配置**：局域网 WHPP 的共享口令、SSH 私钥正文、私钥口令和 Noise 私钥均由桌面系统凭据库存储，Android 端使用 Android Keystore 加密存储；旧版 `config.json` / `SharedPreferences` 中的明文共享口令会自动迁移并删除。
+- 一次性短码通过 Magic Wormhole 的 PAKE 建立加密通道；SSH 配对也使用 PAKE，并固定 Noise 公钥。SSH 外层加密默认开启，关闭后 VPS 管理员可能看到转发内容。
+- 墨洞没有云端文件存储。Tailscale 可能通过 DERP 中继密文；短码可能通过 Transit 中继密文；SSH 模式由用户自己的 VPS 转发流量。
 
 ## 启动参数
 
@@ -118,7 +138,8 @@ cd android && ./gradlew assembleDebug     # 产物:android/app/build/outputs/apk
 
 ### Windows：提示"Windows 已保护你的电脑"
 
-应用未做代码签名，SmartScreen 会拦截首次运行：点击**更多信息** → **仍要运行**。
+正式 Release 使用 Authenticode 签名；首次发布或证书信誉尚未建立时，SmartScreen
+仍可能提示确认。自行本地构建的未签名版本需要点击**更多信息** → **仍要运行**。
 
 ### Windows：首次运行弹出防火墙提示
 
@@ -126,11 +147,9 @@ cd android && ./gradlew assembleDebug     # 产物:android/app/build/outputs/apk
 
 ### macOS：提示"无法验证开发者"或"已损坏，无法打开"
 
-右键点击应用 → **打开** → 再点**打开**确认；仍不行则在终端执行：
-
-```bash
-xattr -cr /Applications/InkHolePet.app
-```
+正式 Release 使用 Developer ID 签名并经过 Apple notarization。若正式包仍出现该提示，
+应重新下载并核对同名 `.sha256`，不要通过移除 quarantine 属性绕过系统验证；自行构建的
+未签名版本不具备 notarization。
 
 ### 找不到其他设备
 
@@ -141,21 +160,21 @@ xattr -cr /Applications/InkHolePet.app
 
 ### 跨网络怎么传？
 
-见上文[「跨网络传输（配合 Tailscale）」](#跨网络传输配合-tailscale)：装 Tailscale、固定监听端口、手动添加对方 IP 或 MagicDNS 名称。
+见上文[「跨网络传输」](#跨网络传输)，按使用场景选择 Tailscale、一次性短码或 SSH VPS 中继。
 
 ### 问题反馈
 
-提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.4.4）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
+提 [Issue](https://github.com/RexVane/InkHole/issues) 时请附上：操作系统与版本、应用版本（如 v1.5.0）、网络环境（家庭 WiFi / 公司网络 / 热点）、具体报错信息或截图。
 
 ## Tests
 
 ```bash
-make test        # 全量测试（Windows Git Bash / macOS / Linux 均可,等价 pytest）
+make test        # Python 桌面测试 + Go 共享核心 race 测试
 ```
 
-覆盖三块：**P2P 引擎端到端**（TCP 传输、取消与双方结束回调、端到端加密 WHE1/WHE2、WHPC v2 身份与能力协商、WHF1 文件夹流、路径穿越与重名防御、原子落盘、设备选择和在线状态等）、**手动添加设备**（验证后上线、首次身份固定、离线剔除与回线自动恢复、配置增删同步）、**桌面主窗口离屏冒烟**（bridge 契约、响应式设置页、手动设备 UI、混合内容选择、版本比较与进度清理）。Android 另有协议、存储、Tailnet 地址和更新单元测试及 Lint。
+覆盖三块：**P2P 引擎端到端**（TCP 传输、取消与双方结束回调、WHE2 分块端到端加密、WHPC v3 身份与能力协商、WHF1 文件夹流、路径穿越与重名防御、原子落盘、设备选择和在线状态等）、**手动添加设备**（验证后上线、首次身份固定、离线剔除与回线自动恢复、配置增删同步）、**桌面主窗口离屏冒烟**（bridge 契约、响应式设置页、手动设备 UI、混合内容选择、版本比较与进度清理）。Android 另有协议、存储、Tailnet 地址和更新单元测试及 Lint。
 
-桌面端同名文件或文件夹：收件箱已有同名项时自动加 " (2)" 后缀，绝不覆盖；传输中断不会留下正式文件或目录。Android 文件夹导出也会选择唯一根目录名。
+桌面端同名文件或文件夹：收件箱已有同名项时自动加 " (2)" 后缀，绝不覆盖；传输中断只留下最长保留 7 天的隐藏续传检查点，不会留下正式文件或目录。Android 文件夹导出也会选择唯一根目录名。
 
 ## Project Structure
 
@@ -165,7 +184,7 @@ make test        # 全量测试（Windows Git Bash / macOS / Linux 均可,等价
 │   ├── __init__.py            # 顶层包
 │   ├── __main__.py            # 入口(python -m inkhole 启动桌宠)
 │   ├── p2p.py                 # P2P 引擎(mDNS 发现 + 手动设备 + TCP 直连 + ACK/进度 + 加密)
-│   ├── crypto.py              # 端到端加密(AES-256-GCM，WHE1 整块 / WHE2 分块流)
+│   ├── crypto.py              # 端到端加密原语（WHPP v3 使用 WHE2 分块流）
 │   ├── pet.py                 # 应用生命周期、桌宠、配置持久化与发送队列
 │   ├── mainwindow.py          # QtWidgets 桌面主窗口、设置页与交互动效
 │   ├── branding.py            # 品牌图标绘制(托盘/任务栏/图标文件共用)
@@ -175,9 +194,14 @@ make test        # 全量测试（Windows Git Bash / macOS / Linux 均可,等价
 │   ├── test_manual_peers.py   # 手动添加设备(直连/探活恢复/配置同步)
 │   └── test_mainwindow_smoke.py # 主窗口离屏冒烟(bridge 契约)
 ├── assets/                    # 应用图标(png/ico/icns,由 generate-icons.py 生成)
+├── transport-core/            # Windows/macOS sidecar 与 Android 共用的 Go 跨网核心
+│   ├── core/                  # Magic Wormhole、SSH、PAKE、Noise、yamux
+│   ├── mobile/                # gomobile AAR 入口
+│   └── third_party/           # 本地 wormhole-william 分支与许可证
 ├── packaging/                 # 轻量 app 打包(PyInstaller -> .exe/.app)
 ├── android/                   # Android 客户端(Kotlin + Compose + 前台服务)
 ├── docs/                      # 使用与实现文档
+├── THIRD_PARTY_NOTICES.md     # 第三方依赖与本地 fork 说明
 ├── .github/workflows/         # CI
 ├── Makefile
 ├── pyproject.toml

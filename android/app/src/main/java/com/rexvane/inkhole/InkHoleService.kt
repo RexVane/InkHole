@@ -20,6 +20,10 @@ import com.rexvane.inkhole.p2p.Peer
 import com.rexvane.inkhole.p2p.InkHoleListener
 import com.rexvane.inkhole.p2p.InkHoleNode
 import com.rexvane.inkhole.p2p.ReceiveFiles
+import com.rexvane.inkhole.transport.TransportEventListener
+import com.rexvane.inkhole.transport.TransportManager
+import com.rexvane.inkhole.transport.TransferSecretStore
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicInteger
@@ -85,6 +89,7 @@ class InkHoleService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_RELOAD) {
+            TransportManager.detach()
             InkHoleBus.node?.stop()
             InkHoleBus.node = null
             InkHoleBus.lastPeers = emptyList()
@@ -99,9 +104,14 @@ class InkHoleService : Service() {
         val name = storedName.filterNot { it.isISOControl() }.trim().take(40)
             .ifEmpty { Build.MODEL }
         if (name != storedName) prefs.edit().putString("peer_name", name).apply()
-        val storedSecret = prefs.getString("secret", "") ?: ""
-        val encryptionEnabled = prefs.getBoolean(
+        val secretLoad = TransferSecretStore.load(applicationContext)
+        val storedSecret = secretLoad.value
+        val encryptionRequested = prefs.getBoolean(
             "encryption_enabled", storedSecret.isNotEmpty())
+        val encryptionEnabled = encryptionRequested && storedSecret.isNotEmpty()
+        if (encryptionRequested && !encryptionEnabled) {
+            prefs.edit().putBoolean("encryption_enabled", false).apply()
+        }
         val secret = if (encryptionEnabled) storedSecret else ""
         val trustedOnly = prefs.getBoolean("trusted_only", false)
         val listenPort = prefs.getInt("listen_port", 0)
@@ -117,11 +127,23 @@ class InkHoleService : Service() {
         }
         InkHoleBus.node = node
         node.start()
+        if (secretLoad.warning.isNotEmpty()) forwarder.onStatus(secretLoad.warning)
+        if (node.getActualPort() > 0) {
+            try {
+                TransportManager.listener = transportForwarder
+                TransportManager.attach(
+                    applicationContext, node, name, node.getInstanceId())
+            } catch (error: Exception) {
+                forwarder.onStatus("跨网核心启动失败: ${error.message}")
+            }
+        }
     }
 
     override fun onDestroy() {
         try { wifiLock?.release() } catch (_: Exception) {}
         wifiLock = null
+        TransportManager.detach()
+        TransportManager.listener = null
         InkHoleBus.node?.stop()
         InkHoleBus.node = null
         super.onDestroy()
@@ -140,10 +162,15 @@ class InkHoleService : Service() {
         }
 
         override fun onFileReceived(filename: String, path: String) {
-            val record = exportToDownloads(File(path))
-            InkHoleBus.recordReceived(this@InkHoleService, record)
-            notifyFileReceived(record)
-            InkHoleBus.uiListener?.onFileReceived(filename, path)
+            // WHPP ACK is emitted after the private atomic commit. Public MediaStore
+            // export can take minutes for a large folder and must not occupy the
+            // receiver connection or turn a durable receive into a sender timeout.
+            Thread({
+                val record = exportToDownloads(File(path))
+                InkHoleBus.recordReceived(this@InkHoleService, record)
+                notifyFileReceived(record)
+                InkHoleBus.uiListener?.onFileReceived(filename, path)
+            }, "inkhole-public-export").apply { isDaemon = true }.start()
         }
 
         override fun onStatus(msg: String) {
@@ -161,6 +188,20 @@ class InkHoleService : Service() {
         }
     }
 
+    private val transportForwarder = TransportEventListener { event, data ->
+        val message = when (event) {
+            "ssh.ready" -> "SSH 中继已连接"
+            "ssh.disconnected" -> "SSH 中继已断开，正在重连"
+            "ssh.connected" -> "SSH 中继已恢复"
+            "ssh.config.error", "ssh.pair.error", "core.error" ->
+                data.optString("error", "跨网操作失败")
+            "wormhole.error" -> "一次性短码失败: ${data.optString("error", "连接已结束")}"
+            else -> ""
+        }
+        if (message.isNotEmpty()) forwarder.onStatus(message)
+        InkHoleBus.dispatchTransportEvent(event, data)
+    }
+
     // ---- 收件箱导出：应用私有目录 -> 系统 Downloads/InkHole ----
     // 私有目录(Android/data/…)用户在文件管理器里根本找不到(Android 11+ 甚至无法访问)。
 
@@ -169,6 +210,7 @@ class InkHoleService : Service() {
         val mime = guessMime(src.name)
         val size = src.length()
         val now = System.currentTimeMillis()
+        val categoryDirectory = publicCategoryDirectory(src)
         if (Build.VERSION.SDK_INT >= 29) {
             var inserted: Uri? = null
             try {
@@ -176,7 +218,7 @@ class InkHoleService : Service() {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, src.name)
                     put(MediaStore.MediaColumns.MIME_TYPE, mime)
                     put(MediaStore.MediaColumns.RELATIVE_PATH,
-                        Environment.DIRECTORY_DOWNLOADS + "/InkHole")
+                        publicInboxRelativePath(categoryDirectory))
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
                 inserted = contentResolver.insert(
@@ -213,7 +255,9 @@ class InkHoleService : Service() {
             == PackageManager.PERMISSION_GRANTED) {
             try {
                 val dir = File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS), "InkHole")
+                    Environment.DIRECTORY_DOWNLOADS),
+                    publicInboxRelativePath(categoryDirectory)
+                        .removePrefix(Environment.DIRECTORY_DOWNLOADS + "/"))
                 if (!dir.exists() && !dir.mkdirs()) throw IOException("无法创建下载目录")
                 val dst = synchronized(exportLock) {
                     val candidate = ReceiveFiles.uniqueFile(dir, src.name)
@@ -236,6 +280,7 @@ class InkHoleService : Service() {
     private fun exportFolderToDownloads(src: File): ReceivedFile = synchronized(exportLock) {
         val mime = "inode/directory"
         val now = System.currentTimeMillis()
+        val categoryDirectory = publicCategoryDirectory(src)
         val files = src.walkTopDown().filter { it.isFile }
             .sortedBy { it.relativeTo(src).invariantSeparatorsPath }
             .toList()
@@ -251,15 +296,15 @@ class InkHoleService : Service() {
                 src.deleteRecursively()
                 return@synchronized ReceivedFile(src.name, null, mime, 0, now)
             }
-            val publicRoot = uniqueMediaStoreFolderName(src.name)
+            val publicRoot = uniqueMediaStoreFolderName(src.name, categoryDirectory)
             val inserted = ArrayList<Uri>(files.size)
             try {
                 for (file in files) {
                     val relative = file.relativeTo(src).invariantSeparatorsPath
                     val parent = relative.substringBeforeLast('/', "")
                     val relativePath = buildString {
-                        append(Environment.DIRECTORY_DOWNLOADS)
-                        append("/InkHole/")
+                        append(publicInboxRelativePath(categoryDirectory))
+                        append('/')
                         append(publicRoot)
                         if (parent.isNotEmpty()) {
                             append('/')
@@ -304,7 +349,9 @@ class InkHoleService : Service() {
             var destination: File? = null
             try {
                 val root = File(Environment.getExternalStoragePublicDirectory(
-                    Environment.DIRECTORY_DOWNLOADS), "InkHole")
+                    Environment.DIRECTORY_DOWNLOADS),
+                    publicInboxRelativePath(categoryDirectory)
+                        .removePrefix(Environment.DIRECTORY_DOWNLOADS + "/"))
                 if (!root.isDirectory && !root.mkdirs()) throw IOException("无法创建下载目录")
                 destination = ReceiveFiles.uniqueDirectory(root, src.name)
                 if (!src.copyRecursively(destination, overwrite = false)) {
@@ -319,19 +366,19 @@ class InkHoleService : Service() {
         ReceivedFile(src.name, null, mime, totalSize, now)
     }
 
-    private fun uniqueMediaStoreFolderName(name: String): String {
+    private fun uniqueMediaStoreFolderName(name: String, categoryDirectory: String): String {
         var candidate = name
         var suffix = 2
-        while (mediaStoreFolderExists(candidate)) {
+        while (mediaStoreFolderExists(candidate, categoryDirectory)) {
             candidate = "$name ($suffix)"
             suffix++
         }
         return candidate
     }
 
-    private fun mediaStoreFolderExists(name: String): Boolean {
+    private fun mediaStoreFolderExists(name: String, categoryDirectory: String): Boolean {
         if (Build.VERSION.SDK_INT < 29) return false
-        val prefix = "${Environment.DIRECTORY_DOWNLOADS}/InkHole/$name/"
+        val prefix = "${publicInboxRelativePath(categoryDirectory)}/$name/"
         return try {
             contentResolver.query(
                 MediaStore.Downloads.EXTERNAL_CONTENT_URI,
@@ -348,6 +395,25 @@ class InkHoleService : Service() {
     private fun guessMime(name: String): String {
         val ext = name.substringAfterLast('.', "").lowercase()
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+    }
+
+    private fun publicCategoryDirectory(src: File): String {
+        val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(InboxClassification.PREF_ENABLED, false)) return ""
+        val category = InboxClassification.categoryFor(src.name, src.isDirectory)
+        return InboxClassification.directoryName(
+            category,
+            prefs.getString(InboxClassification.preferenceKey(category), ""),
+        )
+    }
+
+    private fun publicInboxRelativePath(categoryDirectory: String): String = buildString {
+        append(Environment.DIRECTORY_DOWNLOADS)
+        append("/InkHole")
+        if (categoryDirectory.isNotEmpty()) {
+            append('/')
+            append(categoryDirectory)
+        }
     }
 
     // ---- 通知 ----

@@ -17,8 +17,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: transport-core/go.mod
+
       - name: Install dependencies
-        run: pip install -e ".[test]" zeroconf cryptography
+        run: pip install -e ".[gui,test]"
 
       - name: Run Python tests
         run: pytest -q
+
+      - name: Run shared transport-core tests
+        working-directory: transport-core
+        run: go test -race ./...

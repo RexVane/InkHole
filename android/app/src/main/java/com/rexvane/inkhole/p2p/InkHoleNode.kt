@@ -14,12 +14,16 @@ import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import org.json.JSONObject
 
 /** 检测到设备/收到文件/状态变化时的回调。 */
 interface InkHoleListener {
@@ -39,12 +43,15 @@ data class Peer(
     val host: String,
     val port: Int,
     val serviceName: String = "",  // NSD 服务实例名(唯一，用于离线精确匹配)
-    // 对端全部已知地址：桌面多网卡/VPN 场景发出连接的源 IP 可能不是解析到的
-    // 那一个,「仅接收目标设备」按整个列表放行(来自 TXT ips / API34 hostAddresses)
+    // 对端全部已知地址，用于多网卡/VPN 场景下逐个尝试连接。
     val hosts: List<String> = listOf(host),
     val instanceId: String = "",
     val capabilities: Set<String> = emptySet(),
     val manual: Boolean = false,
+    val transport: String = if (manual) "tailscale" else "lan",
+    val endpointToken: String = "",
+    val publicKey: String = "",
+    val identityFingerprint: String = "",
 )
 
 private data class PeerProbeResult(
@@ -52,10 +59,13 @@ private data class PeerProbeResult(
     val peerName: String,
     val capabilities: Set<String>,
     val connectedAddress: String,
+    val publicKey: String,
+    val fingerprint: String,
 )
 
 private class IdentityMismatchException(message: String) : IOException(message)
 private class TailnetUnavailableException(message: String) : IOException(message)
+private class ReceiverRejectedException(message: String) : IOException(message)
 
 private data class ProbeOutcome(
     val key: String,
@@ -84,7 +94,7 @@ class InkHoleNode(
     private val peerName: String,
     private val inboxDir: File,
     private val secret: String = "",
-    private val trustedOnly: Boolean = false,   // true = 只接受当前选中目标设备的连接
+    private val trustedOnly: Boolean = false,   // true = 只接受当前选中且身份已固定的设备
     private val listenPort: Int = 0,            // 固定监听端口;0 = 系统自动分配(跨网手动直连需固定)
     private val listener: InkHoleListener,
 ) {
@@ -92,13 +102,11 @@ class InkHoleNode(
         private const val SERVICE_TYPE = "_inkhole._tcp."
         private const val DISK_MARGIN = 256L * 1024 * 1024   // 收完至少还要剩这么多
         private const val PROGRESS_INTERVAL_MS = 250L
-        private const val CHUNK_ENC_THRESHOLD = 32L * 1024 * 1024  // 超过走 WHE2 分块
-        private const val MAX_WHE1_SIZE = 64L * 1024 * 1024
         private const val HEADER_TIMEOUT_MS = 15_000
         private const val RECV_IDLE_TIMEOUT_MS = 300_000
-        private const val DRAIN_TIMEOUT_MS = 2_000
+        private const val CHECKPOINT_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
         private const val MAX_INCOMING_CONNECTIONS = 4
-        private const val DRAIN_CAP = 8L * 1024 * 1024       // 拒收时最多帮对端消化的字节数
+        private const val MAX_IDENTITY_FIELD = 512
         // TCP 收发缓冲(4MB):决定窗口上限,必须在 bind/connect 之前设置——
         // 窗口缩放因子在握手时协商,连接建立后再放大不生效,且显式设置会
         // 禁用内核自动调优,设晚了反而把窗口钉死在小值
@@ -114,6 +122,8 @@ class InkHoleNode(
         // 手动设备探活超时:Tailscale 空闲后懒惰唤醒(打洞/DERP 建链)首次
         // 握手常超 1.2s,太紧会把在线的跨网设备判死或迟迟不上线
         private const val PROBE_TIMEOUT_MANUAL_MS = 3_000
+        private val CORE_MAGIC = "IKCI".toByteArray(Charsets.US_ASCII)
+        private val AUTH_MAGIC = "IKAT".toByteArray(Charsets.US_ASCII)
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -130,6 +140,14 @@ class InkHoleNode(
     // 唯一实例 ID 持久化到 SharedPreferences：同一台设备无论 App/前台服务重启
     // 多少次都用同一个服务名，避免旧注册变成永不消失的"幽灵设备"。
     private val instanceId = loadOrCreateInstanceId(context)
+    private val deviceIdentity = DeviceIdentity(context)
+    private val coreIngressToken = ByteArray(24).also(SecureRandom()::nextBytes).let {
+        android.util.Base64.encodeToString(
+            it,
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or
+                android.util.Base64.NO_PADDING,
+        )
+    }
     private val advertisedPeerName = ReceiveFiles.utf8Prefix(peerName, 200)
         .ifBlank { "Android" }
     private val requestedServiceName =
@@ -149,6 +167,10 @@ class InkHoleNode(
     private val peers = LinkedHashMap<String, Peer>()
     private val peersLock = Any()
     private val receiveFileLock = Any()
+    private val activeCheckpoints = ConcurrentHashMap.newKeySet<String>()
+    private val outgoingStateLock = Any()
+    private val trustedPeersLock = Any()
+    private val trustedPeers = loadTrustedPeers()
     // onServiceLost 误报兜底：正在 TCP 探活确认的 serviceName，避免并发重复探活
     private val probingLost = java.util.Collections.synchronizedSet(HashSet<String>())
     @Volatile private var selectedPeer: String? = null   // 显示名
@@ -163,12 +185,66 @@ class InkHoleNode(
     private val manualPeersLock = Any()
     private val identityErrors = java.util.Collections.synchronizedSet(HashSet<String>())
 
+    private fun loadTrustedPeers(): MutableMap<String, String> {
+        val raw = context.getSharedPreferences("inkhole", Context.MODE_PRIVATE)
+            .getString("trusted_peers_v1", "{}").orEmpty()
+        return try {
+            val json = JSONObject(raw)
+            buildMap {
+                for (key in json.keys()) {
+                    val instance = key.lowercase()
+                    val fingerprint = json.optString(key).lowercase()
+                    if (instance.matches(Regex("[0-9a-f]{32}")) && validSha256(fingerprint)) {
+                        put(instance, fingerprint)
+                    }
+                }
+            }.toMutableMap()
+        } catch (_: Exception) {
+            LinkedHashMap()
+        }
+    }
+
+    private fun saveTrustedPeers() {
+        val json = JSONObject()
+        synchronized(trustedPeersLock) {
+            trustedPeers.forEach { (instance, fingerprint) -> json.put(instance, fingerprint) }
+        }
+        context.getSharedPreferences("inkhole", Context.MODE_PRIVATE).edit()
+            .putString("trusted_peers_v1", json.toString()).apply()
+    }
+
+    private fun trustedFingerprint(instanceId: String): String =
+        synchronized(trustedPeersLock) { trustedPeers[instanceId.lowercase()].orEmpty() }
+
+    private fun cleanupTransferArtifacts() {
+        val cutoff = System.currentTimeMillis() - CHECKPOINT_MAX_AGE_MS
+        val groups = LinkedHashMap<String, MutableList<File>>()
+        inboxDir.listFiles().orEmpty().forEach { artifact ->
+            if (!artifact.name.startsWith(".inkhole-")) return@forEach
+            val transferId = Regex("^\\.inkhole-([0-9a-f]{64})\\.")
+                .find(artifact.name)?.groupValues?.get(1)
+            if (transferId != null) {
+                groups.getOrPut(transferId) { mutableListOf() }.add(artifact)
+            } else if (artifact.lastModified() in 1 until cutoff) {
+                if (artifact.isDirectory) artifact.deleteRecursively() else artifact.delete()
+            }
+        }
+        groups.forEach { (transferId, artifacts) ->
+            val newest = artifacts.maxOfOrNull(File::lastModified) ?: return@forEach
+            if (newest >= cutoff || transferId in activeCheckpoints) return@forEach
+            artifacts.forEach { artifact ->
+                if (artifact.isDirectory) artifact.deleteRecursively() else artifact.delete()
+            }
+        }
+    }
+
     // ---- 生命周期 ----
 
     fun start() {
         if (running) return
         running = true
         inboxDir.mkdirs()
+        cleanupTransferArtifacts()
         val tcpStarted = startTcpServer()
         if (!tcpStarted) {
             running = false
@@ -268,6 +344,7 @@ class InkHoleNode(
         addPeer(
             m.key, m.name.ifEmpty { result.peerName }, result.connectedAddress, m.port,
             addresses, result.instanceId, result.capabilities, manual = true,
+            publicKey = result.publicKey, identityFingerprint = result.fingerprint,
         )
     }
 
@@ -280,7 +357,9 @@ class InkHoleNode(
             val strikes = HashMap<String, Int>()
             while (running) {
                 // 获取当前所有已知对端的探活目标(key、hosts、port)
-                val targets = synchronized(peersLock) { peers.toList() }
+                val targets = synchronized(peersLock) {
+                    peers.toList().filterNot { (key, _) -> key.startsWith("external|") }
+                }
                 val manualSnapshot = synchronized(manualPeersLock) { manualPeers.toList() }
                 val manualByKey = manualSnapshot.associateBy { it.key }
                 val lanLinks = currentLanLinks()
@@ -319,6 +398,7 @@ class InkHoleNode(
                     if (!running) break
                     val key = outcome.key
                     val isManual = outcome.manual
+                    val result = outcome.result
                     val present = synchronized(peersLock) { peers.containsKey(key) }
                     if (!present) continue  // 已被其他逻辑移除,跳过
                     if (outcome.identityError != null) {
@@ -335,7 +415,7 @@ class InkHoleNode(
                         else -> PROBE_STRIKES
                     }
 
-                    if (outcome.result == null) {
+                    if (result == null) {
                         val s = (strikes[key] ?: 0) + 1
                         if (s >= threshold) {
                             strikes.remove(key)
@@ -349,7 +429,6 @@ class InkHoleNode(
                         identityErrors.remove(key)
                         synchronized(peersLock) {
                             peers[key]?.let { current ->
-                                val result = outcome.result ?: return@let
                                 val addresses = if (isManual) {
                                     val configured = manualByKey[key]
                                     configured?.let {
@@ -366,6 +445,8 @@ class InkHoleNode(
                                     hosts = addresses.distinct(),
                                     instanceId = result.instanceId,
                                     capabilities = result.capabilities,
+                                    publicKey = result.publicKey,
+                                    identityFingerprint = result.fingerprint,
                                 )
                             }
                         }
@@ -509,268 +590,351 @@ class InkHoleNode(
         return true
     }
 
+    private fun validSha256(value: String): Boolean =
+        value.length == 64 && value.all { it in '0'..'9' || it in 'a'..'f' }
+
+    private fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }
+
+    private fun sha256(file: File): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered(WHPP.BUFFER_SIZE).use { input ->
+            val buffer = ByteArray(WHPP.BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count > 0) digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest()
+    }
+
+    private fun readJson(file: File): JSONObject? = try {
+        if (file.isFile) JSONObject(file.readText(Charsets.UTF_8)) else null
+    } catch (_: Exception) { null }
+
+    private fun writeJsonAtomic(file: File, value: JSONObject) {
+        val temporary = File(file.parentFile, "${file.name}.${UUID.randomUUID()}.tmp")
+        try {
+            FileOutputStream(temporary).use { output ->
+                output.write(value.toString().toByteArray(Charsets.UTF_8))
+                output.flush()
+                output.fd.sync()
+            }
+            if (!temporary.renameTo(file)) throw IOException("无法保存传输检查点")
+        } finally {
+            temporary.delete()
+        }
+    }
+
+    private fun receiveMetadata(header: WHPP.Header, safeName: String): JSONObject =
+        JSONObject().apply {
+            put("version", WHPP.PROTOCOL_VERSION)
+            put("filename", safeName)
+            put("plain_size", header.plainSize)
+            put("sha256", header.sha256)
+            put("kind", header.kind)
+            put("mtime_ms", header.modifiedMs)
+            put("sender_instance_id", header.senderInstanceId)
+            put("sender_fingerprint", DeviceAuth.fingerprint(header.senderPublicKey))
+        }
+
+    private fun metadataMatches(value: JSONObject?, expected: JSONObject): Boolean {
+        if (value == null) return false
+        return listOf("version", "filename", "plain_size", "sha256", "kind", "mtime_ms",
+            "sender_instance_id", "sender_fingerprint")
+            .all { key -> value.opt(key)?.toString() == expected.opt(key)?.toString() }
+    }
+
     // 接收是对端发起的，不主动清理系统缓存；只按当前真实可用空间保守判断。
     @android.annotation.SuppressLint("UsableSpace")
     private fun handleConnection(conn: Socket) {
-        var partFile: File? = null
         var folderPart: File? = null
-        var wantAck = false
+        var checkpointId = ""
+        var checkpointClaimed = false
+        var ackSent = false
         var ok = false
-        var headerRead = false
+        var transferStarted = false
         var receivedName = ""
         try {
             conn.soTimeout = HEADER_TIMEOUT_MS
             val input = BufferedInputStream(conn.getInputStream(), WHPP.BUFFER_SIZE)
-            // 存活探测空连接在 readMagic 处 EOF；WHPC 能力请求不进入传输流程。
-            val magic = WHPP.readMagic(input)
+            val din = DataInputStream(input)
+            val output = BufferedOutputStream(conn.getOutputStream(), WHPP.BUFFER_SIZE)
+            val dout = DataOutputStream(output)
+            var magic = WHPP.readMagic(input)
+            var coreAuthenticated = false
+            if (magic.contentEquals(CORE_MAGIC)) {
+                val supplied = ByteArray(coreIngressToken.length)
+                din.readFully(supplied)
+                if (!MessageDigest.isEqual(
+                        supplied, coreIngressToken.toByteArray(Charsets.US_ASCII))) return
+                coreAuthenticated = true
+                magic = WHPP.readMagic(input)
+            }
             if (magic.contentEquals(WHPP.CAP_MAGIC)) {
-                WHPP.writeCapabilities(conn.getOutputStream(), instanceId, advertisedPeerName)
+                val nonce = ByteArray(32).also(din::readFully)
+                WHPP.writeCapabilities(
+                    output, instanceId, advertisedPeerName, nonce, deviceIdentity)
                 return
             }
             if (!magic.contentEquals(WHPP.MAGIC)) return
             val header = WHPP.readHeaderAfterMagic(input)
-            headerRead = true
-            wantAck = header.wantAck
             conn.soTimeout = RECV_IDLE_TIMEOUT_MS
 
-            // 仅接收目标设备：来源 IP 不在选中设备的地址列表就拒收。
-            // 必须按完整列表匹配——桌面多网卡/VPN 时连接源 IP 常不是
-            // NSD 解析到的那一个,只比对单个 host 会把自己人误拒
-            // (对端还会把 ACK_FAIL 显示成"口令不一致",极难排查)。
-            if (trustedOnly) {
-                val src = conn.inetAddress?.hostAddress
-                val sel = selectedPeer?.let { s ->
-                    synchronized(peersLock) { peers.values.find { it.name == s } }
-                }
-                if (sel == null || src == null || src !in allowedSourceAddresses(sel)) {
-                    listener.onStatus("已拒收 ${src ?: "?"} 的传输（仅接收目标设备）")
-                    drain(conn, input, minOf(header.size, DRAIN_CAP))
-                    return   // finally 统一回 ACK_FAIL
-                }
-            }
-
-            // basename 防路径穿越
             val safeName = ReceiveFiles.safeName(header.filename)
             receivedName = safeName
             val isFolder = header.kind == WHPP.FOLDER_KIND
-            if (header.kind !in listOf("", "file", WHPP.FOLDER_KIND)) {
-                listener.onStatus("拒收 $safeName：不支持的传输类型")
-                return
-            }
-
-            // size 来自网络，不可信
-            val sizeLimit = if (isFolder) Crypto.chunkedWireSize(WHPP.MAX_FILE_SIZE)
-                else WHPP.MAX_FILE_SIZE
-            if (header.size < 0 || header.size > sizeLimit) {
-                listener.onStatus("拒收 $safeName：文件大小非法")
-                return
-            }
-            if (isFolder) {
-                if (header.plainSize < 8 || header.plainSize > WHPP.MAX_FILE_SIZE ||
-                    header.modifiedMs < 0) {
-                    listener.onStatus("拒收 $safeName：文件夹大小或时间非法")
-                    return
-                }
-                if (header.encrypted && (header.encMode != "chunked" ||
-                    header.size != Crypto.chunkedWireSize(header.plainSize))) {
-                    listener.onStatus("拒收 $safeName：文件夹加密声明非法")
-                    return
-                }
-                if (!header.encrypted && header.size != header.plainSize) {
-                    listener.onStatus("拒收 $safeName：文件夹大小声明不一致")
-                    return
-                }
-            }
-            val storageSize = if (isFolder) header.plainSize else header.size
-            // Android 10+ MediaStore export temporarily needs the private folder
-            // and public pending files at once. Reserve 2x so a completed receive
-            // does not become an unusable private-only folder during export.
-            val requiredSpace = if (isFolder && storageSize <=
-                (Long.MAX_VALUE - DISK_MARGIN) / 2) {
-                storageSize * 2 + DISK_MARGIN
-            } else if (storageSize <= Long.MAX_VALUE - DISK_MARGIN) {
-                storageSize + DISK_MARGIN
-            } else Long.MAX_VALUE
-            if (requiredSpace > inboxDir.usableSpace) {
-                listener.onStatus("拒收 $safeName：存储空间不足")
-                drain(conn, input, minOf(header.size, DRAIN_CAP))
+            if (header.version != WHPP.PROTOCOL_VERSION || !header.wantAck ||
+                header.kind !in setOf("file", WHPP.FOLDER_KIND) ||
+                header.plainSize < 0 || header.plainSize > WHPP.MAX_FILE_SIZE ||
+                (isFolder && header.plainSize < 8) || header.modifiedMs < 0 ||
+                !validSha256(header.transferId) || !validSha256(header.sha256) ||
+                !header.senderInstanceId.matches(Regex("[0-9a-f]{32}")) ||
+                (header.encrypted && header.encMode != "chunked")) {
+                listener.onStatus("拒收 $safeName：WHPP v3 传输声明非法")
                 return
             }
             if (header.encrypted && secret.isEmpty()) {
                 listener.onStatus("拒收 $safeName：对方启用了加密，本机未设口令")
-                drain(conn, input, minOf(header.size, DRAIN_CAP))
                 return
             }
-            if (header.encrypted && header.encMode == "chunked" && header.size < 32) {
-                listener.onStatus("拒收 $safeName：加密流大小非法")
+
+            val senderFingerprint = try {
+                DeviceAuth.fingerprint(header.senderPublicKey)
+            } catch (_: Exception) {
+                listener.onStatus("拒收 $safeName：发送设备公钥非法")
                 return
             }
-            if (!isFolder && header.encrypted && header.encMode != "chunked" &&
-                header.size > MAX_WHE1_SIZE) {
-                listener.onStatus("拒收 $safeName：整块加密文件过大")
-                drain(conn, input, DRAIN_CAP)
+            if (trustedOnly && !coreAuthenticated) {
+                val selected = selectedPeer?.let { name ->
+                    synchronized(peersLock) { peers.values.find { it.name == name } }
+                }
+                val pinned = trustedFingerprint(header.senderInstanceId)
+                if (selected == null || selected.instanceId != header.senderInstanceId ||
+                    pinned.isEmpty() || pinned != senderFingerprint) {
+                    listener.onStatus(
+                        "已拒收 ${conn.inetAddress?.hostAddress ?: "?"} 的传输（发送设备未配对或不是当前目标）")
+                    return
+                }
+            }
+
+            checkpointId = header.transferId
+            if (!activeCheckpoints.add(checkpointId)) {
+                listener.onStatus("拒收 $safeName：同一传输正在进行")
+                return
+            }
+            checkpointClaimed = true
+
+            val base = File(inboxDir, ".inkhole-${header.transferId}")
+            val part = File("${base.absolutePath}.part")
+            val meta = File("${base.absolutePath}.json")
+            val done = File("${base.absolutePath}.done.json")
+            val metadata = receiveMetadata(header, safeName)
+            fun authenticateSender(offset: Long, nonce: ByteArray) {
+                val signatureSize = din.readUnsignedShort()
+                if (signatureSize !in 1..256) throw IOException("发送设备签名大小非法")
+                val signature = ByteArray(signatureSize).also(din::readFully)
+                    .toString(Charsets.US_ASCII)
+                if (!DeviceAuth.verify(header.senderPublicKey,
+                        DeviceAuth.transferMessage(nonce, header, offset), signature)) {
+                    throw IOException("发送设备身份签名无效")
+                }
+            }
+            fun sendReceiverChallenge(offset: Long): ByteArray {
+                val nonce = ByteArray(32).also(SecureRandom()::nextBytes)
+                val publicKey = deviceIdentity.publicKey.toByteArray(Charsets.US_ASCII)
+                val signature = deviceIdentity.sign(DeviceAuth.receiverMessage(
+                    nonce, header, offset, instanceId)).toByteArray(Charsets.US_ASCII)
+                if (publicKey.size !in 1..MAX_IDENTITY_FIELD ||
+                    signature.size !in 1..MAX_IDENTITY_FIELD) {
+                    throw IOException("接收设备身份字段过大")
+                }
+                dout.writeByte(WHPP.RESUME)
+                dout.writeLong(offset)
+                dout.write(nonce)
+                dout.write(instanceId.toByteArray(Charsets.US_ASCII))
+                dout.writeShort(publicKey.size)
+                dout.write(publicKey)
+                dout.writeShort(signature.size)
+                dout.write(signature)
+                dout.flush()
+                return nonce
+            }
+            val completed = readJson(done)
+            val completedPath = completed?.optString("path").orEmpty()
+            if (metadataMatches(completed, metadata) && completedPath.isNotEmpty() &&
+                File(completedPath).exists()) {
+                val nonce = sendReceiverChallenge(header.plainSize)
+                authenticateSender(header.plainSize, nonce)
+                if (din.readLong() != 0L) throw IOException("已完成传输仍收到数据")
+                dout.writeByte(WHPP.ACK_OK)
+                dout.write(header.sha256.chunked(2).map { it.toInt(16).toByte() }.toByteArray())
+                dout.flush()
+                ackSent = true
+                ok = true
+                return
+            }
+
+            if (!metadataMatches(readJson(meta), metadata)) {
+                part.delete()
+                meta.delete()
+                writeJsonAtomic(meta, metadata)
+            }
+            var offset = if (part.isFile) part.length() else 0L
+            if (offset > header.plainSize) {
+                part.delete()
+                offset = 0
+            }
+
+            val requiredSpace = if (isFolder && header.plainSize <=
+                (Long.MAX_VALUE - DISK_MARGIN) / 2) {
+                header.plainSize * 2 + DISK_MARGIN
+            } else if (header.plainSize - offset <= Long.MAX_VALUE - DISK_MARGIN) {
+                header.plainSize - offset + DISK_MARGIN
+            } else Long.MAX_VALUE
+            if (requiredSpace > inboxDir.usableSpace) {
+                listener.onStatus("拒收 $safeName：存储空间不足")
                 return
             }
 
             var lastReport = 0L
-            fun report(done: Long) {
+            fun report(doneBytes: Long) {
                 val now = System.currentTimeMillis()
-                if (done >= header.size || now - lastReport >= PROGRESS_INTERVAL_MS) {
+                if (doneBytes >= header.plainSize || now - lastReport >= PROGRESS_INTERVAL_MS) {
                     lastReport = now
-                    listener.onProgress("recv", safeName, done, header.size)
+                    listener.onProgress("recv", safeName, doneBytes, header.plainSize)
                 }
             }
+            transferStarted = true
+            report(offset)
+            val nonce = sendReceiverChallenge(offset)
+            authenticateSender(offset, nonce)
 
-            val dst: File
+            val remaining = header.plainSize - offset
+            val bodySize = din.readLong()
+            val expectedWire = if (header.encrypted && remaining > 0) {
+                Crypto.chunkedWireSize(remaining)
+            } else remaining
+            if (bodySize != expectedWire) throw IOException("续传数据长度不一致")
+
+            if (remaining > 0) {
+                FileOutputStream(part, true).use { fileOutput ->
+                    var appended = 0L
+                    if (header.encrypted) {
+                        val streamHeader = ByteArray(32).also(din::readFully)
+                        val decryptor = Crypto.ChunkedDecryptor(secret, streamHeader)
+                        var consumed = 32L
+                        while (consumed < bodySize) {
+                            val cipherSize = din.readInt()
+                            if (cipherSize !in 16..Crypto.CHUNK_SIZE + 16 ||
+                                consumed + 4 + cipherSize > bodySize) {
+                                throw IOException("加密分块非法")
+                            }
+                            val ciphertext = ByteArray(cipherSize).also(din::readFully)
+                            val plain = decryptor.decryptChunk(ciphertext)
+                                ?: throw IOException("解密失败（两端口令不一致？）")
+                            if (appended + plain.size > remaining) {
+                                throw IOException("解密数据超过声明大小")
+                            }
+                            fileOutput.write(plain)
+                            appended += plain.size
+                            consumed += 4 + cipherSize
+                            report(offset + appended)
+                        }
+                        if (consumed != bodySize || appended != remaining) {
+                            throw EOFException("加密数据不完整")
+                        }
+                    } else {
+                        val buffer = ByteArray(WHPP.BUFFER_SIZE)
+                        while (appended < remaining) {
+                            val count = input.read(
+                                buffer, 0, minOf(buffer.size.toLong(), remaining - appended).toInt())
+                            if (count < 0) throw EOFException("文件数据不完整")
+                            fileOutput.write(buffer, 0, count)
+                            appended += count
+                            report(offset + appended)
+                        }
+                    }
+                    fileOutput.flush()
+                    fileOutput.fd.sync()
+                }
+            } else if (!part.exists() && !part.createNewFile()) {
+                throw IOException("无法创建空文件检查点")
+            }
+
+            if (part.length() != header.plainSize) throw EOFException("文件数据不完整")
+            val actualDigest = sha256(part)
+            val expectedDigest = header.sha256.chunked(2)
+                .map { it.toInt(16).toByte() }.toByteArray()
+            if (!MessageDigest.isEqual(actualDigest, expectedDigest)) {
+                part.delete()
+                meta.delete()
+                throw IOException("文件 SHA-256 校验失败，已丢弃检查点")
+            }
+
+            val destination: File
             if (isFolder) {
                 val staging = File(inboxDir, ".inkhole-${UUID.randomUUID()}.folder.part")
                 if (!staging.mkdir()) throw IOException("无法创建文件夹暂存目录")
                 folderPart = staging
-                val payload: InputStream = if (header.encrypted) {
-                    ChunkedFolderInputStream(
-                        input, header.size, header.plainSize, secret, ::report)
-                } else {
-                    BoundedPayloadInputStream(input, header.plainSize, ::report)
+                try {
+                    part.inputStream().buffered(WHPP.BUFFER_SIZE).use { payload ->
+                        WHF1.receive(payload, header.plainSize, staging)
+                    }
+                } catch (error: Exception) {
+                    part.delete()
+                    meta.delete()
+                    throw error
                 }
-                WHF1.receive(payload, header.plainSize, staging)
-                (payload as VerifiablePayloadInput).verifyComplete()
                 if (header.modifiedMs > 0) staging.setLastModified(header.modifiedMs)
-                val committed = synchronized(receiveFileLock) {
+                destination = synchronized(receiveFileLock) {
                     val candidate = ReceiveFiles.uniqueDirectory(inboxDir, safeName)
                     candidate.takeIf { staging.renameTo(it) }
-                }
-                if (committed == null) {
-                    listener.onStatus("落盘失败: $safeName")
-                    return
-                }
+                } ?: throw IOException("落盘失败: $safeName")
                 folderPart = null
-                dst = committed
+                part.delete()
             } else {
-                val part = File.createTempFile("inkhole-", ".part", inboxDir)
-                partFile = part
-                if (header.encrypted && header.encMode == "chunked") {
-                    // WHE2 分块流：边收边解密边落盘，内存峰值 4MB
-                    val hdr32 = ByteArray(32)
-                    DataInputStream(input).readFully(hdr32)
-                    val decryptor = try {
-                        Crypto.ChunkedDecryptor(secret, hdr32)
-                    } catch (e: IllegalArgumentException) {
-                        listener.onStatus("拒收 $safeName：加密流头非法")
-                        return
-                    }
-                    var consumed = 32L
-                    var intact = true
-                    val din = DataInputStream(input)
-                    FileOutputStream(part).use { fout ->
-                        while (consumed < header.size) {
-                            val ctLen = try { din.readInt() } catch (_: IOException) { intact = false; break }
-                            if (ctLen < 16 || ctLen > Crypto.CHUNK_SIZE + 16) { intact = false; break }
-                            if (consumed + 4L + ctLen > header.size) { intact = false; break }
-                            val ct = ByteArray(ctLen)
-                            try { din.readFully(ct) } catch (_: IOException) { intact = false; break }
-                            val plain = decryptor.decryptChunk(ct)
-                            if (plain == null) {
-                                listener.onStatus("解密失败: $safeName（两端口令不一致？）")
-                                return
-                            }
-                            fout.write(plain)
-                            consumed += 4 + ctLen
-                            report(consumed)
-                        }
-                    }
-                    if (!intact || consumed != header.size) {
-                        listener.onStatus("接收中断: $safeName")
-                        return
-                    }
-                } else {
-                    // 明文 / WHE1 整块加密：写 .part
-                    FileOutputStream(part).use { fout ->
-                        val buf = ByteArray(WHPP.BUFFER_SIZE)
-                        var remaining = header.size
-                        while (remaining > 0) {
-                            val toRead = minOf(buf.size.toLong(), remaining).toInt()
-                            val n = input.read(buf, 0, toRead)
-                            if (n < 0) break
-                            fout.write(buf, 0, n)
-                            remaining -= n
-                            report(header.size - remaining)
-                        }
-                        if (remaining > 0) {
-                            listener.onStatus("接收中断: $safeName")
-                            return
-                        }
-                    }
-
-                    // WHE1 整块加密：解密成功才算收到
-                    if (header.encrypted) {
-                        val blob = part.readBytes()
-                        val plain = Crypto.decrypt(secret, blob)
-                        if (plain == null) {
-                            listener.onStatus("解密失败: $safeName（两端口令不一致？）")
-                            return
-                        }
-                        part.writeBytes(plain)
-                    }
-                }
-
-                val committed = synchronized(receiveFileLock) {
+                destination = synchronized(receiveFileLock) {
                     val candidate = ReceiveFiles.uniqueFile(inboxDir, safeName)
                     candidate.takeIf { part.renameTo(it) }
-                }
-                if (committed == null) {
-                    listener.onStatus("落盘失败: $safeName")
-                    return
-                }
-                partFile = null
-                dst = committed
+                } ?: throw IOException("落盘失败: $safeName")
+                if (header.modifiedMs > 0) destination.setLastModified(header.modifiedMs)
             }
-            ok = true
 
-            listener.onFileReceived(dst.name, dst.absolutePath)
-            listener.onStatus("已接收：${dst.name}")
-        } catch (e: java.io.EOFException) {
-            // 探活空连接(probe)：对端 connect 后立即 close，读协议头时 EOF，静默忽略
-            if (headerRead) listener.onStatus("接收中断: ${receivedName.ifEmpty { "未知文件" }}")
+            val receipt = receiveMetadata(header, safeName).apply {
+                put("path", destination.absolutePath)
+                put("completed_at", System.currentTimeMillis() / 1000)
+            }
+            writeJsonAtomic(done, receipt)
+            meta.delete()
+            dout.writeByte(WHPP.ACK_OK)
+            dout.write(actualDigest)
+            dout.flush()
+            ackSent = true
+            ok = true
+            listener.onFileReceived(destination.name, destination.absolutePath)
+            listener.onStatus("已接收并校验：${destination.name}")
+        } catch (_: EOFException) {
+            if (transferStarted) listener.onStatus("接收中断，已保留续传进度：$receivedName")
         } catch (_: SocketTimeoutException) {
-            // 未发协议头的半开连接静默关闭；传输开始后超时才提示用户。
-            if (headerRead) listener.onStatus("接收中断: ${receivedName.ifEmpty { "未知文件" }}")
+            if (transferStarted) listener.onStatus("接收中断，已保留续传进度：$receivedName")
         } catch (_: java.net.SocketException) {
-            // 对端取消发送(RST 硬断开)或网络断开:按"中断"而非"失败"提示
-            if (headerRead) listener.onStatus("接收中断: ${receivedName.ifEmpty { "未知文件" }}")
-        } catch (e: Exception) {
-            if (running) listener.onStatus("接收失败: ${e.message ?: "未知错误"}")
+            if (transferStarted) listener.onStatus("接收中断，已保留续传进度：$receivedName")
+        } catch (error: Exception) {
+            if (running) listener.onStatus("接收失败: ${error.message ?: "未知错误"}")
         } finally {
-            partFile?.delete()
             folderPart?.deleteRecursively()
-            if (wantAck) {
+            if (transferStarted && !ackSent) {
                 try {
-                    conn.getOutputStream().apply {
-                        write(if (ok) WHPP.ACK_OK else WHPP.ACK_FAIL)
-                        flush()
-                    }
+                    conn.getOutputStream().apply { write(WHPP.ACK_FAIL); flush() }
                 } catch (_: IOException) {}
             }
             try { conn.close() } catch (_: IOException) {}
-            if (receivedName.isNotEmpty()) {
-                listener.onTransferEnded("recv", receivedName, ok)
-            }
+            if (checkpointClaimed) activeCheckpoints.remove(checkpointId)
+            if (transferStarted) listener.onTransferEnded("recv", receivedName, ok)
         }
     }
 
-    /** 拒收时把对端已发出的最多 n 字节读掉再关连接——
-     *  不读就 close 会触发 RST，可能冲掉已排队的失败回执。 */
-    private fun drain(conn: Socket, input: InputStream, n: Long) {
-        try {
-            conn.soTimeout = DRAIN_TIMEOUT_MS
-            val buf = ByteArray(WHPP.BUFFER_SIZE)
-            var left = n
-            while (left > 0) {
-                val got = input.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
-                if (got < 0) return
-                left -= got
-            }
-        } catch (_: IOException) {}
-    }
 
     // ---- 发送文件 ----
 
@@ -812,7 +976,76 @@ class InkHoleNode(
         }
     }
 
-    /** 直接从 content:// 等输入流发送，避免大文件先完整复制到 cache 再读一遍。 */
+    private fun hashInput(inputFactory: () -> InputStream,
+                          cancellationRequested: () -> Boolean): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        useSendInput(inputFactory) { input ->
+            val buffer = ByteArray(WHPP.BUFFER_SIZE)
+            while (true) {
+                if (cancellationRequested()) throw InterruptedIOException("发送已取消")
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count > 0) digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().hex()
+    }
+
+    private fun outgoingTransferId(peer: Peer, name: String, size: Long,
+                                   digest: String): Pair<String, String> {
+        val identity = listOf(name, size.toString(), digest,
+            peer.instanceId.ifEmpty { "${peer.host}:${peer.port}" }).joinToString("\u0000")
+        val key = MessageDigest.getInstance("SHA-256")
+            .digest(identity.toByteArray(Charsets.UTF_8)).hex()
+        val prefs = context.getSharedPreferences("inkhole_outgoing_v3", Context.MODE_PRIVATE)
+        var transferId = prefs.getString(key, "").orEmpty().lowercase()
+        if (!validSha256(transferId)) {
+            transferId = ByteArray(32).also(SecureRandom()::nextBytes).hex()
+            prefs.edit().putString(key, transferId).commit()
+        }
+        return key to transferId
+    }
+
+    private fun completeOutgoingTransfer(key: String) {
+        context.getSharedPreferences("inkhole_outgoing_v3", Context.MODE_PRIVATE)
+            .edit().remove(key).apply()
+    }
+
+    private fun skipExactly(input: InputStream, size: Long,
+                            cancellationRequested: () -> Boolean) {
+        val buffer = ByteArray(WHPP.BUFFER_SIZE)
+        var remaining = size
+        while (remaining > 0) {
+            if (cancellationRequested()) throw InterruptedIOException("发送已取消")
+            val count = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+            if (count < 0) throw EOFException("续传源数据不完整")
+            remaining -= count
+        }
+    }
+
+    private fun readControl(socket: Socket, input: InputStream, size: Int,
+                            cancellationRequested: () -> Boolean,
+                            timeoutMs: Long): ByteArray {
+        val result = ByteArray(size)
+        var offset = 0
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (offset < size) {
+            if (cancellationRequested()) throw InterruptedIOException("发送已取消")
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) throw SocketTimeoutException()
+            socket.soTimeout = minOf(500L, remaining).toInt()
+            try {
+                val count = input.read(result, offset, size - offset)
+                if (count < 0) throw EOFException("控制帧不完整")
+                offset += count
+            } catch (_: SocketTimeoutException) {
+                // Re-check cancellation and the overall deadline.
+            }
+        }
+        return result
+    }
+
+    /** Resumable WHPP v3 sender. Every retry encrypts only the remaining plaintext. */
     @Synchronized
     fun sendStream(plainSize: Long, displayName: String,
                    shouldCancel: (() -> Boolean)? = null,
@@ -825,123 +1058,207 @@ class InkHoleNode(
             listener.onStatus("请先选择目标设备")
             return false
         }
-        val peer = synchronized(peersLock) { peers.values.find { it.name == selected } } ?: run {
-            listener.onStatus("目标设备已离线")
+        val peer = synchronized(peersLock) { peers.values.find { it.name == selected } }
+            ?: run { listener.onStatus("目标设备已离线"); return false }
+        val expectedReceiverFingerprint = peer.identityFingerprint.ifEmpty {
+            trustedFingerprint(peer.instanceId)
+        }
+        if (peer.transport in setOf("lan", "tailscale") &&
+            (!peer.instanceId.matches(Regex("[0-9a-f]{32}")) ||
+                !validSha256(expectedReceiverFingerprint))) {
+            listener.onStatus("接收设备身份尚未验证")
             return false
         }
-
         val transferName = ReceiveFiles.safeName(displayName)
         var completed = false
+
         fun cancellationRequested(): Boolean =
             sendCancelled.get() || shouldCancel?.invoke() == true
+
         sendCancelled.set(false)
         sendInProgress.set(true)
-        return try {
-            val socket = connectToPeer(peer)
-            activeSockets.add(socket)
-            activeSendSocket.set(socket)
-            if (!running) {
-                activeSockets.remove(socket)
-                socket.close()
-                throw IOException("墨洞节点已停止")
+        listener.onSendingChanged(true)
+        try {
+            listener.onStatus("正在校验：$transferName")
+            val digest = hashInput(inputFactory, ::cancellationRequested)
+            val (outgoingKey, transferId) = synchronized(outgoingStateLock) {
+                outgoingTransferId(peer, transferName, plainSize, digest)
             }
-            if (cancellationRequested()) throw java.io.InterruptedIOException("发送已取消")
-            try {
-                socket.use { s ->
-                    val out = BufferedOutputStream(s.getOutputStream(), WHPP.BUFFER_SIZE)
-                    var lastReport = 0L
-                    val progress: (Long, Long) -> Unit = { done, total ->
-                        val now = System.currentTimeMillis()
-                        if (done >= total || now - lastReport >= PROGRESS_INTERVAL_MS) {
-                            lastReport = now
-                            listener.onProgress("send", transferName, done, total)
-                        }
+            val encrypted = secret.isNotEmpty()
+            val header = WHPP.Header(
+                filename = transferName,
+                plainSize = plainSize,
+                transferId = transferId,
+                sha256 = digest,
+                encrypted = encrypted,
+                encMode = if (encrypted) "chunked" else "",
+                senderInstanceId = instanceId,
+                senderPublicKey = deviceIdentity.publicKey,
+            )
+            var lastError: Exception? = null
+
+            repeat(3) { attempt ->
+                if (cancellationRequested()) throw InterruptedIOException("发送已取消")
+                var socket: Socket? = null
+                try {
+                    socket = connectToPeer(peer)
+                    activeSendSocket.set(socket)
+                    activeSockets.add(socket)
+                    val output = BufferedOutputStream(socket.getOutputStream(), WHPP.BUFFER_SIZE)
+                    val input = BufferedInputStream(socket.getInputStream(), WHPP.BUFFER_SIZE)
+                    val dout = DataOutputStream(output)
+                    WHPP.writeHeader(output, header)
+
+                    val marker = readControl(socket, input, 1,
+                        ::cancellationRequested, 60_000)[0].toInt() and 0xff
+                    if (marker == WHPP.ACK_FAIL) throw ReceiverRejectedException("接收方拒绝了传输")
+                    if (marker != WHPP.RESUME) throw IOException("接收方未返回 WHPP v3 续传状态")
+                    val offset = ByteBuffer.wrap(readControl(
+                        socket, input, 8, ::cancellationRequested, 60_000)).long
+                    if (offset < 0 || offset > plainSize) throw IOException("接收方续传偏移非法")
+                    val nonce = readControl(
+                        socket, input, 32, ::cancellationRequested, 60_000)
+                    val receiverInstanceId = readControl(
+                        socket, input, 32, ::cancellationRequested, 60_000)
+                        .toString(Charsets.US_ASCII).lowercase()
+                    val receiverPublicSize = ByteBuffer.wrap(readControl(
+                        socket, input, 2, ::cancellationRequested, 60_000))
+                        .short.toInt() and 0xffff
+                    if (receiverPublicSize !in 1..MAX_IDENTITY_FIELD) {
+                        throw IOException("接收设备公钥大小非法")
+                    }
+                    val receiverPublic = readControl(
+                        socket, input, receiverPublicSize,
+                        ::cancellationRequested, 60_000).toString(Charsets.US_ASCII)
+                    val receiverSignatureSize = ByteBuffer.wrap(readControl(
+                        socket, input, 2, ::cancellationRequested, 60_000))
+                        .short.toInt() and 0xffff
+                    if (receiverSignatureSize !in 1..MAX_IDENTITY_FIELD) {
+                        throw IOException("接收设备签名大小非法")
+                    }
+                    val receiverSignature = readControl(
+                        socket, input, receiverSignatureSize,
+                        ::cancellationRequested, 60_000).toString(Charsets.US_ASCII)
+                    val receiverFingerprint = try {
+                        DeviceAuth.fingerprint(receiverPublic)
+                    } catch (error: Exception) {
+                        throw IOException("接收设备公钥无效", error)
+                    }
+                    if (!receiverInstanceId.matches(Regex("[0-9a-f]{32}")) ||
+                        (peer.instanceId.isNotEmpty() && receiverInstanceId != peer.instanceId) ||
+                        (expectedReceiverFingerprint.isNotEmpty() &&
+                            receiverFingerprint != expectedReceiverFingerprint) ||
+                        !DeviceAuth.verify(receiverPublic, DeviceAuth.receiverMessage(
+                            nonce, header, offset, receiverInstanceId), receiverSignature)) {
+                        throw IOException("接收设备身份验证失败")
+                    }
+                    val signature = deviceIdentity.sign(
+                        DeviceAuth.transferMessage(nonce, header, offset))
+                        .toByteArray(Charsets.US_ASCII)
+                    dout.writeShort(signature.size)
+                    dout.write(signature)
+                    if (offset > 0) {
+                        listener.onStatus("正在续传 $transferName · ${offset * 100 / maxOf(1, plainSize)}%")
+                        listener.onProgress("send", transferName, offset, plainSize)
                     }
 
-                    if (secret.isNotEmpty() && plainSize > CHUNK_ENC_THRESHOLD) {
-                        // 大文件走 WHE2 分块流式加密：内存峰值 4MB
-                        val wireSize = Crypto.chunkedWireSize(plainSize)
-                        WHPP.writeHeader(out, WHPP.Header(
-                            transferName, wireSize, encrypted = true, wantAck = true,
-                            encMode = "chunked"))
-                        val enc = Crypto.ChunkedEncryptor(secret)
-                        out.write(enc.streamHeader)
-                        var sent = enc.streamHeader.size.toLong()
-                        var plainRead = 0L
-                        val dout = DataOutputStream(out)
-                        useSendInput(inputFactory) { fin ->
-                            val buf = ByteArray(Crypto.CHUNK_SIZE)
-                            while (plainRead < plainSize) {
-                                if (cancellationRequested()) {
-                                    throw java.io.InterruptedIOException("发送已取消")
+                    val remaining = plainSize - offset
+                    val wireSize = if (encrypted && remaining > 0) {
+                        Crypto.chunkedWireSize(remaining)
+                    } else remaining
+                    dout.writeLong(wireSize)
+                    if (remaining > 0) {
+                        useSendInput(inputFactory) { source ->
+                            skipExactly(source, offset, ::cancellationRequested)
+                            if (encrypted) {
+                                val encryptor = Crypto.ChunkedEncryptor(secret)
+                                dout.write(encryptor.streamHeader)
+                                var sentWire = encryptor.streamHeader.size.toLong()
+                                var sentPlain = 0L
+                                val buffer = ByteArray(Crypto.CHUNK_SIZE)
+                                while (sentPlain < remaining) {
+                                    if (cancellationRequested()) {
+                                        throw InterruptedIOException("发送已取消")
+                                    }
+                                    val wanted = minOf(buffer.size.toLong(), remaining - sentPlain).toInt()
+                                    val count = readFull(source, buffer, wanted)
+                                    if (count <= 0) throw EOFException("文件读取不完整")
+                                    val ciphertext = encryptor.encryptChunk(buffer, count)
+                                    dout.writeInt(ciphertext.size)
+                                    dout.write(ciphertext)
+                                    sentPlain += count
+                                    sentWire += 4 + ciphertext.size
+                                    listener.onProgress(
+                                        "send", transferName, offset + sentPlain, plainSize)
                                 }
-                                val wanted = minOf(buf.size.toLong(), plainSize - plainRead).toInt()
-                                val n = readFull(fin, buf, wanted)
-                                if (n <= 0) throw EOFException("文件读取不完整")
-                                val ct = enc.encryptChunk(buf, n)
-                                dout.writeInt(ct.size)
-                                dout.write(ct)
-                                plainRead += n
-                                sent += 4 + ct.size
-                                progress(sent, wireSize)
+                                if (sentWire != wireSize) throw IOException("加密发送大小不一致")
+                            } else {
+                                val buffer = ByteArray(WHPP.BUFFER_SIZE)
+                                var sent = 0L
+                                while (sent < remaining) {
+                                    if (cancellationRequested()) {
+                                        throw InterruptedIOException("发送已取消")
+                                    }
+                                    val count = source.read(
+                                        buffer, 0, minOf(buffer.size.toLong(), remaining - sent).toInt())
+                                    if (count < 0) throw EOFException("文件读取不完整")
+                                    dout.write(buffer, 0, count)
+                                    sent += count
+                                    listener.onProgress("send", transferName, offset + sent, plainSize)
+                                }
                             }
                         }
-                        dout.flush()
-                    } else if (secret.isNotEmpty()) {
-                        // 小文件 WHE1 整块(与所有旧版本互通)
-                        val plain = useSendInput(inputFactory) { it.readBytes() }
-                        if (plain.size.toLong() != plainSize) throw EOFException("文件读取不完整")
-                        if (cancellationRequested()) {
-                            throw java.io.InterruptedIOException("发送已取消")
-                        }
-                        val enc = Crypto.encrypt(secret, plain)
-                        WHPP.writeFrame(
-                            out, transferName, enc.size.toLong(), true,
-                            ByteArrayInputStream(enc),
-                            onProgress = { progress(it, enc.size.toLong()) },
-                            shouldCancel = ::cancellationRequested,
-                        )
-                    } else {
-                        // 明文: 流式
-                        useSendInput(inputFactory) { input ->
-                            WHPP.writeFrame(
-                                out, transferName, plainSize, false, input,
-                                onProgress = { progress(it, plainSize) },
-                                shouldCancel = ::cancellationRequested,
-                            )
-                        }
                     }
+                    dout.flush()
 
-                    // 等接收方回执。老版本对端读完即关连接 -> read 返回 -1，按成功；超时也不误报
-                    s.soTimeout = 60_000
-                    val resp = try { s.getInputStream().read() } catch (e: Exception) {
-                        if (cancellationRequested()) throw java.io.InterruptedIOException("发送已取消")
-                        if (e is SocketTimeoutException) -1 else throw e
+                    val ack = readControl(socket, input, 1,
+                        ::cancellationRequested, RECV_IDLE_TIMEOUT_MS.toLong())[0].toInt() and 0xff
+                    if (ack == WHPP.ACK_FAIL) {
+                        throw ReceiverRejectedException("接收方校验或落盘失败")
                     }
-                    if (resp == WHPP.ACK_FAIL) {
-                        listener.onStatus("${peer.name} 接收失败（口令不一致、被拒收或存储问题）")
-                        return false
+                    if (ack != WHPP.ACK_OK) throw IOException("未收到接收成功回执")
+                    val remoteDigest = readControl(
+                        socket, input, WHPP.DIGEST_SIZE, ::cancellationRequested, 60_000)
+                    val expectedDigest = digest.chunked(2)
+                        .map { it.toInt(16).toByte() }.toByteArray()
+                    if (!MessageDigest.isEqual(remoteDigest, expectedDigest)) {
+                        throw IOException("接收方 SHA-256 回执不一致")
+                    }
+                    synchronized(outgoingStateLock) { completeOutgoingTransfer(outgoingKey) }
+                    completed = true
+                    return true
+                } catch (error: ReceiverRejectedException) {
+                    throw error
+                } catch (error: Exception) {
+                    lastError = error
+                    if (cancellationRequested()) throw InterruptedIOException("发送已取消")
+                    if (attempt < 2) {
+                        listener.onStatus("连接中断，正在恢复传输（${attempt + 2}/3）")
+                        Thread.sleep(500L * (attempt + 1))
+                    }
+                } finally {
+                    socket?.let {
+                        activeSendSocket.compareAndSet(it, null)
+                        activeSockets.remove(it)
+                        try { it.close() } catch (_: IOException) {}
                     }
                 }
-            } finally {
-                activeSendSocket.compareAndSet(socket, null)
-                activeSockets.remove(socket)
             }
-            completed = true
-            listener.onStatus("已发送：$transferName")
-            true
-        } catch (e: Exception) {
+            throw lastError ?: IOException("传输连接失败")
+        } catch (error: Exception) {
             if (cancellationRequested()) listener.onStatus("已取消发送：$transferName")
-            else listener.onStatus("发送失败: ${e.message}")
-            false
+            else listener.onStatus("发送失败: ${error.message}")
+            return false
         } finally {
             activeSendSocket.set(null)
             activeSendInput.set(null)
             sendInProgress.set(false)
             sendCancelled.set(false)
+            listener.onSendingChanged(false)
             listener.onTransferEnded("send", transferName, completed)
         }
     }
+
 
     /** 尽量读满 buf(文件尾可能不足)，返回实际读到的字节数；EOF 返回 -1。 */
     private fun readFull(input: InputStream, buf: ByteArray, limit: Int = buf.size): Int {
@@ -977,6 +1294,13 @@ class InkHoleNode(
                     socket.close()
                     throw IOException("墨洞节点已停止")
                 }
+                if (peer.endpointToken.isNotEmpty()) {
+                    socket.getOutputStream().apply {
+                        write(AUTH_MAGIC)
+                        write(peer.endpointToken.toByteArray(Charsets.US_ASCII))
+                        flush()
+                    }
+                }
                 return socket
             } catch (e: Exception) {
                 lastError = e
@@ -986,14 +1310,6 @@ class InkHoleNode(
         throw lastError ?: IOException("目标设备没有可用地址")
     }
 
-    private fun allowedSourceAddresses(peer: Peer): Set<String> {
-        val allowed = LinkedHashSet<String>()
-        for (host in listOf(peer.host) + peer.hosts) {
-            allowed.addAll(resolveHostAddresses(host))
-        }
-        return allowed
-    }
-
     // ---- 对端管理 ----
 
     fun getPeers(): List<Peer> = synchronized(peersLock) { peers.values.toList().sortedBy { it.name } }
@@ -1001,13 +1317,40 @@ class InkHoleNode(
     /** 实际监听端口(0=尚未启动)。设置页展示"本机"信息用。 */
     fun getActualPort(): Int = actualPort
 
+    fun getInstanceId(): String = instanceId
+
+    /** 仅交给同进程 Go 核心，用于认证其回注到接收端口的连接。 */
+    fun getCoreIngressToken(): String = coreIngressToken
+
     fun selectPeer(name: String?) {
         selectedPeer = name
         // 智能保留：记住 serviceName，离线后重新上线能自动恢复选中
-        lastSelectedService = if (name != null) {
-            synchronized(peersLock) { peers.values.find { it.name == name }?.serviceName }
+        val selected = if (name != null) {
+            synchronized(peersLock) { peers.values.find { it.name == name } }
         } else null
+        lastSelectedService = selected?.serviceName
+        if (selected != null && selected.instanceId.isNotEmpty() &&
+            selected.identityFingerprint.isNotEmpty()) {
+            val changed = synchronized(trustedPeersLock) {
+                if (trustedPeers[selected.instanceId] != selected.identityFingerprint) {
+                    trustedPeers[selected.instanceId] = selected.identityFingerprint
+                    true
+                } else false
+            }
+            if (changed) saveTrustedPeers()
+        }
         listener.onStatus(if (name != null) "目标: $name" else "未选择目标")
+    }
+
+    fun getTrustedDevices(): Map<String, String> =
+        synchronized(trustedPeersLock) { LinkedHashMap(trustedPeers) }
+
+    fun revokeTrustedPeer(instanceId: String): Boolean {
+        val removed = synchronized(trustedPeersLock) {
+            trustedPeers.remove(instanceId.lowercase()) != null
+        }
+        if (removed) saveTrustedPeers()
+        return removed
     }
 
     fun getSelectedPeer(): String? = selectedPeer
@@ -1023,7 +1366,10 @@ class InkHoleNode(
 
     private fun addPeer(serviceName: String, displayName: String, host: String, port: Int,
                         hosts: List<String> = listOf(host), instanceId: String = "",
-                        capabilities: Set<String> = emptySet(), manual: Boolean = false) {
+                        capabilities: Set<String> = emptySet(), manual: Boolean = false,
+                        transport: String = if (manual) "tailscale" else "lan",
+                        endpointToken: String = "", publicKey: String = "",
+                        identityFingerprint: String = "") {
         var added = false
         var finalName: String
         synchronized(peersLock) {
@@ -1053,6 +1399,10 @@ class InkHoleNode(
                     instanceId = instanceId,
                     capabilities = capabilities,
                     manual = manual,
+                    transport = transport,
+                    endpointToken = endpointToken,
+                    publicKey = publicKey,
+                    identityFingerprint = identityFingerprint,
                 )
                 if (selectedPeer == existing.name && lastSelectedService == serviceName) {
                     selectedPeer = finalName
@@ -1062,7 +1412,8 @@ class InkHoleNode(
                 finalName = uniqueName()
                 peers[serviceName] = Peer(
                     finalName, host, port, serviceName, hosts,
-                    instanceId, capabilities, manual)
+                    instanceId, capabilities, manual, transport, endpointToken,
+                    publicKey, identityFingerprint)
                 added = true
             }
             // 智能保留：若此设备的 serviceName 匹配之前选中的，自动恢复选择
@@ -1073,6 +1424,47 @@ class InkHoleNode(
         }
         if (added) listener.onStatus("发现: $finalName")
         listener.onPeerChanged(getPeers())
+    }
+
+    /** 将共享传输核心暴露的已认证 loopback 端点加入普通发送目标列表。 */
+    fun upsertExternalPeer(
+        peerId: String,
+        name: String,
+        host: String,
+        port: Int,
+        transport: String,
+        endpointToken: String,
+        externalInstanceId: String = "",
+    ): String {
+        val normalizedId = peerId.trim()
+        val normalizedTransport = transport.trim().lowercase()
+        require(normalizedId.isNotEmpty() && normalizedTransport in setOf("wormhole", "ssh")) {
+            "跨网设备标识或通道无效"
+        }
+        require(host in setOf("127.0.0.1", "::1", "localhost")) {
+            "跨网核心端点必须位于本机"
+        }
+        require(port in 1..65535 && endpointToken.isNotEmpty()) { "跨网核心端点无效" }
+        val serviceName = "external|$normalizedTransport|$normalizedId"
+        addPeer(
+            serviceName = serviceName,
+            displayName = name.trim().ifEmpty {
+                if (normalizedTransport == "wormhole") "一次性接收端" else "SSH 设备"
+            },
+            host = host,
+            port = port,
+            hosts = listOf(host),
+            instanceId = externalInstanceId.lowercase(),
+            capabilities = setOf(WHPP.FOLDER_KIND),
+            manual = true,
+            transport = normalizedTransport,
+            endpointToken = endpointToken,
+        )
+        return synchronized(peersLock) { peers[serviceName]?.name.orEmpty() }
+    }
+
+    fun removeExternalPeer(peerId: String, transport: String) {
+        removePeer("external|${transport.trim().lowercase()}|${peerId.trim()}")
     }
 
     private fun removePeer(serviceName: String) {
@@ -1110,6 +1502,7 @@ class InkHoleNode(
     /** 真正的 Tailscale 网络 = 持有 Tailnet IPv4/IPv6 地址的 VPN 网络。不能只看
      *  TRANSPORT_VPN:Clash/Mihomo 等代理的 TUN 也是 VPN,且会对任意 TCP
      *  连接先本地假 accept——纯 connect 探活在它上面永远"成功"。 */
+    @Suppress("DEPRECATION")
     private fun tailscaleNetwork(): Network? = try {
         val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
             as? ConnectivityManager
@@ -1169,21 +1562,30 @@ class InkHoleNode(
                 socket.use {
                     it.connect(java.net.InetSocketAddress(address, port), timeoutMs)
                     it.soTimeout = timeoutMs
+                    val nonce = ByteArray(32).also(SecureRandom()::nextBytes)
                     it.getOutputStream().apply {
                         write(WHPP.CAP_MAGIC)
+                        write(nonce)
                         flush()
                     }
-                    val capabilities = WHPP.readCapabilities(it.getInputStream())
+                    val capabilities = WHPP.readCapabilities(it.getInputStream(), nonce)
                     if (expectedInstanceId.isNotEmpty() &&
                         capabilities.instanceId != expectedInstanceId.lowercase()) {
                         throw IdentityMismatchException(
                             "设备身份已变化，请删除后重新添加")
+                    }
+                    val trusted = trustedFingerprint(capabilities.instanceId)
+                    if (trusted.isNotEmpty() && trusted != capabilities.fingerprint) {
+                        throw IdentityMismatchException(
+                            "设备密钥已变化，请撤销信任后重新配对")
                     }
                     return PeerProbeResult(
                         capabilities.instanceId,
                         capabilities.peerName,
                         capabilities.capabilities,
                         address,
+                        capabilities.publicKey,
+                        capabilities.fingerprint,
                     )
                 }
             } catch (e: IdentityMismatchException) {
@@ -1214,6 +1616,7 @@ class InkHoleNode(
             setAttribute("instance_id", instanceId)
             setAttribute("whpc", WHPP.CAP_VERSION.toString())
             setAttribute("caps", WHPP.FOLDER_KIND)
+            setAttribute("identity", deviceIdentity.fingerprint)
         }
         registrationListener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
@@ -1318,7 +1721,7 @@ class InkHoleNode(
         attrs["ips"]?.toString(Charsets.UTF_8)?.split(",")
             ?.map { it.trim() }?.filter { it.isNotEmpty() }?.let { hosts.addAll(it) }
         val hostList = hosts.toList()
-        // 发现与更新都先做 WHPC v2 身份验证。系统 mDNS 缓存(Android 13+ 常驻缓存,
+        // 发现与更新都先做 WHPC v3 身份验证。系统 mDNS 缓存(Android 13+ 常驻缓存,
         // 对端崩溃/断网不发 goodbye 时记录可存活几十分钟)会在重启发现时立即
         // 回灌陈旧记录——探活循环刚剔除的下线设备下一秒又被 resolve"复活",
         // 表现为对端明明关了却一直显示在线。可达性标准与探活循环一致:仅认
@@ -1330,7 +1733,8 @@ class InkHoleNode(
             } catch (_: Exception) { return@launch }
             if (running) addPeer(
                 discoveryName, displayName, result.connectedAddress, info.port,
-                hostList, result.instanceId, result.capabilities, manual = false)
+                hostList, result.instanceId, result.capabilities, manual = false,
+                publicKey = result.publicKey, identityFingerprint = result.fingerprint)
         }
     }
 

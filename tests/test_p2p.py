@@ -32,11 +32,21 @@ import socket
 import tempfile
 import threading
 import uuid
+import hashlib
+import io
 
 # 把 src 加入 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from inkhole.p2p import P2PNode, P2PConfig, PeerInfo, _MAGIC
+from inkhole.p2p import (P2PNode, P2PConfig, PeerInfo, _MAGIC,
+                        _probe_peer, inbox_category_for, inbox_root_for)
+from inkhole.device_identity import (DeviceIdentity, receiver_message,
+                                     transfer_message, verify)
+from inkhole.crypto import CHUNK_SIZE, chunked_wire_size, encrypt_chunks
+
+
+_TEST_IDENTITY = DeviceIdentity.generate()
+_TEST_INSTANCE_ID = uuid.uuid4().hex
 
 
 # ---------- 测试框架 ----------
@@ -70,12 +80,412 @@ def make_node(tmpdir, name="test", secret="", port=0,
     return P2PNode(cfg)
 
 
+def send_v3_payload(sock, filename, payload, kind="file", plain_size=None,
+                    expected_digest=None, identity=_TEST_IDENTITY,
+                    instance_id=_TEST_INSTANCE_ID):
+    """Drive the WHPP v3 control handshake for receiver-defense tests."""
+    total = len(payload) if plain_size is None else plain_size
+    digest = expected_digest or hashlib.sha256(payload).hexdigest()
+    transfer_id = hashlib.sha256(
+        f"test:{kind}:{filename}:{digest}".encode()).hexdigest()
+    header = {
+        "version": 3,
+        "filename": filename,
+        "plain_size": total,
+        "transfer_id": transfer_id,
+        "sha256": digest,
+        "kind": kind,
+        "encrypted": False,
+        "want_ack": True,
+        "sender_instance_id": instance_id,
+        "sender_public_key": identity.public_key,
+    }
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    sock.sendall(_MAGIC + struct.pack("!I", len(encoded)) + encoded)
+    marker, offset, nonce = recv_resume(sock, header)
+    if marker != b"\x02":
+        return marker
+    signature = identity.sign(transfer_message(nonce, header, offset)).encode("ascii")
+    sock.sendall(struct.pack("!H", len(signature)) + signature)
+    remaining = payload[offset:]
+    sock.sendall(struct.pack("!Q", total - offset) + remaining)
+    return sock.recv(1)
+
+
+def recv_exact(sock, size):
+    value = bytearray()
+    while len(value) < size:
+        chunk = sock.recv(size - len(value))
+        if not chunk:
+            raise EOFError("socket closed")
+        value.extend(chunk)
+    return bytes(value)
+
+
+def recv_resume(sock, header):
+    marker = recv_exact(sock, 1)
+    if marker != b"\x02":
+        return marker, 0, b""
+    offset = struct.unpack("!Q", recv_exact(sock, 8))[0]
+    nonce = recv_exact(sock, 32)
+    receiver_instance_id = recv_exact(sock, 32).decode("ascii")
+    public_size = struct.unpack("!H", recv_exact(sock, 2))[0]
+    public_key = recv_exact(sock, public_size).decode("ascii")
+    signature_size = struct.unpack("!H", recv_exact(sock, 2))[0]
+    signature = recv_exact(sock, signature_size).decode("ascii")
+    assert verify(public_key, receiver_message(
+        nonce, header, offset, receiver_instance_id), signature)
+    return marker, offset, nonce
+
+
+def raw_v3_header(filename, payload, identity=_TEST_IDENTITY,
+                  instance_id=_TEST_INSTANCE_ID, encrypted=False,
+                  transfer_id=None):
+    return {
+        "version": 3,
+        "filename": filename,
+        "plain_size": len(payload),
+        "transfer_id": transfer_id or hashlib.sha256(os.urandom(32)).hexdigest(),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "kind": "file",
+        "encrypted": encrypted,
+        "enc_mode": "chunked" if encrypted else "",
+        "want_ack": True,
+        "sender_instance_id": instance_id,
+        "sender_public_key": identity.public_key,
+    }
+
+
+def begin_raw_v3(sock, header, identity=_TEST_IDENTITY):
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    sock.sendall(_MAGIC + struct.pack("!I", len(encoded)) + encoded)
+    marker, offset, nonce = recv_resume(sock, header)
+    assert marker == b"\x02"
+    signature = identity.sign(
+        transfer_message(nonce, header, offset)).encode("ascii")
+    sock.sendall(struct.pack("!H", len(signature)) + signature)
+    return offset
+
+
+def test_probe_rejects_non_object_json_response():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve():
+        conn, _addr = listener.accept()
+        with conn:
+            assert recv_exact(conn, 36)[:4] == b"WHPC"
+            body = b"[]"
+            conn.sendall(b"WHPC" + struct.pack("!I", len(body)) + body)
+        listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        try:
+            _probe_peer("127.0.0.1", listener.getsockname()[1], 2)
+        except OSError as exc:
+            assert "格式非法" in str(exc)
+        else:
+            raise AssertionError("non-object WHPC response was accepted")
+    finally:
+        thread.join(2)
+
+
+def test_plain_transfer_resumes_from_persisted_offset(tmp_path):
+    payload = os.urandom(512 * 1024)
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False))
+    node.start()
+    try:
+        header = raw_v3_header("resume.bin", payload)
+        first = socket.create_connection(("127.0.0.1", node.actual_port), timeout=3)
+        assert begin_raw_v3(first, header) == 0
+        half = len(payload) // 2
+        first.sendall(struct.pack("!Q", len(payload)) + payload[:half])
+        first.close()
+        part = tmp_path / f".inkhole-{header['transfer_id']}.part"
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and (
+                not part.exists() or part.stat().st_size != half):
+            time.sleep(0.01)
+        assert part.stat().st_size == half
+
+        with socket.create_connection(("127.0.0.1", node.actual_port), timeout=3) as second:
+            assert begin_raw_v3(second, header) == half
+            second.sendall(struct.pack("!Q", len(payload) - half) + payload[half:])
+            assert recv_exact(second, 33) == b"\x01" + bytes.fromhex(header["sha256"])
+        assert (tmp_path / "resume.bin").read_bytes() == payload
+    finally:
+        node.stop()
+
+
+def test_encrypted_transfer_resumes_with_fresh_suffix_stream(tmp_path):
+    payload = os.urandom(CHUNK_SIZE + 1024)
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False,
+        secret="resume-secret"))
+    node.start()
+    try:
+        header = raw_v3_header("encrypted.bin", payload, encrypted=True)
+        first_wire = list(encrypt_chunks("resume-secret", io.BytesIO(payload)))
+        with socket.create_connection(("127.0.0.1", node.actual_port), timeout=5) as first:
+            assert begin_raw_v3(first, header) == 0
+            first.sendall(struct.pack("!Q", chunked_wire_size(len(payload))))
+            first.sendall(first_wire[0] + first_wire[1])
+        part = tmp_path / f".inkhole-{header['transfer_id']}.part"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (
+                not part.exists() or part.stat().st_size != CHUNK_SIZE):
+            time.sleep(0.01)
+        assert part.stat().st_size == CHUNK_SIZE
+
+        suffix = payload[CHUNK_SIZE:]
+        suffix_wire = b"".join(encrypt_chunks("resume-secret", io.BytesIO(suffix)))
+        with socket.create_connection(("127.0.0.1", node.actual_port), timeout=5) as second:
+            assert begin_raw_v3(second, header) == CHUNK_SIZE
+            second.sendall(struct.pack("!Q", len(suffix_wire)) + suffix_wire)
+            assert recv_exact(second, 33) == b"\x01" + bytes.fromhex(header["sha256"])
+        assert (tmp_path / "encrypted.bin").read_bytes() == payload
+    finally:
+        node.stop()
+
+
+def test_lost_ack_retry_reuses_receipt_without_duplicate(tmp_path):
+    payload = b"receipt-retry"
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False))
+    node.start()
+    try:
+        header = raw_v3_header("lost-ack.txt", payload)
+        first = socket.create_connection(("127.0.0.1", node.actual_port), timeout=3)
+        assert begin_raw_v3(first, header) == 0
+        first.sendall(struct.pack("!Q", len(payload)) + payload)
+        first.close()
+        destination = tmp_path / "lost-ack.txt"
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not destination.exists():
+            time.sleep(0.01)
+        assert destination.read_bytes() == payload
+
+        with socket.create_connection(("127.0.0.1", node.actual_port), timeout=3) as retry:
+            assert begin_raw_v3(retry, header) == len(payload)
+            retry.sendall(struct.pack("!Q", 0))
+            assert recv_exact(retry, 33) == b"\x01" + bytes.fromhex(header["sha256"])
+        assert sorted(path.name for path in tmp_path.glob("lost-ack*")) == ["lost-ack.txt"]
+    finally:
+        node.stop()
+
+
+def test_sender_does_not_succeed_when_ack_connection_resets(tmp_path):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(3)
+
+    receiver_identity = DeviceIdentity.generate()
+    receiver_instance_id = uuid.uuid4().hex
+
+    def reject_acks():
+        for _ in range(3):
+            conn, _ = listener.accept()
+            with conn:
+                assert recv_exact(conn, 4) == _MAGIC
+                header_size = struct.unpack("!I", recv_exact(conn, 4))[0]
+                header = json.loads(recv_exact(conn, header_size))
+                nonce = os.urandom(32)
+                public_key = receiver_identity.public_key.encode("ascii")
+                receiver_signature = receiver_identity.sign(receiver_message(
+                    nonce, header, 0, receiver_instance_id)).encode("ascii")
+                conn.sendall(b"".join((
+                    b"\x02", struct.pack("!Q", 0), nonce,
+                    receiver_instance_id.encode("ascii"),
+                    struct.pack("!H", len(public_key)), public_key,
+                    struct.pack("!H", len(receiver_signature)), receiver_signature,
+                )))
+                signature_size = struct.unpack("!H", recv_exact(conn, 2))[0]
+                recv_exact(conn, signature_size)
+                body_size = struct.unpack("!Q", recv_exact(conn, 8))[0]
+                recv_exact(conn, body_size)
+                assert header["plain_size"] == body_size
+        listener.close()
+
+    thread = threading.Thread(target=reject_acks, daemon=True)
+    thread.start()
+    sent = []
+    node = P2PNode(P2PConfig(inbox=str(tmp_path / "inbox"), enable_mdns=False),
+                   on_sent=sent.append)
+    node._on_peer_added(
+        "Reset", "127.0.0.1", listener.getsockname()[1],
+        instance_id=receiver_instance_id, capabilities={"reliable-v3"},
+        public_key=receiver_identity.public_key,
+        identity_fingerprint=receiver_identity.fingerprint)
+    node.select_peer("Reset")
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"never-success")
+    assert node.send_file(str(source)) is False
+    thread.join(3)
+    assert sent == []
+
+
+def test_sender_rejects_receiver_identity_mismatch_before_body(tmp_path):
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(3)
+    expected_identity = DeviceIdentity.generate()
+    attacker_identity = DeviceIdentity.generate()
+    receiver_instance_id = uuid.uuid4().hex
+    body_seen = []
+
+    def impersonate_receiver():
+        for _ in range(3):
+            conn, _ = listener.accept()
+            with conn:
+                conn.settimeout(1)
+                assert recv_exact(conn, 4) == _MAGIC
+                header_size = struct.unpack("!I", recv_exact(conn, 4))[0]
+                header = json.loads(recv_exact(conn, header_size))
+                nonce = os.urandom(32)
+                public_key = attacker_identity.public_key.encode("ascii")
+                signature = attacker_identity.sign(receiver_message(
+                    nonce, header, 0, receiver_instance_id)).encode("ascii")
+                conn.sendall(b"".join((
+                    b"\x02", struct.pack("!Q", 0), nonce,
+                    receiver_instance_id.encode("ascii"),
+                    struct.pack("!H", len(public_key)), public_key,
+                    struct.pack("!H", len(signature)), signature,
+                )))
+                try:
+                    body_seen.append(bool(conn.recv(1)))
+                except (ConnectionResetError, socket.timeout):
+                    body_seen.append(False)
+        listener.close()
+
+    thread = threading.Thread(target=impersonate_receiver, daemon=True)
+    thread.start()
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path / "inbox"), enable_mdns=False))
+    node._on_peer_added(
+        "Pinned", "127.0.0.1", listener.getsockname()[1],
+        instance_id=receiver_instance_id, capabilities={"reliable-v3"},
+        public_key=expected_identity.public_key,
+        identity_fingerprint=expected_identity.fingerprint)
+    node.select_peer("Pinned")
+    source = tmp_path / "secret.bin"
+    source.write_bytes(b"must not be sent")
+
+    assert node.send_file(str(source)) is False
+    thread.join(5)
+    assert body_seen == [False, False, False]
+
+
+def test_intentional_repeat_send_creates_unique_destination(tmp_path):
+    sender = P2PNode(P2PConfig(
+        inbox=str(tmp_path / "sender"), peer_name="Sender", enable_mdns=False))
+    receiver = P2PNode(P2PConfig(
+        inbox=str(tmp_path / "receiver"), peer_name="Receiver", enable_mdns=False))
+    sender.start()
+    receiver.start()
+    try:
+        sender._on_peer_added("Receiver", "127.0.0.1", receiver.actual_port)
+        sender.select_peer("Receiver")
+        source = tmp_path / "repeat.txt"
+        source.write_text("same contents", encoding="utf-8")
+        assert sender.send_file(str(source))
+        assert sender.send_file(str(source))
+        names = sorted(path.name for path in (tmp_path / "receiver").glob("repeat*"))
+        assert names == ["repeat (2).txt", "repeat.txt"]
+    finally:
+        sender.stop()
+        receiver.stop()
+
+
+def test_stale_transfer_artifacts_are_cleaned_as_a_group(tmp_path):
+    stale_id = "1" * 64
+    fresh_id = "2" * 64
+    stale_paths = [
+        tmp_path / f".inkhole-{stale_id}.part",
+        tmp_path / f".inkhole-{stale_id}.json",
+        tmp_path / f".inkhole-{stale_id}.done.json",
+    ]
+    fresh_paths = [
+        tmp_path / f".inkhole-{fresh_id}.part",
+        tmp_path / f".inkhole-{fresh_id}.json",
+    ]
+    for path in stale_paths + fresh_paths:
+        path.write_text("{}", encoding="utf-8")
+    old = time.time() - 8 * 24 * 60 * 60
+    for path in stale_paths + [fresh_paths[1]]:
+        os.utime(path, (old, old))
+    staging = tmp_path / ".inkhole-abandoned.folder.part"
+    staging.mkdir()
+    os.utime(staging, (old, old))
+    outgoing = tmp_path / ".inkhole-outgoing.json"
+    outgoing.write_text(json.dumps({
+        "old": {"transfer_id": stale_id, "updated_at": int(old)},
+        "fresh": {"transfer_id": fresh_id, "updated_at": int(time.time())},
+    }), encoding="utf-8")
+
+    P2PNode(P2PConfig(inbox=str(tmp_path), enable_mdns=False))
+
+    assert not any(path.exists() for path in stale_paths)
+    assert all(path.exists() for path in fresh_paths)
+    assert not staging.exists()
+    assert list(json.loads(outgoing.read_text(encoding="utf-8"))) == ["fresh"]
+
+
 def test_encryption_can_be_disabled_without_discarding_secret(tmp_path):
     cfg = P2PConfig(inbox=str(tmp_path), secret="saved-secret",
                     encryption_enabled=False)
 
     assert cfg.secret == "saved-secret"
     assert cfg.active_secret == ""
+
+
+def test_inbox_category_resolution(tmp_path):
+    cfg = P2PConfig(
+        inbox=str(tmp_path / "inbox"),
+        inbox_auto_classify=True,
+        inbox_category_dirs={"media": str(tmp_path / "custom-media")},
+    )
+
+    assert inbox_category_for("photo.HEIC") == "media"
+    assert inbox_category_for("clip.mp4") == "media"
+    assert inbox_category_for("backup.tar.gz") == "archive"
+    assert inbox_category_for("notes.pdf") == "file"
+    assert inbox_category_for("archive.zip", "folder-v1") == "folder"
+    assert inbox_root_for(cfg, "photo.jpg") == str(tmp_path / "custom-media")
+    assert inbox_root_for(cfg, "backup.zip") == str(tmp_path / "inbox" / "压缩包")
+
+
+def test_automatic_inbox_classification_receives_into_target_directory(tmp_path):
+    sender = make_node(str(tmp_path), "Alice")
+    receiver = P2PNode(P2PConfig(
+        inbox=str(tmp_path / "Bob_inbox"),
+        peer_name="Bob",
+        enable_mdns=False,
+        inbox_auto_classify=True,
+        inbox_category_dirs={"media": str(tmp_path / "photos")},
+    ))
+    try:
+        sender.start()
+        receiver.start()
+        sender._on_peer_added("Bob", "127.0.0.1", receiver.actual_port)
+        sender.select_peer("Bob")
+
+        photo = tmp_path / "photo.jpg"
+        photo.write_bytes(b"image-content")
+        assert sender.send_file(str(photo))
+        assert wait_for_file(str(tmp_path / "photos"), photo.name) is not None
+
+        document = tmp_path / "notes.pdf"
+        document.write_bytes(b"document-content")
+        assert sender.send_file(str(document))
+        default_file_root = tmp_path / "Bob_inbox" / "文件"
+        assert wait_for_file(str(default_file_root), document.name) is not None
+    finally:
+        sender.stop()
+        receiver.stop()
 
 
 def test_disabled_encryption_sends_plaintext_with_saved_secret(tmp_path):
@@ -397,15 +807,8 @@ def test_path_traversal():
 
         # 手动构造恶意请求：filename 含 ../
         sock = socket.create_connection(("127.0.0.1", node_b.actual_port), timeout=5)
-        header = json.dumps({
-            "filename": "../../../evil.txt",
-            "size": 4,
-            "encrypted": False,
-        }).encode("utf-8")
-        sock.sendall(_MAGIC)
-        sock.sendall(struct.pack("!I", len(header)))
-        sock.sendall(header)
-        sock.sendall(b"evil")
+        check("新版回执确认落盘", send_v3_payload(
+            sock, "../../../evil.txt", b"evil") == b"\x01")
         sock.close()
         time.sleep(0.5)
 
@@ -448,12 +851,23 @@ def test_partial_transfer_not_delivered():
 
         # 声明 100 字节但只发 50 字节就断开(模拟发送方中途崩溃/断网)
         sock = socket.create_connection(("127.0.0.1", node_b.actual_port), timeout=5)
-        header = json.dumps({"filename": "report.txt", "size": 100,
-                             "encrypted": False}).encode("utf-8")
-        sock.sendall(_MAGIC)
-        sock.sendall(struct.pack("!I", len(header)))
-        sock.sendall(header)
-        sock.sendall(b"x" * 50)
+        expected = hashlib.sha256(b"x" * 100).hexdigest()
+        header = {
+            "version": 3, "filename": "report.txt", "plain_size": 100,
+            "transfer_id": hashlib.sha256(b"partial-test").hexdigest(),
+            "sha256": expected, "kind": "file", "encrypted": False,
+            "want_ack": True,
+            "sender_instance_id": _TEST_INSTANCE_ID,
+            "sender_public_key": _TEST_IDENTITY.public_key,
+        }
+        encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        sock.sendall(_MAGIC + struct.pack("!I", len(encoded)) + encoded)
+        marker, offset, nonce = recv_resume(sock, header)
+        check("接收方返回从零续传", marker == b"\x02" and offset == 0)
+        signature = _TEST_IDENTITY.sign(
+            transfer_message(nonce, header, 0)).encode("ascii")
+        sock.sendall(struct.pack("!H", len(signature)) + signature)
+        sock.sendall(struct.pack("!Q", 100) + b"x" * 50)
         sock.close()
         check("接收中断结束回调触发", transfer_done.wait(timeout=5))
 
@@ -463,8 +877,11 @@ def test_partial_transfer_not_delivered():
         check("on_received 未触发", len(received) == 0)
         check("接收结束回调标记失败",
               transfer_ends == [("recv", "report.txt", False)])
-        check(".part 残留已清理",
-              not any(name.endswith(".part") for name in os.listdir(node_b.cfg.inbox)))
+        checkpoints = [name for name in os.listdir(node_b.cfg.inbox)
+                       if name.endswith(".part")]
+        check("半截数据保留为续传检查点", len(checkpoints) == 1)
+        check("续传检查点大小正确",
+              os.path.getsize(os.path.join(node_b.cfg.inbox, checkpoints[0])) == 50)
 
         node_b.stop()
     finally:
@@ -618,12 +1035,8 @@ def test_progress_callback():
 # ---------- 测试 13: 分块加密(WHE2)大文件往返 ----------
 def test_chunked_encryption_roundtrip():
     print("\n=== 测试 13: 分块加密大文件往返 ===")
-    import inkhole.p2p as p2p_mod
     tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
-    saved_threshold = p2p_mod._CHUNK_ENC_THRESHOLD
     try:
-        # 把分块阈值压到 256KB，1.5MB 文件即可触发 chunked 路径
-        p2p_mod._CHUNK_ENC_THRESHOLD = 256 * 1024
         secret = "chunk-secret"
         node_a = make_node(tmpdir, "Alice", secret=secret)
         node_b = make_node(tmpdir, "Bob", secret=secret)
@@ -649,7 +1062,6 @@ def test_chunked_encryption_roundtrip():
         node_a.stop()
         node_b.stop()
     finally:
-        p2p_mod._CHUNK_ENC_THRESHOLD = saved_threshold
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -844,7 +1256,11 @@ def test_trusted_only():
         check("B 没收到文件", not os.path.exists(os.path.join(node_b.cfg.inbox, "hello.txt")))
 
         # B 选中 A(地址 127.0.0.1) -> 放行
-        node_b._on_peer_added("Alice", "127.0.0.1", node_a.actual_port)
+        node_b._on_peer_added(
+            "Alice", "127.0.0.1", node_a.actual_port,
+            instance_id=node_a.cfg.instance_id,
+            public_key=node_a._identity.public_key,
+            identity_fingerprint=node_a._identity.fingerprint)
         node_b.select_peer("Alice")
         ok2 = node_a.send_file(src)
         check("B 选中 A 后发送成功", ok2 is True)
@@ -1285,15 +1701,7 @@ def test_encrypted_folder_stream():
         with open(os.path.join(src, "tiny.txt"), "w", encoding="utf-8") as f:
             f.write("small folder still uses chunked encryption")
 
-        # A folder must never enter the whole-payload WHE1 helper, even when tiny.
-        import inkhole.p2p as p2p_mod
-        original_encrypt = p2p_mod.encrypt
-        p2p_mod.encrypt = lambda *_args: (_ for _ in ()).throw(
-            AssertionError("folder unexpectedly used WHE1"))
-        try:
-            check("小文件夹加密发送成功", node_a.send_path(src))
-        finally:
-            p2p_mod.encrypt = original_encrypt
+        check("小文件夹加密发送成功", node_a.send_path(src))
 
         got = wait_for_directory(node_b.cfg.inbox, "机密项目")
         check("加密文件夹直接落为目录", got is not None)
@@ -1313,7 +1721,12 @@ def test_folder_legacy_zip_fallback():
         node_b = make_node(tmpdir, "LegacyBob")
         node_a.start(); node_b.start()
         time.sleep(0.3)
-        node_a._on_peer_added("LegacyBob", "127.0.0.1", node_b.actual_port)
+        node_a._on_peer_added(
+            "LegacyBob", "127.0.0.1", node_b.actual_port,
+            instance_id=node_b.cfg.instance_id,
+            capabilities={"reliable-v3"},
+            public_key=node_b._identity.public_key,
+            identity_fingerprint=node_b._identity.fingerprint)
         node_a.select_peer("LegacyBob")
         node_a._probe_peer_capabilities = lambda _peer: set()
 
@@ -1368,17 +1781,9 @@ def test_folder_traversal_rejected_atomically():
         payload = (_FOLDER_MAGIC + struct.pack("!I", 1)
                    + _FOLDER_ENTRY.pack(1, len(relative), 4, 0)
                    + relative + b"evil")
-        header = json.dumps({
-            "filename": "unsafe-folder",
-            "size": len(payload),
-            "plain_size": len(payload),
-            "kind": _FOLDER_KIND,
-            "encrypted": False,
-            "want_ack": True,
-        }).encode("utf-8")
         with socket.create_connection(("127.0.0.1", node.actual_port), timeout=3) as sock:
-            sock.sendall(_MAGIC + struct.pack("!I", len(header)) + header + payload)
-            check("接收方返回失败回执", sock.recv(1) == _ACK_FAIL)
+            check("接收方返回失败回执", send_v3_payload(
+                sock, "unsafe-folder", payload, kind=_FOLDER_KIND) == _ACK_FAIL)
 
         check("越界文件未写入", not os.path.exists(os.path.join(tmpdir, "escape.txt")))
         check("正式目录未落盘", not os.path.exists(

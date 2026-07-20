@@ -1,11 +1,11 @@
 [project]
 name = "inkhole"
-version = "1.4.4"
-description = "Cross-platform file transfer over LAN auto-discovery and direct IP connections."
+version = "1.5.0"
+description = "Cross-platform file transfer over LAN, one-time secure codes, Tailscale, and SSH relays."
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-gui = ["PySide6", "zeroconf", "cryptography", "psutil"]
+gui = ["PySide6", "zeroconf", "cryptography", "psutil", "keyring", "qrcode[pil]"]
 test = ["pytest>=8"]
 
 [tool.pytest.ini_options]

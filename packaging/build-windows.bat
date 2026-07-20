@@ -8,7 +8,16 @@ python -c "import PySide6" 2>nul || pip install PySide6
 python -c "import zeroconf" 2>nul || pip install zeroconf
 python -c "import cryptography" 2>nul || pip install cryptography
 python -c "import psutil" 2>nul || pip install psutil
+python -c "import keyring" 2>nul || pip install keyring
+python -c "import qrcode" 2>nul || pip install "qrcode[pil]"
 python -c "import PyInstaller" 2>nul || pip install pyinstaller
+
+echo ==^> 编译共享跨网核心
+if not exist "..\transport-core\bin" mkdir "..\transport-core\bin"
+pushd "..\transport-core"
+go build -trimpath -ldflags="-s -w" -o bin\inkhole-core.exe .\cmd\inkhole-core
+if errorlevel 1 exit /b %errorlevel%
+popd
 
 echo ==^> 打包
 pyinstaller inkhole-pet.spec --noconfirm --clean

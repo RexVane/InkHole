@@ -26,13 +26,20 @@ import os
 import re
 import sys
 import json
+import hmac
 import queue
 import argparse
+import copy
+import secrets
+import shutil
 import threading
 import time
 from collections import deque
 
 from .p2p import P2PNode, P2PConfig
+from .device_identity import DeviceIdentity
+from .transport import TransportCore, TransportCoreError
+from . import secret_store
 from . import __version__ as _APP_VERSION
 
 
@@ -49,6 +56,135 @@ def _version_newer(remote: str, local: str) -> bool:
         return parts(remote) > parts(local)
     except Exception:
         return False
+
+
+def _parse_release_checksum(raw: bytes, filename: str) -> str:
+    """Parse a plain checksum or the signed PowerShell manifest first line."""
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValueError("更新校验文件不是 ASCII") from exc
+    line = lines[0].strip() if lines else ""
+    prefix = "# INKHOLE-SHA256 "
+    if line.startswith(prefix):
+        line = line[len(prefix):]
+    fields = line.split()
+    if (len(fields) != 2 or fields[1].lstrip("*") != filename
+            or re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]) is None):
+        raise ValueError("更新校验文件格式无效")
+    return fields[0].lower()
+
+
+def _sha256_path(path: str) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            chunk = source.read(256 * 1024)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+
+
+def _extract_update_zip(zip_path: str, destination: str) -> None:
+    """Extract an update only when every ZIP member remains below destination."""
+    import stat
+    import zipfile
+    root = os.path.abspath(destination)
+    with zipfile.ZipFile(zip_path) as archive:
+        members = archive.infolist()
+        if len(members) > 20_000:
+            raise ValueError("更新包文件数量异常")
+        if sum(member.file_size for member in members) > 1024 * 1024 * 1024:
+            raise ValueError("更新包解压大小异常")
+        for member in members:
+            target = os.path.abspath(os.path.join(root, member.filename))
+            try:
+                inside = os.path.commonpath((root, target)) == root
+            except ValueError:
+                inside = False
+            if not inside:
+                raise ValueError("更新包包含越界路径")
+            mode = member.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise ValueError("更新包包含符号链接")
+            if member.flag_bits & 0x1:
+                raise ValueError("更新包包含加密条目")
+        archive.extractall(root)
+
+
+def _verify_windows_update_signature(current_exe: str, candidate_exe: str,
+                                     manifest_path: str, workdir: str) -> None:
+    """Require the candidate EXE and whole-package manifest to match our signer."""
+    import subprocess
+    script = os.path.join(workdir, "verify-update.ps1")
+    with open(script, "w", encoding="utf-8") as output:
+        output.write(
+            "param([string]$Current, [string]$Candidate, [string]$Manifest)\n"
+            "$currentSig = Get-AuthenticodeSignature -LiteralPath $Current\n"
+            "$candidateSig = Get-AuthenticodeSignature -LiteralPath $Candidate\n"
+            "$manifestSig = Get-AuthenticodeSignature -LiteralPath $Manifest\n"
+            "@{ current_status = $currentSig.Status.ToString(); "
+            "current_thumbprint = $currentSig.SignerCertificate.Thumbprint; "
+            "candidate_status = $candidateSig.Status.ToString(); "
+            "candidate_thumbprint = $candidateSig.SignerCertificate.Thumbprint; "
+            "manifest_status = $manifestSig.Status.ToString(); "
+            "manifest_thumbprint = $manifestSig.SignerCertificate.Thumbprint } | "
+            "ConvertTo-Json -Compress\n"
+        )
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+         "Bypass", "-File", script, current_exe, candidate_exe, manifest_path],
+        capture_output=True, text=True, timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError("无法验证更新程序的 Windows 签名")
+    try:
+        signature = json.loads(completed.stdout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Windows 签名验证结果无效") from exc
+    current_thumbprint = str(signature.get("current_thumbprint") or "").upper()
+    candidate_thumbprint = str(signature.get("candidate_thumbprint") or "").upper()
+    manifest_thumbprint = str(signature.get("manifest_thumbprint") or "").upper()
+    if (signature.get("current_status") != "Valid"
+            or signature.get("candidate_status") != "Valid"
+            or signature.get("manifest_status") != "Valid"
+            or not current_thumbprint
+            or not hmac.compare_digest(current_thumbprint, candidate_thumbprint)
+            or not hmac.compare_digest(current_thumbprint, manifest_thumbprint)):
+        raise ValueError("更新包签名无效或发布证书与当前版本不一致")
+
+
+def _windows_update_script(app_dir: str, backup_dir: str, unzip_dir: str,
+                           zip_path: str, manifest_path: str) -> str:
+    """Build a recoverable onedir replacement script for the detached updater."""
+    return "\r\n".join([
+        "@echo off",
+        "timeout /t 2 /nobreak >nul",
+        f'robocopy "{app_dir}" "{backup_dir}" /MIR /R:2 /W:1 >nul',
+        "if errorlevel 8 goto restart_current",
+        f'robocopy "{unzip_dir}\\InkHolePet" "{app_dir}" /MIR /IS /IT /R:3 /W:2 >nul',
+        "if errorlevel 8 goto rollback",
+        f'start "" "{app_dir}\\InkHolePet.exe"',
+        "goto cleanup",
+        ":rollback",
+        f'robocopy "{backup_dir}" "{app_dir}" /MIR /IS /IT /R:3 /W:2 >nul',
+        "if errorlevel 8 goto rollback_failed",
+        ":restart_current",
+        f'start "" "{app_dir}\\InkHolePet.exe"',
+        ":cleanup",
+        f'rd /s /q "{backup_dir}"',
+        f'rd /s /q "{unzip_dir}"',
+        f'del "{zip_path}" "{manifest_path}"',
+        'del "%~f0"',
+        "exit /b 0",
+        ":rollback_failed",
+        f'start "" "{app_dir}\\InkHolePet.exe"',
+        "rem Keep the verified package and backup for manual recovery.",
+        "exit /b 1",
+    ])
 
 
 def _summarize_release_notes(raw: str, max_items: int = 4) -> str:
@@ -151,10 +287,12 @@ def _default_inbox() -> str:
 
 
 # ---------- 设置持久化 ----------
-# 双击 exe 的用户没有命令行：名字/口令/收件箱改一次就记住。
-# 显式 CLI 参数 > 配置文件 > 默认值；显式参数会写回配置(下次不带参数也生效)。
+# 双击 exe 的用户没有命令行：名字/收件箱等写普通配置，口令写系统凭据库。
+# 显式 CLI 参数 > 已保存设置 > 默认值；显式参数会在可用时安全保存。
 
 _CONFIG_LOCK = threading.RLock()
+_TRANSFER_SECRET_NAME = "transfer_secret_v1"
+_TRANSFER_SECRET_WARNING = ""
 
 def _config_path() -> str:
     if sys.platform == "win32":
@@ -181,16 +319,24 @@ def _save_config(cfg: P2PConfig, **extra) -> None:
     with _CONFIG_LOCK:
         try:
             data = _load_saved_config()
-            # SSH 中转方案已移除:清掉历史遗留的相关键,避免污染配置
-            for stale in ("ssh_relay", "relay", "transport_mode"):
+            # Only remove obsolete pre-1.5 relay keys. cross_network is the
+            # additive v1.5 schema and is preserved by the read-modify-write.
+            for stale in ("relay", "transport_mode"):
                 data.pop(stale, None)
-            data.update({"name": cfg.peer_name, "secret": cfg.secret,
+            # Secrets live in the OS credential store. Also scrub the legacy
+            # plaintext field whenever any setting is persisted.
+            data.pop("secret", None)
+            data.update({"name": cfg.peer_name,
                          "encryption_enabled": bool(cfg.encryption_enabled),
                          "inbox": cfg.inbox, "port": cfg.listen_port,
+                         "inbox_auto_classify": bool(cfg.inbox_auto_classify),
+                         "inbox_category_dirs": dict(cfg.inbox_category_dirs or {}),
                          "trusted_only": cfg.trusted_only,
                          "instance_id": cfg.instance_id,
-                         "manual_peers": list(cfg.manual_peers or [])})
+                         "manual_peers": list(cfg.manual_peers or []),
+                         "trusted_peers": dict(cfg.trusted_peers or {})})
             data.update(extra)
+            data.pop("secret", None)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -200,6 +346,118 @@ def _save_config(cfg: P2PConfig, **extra) -> None:
                 pass
         except OSError:
             pass
+
+
+def _normalize_cross_network(raw) -> dict:
+    source = raw if isinstance(raw, dict) else {}
+    wormhole = source.get("wormhole") if isinstance(source.get("wormhole"), dict) else {}
+    ssh_raw = source.get("ssh") if isinstance(source.get("ssh"), dict) else {}
+    profile_raw = ssh_raw.get("profile") if isinstance(ssh_raw.get("profile"), dict) else {}
+
+    def normalized_port(value, default: int, allow_zero: bool = False) -> int:
+        try:
+            port = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        if allow_zero and port == 0:
+            return 0
+        return port if 1 <= port <= 65535 else default
+
+    profile_id = str(profile_raw.get("id") or "").strip() or secrets.token_hex(12)
+    profile = {
+        "id": profile_id,
+        "host": str(profile_raw.get("host") or "").strip(),
+        "port": normalized_port(profile_raw.get("port") or 22, 22),
+        "user": str(profile_raw.get("user") or "").strip(),
+        "private_key_mode": ("paste" if profile_raw.get("private_key_mode") == "paste"
+                             else "file"),
+        "private_key_path": str(profile_raw.get("private_key_path") or ""),
+        "private_key_label": str(profile_raw.get("private_key_label") or ""),
+        "host_key_sha256": str(profile_raw.get("host_key_sha256") or ""),
+    }
+    peers = []
+    for value in ssh_raw.get("peers") or []:
+        if not isinstance(value, dict):
+            continue
+        try:
+            remote_port = int(value.get("remote_port") or 0)
+            instance_id = str(value.get("instance_id") or "").strip()
+            public_key = str(value.get("noise_public") or "").strip()
+            if not instance_id or not public_key or not 1 <= remote_port <= 65535:
+                continue
+            peers.append({
+                "id": str(value.get("id") or instance_id),
+                "name": str(value.get("name") or "SSH 设备"),
+                "instance_id": instance_id,
+                "remote_port": remote_port,
+                "noise_public": public_key,
+                "end_to_end": bool(value.get("end_to_end", True)),
+            })
+        except (TypeError, ValueError):
+            continue
+    return {
+        "wormhole": {
+            "rendezvous_url": str(wormhole.get("rendezvous_url") or "").strip(),
+            "transit_relay": str(wormhole.get("transit_relay") or "").strip(),
+        },
+        "ssh": {
+            "enabled": bool(ssh_raw.get("enabled", False)),
+            "profile": profile,
+            "remote_port": normalized_port(
+                ssh_raw.get("remote_port") or 0, 0, allow_zero=True),
+            "peers": peers,
+        },
+    }
+
+
+def _summarize_transfer_paths(paths: list[str]) -> dict:
+    """Validate selected paths and build the metadata shown before receiving."""
+    item_count = 0
+    file_count = 0
+    directory_count = 0
+    total_bytes = 0
+    names = []
+    normalized = []
+    for raw in paths:
+        path = os.path.abspath(str(raw))
+        if not (os.path.isfile(path) or os.path.isdir(path)):
+            continue
+        normalized.append(path)
+        item_count += 1
+        if len(names) < 8:
+            names.append(os.path.basename(path) or path)
+        if os.path.isfile(path):
+            file_count += 1
+            total_bytes += os.path.getsize(path)
+            continue
+        directory_count += 1
+        for root, dirs, files in os.walk(path, followlinks=False):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+            if root != path:
+                directory_count += 1
+            for filename in files:
+                current = os.path.join(root, filename)
+                if os.path.isfile(current) and not os.path.islink(current):
+                    file_count += 1
+                    total_bytes += os.path.getsize(current)
+    if not normalized:
+        raise ValueError("没有可发送的文件或文件夹")
+    return {
+        "paths": normalized,
+        "summary": {
+            "device_name": "",
+            "instance_id": "",
+            "item_count": item_count,
+            "file_count": file_count,
+            "directory_count": directory_count,
+            "total_bytes": total_bytes,
+            "names": names,
+        },
+    }
+
+
+def _ssh_secret_name(profile_id: str, kind: str) -> str:
+    return f"ssh:{profile_id}:{kind}"
 
 
 class SendQueue:
@@ -351,6 +609,8 @@ class SendQueue:
 
 
 def _build_config(argv=None):
+    global _TRANSFER_SECRET_WARNING
+    _TRANSFER_SECRET_WARNING = ""
     saved = _load_saved_config()
     ap = argparse.ArgumentParser(description="墨洞桌宠挂件(P2P 局域网直连，无需服务器)")
     ap.add_argument("--inbox", default=None,
@@ -371,7 +631,50 @@ def _build_config(argv=None):
     except (TypeError, ValueError):
         port = 0
     name = args.name if args.name is not None else str(saved.get("name") or "")
-    secret = args.secret if args.secret is not None else str(saved.get("secret") or "")
+
+    # Device identity is required for every WHPC/WHPP connection. Load it
+    # before optional passwords so an authorization wait for an old password
+    # cannot queue ahead of creating a fresh identity on this installation.
+    identity_read_ok, stored_identity = secret_store.get_with_status(
+        "lan_identity_p256")
+    try:
+        identity = (DeviceIdentity.from_private_key(stored_identity)
+                    if identity_read_ok and stored_identity else None)
+    except (ValueError, TypeError):
+        identity = None
+    if identity is None:
+        identity = DeviceIdentity.generate()
+        if identity_read_ok:
+            if not secret_store.set(
+                    "lan_identity_p256", identity.export_private_key()):
+                _TRANSFER_SECRET_WARNING = (
+                    "无法保存设备身份，本次运行使用临时身份")
+        else:
+            _TRANSFER_SECRET_WARNING = (
+                "系统安全存储正在等待授权，本次运行使用临时设备身份")
+
+    secure_read_ok, secure_secret = secret_store.get_with_status(
+        _TRANSFER_SECRET_NAME)
+    has_legacy_secret = "secret" in saved
+    legacy_secret = str(saved.get("secret") or "")
+    if args.secret is not None:
+        secret = args.secret
+        if not secret_store.set(_TRANSFER_SECRET_NAME, secret):
+            _TRANSFER_SECRET_WARNING = (
+                "无法使用系统安全存储，传输口令仅在本次运行中生效")
+    elif secure_read_ok and secure_secret:
+        secret = secure_secret
+    else:
+        secret = legacy_secret
+        if legacy_secret and not secure_read_ok:
+            _TRANSFER_SECRET_WARNING = (
+                "系统安全存储正在等待授权；已从普通配置移除旧传输口令，"
+                "口令仅在本次运行中生效")
+        elif legacy_secret and not secret_store.set(
+                _TRANSFER_SECRET_NAME, legacy_secret):
+            _TRANSFER_SECRET_WARNING = (
+                "无法迁移旧传输口令到系统安全存储；"
+                "已从普通配置移除，口令仅在本次运行中生效")
     saved_encryption = saved.get("encryption_enabled")
     encryption_enabled = (
         bool(saved_encryption) if isinstance(saved_encryption, bool)
@@ -379,8 +682,16 @@ def _build_config(argv=None):
     if args.secret is not None:
         # An explicit --secret (including an empty value) expresses the CLI intent.
         encryption_enabled = bool(secret)
+    elif encryption_enabled and not secret:
+        encryption_enabled = False
     trusted_only = bool(saved.get("trusted_only", False))
+    inbox_auto_classify = bool(saved.get("inbox_auto_classify", False))
+    inbox_category_dirs = (saved.get("inbox_category_dirs")
+                           if isinstance(saved.get("inbox_category_dirs"), dict)
+                           else {})
     instance_id = str(saved.get("instance_id") or "")   # 空则 P2PConfig 自动生成
+    trusted_peers = (saved.get("trusted_peers")
+                     if isinstance(saved.get("trusted_peers"), dict) else {})
     manual_peers = []
     for m in (saved.get("manual_peers") or []):
         try:
@@ -398,11 +709,18 @@ def _build_config(argv=None):
             continue   # 配置文件被手改坏的条目直接丢弃
 
     cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret,
+                    inbox_auto_classify=inbox_auto_classify,
+                    inbox_category_dirs=inbox_category_dirs,
                     trusted_only=trusted_only, instance_id=instance_id,
                     manual_peers=manual_peers,
-                    encryption_enabled=encryption_enabled)
+                    encryption_enabled=encryption_enabled,
+                    core_ingress_token=secrets.token_urlsafe(24),
+                    identity_private_key=identity.export_private_key(),
+                    trusted_peers=trusted_peers)
     # 首次运行(配置里还没有 instance_id)时生成一个并落盘，之后重启复用同一 ID
-    if str(saved.get("instance_id") or "").lower() != cfg.instance_id:
+    if (str(saved.get("instance_id") or "").lower() != cfg.instance_id
+            or has_legacy_secret
+            or (bool(saved_encryption) and not encryption_enabled)):
         _save_config(cfg)
     if any(a is not None for a in (args.inbox, args.port, args.name, args.secret)):
         _save_config(cfg)   # 显式 CLI 参数视为用户意图，记住
@@ -506,8 +824,8 @@ def is_autostart_enabled() -> bool:
 def set_autostart(enabled: bool, cfg: P2PConfig) -> bool:
     """设置或取消开机自启，返回操作后的状态。
 
-    自启项不带任何参数：名字/口令/收件箱都在配置文件(config.json)里，
-    启动时自动读取——口令不会明文进注册表/自启脚本。
+    自启项不带任何参数：普通设置从 config.json 读取，传输口令从系统凭据库读取，
+    不会明文进入配置、注册表或自启脚本。
     """
     path = _startup_script_path()
     if enabled:
@@ -643,8 +961,6 @@ def main(argv=None) -> None:
     from .macos import configure_bundle_localizations
     configure_bundle_localizations()
 
-    cfg, size_override = _build_config(argv)
-    _install_crash_log(cfg.inbox)   # 尽早安装:之后任何崩溃/print 都安全且留痕
     try:
         from PySide6.QtCore import QObject, Signal, Slot, QUrl, Qt
         from PySide6.QtGui import QGuiApplication
@@ -663,6 +979,13 @@ def main(argv=None) -> None:
             "未安装 PySide6。请先运行：pip install PySide6 --break-system-packages\n"
             "(P2P 引擎本身无需 GUI，可用 python -m inkhole.p2p 跑命令行版)\n")
         raise SystemExit(1)
+
+    # Keychain may display an access prompt after an ad-hoc local rebuild.
+    # Cocoa must already have an application/event owner or SecItemCopyMatching
+    # can wait forever before the first window and P2P listener are created.
+    app = (QApplication if _HAS_WIDGETS else QGuiApplication)([sys.argv[0]])
+    cfg, size_override = _build_config(argv)
+    _install_crash_log(cfg.inbox)   # 尽早安装:之后任何崩溃/print 都安全且留痕
 
     def _setup_tray(app, bridge):
         """构建右键菜单 +(可用时)系统托盘图标。
@@ -758,6 +1081,7 @@ def main(argv=None) -> None:
         progressCleared = Signal()
         transferStateChanged = Signal(bool)
         sendStateChanged = Signal(bool)
+        transportEvent = Signal(str, object)
         # 检查更新结果: has_new, 最新版本号, 更新说明摘要, 资产下载 url(空=无对应平台包)
         updateCheckFinished = Signal(bool, str, str, str)
 
@@ -780,6 +1104,15 @@ def main(argv=None) -> None:
             self._speed_state = {}
             self._last_status = "正在启动…"
             self._lan_cfg = cfg
+            self._cross_network = _normalize_cross_network(
+                _load_saved_config().get("cross_network"))
+            self._transport_core = None
+            self._transport_error = ""
+            self._wormhole_pending: dict[str, list[str]] = {}
+            self._wormhole_active = ""
+            self._ssh_session_id = ""
+            self._ssh_runtime_peers: dict[str, dict] = {}
+            self.transportEvent.connect(self._handle_transport_event)
             # 设置保存会后台重启节点(mDNS 重新注册,阻塞数秒不能占 UI 线程);
             # _restart_gate 保证同一时刻只有一次重启,_restarting 供发送路径守卫。
             self._restart_gate = threading.Lock()
@@ -794,6 +1127,7 @@ def main(argv=None) -> None:
                 cancel_fn=lambda: self.node.cancel_send(),
             )
             self.node.start()
+            self._start_transport_core()
 
         def _make_node(self, cfg):
             return P2PNode(
@@ -807,7 +1141,382 @@ def main(argv=None) -> None:
                 on_transfer_end=lambda kind, name, completed: self._on_transfer_end(
                     kind, name, completed),
                 on_manual_peer_verified=lambda: _save_config(self._lan_cfg),
+                on_trust_changed=lambda: _save_config(self._lan_cfg),
             )
+
+        # ---------- shared cross-network transport core ----------
+        def _start_transport_core(self) -> None:
+            try:
+                core = TransportCore(lambda message: self.transportEvent.emit(
+                    str(message.get("event") or ""), message.get("data") or {}))
+                core.call("start", {
+                    "local_target": f"127.0.0.1:{self.node.actual_port}",
+                    "local_token": self._lan_cfg.core_ingress_token,
+                    "device_name": self._lan_cfg.peer_name,
+                    "instance_id": self._lan_cfg.instance_id,
+                }, timeout=8)
+                self._transport_core = core
+                self._transport_error = ""
+                if self._cross_network["ssh"]["enabled"]:
+                    threading.Thread(target=self._start_ssh_runtime, daemon=True).start()
+            except (TransportCoreError, OSError) as exc:
+                self._transport_core = None
+                self._transport_error = str(exc)
+
+        def _retarget_transport_core(self) -> None:
+            core = self._transport_core
+            if core is None:
+                return
+            try:
+                core.call("start", {
+                    "local_target": f"127.0.0.1:{self.node.actual_port}",
+                    "local_token": self._lan_cfg.core_ingress_token,
+                    "device_name": self._lan_cfg.peer_name,
+                    "instance_id": self._lan_cfg.instance_id,
+                }, timeout=8)
+            except TransportCoreError as exc:
+                self.transportEvent.emit("core.error", {"error": str(exc)})
+
+        @Slot(str, object)
+        def _handle_transport_event(self, name: str, data) -> None:
+            if not isinstance(data, dict):
+                data = {}
+            if name == "wormhole.ready" and data.get("role") == "sender":
+                session_id = str(data.get("session_id") or "")
+                paths = self._wormhole_pending.pop(session_id, [])
+                try:
+                    endpoint = str(data.get("local_endpoint") or "")
+                    host, raw_port = endpoint.rsplit(":", 1)
+                    peer_name = self.node.upsert_external_peer(
+                        session_id, "一次性接收端", host.strip("[]"), int(raw_port),
+                        "wormhole", str(data.get("endpoint_token") or ""))
+                    self.node.select_peer(peer_name)
+                    self._wormhole_active = session_id
+                    for path in paths:
+                        self._enqueue_path(path)
+                except (ValueError, OSError) as exc:
+                    self._route_status(f"短码通道建立失败：{exc}")
+            elif name == "wormhole.error":
+                session_id = str(data.get("session_id") or "")
+                self._wormhole_pending.pop(session_id, None)
+                if self._wormhole_active == session_id:
+                    self.node.remove_external_peer(session_id, "wormhole")
+                    self._wormhole_active = ""
+                self._route_status(f"一次性短码失败：{data.get('error') or '连接已结束'}")
+            elif name == "ssh.paired":
+                peer = data.get("peer")
+                if isinstance(peer, dict):
+                    self._remember_ssh_peer(peer)
+            elif name == "ssh.ready":
+                self._ssh_session_id = str(data.get("session_id") or "")
+                self._cross_network["ssh"]["remote_port"] = int(
+                    data.get("remote_port") or 0)
+                for peer in data.get("peers") or []:
+                    if isinstance(peer, dict):
+                        self._remember_ssh_peer(peer)
+                _save_config(self._lan_cfg,
+                             cross_network=copy.deepcopy(self._cross_network))
+                self._route_status("SSH 中继已连接")
+            elif name in {"ssh.config.error", "ssh.check.error", "ssh.pair.error"}:
+                self._route_status(str(data.get("error") or "SSH 操作失败"))
+            elif name == "ssh.disconnected":
+                self._route_status("SSH 中继已断开，正在重连")
+            elif name == "ssh.connected":
+                self._route_status("SSH 中继已恢复")
+            elif name == "core.error":
+                self._route_status(str(data.get("error") or "跨网核心错误"))
+
+        def _require_transport_core(self) -> TransportCore:
+            if self._transport_core is None:
+                raise TransportCoreError(self._transport_error or "跨网核心未运行")
+            return self._transport_core
+
+        @staticmethod
+        def _summarize_paths(paths: list[str]) -> dict:
+            return _summarize_transfer_paths(paths)
+
+        def startOneTimeSend(self, paths: list[str]) -> None:
+            def worker():
+                workdir = ""
+                try:
+                    payload = self._summarize_paths(paths)
+                    payload["summary"]["device_name"] = self._lan_cfg.peer_name
+                    payload["summary"]["instance_id"] = self._lan_cfg.instance_id
+                    result = self._require_transport_core().call(
+                        "wormhole.create", {
+                            "summary": payload["summary"],
+                            "settings": self._wormhole_settings(),
+                        }, timeout=30)
+                    session_id = str(result.get("session_id") or "")
+                    self._wormhole_pending[session_id] = payload["paths"]
+                    self.transportEvent.emit("wormhole.code", result)
+                except (TransportCoreError, OSError, ValueError) as exc:
+                    self.transportEvent.emit("wormhole.error", {"error": str(exc)})
+            threading.Thread(target=worker, daemon=True).start()
+
+        def joinOneTime(self, code: str) -> None:
+            def worker():
+                try:
+                    result = self._require_transport_core().call(
+                        "wormhole.join", {
+                            "code": str(code).strip(),
+                            "settings": self._wormhole_settings(),
+                        }, timeout=620)
+                    self.transportEvent.emit("wormhole.offer", result)
+                except TransportCoreError as exc:
+                    self.transportEvent.emit("wormhole.error", {"error": str(exc)})
+            threading.Thread(target=worker, daemon=True).start()
+
+        def acceptOneTime(self, session_id: str) -> None:
+            def worker():
+                try:
+                    self._require_transport_core().call(
+                        "wormhole.accept", {"session_id": session_id}, timeout=60)
+                except TransportCoreError as exc:
+                    self.transportEvent.emit("wormhole.error", {
+                        "session_id": session_id, "error": str(exc)})
+            threading.Thread(target=worker, daemon=True).start()
+
+        def rejectOneTime(self, session_id: str) -> None:
+            core = self._transport_core
+            if core is None:
+                return
+            threading.Thread(target=lambda: self._safe_core_call(
+                "wormhole.reject", {"session_id": session_id}), daemon=True).start()
+
+        def cancelTransportSession(self, session_id: str) -> None:
+            core = self._transport_core
+            if core is None or not session_id:
+                return
+            self._wormhole_pending.pop(session_id, None)
+            if self._wormhole_active == session_id:
+                self.node.remove_external_peer(session_id, "wormhole")
+                self._wormhole_active = ""
+            threading.Thread(target=lambda: self._safe_core_call(
+                "session.cancel", {"session_id": session_id}), daemon=True).start()
+
+        def _safe_core_call(self, method: str, params: dict) -> dict:
+            try:
+                return self._require_transport_core().call(method, params, timeout=30)
+            except TransportCoreError:
+                return {}
+
+        def _wormhole_settings(self) -> dict:
+            settings = self._cross_network["wormhole"]
+            return {
+                "rendezvous_url": settings.get("rendezvous_url", ""),
+                "transit_relay": settings.get("transit_relay", ""),
+                "timeout_minutes": 10,
+            }
+
+        # ---------- SSH VPS relay ----------
+        def crossNetworkConfig(self) -> dict:
+            result = copy.deepcopy(self._cross_network)
+            profile = result["ssh"]["profile"]
+            profile_id = profile["id"]
+            profile["has_pasted_key"] = bool(secret_store.get(
+                _ssh_secret_name(profile_id, "private_key")))
+            profile["has_passphrase"] = bool(secret_store.get(
+                _ssh_secret_name(profile_id, "passphrase")))
+            result["core_available"] = self._transport_core is not None
+            result["core_error"] = self._transport_error
+            result["secure_store_available"] = secret_store.available()
+            return result
+
+        def _ssh_profile_payload(self, profile: dict,
+                                 pasted_override: str | None = None,
+                                 passphrase_override: str | None = None) -> dict:
+            profile_id = str(profile.get("id") or "")
+            mode = profile.get("private_key_mode")
+            if mode == "paste":
+                private_key = (pasted_override if pasted_override is not None else
+                               secret_store.get(_ssh_secret_name(profile_id, "private_key")))
+                if not private_key:
+                    raise ValueError("请粘贴已有 SSH 私钥")
+            else:
+                path = os.path.expanduser(str(profile.get("private_key_path") or ""))
+                if not os.path.isfile(path):
+                    raise ValueError("请选择有效的 SSH 私钥文件")
+                if os.path.getsize(path) > 1024 * 1024:
+                    raise ValueError("SSH 私钥文件过大")
+                with open(path, "r", encoding="utf-8") as handle:
+                    private_key = handle.read()
+            passphrase = (passphrase_override if passphrase_override is not None else
+                          secret_store.get(_ssh_secret_name(profile_id, "passphrase")))
+            return {
+                "id": profile_id,
+                "host": str(profile.get("host") or "").strip(),
+                "port": int(profile.get("port") or 22),
+                "user": str(profile.get("user") or "").strip(),
+                "private_key": private_key,
+                "private_key_label": str(profile.get("private_key_label") or ""),
+                "passphrase": passphrase,
+                "host_key_sha256": str(profile.get("host_key_sha256") or ""),
+            }
+
+        def checkSSHProfile(self, ssh_settings: dict, pasted_key: str | None,
+                            passphrase: str | None) -> None:
+            def worker():
+                try:
+                    normalized = _normalize_cross_network({"ssh": ssh_settings})["ssh"]
+                    profile = self._ssh_profile_payload(
+                        normalized["profile"], pasted_key, passphrase)
+                    result = self._require_transport_core().call(
+                        "ssh.check", {"profile": profile}, timeout=35)
+                    self.transportEvent.emit("ssh.check.result", result)
+                except (TransportCoreError, OSError, ValueError) as exc:
+                    self.transportEvent.emit("ssh.check.error", {"error": str(exc)})
+            threading.Thread(target=worker, daemon=True).start()
+
+        def saveCrossNetworkConfig(self, wormhole_settings: dict,
+                                   ssh_settings: dict,
+                                   pasted_key: str | None = None,
+                                   passphrase: str | None = None) -> bool:
+            try:
+                normalized = _normalize_cross_network({
+                    "wormhole": wormhole_settings, "ssh": ssh_settings})
+                profile = normalized["ssh"]["profile"]
+                profile_id = profile["id"]
+                if profile["private_key_mode"] == "paste" and pasted_key is not None:
+                    if not secret_store.set(
+                            _ssh_secret_name(profile_id, "private_key"), pasted_key):
+                        raise ValueError("系统安全存储不可用，不能保存粘贴的私钥")
+                    profile["private_key_label"] = "已存入系统安全存储"
+                if passphrase is not None:
+                    if passphrase and not secret_store.set(
+                            _ssh_secret_name(profile_id, "passphrase"), passphrase):
+                        raise ValueError("系统安全存储不可用，不能保存私钥口令")
+                    if not passphrase:
+                        secret_store.delete(_ssh_secret_name(profile_id, "passphrase"))
+                if normalized["ssh"]["enabled"]:
+                    self._ssh_profile_payload(profile)
+                self._cross_network = normalized
+                _save_config(self._lan_cfg, cross_network=copy.deepcopy(normalized))
+                if normalized["ssh"]["enabled"]:
+                    threading.Thread(target=self._restart_ssh_runtime, daemon=True).start()
+                else:
+                    self._stop_ssh_runtime()
+                return True
+            except (OSError, ValueError, TypeError) as exc:
+                self.transportEvent.emit("ssh.config.error", {"error": str(exc)})
+                return False
+
+        def _restart_ssh_runtime(self) -> None:
+            self._stop_ssh_runtime()
+            self._start_ssh_runtime()
+
+        def _stop_ssh_runtime(self) -> None:
+            session_id = self._ssh_session_id
+            self._ssh_session_id = ""
+            if session_id:
+                self._safe_core_call("session.cancel", {"session_id": session_id})
+            for peer_id in list(self._ssh_runtime_peers):
+                self.node.remove_external_peer(peer_id, "ssh")
+            self._ssh_runtime_peers.clear()
+
+        def _start_ssh_runtime(self) -> None:
+            ssh_config = self._cross_network["ssh"]
+            if not ssh_config.get("enabled"):
+                return
+            try:
+                profile = self._ssh_profile_payload(ssh_config["profile"])
+                profile_id = ssh_config["profile"]["id"]
+                noise_private = secret_store.get(
+                    _ssh_secret_name(profile_id, "noise_private"))
+                result = self._require_transport_core().call("ssh.listen", {
+                    "profile": profile,
+                    "remote_port": int(ssh_config.get("remote_port") or 0),
+                    "noise_private": noise_private,
+                    "peers": ssh_config.get("peers") or [],
+                }, timeout=45)
+                generated = str(result.get("noise_private") or "")
+                if generated and not secret_store.set(
+                        _ssh_secret_name(profile_id, "noise_private"), generated):
+                    self._safe_core_call("session.cancel", {
+                        "session_id": str(result.get("session_id") or "")})
+                    raise ValueError("系统安全存储不可用，无法保存 SSH 端到端身份")
+                self.transportEvent.emit("ssh.ready", result)
+            except (TransportCoreError, OSError, ValueError, TypeError) as exc:
+                self.transportEvent.emit("ssh.config.error", {"error": str(exc)})
+
+        def _remember_ssh_peer(self, peer: dict) -> None:
+            try:
+                peer_id = str(peer.get("id") or peer.get("instance_id") or "")
+                runtime = dict(peer)
+                if runtime.get("endpoint") and runtime.get("endpoint_token"):
+                    self._ssh_runtime_peers[peer_id] = runtime
+                    host, raw_port = str(runtime["endpoint"]).rsplit(":", 1)
+                    self.node.upsert_external_peer(
+                        peer_id, str(runtime.get("name") or "SSH 设备"),
+                        host.strip("[]"), int(raw_port), "ssh",
+                        str(runtime["endpoint_token"]),
+                        str(runtime.get("instance_id") or ""))
+                saved = {
+                    "id": peer_id,
+                    "name": str(peer.get("name") or "SSH 设备"),
+                    "instance_id": str(peer.get("instance_id") or ""),
+                    "remote_port": int(peer.get("remote_port") or 0),
+                    "noise_public": str(peer.get("noise_public") or ""),
+                    "end_to_end": bool(peer.get("end_to_end", True)),
+                }
+                peers = self._cross_network["ssh"]["peers"]
+                peers[:] = [value for value in peers
+                            if value.get("instance_id") != saved["instance_id"]]
+                peers.append(saved)
+                _save_config(self._lan_cfg,
+                             cross_network=copy.deepcopy(self._cross_network))
+            except (ValueError, TypeError, OSError) as exc:
+                self._route_status(f"SSH 设备配置无效：{exc}")
+
+        def _reinject_transport_peers(self) -> None:
+            for peer_id, peer in list(self._ssh_runtime_peers.items()):
+                try:
+                    host, raw_port = str(peer["endpoint"]).rsplit(":", 1)
+                    self.node.upsert_external_peer(
+                        peer_id, str(peer.get("name") or "SSH 设备"),
+                        host.strip("[]"), int(raw_port), "ssh",
+                        str(peer.get("endpoint_token") or ""),
+                        str(peer.get("instance_id") or ""))
+                except (KeyError, ValueError, OSError):
+                    continue
+
+        def createSSHPairing(self) -> None:
+            if not self._ssh_session_id:
+                self.transportEvent.emit("ssh.pair.error", {"error": "SSH 中继尚未连接"})
+                return
+            def worker():
+                try:
+                    result = self._require_transport_core().call(
+                        "ssh.pair.create", {"session_id": self._ssh_session_id}, timeout=15)
+                    self.transportEvent.emit("ssh.pair.code", result)
+                except TransportCoreError as exc:
+                    self.transportEvent.emit("ssh.pair.error", {"error": str(exc)})
+            threading.Thread(target=worker, daemon=True).start()
+
+        def joinSSHPairing(self, code: str) -> None:
+            if not self._ssh_session_id:
+                self.transportEvent.emit("ssh.pair.error", {"error": "SSH 中继尚未连接"})
+                return
+            def worker():
+                try:
+                    result = self._require_transport_core().call(
+                        "ssh.pair.join", {"session_id": self._ssh_session_id,
+                                          "code": str(code).strip()}, timeout=45)
+                    self.transportEvent.emit("ssh.pair.joined", result)
+                except TransportCoreError as exc:
+                    self.transportEvent.emit("ssh.pair.error", {"error": str(exc)})
+            threading.Thread(target=worker, daemon=True).start()
+
+        def removeSSHPeer(self, instance_id: str) -> None:
+            peers = self._cross_network["ssh"]["peers"]
+            peers[:] = [peer for peer in peers
+                        if peer.get("instance_id") != instance_id]
+            self.node.remove_external_peer(instance_id, "ssh")
+            self._ssh_runtime_peers.pop(instance_id, None)
+            _save_config(self._lan_cfg,
+                         cross_network=copy.deepcopy(self._cross_network))
+            if self._cross_network["ssh"]["enabled"]:
+                threading.Thread(target=self._restart_ssh_runtime, daemon=True).start()
 
         def _on_send_busy_changed(self, busy: bool) -> None:
             self.sendStateChanged.emit(busy)
@@ -915,6 +1624,11 @@ def main(argv=None) -> None:
                 self, peer_name, secret, port, encryption_enabled) -> None:
             cfg = self._lan_cfg
             with self._engine_lock:
+                if (secret is not None and secret != cfg.secret
+                        and not secret_store.set(_TRANSFER_SECRET_NAME, secret)):
+                    self._route_status(
+                        "无法使用系统安全存储，传输口令未保存，设置未生效")
+                    return
                 selected_service = self.node._last_selected_service
                 selected = self.node.selected_peer()
                 if selected:
@@ -941,6 +1655,8 @@ def main(argv=None) -> None:
                     self.status.emit("缺少 cryptography 库，加密未开启")
                 self.node._last_selected_service = selected_service
                 self.node.start()
+                self._retarget_transport_core()
+                self._reinject_transport_peers()
             self.peersChanged.emit()
 
         def _route_status(self, msg: str) -> None:
@@ -1021,6 +1737,12 @@ def main(argv=None) -> None:
             目录与文件都由协议层在单个队列任务内完整处理。"""
             if total > 1:
                 self.status.emit(f"已发送 {ok}/{total} 项")
+            if self._wormhole_active:
+                session_id = self._wormhole_active
+                self._wormhole_active = ""
+                self.node.remove_external_peer(session_id, "wormhole")
+                threading.Thread(target=lambda: self._safe_core_call(
+                    "session.cancel", {"session_id": session_id}), daemon=True).start()
 
         @Slot(result=bool)
         def hasTarget(self) -> bool:
@@ -1115,6 +1837,28 @@ def main(argv=None) -> None:
                 os.makedirs(directory, exist_ok=True)
             except OSError:
                 pass
+            _save_config(self._lan_cfg)
+
+        def setInboxClassification(self, enabled: bool, directories: dict) -> None:
+            """Persist automatic receive routing without rebuilding the node."""
+            source = directories if isinstance(directories, dict) else {}
+            normalized = {
+                category: str(source.get(category) or "").strip()
+                for category in ("media", "archive", "file", "folder")
+            }
+            enabled = bool(enabled)
+            if (enabled == self._lan_cfg.inbox_auto_classify
+                    and normalized == self._lan_cfg.inbox_category_dirs):
+                return
+            self._lan_cfg.inbox_auto_classify = enabled
+            self._lan_cfg.inbox_category_dirs = normalized
+            if enabled:
+                for directory in normalized.values():
+                    if directory:
+                        try:
+                            os.makedirs(os.path.expanduser(directory), exist_ok=True)
+                        except OSError:
+                            pass
             _save_config(self._lan_cfg)
 
         # ---- 手动设备(Tailscale/固定 IP 直连) ----
@@ -1363,6 +2107,7 @@ def main(argv=None) -> None:
                 return
 
             def worker():
+                workdir = ""
                 try:
                     import tempfile
                     import urllib.request
@@ -1374,6 +2119,8 @@ def main(argv=None) -> None:
                     with urllib.request.urlopen(req, timeout=30) as resp, \
                             open(zip_path, "wb") as out:
                         total = int(resp.headers.get("Content-Length") or 0)
+                        if total > 512 * 1024 * 1024:
+                            raise ValueError("更新包下载大小异常")
                         done = 0
                         while True:
                             chunk = resp.read(256 * 1024)
@@ -1381,22 +2128,43 @@ def main(argv=None) -> None:
                                 break
                             out.write(chunk)
                             done += len(chunk)
+                            if done > 512 * 1024 * 1024:
+                                raise ValueError("更新包下载大小异常")
                             if total:
                                 self.status.emit(
                                     f"正在下载新版本… {done * 100 // total}%")
+                    manifest_path = zip_path + ".sha256.ps1"
+                    checksum_request = urllib.request.Request(
+                        asset_url + ".sha256.ps1",
+                        headers={"User-Agent": "InkHole-Updater"})
+                    with urllib.request.urlopen(checksum_request, timeout=15) as resp:
+                        checksum_manifest = resp.read(128 * 1024 + 1)
+                    if len(checksum_manifest) > 128 * 1024:
+                        raise ValueError("更新校验文件过大")
+                    with open(manifest_path, "wb") as manifest_output:
+                        manifest_output.write(checksum_manifest)
+
+                    self.status.emit("正在验证发布签名…")
+                    unzip_dir = os.path.join(workdir, "unzip")
+                    _extract_update_zip(zip_path, unzip_dir)
+                    candidate_exe = os.path.join(
+                        unzip_dir, "InkHolePet", "InkHolePet.exe")
+                    if not os.path.isfile(candidate_exe):
+                        raise ValueError("更新包缺少 InkHolePet.exe")
+                    _verify_windows_update_signature(
+                        sys.executable, candidate_exe, manifest_path, workdir)
+                    expected_hash = _parse_release_checksum(
+                        checksum_manifest, os.path.basename(zip_path))
+                    actual_hash = _sha256_path(zip_path)
+                    if not hmac.compare_digest(actual_hash, expected_hash):
+                        raise ValueError("更新包 SHA-256 校验失败")
                     app_dir = os.path.dirname(sys.executable)
                     bat = os.path.join(workdir, "update.bat")
+                    backup_dir = os.path.join(workdir, "backup")
                     with open(bat, "w", encoding="gbk", errors="ignore") as f:
-                        f.write("\r\n".join([
-                            "@echo off",
-                            "timeout /t 2 /nobreak >nul",
-                            f'powershell -NoProfile -Command "Expand-Archive -Force '
-                            f"'{zip_path}' '{workdir}\\unzip'\"",
-                            f'robocopy "{workdir}\\unzip\\InkHolePet" "{app_dir}" /E /IS /IT >nul',
-                            f'start "" "{app_dir}\\InkHolePet.exe"',
-                            f'rd /s /q "{workdir}\\unzip"',
-                            f'del "{zip_path}"',
-                        ]))
+                        f.write(_windows_update_script(
+                            app_dir, backup_dir, unzip_dir, zip_path,
+                            manifest_path))
                     self.status.emit("下载完成，正在重启应用…")
                     import subprocess
                     subprocess.Popen(
@@ -1405,6 +2173,8 @@ def main(argv=None) -> None:
                         close_fds=True)
                     self.quit()   # quit 内部会停节点并退出事件循环(线程安全)
                 except Exception as exc:
+                    if workdir:
+                        shutil.rmtree(workdir, ignore_errors=True)
                     self.status.emit(f"自动更新失败：{exc}，请到下载页手动更新")
 
             threading.Thread(target=worker, daemon=True).start()
@@ -1421,13 +2191,15 @@ def main(argv=None) -> None:
         @Slot()
         def quit(self):
             """退出:节点停止放后台并限时等待,不让 mDNS 注销卡住退出。"""
+            if self._transport_core is not None:
+                self._transport_core.close()
+                self._transport_core = None
             closer = threading.Thread(target=self.node.stop, daemon=True)
             closer.start()
             closer.join(2.0)   # 给 mDNS goodbye 留 2 秒,超时直接退
             QGuiApplication.quit()
 
     # 有 QtWidgets 用 QApplication(支持托盘菜单),否则退回 QGuiApplication
-    app = (QApplication if _HAS_WIDGETS else QGuiApplication)(sys.argv)
     app.setApplicationName("墨洞")
     app_icon_scale = MACOS_ICON_SCALE if sys.platform == "darwin" else 1.0
     app.setWindowIcon(_make_app_icon(app_icon_scale))
@@ -1479,6 +2251,9 @@ def main(argv=None) -> None:
         if not _load_saved_config().get("usage_guide_seen", False):
             main_win._show_usage_guide()
             _save_config(bridge._lan_cfg, usage_guide_seen=True)
+
+    if _TRANSFER_SECRET_WARNING:
+        bridge._route_status(_TRANSFER_SECRET_WARNING)
 
     # 系统托盘(Windows 右下托盘 / macOS 顶部菜单栏,Qt 跨平台一套代码)
     _tray = _setup_tray(app, bridge)   # 返回托盘对象(需持引用防被回收),失败返回 None

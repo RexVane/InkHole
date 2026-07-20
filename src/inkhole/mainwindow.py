@@ -20,6 +20,7 @@ import re
 import sys
 import math
 import time
+from datetime import datetime, timezone
 
 from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QSize, Slot, Signal,
                             QStandardPaths,
@@ -27,10 +28,10 @@ from PySide6.QtCore import (Qt, QTimer, QRectF, QPointF, QSize, Slot, Signal,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import (QPainter, QColor, QRadialGradient, QLinearGradient,
                            QPen, QFont, QIcon, QPixmap, QIntValidator,
-                           QPainterPath, QFontMetrics)
+                           QPainterPath, QFontMetrics, QImage)
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QFrame, QFileDialog,
-                               QLineEdit, QCheckBox,
+                               QLineEdit, QCheckBox, QPlainTextEdit,
                                QDialog, QDialogButtonBox, QSizePolicy, QStackedWidget,
                                QSizeGrip, QToolButton, QStyle,
                                QGraphicsOpacityEffect,
@@ -738,6 +739,7 @@ class AndroidStyleDialog(QDialog):
         self.body_html = body_html
         self._clicked_action: str | None = None
         self.actions: dict[str, QPushButton] = {}
+        self._backdrop_snapshot: QPixmap | None = None
         self.setObjectName("InAppDialog")
         self.setWindowTitle(title)
         self.setAccessibleName(title)
@@ -762,6 +764,7 @@ class AndroidStyleDialog(QDialog):
         self._card.setAutoFillBackground(False)
         self._card.setFixedWidth(460)
         card_layout = QVBoxLayout(self._card)
+        self._card_layout = card_layout
         card_layout.setContentsMargins(24, 22, 24, 16)
         card_layout.setSpacing(16)
 
@@ -798,10 +801,15 @@ class AndroidStyleDialog(QDialog):
         self._entrance_animation.setEasingCurve(QEasingCurve.OutCubic)
 
     def paintEvent(self, _event):
+        # A translucent top-level dialog is composited against the desktop on
+        # macOS instead of the parent window, which turns the backdrop gray.
+        # Paint a frozen parent snapshot first, then apply the modal dim.
         p = QPainter(self)
-        p.setCompositionMode(QPainter.CompositionMode_Source)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 0))
-        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        snapshot = self._backdrop_snapshot
+        if snapshot is not None and not snapshot.isNull():
+            p.drawPixmap(self.rect(), snapshot)
+        else:
+            p.fillRect(self.rect(), QColor(8, 11, 12))
         p.fillRect(self.rect(), QColor(0, 0, 0, 150))
 
     def addAction(self, key: str, text: str, primary: bool = False) -> QPushButton:
@@ -812,6 +820,9 @@ class AndroidStyleDialog(QDialog):
         self._action_layout.addWidget(button)
         self.actions[key] = button
         return button
+
+    def addBodyWidget(self, widget: QWidget) -> None:
+        self._card_layout.insertWidget(self._card_layout.count() - 1, widget)
 
     def clickedAction(self) -> str | None:
         return self._clicked_action
@@ -824,6 +835,7 @@ class AndroidStyleDialog(QDialog):
         parent = self.parentWidget()
         if parent is not None:
             self.setGeometry(parent.frameGeometry())
+            self._backdrop_snapshot = parent.grab()
         super().showEvent(event)
         self._entrance_animation.start()
 
@@ -832,6 +844,104 @@ class AndroidStyleDialog(QDialog):
             self.reject()
             return
         super().mousePressEvent(event)
+
+
+class CodeEntryDialog(AndroidStyleDialog):
+    def __init__(self, parent: QWidget, title: str, label: str):
+        super().__init__(parent, title,
+                         "<p style='margin:0; color:#B2BFBC;'>输入对方显示的短码</p>")
+        self.input = OutlinedLineEdit(label)
+        self.input.setMaxLength(160)
+        self.addBodyWidget(self.input)
+        self.addAction("cancel", "取消")
+        self.addAction("join", "连接", True)
+        self.actions["join"].setEnabled(False)
+        self.input.textChanged.connect(
+            lambda value: self.actions["join"].setEnabled(bool(value.strip())))
+
+    def code(self) -> str:
+        return self.input.text().strip()
+
+
+class ShortCodeDialog(AndroidStyleDialog):
+    def __init__(self, parent: QWidget, title: str = "一次性短码"):
+        super().__init__(parent, title,
+                         "<p style='margin:0; color:#B2BFBC;'>正在生成安全短码…</p>")
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+        self.code_label = QLabel("…")
+        self.code_label.setAlignment(Qt.AlignCenter)
+        self.code_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.code_label.setStyleSheet(
+            f"color:{_TEAL_BRIGHT}; font-size:19px; font-weight:700; padding:5px;")
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setFixedHeight(190)
+        self.status_label = QLabel("等待接收端输入")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
+        lay.addWidget(self.code_label)
+        lay.addWidget(self.qr_label)
+        lay.addWidget(self.status_label)
+        self.addBodyWidget(content)
+        copy_button = self.addAction("copy", "复制短码")
+        copy_button.clicked.disconnect()
+        copy_button.clicked.connect(self._copy)
+        self.addAction("cancel", "取消", True)
+        self.session_id = ""
+        self._code = ""
+        self._expires: datetime | None = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+
+    def set_code(self, session_id: str, code: str, uri: str, expires_at: str):
+        self.session_id = session_id
+        self._code = code
+        self.code_label.setText(code)
+        self._body_label.setText(
+            "<p style='margin:0; color:#B2BFBC;'>在另一台墨洞输入此码或扫描二维码</p>")
+        try:
+            self._expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            self._expires = None
+        self._set_qr(uri)
+        self._timer.start()
+        self._tick()
+
+    def mark_connected(self):
+        self.status_label.setText("接收端已确认，正在发送")
+        self._timer.stop()
+        QTimer.singleShot(700, self.accept)
+
+    def _copy(self):
+        if self._code:
+            QApplication.clipboard().setText(self._code)
+            self.status_label.setText("短码已复制")
+
+    def _set_qr(self, value: str):
+        try:
+            import qrcode
+            image = qrcode.make(value).convert("RGBA")
+            raw = image.tobytes("raw", "RGBA")
+            qimage = QImage(raw, image.width, image.height,
+                            QImage.Format_RGBA8888).copy()
+            self.qr_label.setPixmap(QPixmap.fromImage(qimage).scaled(
+                180, 180, Qt.KeepAspectRatio, Qt.FastTransformation))
+        except Exception:
+            self.qr_label.hide()
+
+    def _tick(self):
+        if self._expires is None:
+            return
+        seconds = max(0, int((self._expires - datetime.now(timezone.utc)).total_seconds()))
+        if seconds <= 0:
+            self.status_label.setText("短码已过期")
+            self._timer.stop()
+            return
+        self.status_label.setText(f"等待接收端输入 · {seconds // 60:02d}:{seconds % 60:02d}")
 
 
 def _send_start_directory(start_dir: str | None) -> str:
@@ -1457,6 +1567,15 @@ class MainWindow(QWidget):
         self._page_animation = None
         self._manual_draft: list[dict] = []
         self._editing_manual_index: int | None = None
+        self._short_code_dialog: ShortCodeDialog | None = None
+        self._receive_wait_dialog: AndroidStyleDialog | None = None
+        self._receive_request_active = False
+        self._ssh_paste_dirty = False
+        self._ssh_passphrase_dirty = False
+        self._ssh_profile_id = ""
+        self._ssh_host_fingerprint = ""
+        self._ssh_peer_draft: list[dict] = []
+        self._ssh_pair_dialog: ShortCodeDialog | None = None
         self._drag_level = 0.0
         self._drag_animation = QVariantAnimation(self)
         self._drag_animation.setDuration(170)
@@ -1492,6 +1611,8 @@ class MainWindow(QWidget):
             bridge.progressCleared.connect(self._hole.clear_transfer_progress)
         if hasattr(bridge, "sendStateChanged"):
             bridge.sendStateChanged.connect(self._set_send_active)
+        if hasattr(bridge, "transportEvent"):
+            bridge.transportEvent.connect(self._on_transport_event)
         self._refresh_peers()
         self._refresh_recent()
         if hasattr(bridge, "lastStatus"):
@@ -1582,6 +1703,27 @@ class MainWindow(QWidget):
         send_row.addWidget(self._send_action_stack)
         send_row.addStretch(1)
         left.addLayout(send_row)
+
+        remote_row = QHBoxLayout()
+        remote_row.setSpacing(8)
+        remote_row.addStretch(1)
+        self._one_time_send_btn = QPushButton("一次性发送")
+        self._one_time_send_btn.setObjectName("QuietAction")
+        self._one_time_send_btn.setIcon(
+            self.style().standardIcon(QStyle.SP_ArrowForward))
+        self._one_time_send_btn.setCursor(Qt.PointingHandCursor)
+        self._one_time_send_btn.clicked.connect(self._pick_one_time_send)
+        self._receive_code_btn = QPushButton("输入短码接收")
+        self._receive_code_btn.setObjectName("QuietAction")
+        self._receive_code_btn.setIcon(
+            self.style().standardIcon(QStyle.SP_ArrowDown))
+        self._receive_code_btn.setToolTip("输入另一台设备生成的一次性短码")
+        self._receive_code_btn.setCursor(Qt.PointingHandCursor)
+        self._receive_code_btn.clicked.connect(self._input_receive_code)
+        remote_row.addWidget(self._one_time_send_btn)
+        remote_row.addWidget(self._receive_code_btn)
+        remote_row.addStretch(1)
+        left.addLayout(remote_row)
 
         self._status_bar = QFrame()
         self._status_bar.setObjectName("StatusBar")
@@ -1845,7 +1987,7 @@ class MainWindow(QWidget):
             lambda name: self._local_info_lbl.setText(
                 f"本机：{name or cfg.peer_name}-{cfg.instance_id[:8]}")
         )
-        self._ed_inbox = OutlinedLineEdit("收件箱")
+        self._ed_inbox = OutlinedLineEdit("默认目录")
         self._ed_inbox.setReadOnly(True)
         b_browse = QPushButton("更换目录")
         b_browse.setObjectName("QuietAction")
@@ -1861,6 +2003,63 @@ class MainWindow(QWidget):
         inbox_lay.addWidget(self._ed_inbox, 1)
         inbox_lay.addWidget(b_browse)
         device_lay.addWidget(inbox_row)
+
+        self._cb_auto_classify = QCheckBox("启用文件自动分类")
+        self._cb_auto_classify.setToolTip(
+            "图片和视频、压缩包、文件、文件夹分别保存到对应目录")
+        device_lay.addWidget(self._cb_auto_classify)
+        category_titles = {
+            "media": "图片和视频",
+            "archive": "压缩包",
+            "file": "文件",
+            "folder": "文件夹",
+        }
+        self._inbox_category_fields = {}
+        self._inbox_category_browse = {}
+        self._inbox_category_reset = {}
+        for category, title_text in category_titles.items():
+            category_row = QWidget()
+            category_lay = QHBoxLayout(category_row)
+            category_lay.setContentsMargins(20, 0, 0, 0)
+            category_lay.setSpacing(8)
+            category_label = QLabel(title_text)
+            category_label.setFixedWidth(74)
+            category_label.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
+            category_edit = OutlinedLineEdit(f"{title_text}目录（留空=默认目录）")
+            category_edit.setReadOnly(True)
+            category_button = QPushButton("选择")
+            category_button.setObjectName("QuietAction")
+            category_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+            category_button.setCursor(Qt.PointingHandCursor)
+            category_button.clicked.connect(
+                lambda _checked=False, key=category: self._choose_category_inbox(key))
+            reset_button = QToolButton()
+            reset_button.setObjectName("Win")
+            reset_button.setIcon(
+                self.style().standardIcon(QStyle.SP_DialogResetButton))
+            reset_button.setFixedSize(30, 28)
+            reset_button.setToolTip(f"恢复{title_text}的默认目录")
+            reset_button.setCursor(Qt.PointingHandCursor)
+            reset_button.clicked.connect(category_edit.clear)
+            category_lay.addWidget(category_label)
+            category_lay.addWidget(category_edit, 1)
+            category_lay.addWidget(category_button)
+            category_lay.addWidget(reset_button)
+            device_lay.addWidget(category_row)
+            self._inbox_category_fields[category] = category_edit
+            self._inbox_category_browse[category] = category_button
+            self._inbox_category_reset[category] = reset_button
+
+        def _set_category_controls_enabled(enabled: bool):
+            for field in self._inbox_category_fields.values():
+                field.setEnabled(enabled)
+            for button in self._inbox_category_browse.values():
+                button.setEnabled(enabled)
+            for button in self._inbox_category_reset.values():
+                button.setEnabled(enabled)
+
+        self._set_category_controls_enabled = _set_category_controls_enabled
+        self._cb_auto_classify.toggled.connect(_set_category_controls_enabled)
         left_col.addWidget(device_group)
 
         # ---- 2. 传输安全 ----
@@ -1902,13 +2101,20 @@ class MainWindow(QWidget):
         trusted_row, self._cb_trusted = _toggle_row(
             "仅接收目标设备", "只允许当前选中的设备向本机发送文件")
         security_lay.addWidget(trusted_row)
+        security_lay.addWidget(_section_label("已信任设备"))
+        trusted_list = QWidget()
+        self._trusted_list_lay = QVBoxLayout(trusted_list)
+        self._trusted_list_lay.setContentsMargins(0, 0, 0, 0)
+        self._trusted_list_lay.setSpacing(5)
+        security_lay.addWidget(trusted_list)
         left_col.addWidget(security_group)
 
         # ---- 3. 跨网络配置 ----
         network_group, network_lay = _settings_group("跨网络配置")
+        network_lay.addWidget(_section_label("Tailscale"))
         network_hint = QLabel(
             "跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），"
-            "并填写对方 Tailscale IP 或 MagicDNS 名称与监听端口")
+            "并填写对方 Tailscale IP 或 MagicDNS 名称与监听端口；保存设置后自动生效")
         network_hint.setWordWrap(True)
         network_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
         network_lay.addWidget(network_hint)
@@ -1943,6 +2149,117 @@ class MainWindow(QWidget):
         self._manual_list_lay.setContentsMargins(0, 4, 0, 0)
         self._manual_list_lay.setSpacing(4)
         network_lay.addWidget(manual_box)
+
+        network_lay.addWidget(_divider())
+        network_lay.addWidget(_section_label("短码服务设置"))
+        wormhole_hint = QLabel(
+            "这里只配置服务地址；一次性发送和输入短码接收请在主页操作")
+        wormhole_hint.setWordWrap(True)
+        wormhole_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        network_lay.addWidget(wormhole_hint)
+        self._wh_rendezvous = OutlinedLineEdit(
+            "配对服务地址（留空使用默认服务）")
+        self._wh_transit = OutlinedLineEdit(
+            "传输中继地址（留空使用默认服务）")
+        network_lay.addWidget(self._wh_rendezvous)
+        network_lay.addWidget(self._wh_transit)
+
+        network_lay.addWidget(_divider())
+        network_lay.addWidget(_section_label("SSH 中继"))
+        ssh_toggle_row, self._cb_ssh = _toggle_row(
+            "启用 SSH 中继", "两端连接同一台 VPS，仅需开放 SSH 端口")
+        self._cb_ssh.toggled.connect(self._set_ssh_controls_enabled)
+        network_lay.addWidget(ssh_toggle_row)
+
+        ssh_address_row = QWidget()
+        ssh_address_lay = QHBoxLayout(ssh_address_row)
+        ssh_address_lay.setContentsMargins(0, 0, 0, 0)
+        ssh_address_lay.setSpacing(8)
+        self._ssh_host = OutlinedLineEdit("VPS IP 或域名")
+        self._ssh_port = OutlinedLineEdit("SSH 端口")
+        self._ssh_port.setValidator(QIntValidator(1, 65535, self._ssh_port))
+        self._ssh_port.setMaximumWidth(120)
+        self._ssh_user = OutlinedLineEdit("用户名")
+        ssh_address_lay.addWidget(self._ssh_host, 3)
+        ssh_address_lay.addWidget(self._ssh_port, 1)
+        ssh_address_lay.addWidget(self._ssh_user, 2)
+        network_lay.addWidget(ssh_address_row)
+
+        key_mode = QFrame()
+        key_mode.setObjectName("ModeSegment")
+        key_mode_lay = QHBoxLayout(key_mode)
+        key_mode_lay.setContentsMargins(3, 3, 3, 3)
+        key_mode_lay.setSpacing(3)
+        self._ssh_key_file_mode = QPushButton("私钥文件")
+        self._ssh_key_paste_mode = QPushButton("粘贴私钥")
+        for button in (self._ssh_key_file_mode, self._ssh_key_paste_mode):
+            button.setObjectName("ModeOption")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            key_mode_lay.addWidget(button)
+        self._ssh_key_file_mode.clicked.connect(lambda: self._set_ssh_key_mode("file"))
+        self._ssh_key_paste_mode.clicked.connect(lambda: self._set_ssh_key_mode("paste"))
+        network_lay.addWidget(key_mode)
+
+        self._ssh_key_stack = QStackedWidget()
+        file_key_page = QWidget()
+        file_key_lay = QHBoxLayout(file_key_page)
+        file_key_lay.setContentsMargins(0, 0, 0, 0)
+        file_key_lay.setSpacing(8)
+        self._ssh_key_path = OutlinedLineEdit("SSH 私钥文件")
+        self._ssh_key_path.setReadOnly(True)
+        choose_key = QPushButton("选择文件")
+        choose_key.setObjectName("QuietAction")
+        choose_key.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        choose_key.clicked.connect(self._choose_ssh_key)
+        file_key_lay.addWidget(self._ssh_key_path, 1)
+        file_key_lay.addWidget(choose_key)
+        self._ssh_key_stack.addWidget(file_key_page)
+        self._ssh_key_paste = QPlainTextEdit()
+        self._ssh_key_paste.setPlaceholderText("粘贴已有 OpenSSH / PEM 私钥")
+        self._ssh_key_paste.setMaximumHeight(96)
+        self._ssh_key_paste.textChanged.connect(
+            lambda: setattr(self, "_ssh_paste_dirty", True))
+        self._ssh_key_stack.addWidget(self._ssh_key_paste)
+        # The file page is a single row, while the paste page needs room for
+        # a few key lines. Keep the stacked container from consuming all
+        # remaining vertical space when the file page is active.
+        self._ssh_key_stack.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed)
+        network_lay.addWidget(self._ssh_key_stack)
+
+        self._ssh_passphrase = OutlinedLineEdit("私钥口令（可选）")
+        self._ssh_passphrase.setEchoMode(QLineEdit.Password)
+        self._ssh_passphrase.textEdited.connect(
+            lambda _text: setattr(self, "_ssh_passphrase_dirty", True))
+        network_lay.addWidget(self._ssh_passphrase)
+        self._ssh_fingerprint = QLabel("主机指纹：尚未验证")
+        self._ssh_fingerprint.setWordWrap(True)
+        self._ssh_fingerprint.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._ssh_fingerprint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        network_lay.addWidget(self._ssh_fingerprint)
+
+        ssh_action_row = QHBoxLayout()
+        self._ssh_test_btn = QPushButton("验证连接")
+        self._ssh_test_btn.setObjectName("QuietAction")
+        self._ssh_test_btn.clicked.connect(self._test_ssh)
+        self._ssh_pair_btn = QPushButton("生成配对码")
+        self._ssh_pair_btn.setObjectName("QuietAction")
+        self._ssh_pair_btn.clicked.connect(self._bridge.createSSHPairing)
+        self._ssh_join_btn = QPushButton("输入配对码")
+        self._ssh_join_btn.setObjectName("QuietAction")
+        self._ssh_join_btn.clicked.connect(self._input_ssh_pairing)
+        ssh_action_row.addWidget(self._ssh_test_btn)
+        ssh_action_row.addStretch(1)
+        ssh_action_row.addWidget(self._ssh_pair_btn)
+        ssh_action_row.addWidget(self._ssh_join_btn)
+        network_lay.addLayout(ssh_action_row)
+
+        ssh_peer_box = QWidget()
+        self._ssh_peer_list_lay = QVBoxLayout(ssh_peer_box)
+        self._ssh_peer_list_lay.setContentsMargins(0, 2, 0, 0)
+        self._ssh_peer_list_lay.setSpacing(4)
+        network_lay.addWidget(ssh_peer_box)
         left_col.addWidget(network_group)
 
         left_col.addStretch(1)
@@ -2058,7 +2375,13 @@ class MainWindow(QWidget):
         self._set_encryption_controls_enabled(encryption_enabled)
         self._sp_port.setText(str(cfg.listen_port) if cfg.listen_port else "")
         self._ed_inbox.setText(os.path.abspath(cfg.inbox))
+        self._cb_auto_classify.setChecked(bool(getattr(cfg, "inbox_auto_classify", False)))
+        category_dirs = getattr(cfg, "inbox_category_dirs", {}) or {}
+        for category, field in self._inbox_category_fields.items():
+            field.setText(str(category_dirs.get(category) or ""))
+        self._set_category_controls_enabled(self._cb_auto_classify.isChecked())
         self._cb_trusted.setChecked(cfg.trusted_only)
+        self._refresh_trusted_list()
         self._cb_pet.setChecked(bool(self._ctl["pet_visible"]()))
         self._cb_auto.setChecked(bool(self._ctl["is_autostart"]()))
         actual_port = (self._bridge.actualPort()
@@ -2070,11 +2393,143 @@ class MainWindow(QWidget):
         self._manual_draft = [dict(entry) for entry in self._bridge.manualPeers()]
         self._reset_manual_editor()
         self._refresh_manual_list()
+        cross = (self._bridge.crossNetworkConfig()
+                 if hasattr(self._bridge, "crossNetworkConfig") else {
+                     "wormhole": {}, "ssh": {"enabled": False, "profile": {},
+                                               "remote_port": 0, "peers": []}})
+        wormhole = cross.get("wormhole") or {}
+        ssh = cross.get("ssh") or {}
+        profile = ssh.get("profile") or {}
+        self._wh_rendezvous.setText(str(wormhole.get("rendezvous_url") or ""))
+        self._wh_transit.setText(str(wormhole.get("transit_relay") or ""))
+        self._ssh_profile_id = str(profile.get("id") or "")
+        self._ssh_host.setText(str(profile.get("host") or ""))
+        self._ssh_port.setText(str(profile.get("port") or 22))
+        self._ssh_user.setText(str(profile.get("user") or ""))
+        self._ssh_key_path.setText(str(profile.get("private_key_path") or ""))
+        self._ssh_key_paste.clear()
+        if profile.get("has_pasted_key"):
+            self._ssh_key_paste.setPlaceholderText("私钥已保存在系统安全存储中")
+        else:
+            self._ssh_key_paste.setPlaceholderText("粘贴已有 OpenSSH / PEM 私钥")
+        self._ssh_passphrase.clear()
+        if profile.get("has_passphrase"):
+            self._ssh_passphrase.setPlaceholderText("口令已保存在系统安全存储中")
+        self._ssh_host_fingerprint = str(profile.get("host_key_sha256") or "")
+        self._refresh_ssh_fingerprint()
+        self._set_ssh_key_mode(str(profile.get("private_key_mode") or "file"))
+        self._cb_ssh.setChecked(bool(ssh.get("enabled")))
+        self._set_ssh_controls_enabled(self._cb_ssh.isChecked())
+        self._ssh_paste_dirty = False
+        self._ssh_passphrase_dirty = False
+        self._ssh_peer_draft = [dict(peer) for peer in ssh.get("peers") or []]
+        self._refresh_ssh_peer_list()
         self._show_page(1)
 
     def _set_encryption_controls_enabled(self, enabled: bool):
         self._ed_secret.setEnabled(enabled)
         self._secret_eye.setEnabled(enabled)
+
+    def _set_ssh_controls_enabled(self, enabled: bool):
+        for widget in (self._ssh_host, self._ssh_port, self._ssh_user,
+                       self._ssh_key_file_mode, self._ssh_key_paste_mode,
+                       self._ssh_key_stack, self._ssh_passphrase,
+                       self._ssh_test_btn, self._ssh_pair_btn, self._ssh_join_btn):
+            widget.setEnabled(enabled)
+
+    def _set_ssh_key_mode(self, mode: str):
+        paste = mode == "paste"
+        self._ssh_key_file_mode.setChecked(not paste)
+        self._ssh_key_paste_mode.setChecked(paste)
+        self._ssh_key_stack.setFixedHeight(96 if paste else 48)
+        self._ssh_key_stack.setCurrentIndex(1 if paste else 0)
+
+    def _choose_ssh_key(self):
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "选择 SSH 私钥", self._ssh_key_path.text() or os.path.expanduser("~/.ssh"),
+            "SSH 私钥 (*)")
+        if path:
+            self._ssh_key_path.setText(path)
+
+    def _refresh_ssh_fingerprint(self):
+        text = self._ssh_host_fingerprint or "尚未验证"
+        self._ssh_fingerprint.setText(f"主机指纹：{text}")
+
+    def _ssh_settings_draft(self) -> dict:
+        current = (self._bridge.crossNetworkConfig().get("ssh") or {}
+                   if hasattr(self._bridge, "crossNetworkConfig") else {})
+        return {
+            "enabled": self._cb_ssh.isChecked(),
+            "profile": {
+                "id": self._ssh_profile_id,
+                "host": self._ssh_host.text().strip(),
+                "port": int(self._ssh_port.text() or 22),
+                "user": self._ssh_user.text().strip(),
+                "private_key_mode": ("paste" if self._ssh_key_paste_mode.isChecked()
+                                     else "file"),
+                "private_key_path": self._ssh_key_path.text().strip(),
+                "private_key_label": "已存入系统安全存储"
+                if self._ssh_key_paste_mode.isChecked() else "",
+                "host_key_sha256": self._ssh_host_fingerprint,
+            },
+            "remote_port": int(current.get("remote_port") or 0),
+            "peers": [dict(peer) for peer in self._ssh_peer_draft],
+        }
+
+    def _test_ssh(self):
+        try:
+            settings = self._ssh_settings_draft()
+        except ValueError:
+            self._show_notice("SSH 中继", "SSH 端口无效")
+            return
+        self._ssh_test_btn.setEnabled(False)
+        self._ssh_test_btn.setText("验证中…")
+        pasted = self._ssh_key_paste.toPlainText() if self._ssh_paste_dirty else None
+        passphrase = self._ssh_passphrase.text() if self._ssh_passphrase_dirty else None
+        self._bridge.checkSSHProfile(settings, pasted, passphrase)
+
+    def _input_ssh_pairing(self):
+        dialog = CodeEntryDialog(self, "输入 SSH 配对码", "SSH 配对码")
+        if dialog.exec() == QDialog.Accepted and dialog.clickedAction() == "join":
+            self._bridge.joinSSHPairing(dialog.code())
+
+    def _refresh_ssh_peer_list(self):
+        while self._ssh_peer_list_lay.count():
+            item = self._ssh_peer_list_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for index, peer in enumerate(self._ssh_peer_draft):
+            row = QWidget()
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(2, 0, 0, 0)
+            lay.setSpacing(7)
+            label = ElidedLabel(str(peer.get("name") or "SSH 设备"))
+            label.setStyleSheet(f"color:{_TEXT_SECOND}; font-size:11.5px;")
+            encrypted = QCheckBox("外层加密")
+            encrypted.setChecked(bool(peer.get("end_to_end", True)))
+            encrypted.toggled.connect(
+                lambda checked, i=index: self._set_ssh_peer_encryption(i, checked))
+            remove = QPushButton("删除")
+            remove.setObjectName("Link")
+            remove.clicked.connect(
+                lambda _checked=False, i=index: self._remove_ssh_peer_draft(i))
+            lay.addWidget(label, 1)
+            lay.addWidget(encrypted)
+            lay.addWidget(remove)
+            self._ssh_peer_list_lay.addWidget(row)
+
+    def _set_ssh_peer_encryption(self, index: int, enabled: bool):
+        if 0 <= index < len(self._ssh_peer_draft):
+            self._ssh_peer_draft[index]["end_to_end"] = bool(enabled)
+            if not enabled:
+                self._show_notice(
+                    "关闭外层加密",
+                    "关闭后 VPS 管理员可能读取传输内容和元数据。SSH 登录通道仍会加密。")
+
+    def _remove_ssh_peer_draft(self, index: int):
+        if 0 <= index < len(self._ssh_peer_draft):
+            self._ssh_peer_draft.pop(index)
+            self._refresh_ssh_peer_list()
 
     def _cancel_settings(self):
         """放弃设置页草稿；返回主页不触碰正在运行的节点。"""
@@ -2108,9 +2563,9 @@ class MainWindow(QWidget):
             "墨洞。发现设备后，点击对方设备，再点击墨洞图标选择发送内容；也可以把内容拖到"
             "窗口或墨洞图标。</p>"
             "<p style='margin:0 0 4px 0;'><b>跨网络</b></p>"
-            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>两台设备登录同一个 Tailscale 网络。"
-            "在设置中配置固定监听端口，然后填写对方的 Tailscale IP 或 MagicDNS 名称和监听端口添加设备。"
-            "添加后，发送方式与局域网相同。</p>"
+            "<p style='margin:0 0 12px 0; color:#B2BFBC;'>长期直连可使用 Tailscale；临时发送可在"
+            "「跨网络传输」中生成一次性短码；有 VPS 时可在设置中启用 SSH 中继，并用配对码添加长期设备。"
+            "SSH 只选择或粘贴已有私钥。</p>"
             "<p style='margin:0 0 4px 0;'><b>文件位置</b></p>"
             "<p style='margin:0; color:#B2BFBC;'>收到的文件保存在设置里的收件箱目录，也可以"
             "在首页「已接收」中查看。</p>"
@@ -2162,6 +2617,43 @@ class MainWindow(QWidget):
             self._bridge.performUpdate(asset_url)
         elif clicked == "release":
             self._bridge.openPath(self._bridge.releasesPage())
+
+    def _refresh_trusted_list(self):
+        while self._trusted_list_lay.count():
+            item = self._trusted_list_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        node = self._bridge.node
+        trusted = node.trusted_devices()
+        names = {peer.instance_id: peer.name for peer in node.peers()
+                 if peer.instance_id}
+        if not trusted:
+            empty = QLabel("尚未配对设备")
+            empty.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
+            self._trusted_list_lay.addWidget(empty)
+            return
+        for instance_id, fingerprint in sorted(trusted.items()):
+            row = QWidget()
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(0, 0, 0, 0)
+            label = QLabel(
+                f"{names.get(instance_id, instance_id[:8])}  ·  {fingerprint[:12]}")
+            label.setStyleSheet(f"color:{_TEXT_SECOND}; font-size:11px;")
+            layout.addWidget(label, 1)
+            revoke = QToolButton()
+            revoke.setObjectName("Win")
+            revoke.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+            revoke.setFixedSize(28, 28)
+            revoke.setToolTip("撤销设备信任")
+            revoke.setAccessibleName(f"撤销 {names.get(instance_id, instance_id[:8])} 的信任")
+
+            def remove(_checked=False, target=instance_id):
+                node.revoke_trust(target)
+                self._refresh_trusted_list()
+
+            revoke.clicked.connect(remove)
+            layout.addWidget(revoke)
+            self._trusted_list_lay.addWidget(row)
 
     # ---- 手动设备(Tailscale/固定 IP 直连) ----
     def _refresh_manual_list(self):
@@ -2278,10 +2770,20 @@ class MainWindow(QWidget):
         self._manual_add_btn.setText("添加设备")
 
     def _choose_inbox(self):
-        d = QFileDialog.getExistingDirectory(self, "选择收件箱目录",
+        d = QFileDialog.getExistingDirectory(self, "选择默认目录",
                                              self._ed_inbox.text())
         if d:
             self._ed_inbox.setText(d)
+
+    def _choose_category_inbox(self, category: str):
+        field = self._inbox_category_fields.get(category)
+        if field is None:
+            return
+        start = field.text() or self._ed_inbox.text()
+        directory = QFileDialog.getExistingDirectory(
+            self, f"选择{field.placeholderText().split('目录', 1)[0]}目录", start)
+        if directory:
+            field.setText(directory)
 
     def _save_settings(self):
         name = self._ed_name.text().strip()
@@ -2301,9 +2803,36 @@ class MainWindow(QWidget):
         if encryption_enabled and not secret:
             self._show_notice("传输安全", "启用端到端加密后必须填写加密口令")
             return
+        if hasattr(self._bridge, "saveCrossNetworkConfig"):
+            try:
+                ssh_settings = self._ssh_settings_draft()
+            except ValueError:
+                self._show_notice("SSH 中继", "SSH 端口必须在 1-65535 范围内")
+                return
+            if ssh_settings["enabled"] and not self._ssh_host_fingerprint:
+                self._show_notice("SSH 中继", "请先验证连接并确认 VPS 主机指纹")
+                return
+            wormhole_settings = {
+                "rendezvous_url": self._wh_rendezvous.text().strip(),
+                "transit_relay": self._wh_transit.text().strip(),
+            }
+            pasted = (self._ssh_key_paste.toPlainText()
+                      if self._ssh_paste_dirty else None)
+            passphrase = (self._ssh_passphrase.text()
+                          if self._ssh_passphrase_dirty else None)
+            if not self._bridge.saveCrossNetworkConfig(
+                    wormhole_settings, ssh_settings, pasted, passphrase):
+                return
         inbox = self._ed_inbox.text()
         if inbox:
             self._bridge.setInbox(inbox)   # 单独持久化:即使名字/端口没变也要落盘
+        category_dirs = {
+            category: field.text().strip()
+            for category, field in self._inbox_category_fields.items()
+        }
+        if hasattr(self._bridge, "setInboxClassification"):
+            self._bridge.setInboxClassification(
+                self._cb_auto_classify.isChecked(), category_dirs)
         if self._cb_trusted.isChecked() != self._bridge.lanConfig().trusted_only:
             self._bridge.toggleTrustedOnly()
         self._ctl["set_pet_visible"](self._cb_pet.isChecked())
@@ -2360,7 +2889,11 @@ class MainWindow(QWidget):
             " font-size:13px; font-weight:650;")
         # 副行:局域网(自动发现)显示唯一标识,跨网络(手动)显示 IP:端口。
         # 与安卓 DeviceChip 一致——第一行始终是显示名(手动设备即备注)。
-        if peer.service_name.startswith("manual|"):
+        if getattr(peer, "transport", "lan") == "ssh":
+            subline = "SSH 中继"
+        elif getattr(peer, "transport", "lan") == "wormhole":
+            subline = "一次性短码"
+        elif peer.service_name.startswith("manual|"):
             subline = f"{peer.host}:{peer.port}"
         else:
             subline = peer.instance_id[:8] if peer.instance_id else ""
@@ -2462,28 +2995,157 @@ class MainWindow(QWidget):
         return card
 
     # ================= 发送 / 状态 =================
-    def _pick_and_send(self):
-        if not self._bridge.node.selected_peer():
-            self._on_error(
-                "还没发现设备" if not self._bridge.node.peers()
-                else "先点选一台目标设备")
-            return
+    def _select_send_paths(self) -> list[str]:
         start_dir = getattr(self, "_send_dialog_dir", None)
         if _use_macos_native_send_panel():
             native_result = _pick_macos_send_paths(start_dir)
             if native_result is not None:
                 paths, current_dir = native_result
                 self._send_dialog_dir = current_dir
-                for path in paths:
-                    self._bridge.dropFile(path)
-                return
+                return paths
 
         dialog = SendContentDialog(self, start_dir)
         if dialog.exec() != QDialog.Accepted:
-            return
+            return []
         self._send_dialog_dir = dialog.directory().absolutePath()
-        for path in dialog.selected_paths():
+        return dialog.selected_paths()
+
+    def _pick_and_send(self):
+        if not self._bridge.node.selected_peer():
+            self._on_error(
+                "还没发现设备" if not self._bridge.node.peers()
+                else "先点选一台目标设备")
+            return
+        for path in self._select_send_paths():
             self._bridge.dropFile(path)
+
+    def _pick_one_time_send(self):
+        paths = self._select_send_paths()
+        if not paths:
+            return
+        dialog = ShortCodeDialog(self)
+        self._short_code_dialog = dialog
+        dialog.finished.connect(lambda _result, current=dialog:
+                                self._short_code_finished(current))
+        dialog.open()
+        self._bridge.startOneTimeSend(paths)
+
+    def _short_code_finished(self, dialog: ShortCodeDialog):
+        if dialog.clickedAction() == "cancel" and dialog.session_id:
+            self._bridge.cancelTransportSession(dialog.session_id)
+        if self._short_code_dialog is dialog:
+            self._short_code_dialog = None
+
+    def _input_receive_code(self):
+        entry = CodeEntryDialog(self, "输入接收码", "一次性短码")
+        if entry.exec() != QDialog.Accepted or entry.clickedAction() != "join":
+            return
+        self._receive_request_active = True
+        waiting = AndroidStyleDialog(
+            self, "连接一次性传输",
+            "<p style='margin:0; color:#B2BFBC;'>正在验证短码并连接发送端…</p>")
+        waiting.addAction("cancel", "取消", True)
+        waiting.finished.connect(lambda _result: setattr(
+            self, "_receive_request_active", False)
+            if self._receive_wait_dialog is waiting else None)
+        self._receive_wait_dialog = waiting
+        waiting.open()
+        self._bridge.joinOneTime(entry.code())
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        size = float(max(0, value))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+    @Slot(str, object)
+    def _on_transport_event(self, name: str, data):
+        data = data if isinstance(data, dict) else {}
+        if name == "wormhole.code":
+            dialog = self._short_code_dialog
+            if dialog is not None:
+                dialog.set_code(str(data.get("session_id") or ""),
+                                str(data.get("code") or ""),
+                                str(data.get("uri") or ""),
+                                str(data.get("expires_at") or ""))
+        elif name == "wormhole.ready" and data.get("role") == "sender":
+            if self._short_code_dialog is not None:
+                self._short_code_dialog.mark_connected()
+        elif name == "wormhole.offer":
+            session_id = str(data.get("session_id") or "")
+            if not self._receive_request_active:
+                self._bridge.rejectOneTime(session_id)
+                return
+            self._receive_request_active = False
+            if self._receive_wait_dialog is not None:
+                self._receive_wait_dialog.accept()
+                self._receive_wait_dialog = None
+            summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+            names = [html.escape(str(value)) for value in summary.get("names") or []]
+            names_html = "<br>".join(names) or "未提供名称摘要"
+            body = (
+                f"<p style='margin:0 0 8px 0; color:#F1F4F3;'><b>"
+                f"{html.escape(str(summary.get('device_name') or '未知设备'))}</b></p>"
+                f"<p style='margin:0 0 10px 0; color:#B2BFBC;'>"
+                f"{int(summary.get('item_count') or 0)} 个项目 · "
+                f"{self._format_bytes(int(summary.get('total_bytes') or 0))}</p>"
+                f"<p style='margin:0; color:#8F9B98;'>{names_html}</p>")
+            action = self._show_android_dialog(
+                "接收一次性传输", body,
+                [("reject", "拒绝", False), ("accept", "接收", True)])
+            if action == "accept":
+                self._bridge.acceptOneTime(session_id)
+            else:
+                self._bridge.rejectOneTime(session_id)
+        elif name == "wormhole.error":
+            if self._short_code_dialog is not None:
+                self._short_code_dialog.reject()
+            if self._receive_wait_dialog is not None:
+                self._receive_wait_dialog.reject()
+                self._receive_wait_dialog = None
+            self._show_notice("一次性短码", str(data.get("error") or "连接失败"))
+        elif name == "ssh.check.result":
+            self._ssh_test_btn.setEnabled(True)
+            self._ssh_test_btn.setText("验证连接")
+            fingerprint = str(data.get("fingerprint") or "")
+            body = (
+                "<p style='margin:0 0 8px 0; color:#B2BFBC;'>请与 VPS 控制台显示的指纹核对：</p>"
+                f"<p style='margin:0; color:#83E8D3; font-family:monospace;'>"
+                f"{html.escape(fingerprint)}</p>")
+            action = self._show_android_dialog(
+                "确认 VPS 主机指纹", body,
+                [("cancel", "取消", False), ("trust", "确认并固定", True)])
+            if action == "trust":
+                self._ssh_host_fingerprint = fingerprint
+                self._refresh_ssh_fingerprint()
+        elif name == "ssh.check.error":
+            self._ssh_test_btn.setEnabled(True)
+            self._ssh_test_btn.setText("验证连接")
+            self._show_notice("SSH 连接失败", str(data.get("error") or "验证失败"))
+        elif name == "ssh.pair.code":
+            dialog = ShortCodeDialog(self, "SSH 设备配对")
+            self._ssh_pair_dialog = dialog
+            dialog.set_code("", str(data.get("code") or ""),
+                            str(data.get("uri") or ""),
+                            str(data.get("expires_at") or ""))
+            dialog.finished.connect(lambda _result: setattr(
+                self, "_ssh_pair_dialog", None)
+                if self._ssh_pair_dialog is dialog else None)
+            dialog.open()
+        elif name in {"ssh.pair.joined", "ssh.paired"}:
+            if self._ssh_pair_dialog is not None:
+                self._ssh_pair_dialog.mark_connected()
+            if self._stack.currentIndex() == 1 and hasattr(
+                    self._bridge, "crossNetworkConfig"):
+                self._ssh_peer_draft = [dict(peer) for peer in
+                    self._bridge.crossNetworkConfig().get("ssh", {}).get("peers", [])]
+                self._refresh_ssh_peer_list()
+            self._show_notice("SSH 设备配对", "设备已配对并加入长期设备列表")
+        elif name == "ssh.config.error":
+            self._show_notice("SSH 中继", str(data.get("error") or "配置失败"))
 
     @Slot(str)
     def _on_status(self, msg: str):
