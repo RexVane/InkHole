@@ -28,7 +28,7 @@
 - 设置内检查更新并应用内下载安装新 APK；更新弹窗显示当前/最新版本、可用状态和最多 4 条简洁版本变化（发布 APK 使用固定发布签名）。
 - 与桌面端同款品牌图标（自适应 + Android 13 单色图标 + 通知小图标）。
 - 使用 WHPP v3 明文或 WHE2 分块加密传输，并强制校验 ACK 与 SHA-256；支持 WHPC 能力协商与 WHF1 流式文件夹接收，不需要先收 ZIP 再解压。
-- 明文、WHE2 加密、普通文件和 WHF1 文件夹均支持跨断网与进程重启续传；检查点、完成回执和暂存数据最多保留 7 天。
+- 明文、WHE2 加密、普通文件和 WHF1 文件夹均支持跨断网与进程重启续传；发布正式目标前会先持久化提交日志。进程在目标改名后、完成回执写入前退出时，重试会校验收件目录范围、文件类型、大小和 SHA-256 后恢复原目标；目标被改动时拒绝假成功并从零重传。检查点、提交日志、完成回执和暂存数据最多保留 7 天。
 
 ## 构建
 
@@ -62,7 +62,7 @@ cd android
 - Magic Wormhole AppID: `com.rexvane.inkhole/transport-v1`。
 - SSH 配对 AppID: `com.rexvane.inkhole/ssh-pair-v1`；数据通道使用 Noise IK 和 yamux。
 
-Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 的 38 项单元测试覆盖协议、加密原语、完成回执恢复、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。正式标签由三端打包工作流调用该流程，只有 Windows、macOS 和 Android 全部成功才统一创建 Release。
+Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 的 42 项单元测试覆盖协议、加密原语、完成回执与提交日志恢复、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。正式标签由三端打包工作流调用该流程，只有 Windows、macOS 和 Android 全部成功才统一创建 Release。
 
 ## 权限
 

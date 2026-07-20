@@ -81,7 +81,10 @@ yamux。每个跨网会话都映射为本机回环端点：
 
 这样 Python 和 Kotlin 仍然只处理同一套 WHPP/WHF1 字节协议，局域网、
 Tailscale、短码和 SSH 的文件名、目录结构、强制 ACK/SHA-256、断点续传、
-进度、取消与原子落盘行为保持一致。
+进度、取消与原子落盘行为保持一致。桌面和 Android 在发布正式目标前都会写
+`.commit.json` 提交日志；若进程在改名后、写完成回执前退出，发送方重试时会
+重新校验目标或 WHF1 检查点，补写回执并复用原目标。路径越界、符号链接、大小
+或摘要不匹配时不会恢复成功。
 
 ## 安全与限制
 
@@ -124,8 +127,8 @@ cd ../android
 ./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
-根目录 `make test` 会依次运行 Python 桌面测试和 Go 共享核心 race 测试。
-Android CI 会在干净环境安装固定版本的 NDK，现场生成 AAR，再运行单测、Lint
+根目录 `make test` 会依次运行 116 项 Python 桌面测试和 Go 共享核心 race 测试。
+Android CI 会在干净环境安装固定版本的 NDK，现场生成 AAR，再运行 42 项单测、Lint
 和 APK 构建。正式标签会等待 Windows、macOS 与 Android 产物全部构建、签名和
 校验成功后再一次性创建 Release。第三方依赖和本地 `wormhole-william` fork 见
 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)。

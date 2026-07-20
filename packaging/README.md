@@ -54,8 +54,11 @@ Release，三端产物全部通过后才由单一发布任务一次性上传。
 | `APPLE_APP_SPECIFIC_PASSWORD` | Apple app-specific password |
 | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
-手动运行工作流时，证书 secret 未配置仍可构建测试产物；正式标签缺少任一桌面签名、
-公证或 Android 发布签名凭据都会失败，且不会创建 Release。
+手动运行工作流时，证书 secret 未配置仍可构建测试产物，用于核对 Windows/macOS
+打包结构、ZIP 校验清单和 Android 固定签名 APK；这些未签名桌面产物不能作为正式版
+分发。正式标签缺少任一桌面签名、公证或 Android 发布签名凭据都会失败，且不会创建
+Release。发布前应先在 `main` 手动运行一次 Package 工作流，确认三端验证构建全部成功，
+再创建与 `pyproject.toml`、Python `__version__` 和 Android `versionName` 一致的标签。
 
 依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。生成品牌图标时另需 `Pillow`；macOS 使用 `pyobjc-framework-Cocoa` 提供原生文件/文件夹混选和「挂件常驻所有桌面」，缺少时选择器回退 Qt 版本且跳过 Spaces 增强。
 
