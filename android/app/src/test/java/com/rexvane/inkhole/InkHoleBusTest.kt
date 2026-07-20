@@ -7,6 +7,21 @@ import org.junit.Test
 
 class InkHoleBusTest {
     @Test
+    fun recoveredTransferReplacesItsPreviousHistoryEntry() {
+        val old = ReceivedFile(
+            "report.txt", null, "text/plain", 12, 100, "transfer-1")
+        val unrelated = ReceivedFile(
+            "other.txt", null, "text/plain", 3, 90, "transfer-2")
+        val recovered = ReceivedFile(
+            "report.txt", null, "text/plain", 12, 110, "transfer-1")
+
+        assertEquals(
+            listOf(recovered, unrelated),
+            InkHoleBus.mergeHistory(listOf(old, unrelated), recovered),
+        )
+    }
+
+    @Test
     fun transportEventsAreReplayedAfterActivityRecreation() {
         val first = mutableListOf<String>()
         val firstListener = TransportEventListener { event, _ -> first += event }

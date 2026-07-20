@@ -23,6 +23,10 @@ object WHPP {
     const val ACK_FAIL: Int = 0x00                // 接收方回执：失败
     const val RESUME: Int = 0x02                  // 后跟 8B 已持久化明文偏移
     const val DIGEST_SIZE = 32
+    private val RECEIPT_KEYS = listOf(
+        "version", "filename", "plain_size", "sha256", "kind", "mtime_ms",
+        "sender_instance_id", "sender_fingerprint",
+    )
 
     data class Header(
         val version: Int = PROTOCOL_VERSION,
@@ -46,6 +50,13 @@ object WHPP {
         val publicKey: String,
         val fingerprint: String,
     )
+
+    internal fun metadataMatches(value: JSONObject?, expected: JSONObject): Boolean {
+        if (value == null) return false
+        return RECEIPT_KEYS.all { key ->
+            value.opt(key)?.toString() == expected.opt(key)?.toString()
+        }
+    }
 
     /** 把 header JSON 序列化(与桌面版 Python 完全一致)。 */
     fun encodeHeader(h: Header): ByteArray {

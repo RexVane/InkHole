@@ -6,11 +6,35 @@ import java.io.DataOutputStream
 import java.io.IOException
 import java.security.MessageDigest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 
 class WHPPTest {
+    @Test
+    fun completionReceiptDoesNotDependOnExportedPath() {
+        val expected = JSONObject().apply {
+            put("version", WHPP.PROTOCOL_VERSION)
+            put("filename", "exported.txt")
+            put("plain_size", 12L)
+            put("sha256", "a".repeat(64))
+            put("kind", "file")
+            put("mtime_ms", 0L)
+            put("sender_instance_id", "b".repeat(32))
+            put("sender_fingerprint", "c".repeat(64))
+        }
+        val receipt = JSONObject(expected.toString()).apply {
+            put("path", "/private/inbox/already-exported-and-removed.txt")
+            put("completed_at", 123L)
+        }
+
+        assertTrue(WHPP.metadataMatches(receipt, expected))
+        receipt.put("sha256", "d".repeat(64))
+        assertFalse(WHPP.metadataMatches(receipt, expected))
+    }
+
     @Test
     fun deviceAuthMessagesMatchDesktopVectors() {
         val nonce = ByteArray(32) { it.toByte() }

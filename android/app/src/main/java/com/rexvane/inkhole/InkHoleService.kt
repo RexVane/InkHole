@@ -127,6 +127,7 @@ class InkHoleService : Service() {
         }
         InkHoleBus.node = node
         node.start()
+        recoverPendingExports(node)
         if (secretLoad.warning.isNotEmpty()) forwarder.onStatus(secretLoad.warning)
         if (node.getActualPort() > 0) {
             try {
@@ -161,15 +162,12 @@ class InkHoleService : Service() {
             InkHoleBus.uiListener?.onPeerChanged(peers)
         }
 
-        override fun onFileReceived(filename: String, path: String) {
+        override fun onFileReceived(filename: String, path: String, transferId: String) {
             // WHPP ACK is emitted after the private atomic commit. Public MediaStore
             // export can take minutes for a large folder and must not occupy the
             // receiver connection or turn a durable receive into a sender timeout.
             Thread({
-                val record = exportToDownloads(File(path))
-                InkHoleBus.recordReceived(this@InkHoleService, record)
-                notifyFileReceived(record)
-                InkHoleBus.uiListener?.onFileReceived(filename, path)
+                exportAndRecord(filename, path, transferId)
             }, "inkhole-public-export").apply { isDaemon = true }.start()
         }
 
@@ -186,6 +184,27 @@ class InkHoleService : Service() {
         override fun onTransferEnded(kind: String, filename: String, completed: Boolean) {
             InkHoleBus.uiListener?.onTransferEnded(kind, filename, completed)
         }
+    }
+
+    private fun recoverPendingExports(node: InkHoleNode) {
+        val pending = node.pendingCompletedTransfers()
+        if (pending.isEmpty()) return
+        Thread({
+            pending.forEach { transfer ->
+                exportAndRecord(transfer.filename, transfer.path, transfer.transferId)
+            }
+        }, "inkhole-export-recovery").apply { isDaemon = true }.start()
+    }
+
+    private fun exportAndRecord(filename: String, path: String, transferId: String) {
+        val source = File(path)
+        val record = synchronized(exportLock) {
+            if (!source.exists()) return
+            exportToDownloads(source).copy(transferId = transferId)
+        }
+        InkHoleBus.recordReceived(this, record)
+        notifyFileReceived(record)
+        InkHoleBus.uiListener?.onFileReceived(filename, path, transferId)
     }
 
     private val transportForwarder = TransportEventListener { event, data ->

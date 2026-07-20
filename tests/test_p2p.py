@@ -278,6 +278,36 @@ def test_lost_ack_retry_reuses_receipt_without_duplicate(tmp_path):
         node.stop()
 
 
+def test_lost_ack_receipt_survives_destination_move(tmp_path):
+    payload = b"exported-before-ack-retry"
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False))
+    node.start()
+    try:
+        header = raw_v3_header("exported.txt", payload)
+        first = socket.create_connection(("127.0.0.1", node.actual_port), timeout=3)
+        assert begin_raw_v3(first, header) == 0
+        first.sendall(struct.pack("!Q", len(payload)) + payload)
+        first.close()
+        destination = tmp_path / "exported.txt"
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not destination.exists():
+            time.sleep(0.01)
+        assert destination.read_bytes() == payload
+
+        exported = tmp_path / "public-downloads.txt"
+        destination.replace(exported)
+        with socket.create_connection(("127.0.0.1", node.actual_port), timeout=3) as retry:
+            assert begin_raw_v3(retry, header) == len(payload)
+            retry.sendall(struct.pack("!Q", 0))
+            assert recv_exact(retry, 33) == b"\x01" + bytes.fromhex(header["sha256"])
+
+        assert exported.read_bytes() == payload
+        assert not destination.exists()
+    finally:
+        node.stop()
+
+
 def test_sender_does_not_succeed_when_ack_connection_resets(tmp_path):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))

@@ -38,6 +38,9 @@ macOS ZIP 上传同名 `.sha256`；Windows ZIP 上传同名、带 Authenticode �
 `.sha256.ps1`。Windows 应用内更新会校验 ZIP 的 SHA-256，并要求当前 EXE、候选
 EXE 和校验清单使用同一发布证书。
 
+正式标签同时调用 Android 构建；Windows、macOS 和 Android 任一任务失败都不会创建
+Release，三端产物全部通过后才由单一发布任务一次性上传。
+
 仓库需要配置以下 GitHub Actions secrets：
 
 | Secret | 用途 |
@@ -51,7 +54,8 @@ EXE 和校验清单使用同一发布证书。
 | `APPLE_APP_SPECIFIC_PASSWORD` | Apple app-specific password |
 | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
-证书 secret 未配置时工作流仍可构建测试产物，但该产物不应作为正式 Release 发布。
+手动运行工作流时，证书 secret 未配置仍可构建测试产物；正式标签缺少任一桌面签名、
+公证或 Android 发布签名凭据都会失败，且不会创建 Release。
 
 依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。生成品牌图标时另需 `Pillow`；macOS 使用 `pyobjc-framework-Cocoa` 提供原生文件/文件夹混选和「挂件常驻所有桌面」，缺少时选择器回退 Qt 版本且跳过 Spaces 增强。
 

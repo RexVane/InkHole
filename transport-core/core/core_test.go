@@ -336,6 +336,37 @@ func TestStreamBridgeMultiplexesLoopbackConnections(t *testing.T) {
 	}
 }
 
+func TestStreamBridgeClosesLoopbackEndpointWithSessionContext(t *testing.T) {
+	left, right := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	receiver, err := newReceivingBridge(ctx, right, "127.0.0.1:1", "unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender, err := newSendingBridge(ctx, left)
+	if err != nil {
+		_ = receiver.Close()
+		t.Fatal(err)
+	}
+	address := sender.Addr()
+	cancel()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, dialErr := net.DialTimeout("tcp", address, 50*time.Millisecond)
+		if dialErr != nil {
+			break
+		}
+		_ = conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("cancelled bridge listener remained open")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = sender.Close()
+	_ = receiver.Close()
+}
+
 func testNoisePublic(t *testing.T) string {
 	t.Helper()
 	key, err := generateNoiseKey()

@@ -6,7 +6,7 @@ on:
     tags:
       - "v*"
 
-# 推 v* tag 时自动发布桌面二进制到对应 Release
+# A tag becomes a Release only after Windows, macOS and Android all pass.
 permissions:
   contents: write
 
@@ -156,6 +156,7 @@ jobs:
             --team-id "$APPLE_TEAM_ID"
           xcrun stapler staple packaging/dist/InkHolePet.app
           xcrun stapler validate packaging/dist/InkHolePet.app
+          spctl --assess --type execute --verbose=4 packaging/dist/InkHolePet.app
 
       # Windows: onedir 产物是文件夹，zip 打包后上传
       # 用户解压后双击 InkHolePet\InkHolePet.exe 即可，不再解压到 %TEMP%，绕开 Defender 拦截
@@ -169,7 +170,7 @@ jobs:
       - name: Zip macOS app
         if: runner.os == 'macOS'
         working-directory: packaging/dist
-        run: zip -r -y InkHolePet-macos.zip InkHolePet.app
+        run: ditto -c -k --sequesterRsrc --keepParent InkHolePet.app InkHolePet-macos.zip
 
       - name: Create signed Windows update manifest
         if: runner.os == 'Windows'
@@ -211,11 +212,39 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.manifest }}
 
-      - name: Publish to Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  android:
+    uses: ./.github/workflows/android.yml
+    secrets: inherit
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Require the complete release asset set
+        shell: bash
+        run: |
+          test -f release/InkHolePet-windows.zip
+          test -f release/InkHolePet-windows.zip.sha256.ps1
+          test -f release/InkHolePet-macos.zip
+          test -f release/InkHolePet-macos.zip.sha256
+          test "$(find release -maxdepth 1 -type f -name 'InkHole-v*.apk' | wc -l)" -eq 1
+
+      - name: Publish complete Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ matrix.asset }}
-            ${{ matrix.manifest }}
+          name: InkHole ${{ github.ref_name }}
+          generate_release_notes: true
           fail_on_unmatched_files: true
+          files: |
+            release/InkHolePet-windows.zip
+            release/InkHolePet-windows.zip.sha256.ps1
+            release/InkHolePet-macos.zip
+            release/InkHolePet-macos.zip.sha256
+            release/InkHole-v*.apk

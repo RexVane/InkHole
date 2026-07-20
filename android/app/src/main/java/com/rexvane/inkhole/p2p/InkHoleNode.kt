@@ -28,7 +28,7 @@ import org.json.JSONObject
 /** 检测到设备/收到文件/状态变化时的回调。 */
 interface InkHoleListener {
     fun onPeerChanged(peers: List<Peer>)
-    fun onFileReceived(filename: String, path: String)
+    fun onFileReceived(filename: String, path: String, transferId: String)
     fun onStatus(msg: String)
     /** 传输进度。kind = "send"/"recv"；节流后最多约 4 次/秒。 */
     fun onProgress(kind: String, filename: String, done: Long, total: Long) {}
@@ -638,13 +638,6 @@ class InkHoleNode(
             put("sender_fingerprint", DeviceAuth.fingerprint(header.senderPublicKey))
         }
 
-    private fun metadataMatches(value: JSONObject?, expected: JSONObject): Boolean {
-        if (value == null) return false
-        return listOf("version", "filename", "plain_size", "sha256", "kind", "mtime_ms",
-            "sender_instance_id", "sender_fingerprint")
-            .all { key -> value.opt(key)?.toString() == expected.opt(key)?.toString() }
-    }
-
     // 接收是对端发起的，不主动清理系统缓存；只按当前真实可用空间保守判断。
     @android.annotation.SuppressLint("UsableSpace")
     private fun handleConnection(conn: Socket) {
@@ -761,9 +754,9 @@ class InkHoleNode(
                 return nonce
             }
             val completed = readJson(done)
-            val completedPath = completed?.optString("path").orEmpty()
-            if (metadataMatches(completed, metadata) && completedPath.isNotEmpty() &&
-                File(completedPath).exists()) {
+            // Public Downloads export removes the private destination after commit.
+            // The durable receipt, not that movable path, is the idempotency proof.
+            if (WHPP.metadataMatches(completed, metadata)) {
                 val nonce = sendReceiverChallenge(header.plainSize)
                 authenticateSender(header.plainSize, nonce)
                 if (din.readLong() != 0L) throw IOException("已完成传输仍收到数据")
@@ -775,7 +768,7 @@ class InkHoleNode(
                 return
             }
 
-            if (!metadataMatches(readJson(meta), metadata)) {
+            if (!WHPP.metadataMatches(readJson(meta), metadata)) {
                 part.delete()
                 meta.delete()
                 writeJsonAtomic(meta, metadata)
@@ -786,12 +779,14 @@ class InkHoleNode(
                 offset = 0
             }
 
-            val requiredSpace = if (isFolder && header.plainSize <=
-                (Long.MAX_VALUE - DISK_MARGIN) / 2) {
-                header.plainSize * 2 + DISK_MARGIN
-            } else if (header.plainSize - offset <= Long.MAX_VALUE - DISK_MARGIN) {
-                header.plainSize - offset + DISK_MARGIN
-            } else Long.MAX_VALUE
+            val remainingSpace = header.plainSize - offset
+            val requiredSpace = when {
+                remainingSpace > Long.MAX_VALUE - DISK_MARGIN -> Long.MAX_VALUE
+                isFolder && header.plainSize >
+                    Long.MAX_VALUE - DISK_MARGIN - remainingSpace -> Long.MAX_VALUE
+                isFolder -> remainingSpace + header.plainSize + DISK_MARGIN
+                else -> remainingSpace + DISK_MARGIN
+            }
             if (requiredSpace > inboxDir.usableSpace) {
                 listener.onStatus("拒收 $safeName：存储空间不足")
                 return
@@ -912,7 +907,7 @@ class InkHoleNode(
             dout.flush()
             ackSent = true
             ok = true
-            listener.onFileReceived(destination.name, destination.absolutePath)
+            listener.onFileReceived(destination.name, destination.absolutePath, header.transferId)
             listener.onStatus("已接收并校验：${destination.name}")
         } catch (_: EOFException) {
             if (transferStarted) listener.onStatus("接收中断，已保留续传进度：$receivedName")
@@ -1344,6 +1339,9 @@ class InkHoleNode(
 
     fun getTrustedDevices(): Map<String, String> =
         synchronized(trustedPeersLock) { LinkedHashMap(trustedPeers) }
+
+    internal fun pendingCompletedTransfers(): List<CompletedTransfer> =
+        CompletedTransfers.pending(inboxDir)
 
     fun revokeTrustedPeer(instanceId: String): Boolean {
         val removed = synchronized(trustedPeersLock) {

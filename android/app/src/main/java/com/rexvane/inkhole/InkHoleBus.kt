@@ -18,6 +18,7 @@ data class ReceivedFile(
     val mime: String,
     val size: Long = 0,
     val time: Long = 0,
+    val transferId: String = "",
 )
 
 /**
@@ -97,6 +98,7 @@ object InkHoleBus {
                     mime = o.optString("mime", "application/octet-stream"),
                     size = o.optLong("size", 0),
                     time = o.optLong("time", 0),
+                    transferId = o.optString("transfer_id", ""),
                 ))
             }
             receivedFiles.addAll(loaded)
@@ -115,6 +117,7 @@ object InkHoleBus {
                     put("mime", r.mime)
                     put("size", r.size)
                     put("time", r.time)
+                    if (r.transferId.isNotEmpty()) put("transfer_id", r.transferId)
                 })
             }
             context.getSharedPreferences("inkhole", Context.MODE_PRIVATE)
@@ -125,11 +128,17 @@ object InkHoleBus {
 
     @Synchronized
     fun recordReceived(context: Context, record: ReceivedFile) {
-        receivedFiles.add(0, record)
-        while (receivedFiles.size > HISTORY_MAX) {
-            receivedFiles.removeAt(receivedFiles.lastIndex)
-        }
+        val merged = mergeHistory(receivedFiles, record)
+        receivedFiles.clear()
+        receivedFiles.addAll(merged)
         saveHistory(context)
+    }
+
+    internal fun mergeHistory(existing: List<ReceivedFile>, record: ReceivedFile): List<ReceivedFile> {
+        val previous = if (record.transferId.isEmpty()) existing else {
+            existing.filterNot { it.transferId == record.transferId }
+        }
+        return (listOf(record) + previous).take(HISTORY_MAX)
     }
 
     @Synchronized

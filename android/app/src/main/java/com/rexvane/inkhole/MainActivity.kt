@@ -303,7 +303,7 @@ class MainActivity : ComponentActivity() {
                 selectedPeer.value = null   // 选中的设备离线了
             }
         }
-        override fun onFileReceived(filename: String, path: String) = runOnUiThread {
+        override fun onFileReceived(filename: String, path: String, transferId: String) = runOnUiThread {
             refreshReceived()
         }
         override fun onStatus(msg: String) = runOnUiThread { statusMsg.value = msg }

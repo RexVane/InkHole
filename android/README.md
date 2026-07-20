@@ -24,7 +24,7 @@
 - 传输状态栏百分比与实时速度前置并支持两行显示，长文件名只截断名字、不遮挡速度。
 - 前台服务维持 P2P 节点，锁屏或切到后台后仍可接收。
 - 支持系统 `ACTION_SEND` / `ACTION_SEND_MULTIPLE` 分享入口。
-- 接收文件导出到系统 `Download/InkHole`，文件夹保留相对目录结构并直接可用；Android 10+ 无法可靠创建完全空的公共目录，因此空目录会被忽略。
+- 接收文件导出到系统 `Download/InkHole`，文件夹保留相对目录结构并直接可用；ACK 后、导出前若进程被系统终止，前台服务下次启动会从完成回执恢复导出，并按 `transfer_id` 更新接收历史，避免重复文件和重复记录；Android 10+ 无法可靠创建完全空的公共目录，因此空目录会被忽略。
 - 设置内检查更新并应用内下载安装新 APK；更新弹窗显示当前/最新版本、可用状态和最多 4 条简洁版本变化（发布 APK 使用固定发布签名）。
 - 与桌面端同款品牌图标（自适应 + Android 13 单色图标 + 通知小图标）。
 - 使用 WHPP v3 明文或 WHE2 分块加密传输，并强制校验 ACK 与 SHA-256；支持 WHPC 能力协商与 WHF1 流式文件夹接收，不需要先收 ZIP 再解压。
@@ -62,7 +62,7 @@ cd android
 - Magic Wormhole AppID: `com.rexvane.inkhole/transport-v1`。
 - SSH 配对 AppID: `com.rexvane.inkhole/ssh-pair-v1`；数据通道使用 Noise IK 和 yamux。
 
-Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 单元测试覆盖协议、加密原语、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。
+Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 的 38 项单元测试覆盖协议、加密原语、完成回执恢复、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。正式标签由三端打包工作流调用该流程，只有 Windows、macOS 和 Android 全部成功才统一创建 Release。
 
 ## 权限
 

@@ -40,6 +40,7 @@ func newSendingBridge(parent context.Context, conn net.Conn) (*streamBridge, err
 		token: newCapabilityToken()}
 	bridge.wg.Add(1)
 	go bridge.acceptLocal(ctx)
+	bridge.closeWhenDone(ctx)
 	return bridge, nil
 }
 
@@ -54,7 +55,18 @@ func newReceivingBridge(parent context.Context, conn net.Conn, target, targetTok
 	bridge := &streamBridge{session: mux, cancel: cancel}
 	bridge.wg.Add(1)
 	go bridge.acceptRemote(ctx, target, targetToken)
+	bridge.closeWhenDone(ctx)
 	return bridge, nil
+}
+
+func (b *streamBridge) closeWhenDone(ctx context.Context) {
+	go func() {
+		<-ctx.Done()
+		if b.listener != nil {
+			_ = b.listener.Close()
+		}
+		_ = b.session.Close()
+	}()
 }
 
 func (b *streamBridge) Addr() string {

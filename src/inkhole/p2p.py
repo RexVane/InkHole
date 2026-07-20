@@ -1407,9 +1407,6 @@ class P2PNode:
                 return
             try:
                 os.makedirs(target_root, exist_ok=True)
-                if plain_size + _DISK_MARGIN > shutil.disk_usage(target_root).free:
-                    self._status(f"拒收 {filename}：磁盘空间不足")
-                    return
             except OSError as exc:
                 self._status(f"拒收 {filename}：无法使用收件箱目录 ({exc})")
                 return
@@ -1470,9 +1467,10 @@ class P2PNode:
                 return nonce
 
             completed = _load_json_file(done_path)
-            completed_path = str(completed.get("path") or "")
-            if (all(completed.get(key) == value for key, value in metadata.items())
-                    and completed_path and os.path.exists(completed_path)):
+            # The receipt proves that this transfer was atomically committed. The
+            # delivered item may since have been moved, exported or deleted; tying
+            # idempotency to its current path would duplicate a lost-ACK transfer.
+            if all(completed.get(key) == value for key, value in metadata.items()):
                 nonce = send_receiver_challenge(plain_size)
                 authenticate_sender(plain_size, nonce)
                 body_size = _recv_exact(conn, 8)
@@ -1495,6 +1493,15 @@ class P2PNode:
             if offset > plain_size:
                 os.remove(part_path)
                 offset = 0
+            remaining_disk = plain_size - offset
+            required_disk = remaining_disk + _DISK_MARGIN
+            if is_folder:
+                # The completed WHF1 checkpoint and extracted tree coexist until
+                # the directory has been validated and atomically committed.
+                required_disk += plain_size
+            if required_disk > shutil.disk_usage(target_root).free:
+                self._status(f"拒收 {filename}：磁盘空间不足")
+                return
 
             progress = _Progress(self.on_progress, "recv", filename, plain_size)
             transfer_name = filename

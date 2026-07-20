@@ -94,7 +94,9 @@ Tailscale、短码和 SSH 的文件名、目录结构、强制 ACK/SHA-256、断
 - Android 前台服务持有 WiFiLock，锁屏后仍保持监听；系统厂商若强行停止应用，
   设备自然会离线，服务下次启动会恢复。
 - Android 10+ 导出到 `Download/InkHole`。受 Scoped Storage 限制，完全空的
-  目录不能可靠创建；包含文件的目录结构会保留。
+  目录不能可靠创建；包含文件的目录结构会保留。接收完成 ACK 已发出、公共目录
+  尚未导出时若进程退出，下次启动会扫描完成回执继续导出，并按 `transfer_id`
+  合并接收历史。
 
 ## 构建与验证
 
@@ -124,7 +126,8 @@ cd ../android
 
 根目录 `make test` 会依次运行 Python 桌面测试和 Go 共享核心 race 测试。
 Android CI 会在干净环境安装固定版本的 NDK，现场生成 AAR，再运行单测、Lint
-和 APK 构建。第三方依赖和本地 `wormhole-william` fork 见
+和 APK 构建。正式标签会等待 Windows、macOS 与 Android 产物全部构建、签名和
+校验成功后再一次性创建 Release。第三方依赖和本地 `wormhole-william` fork 见
 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)。
 
 ## 名称说明
