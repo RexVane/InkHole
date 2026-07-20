@@ -796,6 +796,46 @@ def _write_json_atomic(path: str, value: dict) -> None:
             pass
 
 
+def _metadata_matches(value: dict, expected: dict) -> bool:
+    return all(value.get(key) == item for key, item in expected.items())
+
+
+def _validated_commit_destination(commit: dict, metadata: dict,
+                                  target_root: str, part_path: str,
+                                  is_folder: bool) -> str | None:
+    """Return a safely committed destination after a crash, if it still matches."""
+    if not _metadata_matches(commit, metadata):
+        return None
+    destination = commit.get("path")
+    if not isinstance(destination, str) or not destination:
+        return None
+    destination = os.path.abspath(destination)
+    try:
+        if (os.path.realpath(os.path.dirname(destination))
+                != os.path.realpath(target_root)):
+            return None
+        destination_mode = os.stat(destination, follow_symlinks=False).st_mode
+        if is_folder:
+            if not stat.S_ISDIR(destination_mode):
+                return None
+            part_stat = os.stat(part_path, follow_symlinks=False)
+            if (not stat.S_ISREG(part_stat.st_mode)
+                    or part_stat.st_size != metadata["plain_size"]
+                    or not hmac.compare_digest(
+                        _sha256_file(part_path), metadata["sha256"])):
+                return None
+        else:
+            destination_stat = os.stat(destination, follow_symlinks=False)
+            if (not stat.S_ISREG(destination_stat.st_mode)
+                    or destination_stat.st_size != metadata["plain_size"]
+                    or not hmac.compare_digest(
+                        _sha256_file(destination), metadata["sha256"])):
+                return None
+    except (OSError, KeyError, TypeError):
+        return None
+    return destination
+
+
 class _FolderWireReader:
     """Expose an exact WHF1 plaintext stream from clear or WHE2 wire data."""
 
@@ -1431,6 +1471,7 @@ class P2PNode:
             part_path = checkpoint_base + ".part"
             meta_path = checkpoint_base + ".json"
             done_path = checkpoint_base + ".done.json"
+            commit_path = checkpoint_base + ".commit.json"
             metadata = {
                 "version": _PROTOCOL_VERSION,
                 "filename": filename,
@@ -1471,19 +1512,45 @@ class P2PNode:
                 )))
                 return nonce
 
+            recovered_destination = None
+            commit = _load_json_file(commit_path)
+            if commit:
+                recovered_destination = _validated_commit_destination(
+                    commit, metadata, target_root, part_path, is_folder)
+                if not recovered_destination:
+                    try:
+                        os.remove(commit_path)
+                    except OSError:
+                        pass
+
             completed = _load_json_file(done_path)
             # The receipt proves that this transfer was atomically committed. The
             # delivered item may since have been moved, exported or deleted; tying
             # idempotency to its current path would duplicate a lost-ACK transfer.
-            if all(completed.get(key) == value for key, value in metadata.items()):
+            if (_metadata_matches(completed, metadata)
+                    or recovered_destination is not None):
                 nonce = send_receiver_challenge(plain_size)
                 authenticate_sender(plain_size, nonce)
                 body_size = _recv_exact(conn, 8)
                 if body_size is None or struct.unpack("!Q", body_size)[0] != 0:
                     raise ValueError("已完成传输仍收到数据")
+                if recovered_destination:
+                    _apply_mtime(recovered_destination, modified_ms)
+                    _write_json_atomic(done_path, commit)
+                for obsolete in ((part_path,) if is_folder else ()) + (
+                        meta_path, commit_path):
+                    try:
+                        os.remove(obsolete)
+                    except OSError:
+                        pass
                 conn.sendall(_ACK_OK + bytes.fromhex(expected_digest))
                 ack_sent = True
                 ok = True
+                if recovered_destination:
+                    if self.on_received:
+                        self.on_received(recovered_destination)
+                    self._status(
+                        f"已恢复并校验：{os.path.basename(recovered_destination)}")
                 return
 
             existing = _load_json_file(meta_path)
@@ -1602,22 +1669,29 @@ class P2PNode:
                 _apply_mtime(folder_staging, modified_ms)
                 with self._lock:
                     dst = _unique_directory_path(target_root, filename)
+                    receipt = dict(metadata)
+                    receipt["path"] = dst
+                    receipt["completed_at"] = int(time.time())
+                    _write_json_atomic(commit_path, receipt)
                     os.replace(folder_staging, dst)
                 folder_staging = ""
-                os.remove(part_path)
             else:
                 with self._lock:
                     dst = _unique_path(target_root, filename)
+                    receipt = dict(metadata)
+                    receipt["path"] = dst
+                    receipt["completed_at"] = int(time.time())
+                    _write_json_atomic(commit_path, receipt)
                     os.replace(part_path, dst)
+                _apply_mtime(dst, modified_ms)
 
-            receipt = dict(metadata)
-            receipt["path"] = dst
-            receipt["completed_at"] = int(time.time())
             _write_json_atomic(done_path, receipt)
-            try:
-                os.remove(meta_path)
-            except FileNotFoundError:
-                pass
+            for obsolete in ((part_path,) if is_folder else ()) + (
+                    meta_path, commit_path):
+                try:
+                    os.remove(obsolete)
+                except OSError:
+                    pass
             conn.sendall(_ACK_OK + bytes.fromhex(expected_digest))
             ack_sent = True
             ok = True

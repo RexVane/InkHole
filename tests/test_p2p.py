@@ -303,6 +303,137 @@ def test_lost_ack_retry_reuses_receipt_without_duplicate(tmp_path, monkeypatch):
         node.stop()
 
 
+def test_commit_journal_recovers_crash_after_file_publish(tmp_path, monkeypatch):
+    payload = b"published-before-receipt"
+    failed_once = False
+    original_write_json = p2p_module._write_json_atomic
+
+    def fail_first_completion_receipt(path, value):
+        nonlocal failed_once
+        if path.endswith(".done.json") and not failed_once:
+            failed_once = True
+            raise OSError("simulated crash after publish")
+        original_write_json(path, value)
+
+    monkeypatch.setattr(
+        p2p_module, "_write_json_atomic", fail_first_completion_receipt)
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False))
+    node.start()
+    try:
+        header = raw_v3_header("crash.txt", payload)
+        with socket.create_connection(
+                ("127.0.0.1", node.actual_port), timeout=3) as first:
+            assert begin_raw_v3(first, header) == 0
+            first.sendall(struct.pack("!Q", len(payload)) + payload)
+            assert recv_exact(first, 1) == b"\x00"
+
+        destination = tmp_path / "crash.txt"
+        commit = tmp_path / f".inkhole-{header['transfer_id']}.commit.json"
+        assert destination.read_bytes() == payload
+        assert commit.is_file()
+
+        with socket.create_connection(
+                ("127.0.0.1", node.actual_port), timeout=3) as retry:
+            assert begin_raw_v3(retry, header) == len(payload)
+            retry.sendall(struct.pack("!Q", 0))
+            assert recv_exact(retry, 33) == (
+                b"\x01" + bytes.fromhex(header["sha256"]))
+
+        assert sorted(path.name for path in tmp_path.glob("crash*")) == ["crash.txt"]
+        assert not commit.exists()
+    finally:
+        node.stop()
+
+
+def test_commit_journal_rejects_tampered_file(tmp_path, monkeypatch):
+    payload = b"original-verified-value"
+    tampered = b"x" * len(payload)
+    failed_once = False
+    original_write_json = p2p_module._write_json_atomic
+
+    def fail_first_completion_receipt(path, value):
+        nonlocal failed_once
+        if path.endswith(".done.json") and not failed_once:
+            failed_once = True
+            raise OSError("simulated crash after publish")
+        original_write_json(path, value)
+
+    monkeypatch.setattr(
+        p2p_module, "_write_json_atomic", fail_first_completion_receipt)
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False))
+    node.start()
+    try:
+        header = raw_v3_header("tampered.txt", payload)
+        with socket.create_connection(
+                ("127.0.0.1", node.actual_port), timeout=3) as first:
+            assert begin_raw_v3(first, header) == 0
+            first.sendall(struct.pack("!Q", len(payload)) + payload)
+            assert recv_exact(first, 1) == b"\x00"
+        (tmp_path / "tampered.txt").write_bytes(tampered)
+
+        with socket.create_connection(
+                ("127.0.0.1", node.actual_port), timeout=3) as retry:
+            assert begin_raw_v3(retry, header) == 0
+            retry.sendall(struct.pack("!Q", len(payload)) + payload)
+            assert recv_exact(retry, 33) == (
+                b"\x01" + bytes.fromhex(header["sha256"]))
+
+        assert (tmp_path / "tampered.txt").read_bytes() == tampered
+        assert (tmp_path / "tampered (2).txt").read_bytes() == payload
+    finally:
+        node.stop()
+
+
+def test_commit_journal_recovers_crash_after_folder_publish(tmp_path, monkeypatch):
+    relative = b"inside.txt"
+    content = b"folder-content"
+    payload = (p2p_module._FOLDER_MAGIC + struct.pack("!I", 1)
+               + p2p_module._FOLDER_ENTRY.pack(
+                   1, len(relative), len(content), 0)
+               + relative + content)
+    failed_once = False
+    original_write_json = p2p_module._write_json_atomic
+
+    def fail_first_completion_receipt(path, value):
+        nonlocal failed_once
+        if path.endswith(".done.json") and not failed_once:
+            failed_once = True
+            raise OSError("simulated crash after folder publish")
+        original_write_json(path, value)
+
+    monkeypatch.setattr(
+        p2p_module, "_write_json_atomic", fail_first_completion_receipt)
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Receiver", enable_mdns=False))
+    node.start()
+    try:
+        header = raw_v3_header("crash-folder", payload)
+        header["kind"] = p2p_module._FOLDER_KIND
+        with socket.create_connection(
+                ("127.0.0.1", node.actual_port), timeout=3) as first:
+            assert begin_raw_v3(first, header) == 0
+            first.sendall(struct.pack("!Q", len(payload)) + payload)
+            assert recv_exact(first, 1) == b"\x00"
+
+        destination = tmp_path / "crash-folder"
+        assert (destination / "inside.txt").read_bytes() == content
+        with socket.create_connection(
+                ("127.0.0.1", node.actual_port), timeout=3) as retry:
+            assert begin_raw_v3(retry, header) == len(payload)
+            retry.sendall(struct.pack("!Q", 0))
+            assert recv_exact(retry, 33) == (
+                b"\x01" + bytes.fromhex(header["sha256"]))
+
+        assert sorted(path.name for path in tmp_path.glob("crash-folder*")) == [
+            "crash-folder"]
+        checkpoint = tmp_path / f".inkhole-{header['transfer_id']}.part"
+        assert not checkpoint.exists()
+    finally:
+        node.stop()
+
+
 def test_lost_ack_receipt_survives_destination_move(tmp_path):
     payload = b"exported-before-ack-retry"
     node = P2PNode(P2PConfig(

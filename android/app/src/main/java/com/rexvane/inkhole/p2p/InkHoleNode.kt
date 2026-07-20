@@ -723,6 +723,7 @@ class InkHoleNode(
             val part = File("${base.absolutePath}.part")
             val meta = File("${base.absolutePath}.json")
             val done = File("${base.absolutePath}.done.json")
+            val commit = File("${base.absolutePath}.commit.json")
             val metadata = receiveMetadata(header, safeName)
             fun authenticateSender(offset: Long, nonce: ByteArray) {
                 val signatureSize = din.readUnsignedShort()
@@ -754,18 +755,37 @@ class InkHoleNode(
                 dout.flush()
                 return nonce
             }
+            val pendingCommit = readJson(commit)
+            val recoveredDestination = ReceiveCommits.recover(
+                inboxDir, pendingCommit, part, metadata, isFolder)
+            if (recoveredDestination == null && commit.exists()) {
+                commit.delete()
+            }
+
             val completed = readJson(done)
             // Public Downloads export removes the private destination after commit.
             // The durable receipt, not that movable path, is the idempotency proof.
-            if (WHPP.metadataMatches(completed, metadata)) {
+            if (WHPP.metadataMatches(completed, metadata) || recoveredDestination != null) {
                 val nonce = sendReceiverChallenge(header.plainSize)
                 authenticateSender(header.plainSize, nonce)
                 if (din.readLong() != 0L) throw IOException("已完成传输仍收到数据")
+                recoveredDestination?.let { destination ->
+                    if (header.modifiedMs > 0) destination.setLastModified(header.modifiedMs)
+                    writeJsonAtomic(done, pendingCommit!!)
+                }
+                if (isFolder) part.delete()
+                meta.delete()
+                commit.delete()
                 dout.writeByte(WHPP.ACK_OK)
                 dout.write(header.sha256.chunked(2).map { it.toInt(16).toByte() }.toByteArray())
                 dout.flush()
                 ackSent = true
                 ok = true
+                recoveredDestination?.let { destination ->
+                    listener.onFileReceived(
+                        destination.name, destination.absolutePath, header.transferId)
+                    listener.onStatus("已恢复并校验：${destination.name}")
+                }
                 return
             }
 
@@ -869,6 +889,7 @@ class InkHoleNode(
             }
 
             val destination: File
+            val receipt: JSONObject
             if (isFolder) {
                 val staging = File(inboxDir, ".inkhole-${UUID.randomUUID()}.folder.part")
                 if (!staging.mkdir()) throw IOException("无法创建文件夹暂存目录")
@@ -883,26 +904,39 @@ class InkHoleNode(
                     throw error
                 }
                 if (header.modifiedMs > 0) staging.setLastModified(header.modifiedMs)
-                destination = synchronized(receiveFileLock) {
+                val committed = synchronized(receiveFileLock) {
                     val candidate = ReceiveFiles.uniqueDirectory(inboxDir, safeName)
-                    candidate.takeIf { staging.renameTo(it) }
-                } ?: throw IOException("落盘失败: $safeName")
+                    val candidateReceipt = receiveMetadata(header, safeName).apply {
+                        put("path", candidate.absolutePath)
+                        put("completed_at", System.currentTimeMillis() / 1000)
+                    }
+                    writeJsonAtomic(commit, candidateReceipt)
+                    if (!staging.renameTo(candidate)) throw IOException("落盘失败: $safeName")
+                    candidate to candidateReceipt
+                }
+                destination = committed.first
+                receipt = committed.second
                 folderPart = null
-                part.delete()
             } else {
-                destination = synchronized(receiveFileLock) {
+                val committed = synchronized(receiveFileLock) {
                     val candidate = ReceiveFiles.uniqueFile(inboxDir, safeName)
-                    candidate.takeIf { part.renameTo(it) }
-                } ?: throw IOException("落盘失败: $safeName")
+                    val candidateReceipt = receiveMetadata(header, safeName).apply {
+                        put("path", candidate.absolutePath)
+                        put("completed_at", System.currentTimeMillis() / 1000)
+                    }
+                    writeJsonAtomic(commit, candidateReceipt)
+                    if (!part.renameTo(candidate)) throw IOException("落盘失败: $safeName")
+                    candidate to candidateReceipt
+                }
+                destination = committed.first
+                receipt = committed.second
                 if (header.modifiedMs > 0) destination.setLastModified(header.modifiedMs)
             }
 
-            val receipt = receiveMetadata(header, safeName).apply {
-                put("path", destination.absolutePath)
-                put("completed_at", System.currentTimeMillis() / 1000)
-            }
             writeJsonAtomic(done, receipt)
+            if (isFolder) part.delete()
             meta.delete()
+            commit.delete()
             dout.writeByte(WHPP.ACK_OK)
             dout.write(actualDigest)
             dout.flush()
