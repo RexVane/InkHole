@@ -54,6 +54,8 @@ import com.rexvane.inkhole.transport.TransportException
 import com.rexvane.inkhole.transport.TransportManager
 import com.rexvane.inkhole.transport.TransferSecretStore
 import com.rexvane.inkhole.transport.WormholeConfig
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -323,6 +325,17 @@ class MainActivity : ComponentActivity() {
         sshFingerprintDraft.value = ""
     }
 
+    private val qrScanLauncher = registerForActivityResult(ScanContract()) { result ->
+        result.contents?.let(::handleScannedReceiveCode)
+    }
+
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) launchReceiveQrScanner()
+        else Toast.makeText(this, "需要相机权限才能扫描二维码", Toast.LENGTH_LONG).show()
+    }
+
     private val transportUiListener = TransportEventListener { event, data ->
         runOnUiThread { handleTransportEvent(event, data) }
     }
@@ -549,6 +562,48 @@ class MainActivity : ComponentActivity() {
         intent.data = null
     }
 
+    private fun launchReceiveQrScanner() {
+        qrScanLauncher.launch(ScanOptions().apply {
+            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            setPrompt("将一次性短码二维码放入框内")
+            setBeepEnabled(false)
+            setOrientationLocked(false)
+        })
+    }
+
+    private fun requestReceiveQrScan() {
+        if (checkSelfPermission(android.Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED) {
+            launchReceiveQrScanner()
+        } else {
+            cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun handleScannedReceiveCode(rawValue: String) {
+        val raw = rawValue.trim()
+        val uri = runCatching { Uri.parse(raw) }.getOrNull()
+        val isReceiveUri = uri?.let {
+            it.scheme.equals("inkhole", ignoreCase = true) &&
+                it.host.equals("receive", ignoreCase = true)
+        } == true
+        val code = if (isReceiveUri) {
+            uri?.getQueryParameter("code").orEmpty().trim()
+        } else if (!raw.contains("://")) {
+            raw
+        } else {
+            ""
+        }
+        if (code.isBlank() || code.length > 160) {
+            Toast.makeText(this, "二维码不是有效的一次性短码", Toast.LENGTH_LONG).show()
+            return
+        }
+        deepLinkReceiveCode.value = code
+        deepLinkPairCode.value = ""
+        showCrossNetworkActions.value = true
+        Toast.makeText(this, "已识别短码，请点击连接并接收", Toast.LENGTH_SHORT).show()
+    }
+
     private fun beginOneTimeSend(uris: List<Uri>) {
         if (sendWorkerRunning.get() || InkHoleBus.node?.isSending() == true) {
             statusMsg.value = "请等待当前发送完成"
@@ -683,6 +738,7 @@ class MainActivity : ComponentActivity() {
                     pickerMode = PickerMode.ONE_TIME
                     filePicker.launch(arrayOf("*/*"))
                 },
+                onScanOneTime = { requestReceiveQrScan() },
                 onJoinOneTime = { code ->
                     receiveRequestActive = true
                     joiningOneTime.value = true

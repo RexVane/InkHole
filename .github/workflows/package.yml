@@ -255,6 +255,7 @@ jobs:
             本版本包含三端构建产物。
 
             - Android APK：使用项目固定发布密钥签名，可直接安装验证。
+            - Android 一次性接收：支持扫描发送端生成的短码二维码，识别后仍需点击“连接并接收”确认。
             - Windows ZIP：本次未配置 Authenticode 证书，为未签名压缩包；下载后请解压运行，并按需在 Windows SmartScreen 中确认。
             - macOS ZIP：本次未配置 Developer ID 证书和 Apple notarization，为未签名、未公证压缩包；首次打开时请在系统安全设置中允许。
             - Windows/macOS 均附带 SHA-256 校验文件。

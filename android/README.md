@@ -1,12 +1,13 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.5.1`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
+墨洞 Android 客户端（当前版本 `1.5.2`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
 
 ## 功能
 
 - 使用 Android NSD 发现 `_inkhole._tcp` 服务并手动选择发送目标。
 - **手动添加设备**（设置内填对方 Tailscale IP 或 MagicDNS 名称 + 对方监听端口）：跨网络传输，离线自动剔除、回线自动恢复。
 - **一次性短码**：选择多个文件后生成 PAKE 安全短码和二维码；接收端先确认设备、数量、大小与名称摘要，再建立 Magic Wormhole 加密会话。文件继续使用 WHPP，不走依赖自带的 ZIP 传输。
+- 一次性接收支持扫描发送端生成的二维码，也可以手动输入短码；扫码仅在点击扫码按钮时请求相机权限，识别后仍需点击“连接并接收”确认。
 - 短码服务会优先直连，无法直连时使用加密 Transit；如果 Android 系统配置了 HTTP 代理，跨网核心会自动继承该代理，不需要把代理口令写进墨洞配置。
 - **SSH VPS 中继**：填写 VPS、端口和用户名，选择私钥文件或粘贴已有私钥；验证主机指纹后启用。设备通过一次性 PAKE 配对码交换 Noise 身份，长期出现在发送目标列表中。
 - **安全存储**：共享传输口令、粘贴私钥、私钥口令和 Noise 私钥由 Android Keystore 加密；旧版 `SharedPreferences` 明文口令会自动迁移并清除。文件模式只保存持久化 SAF URI，不提供 SSH 密钥生成功能。

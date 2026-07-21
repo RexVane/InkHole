@@ -4,6 +4,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- 一次性短码二维码扫描，仅在用户点击扫码时请求运行时权限 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <!-- WifiLock:息屏后保持 WiFi 联通,对端不再把本机判离线 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 应用内更新:下载新版 APK 后拉起系统安装器 -->

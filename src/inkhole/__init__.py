@@ -11,4 +11,4 @@
 """
 
 __all__ = ["p2p", "pet", "crypto"]
-__version__ = "1.5.1"
+__version__ = "1.5.2"

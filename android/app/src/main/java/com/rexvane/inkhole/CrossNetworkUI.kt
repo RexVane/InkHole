@@ -17,10 +17,12 @@ import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -50,6 +52,7 @@ fun CrossNetworkActionsDialog(
     initialPairCode: String,
     onDismiss: () -> Unit,
     onOneTimeSend: () -> Unit,
+    onScanOneTime: () -> Unit,
     onJoinOneTime: (String) -> Unit,
     onCreateSSHPair: () -> Unit,
     onJoinSSHPair: (String) -> Unit,
@@ -69,13 +72,28 @@ fun CrossNetworkActionsDialog(
                     Spacer(Modifier.width(7.dp))
                     Text("选择内容并生成短码")
                 }
-                OutlinedTextField(
-                    value = receiveCode,
-                    onValueChange = { receiveCode = it.trimStart().take(160) },
-                    label = { Text("一次性接收短码") },
-                    singleLine = true,
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                )
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = receiveCode,
+                        onValueChange = { receiveCode = it.trimStart().take(160) },
+                        label = { Text("一次性接收短码") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    IconButton(
+                        onClick = onScanOneTime,
+                        enabled = !joining,
+                    ) {
+                        Icon(
+                            Icons.Outlined.QrCodeScanner,
+                            contentDescription = "扫描一次性短码二维码",
+                        )
+                    }
+                }
                 OutlinedButton(
                     onClick = { onJoinOneTime(receiveCode.trim()) },
                     enabled = receiveCode.isNotBlank() && !joining,
