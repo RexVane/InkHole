@@ -61,21 +61,32 @@ jobs:
             exit 1
           }
 
-      - name: Require Windows signing credentials for releases
+      - name: Report Windows signing status
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
-        run: test -n "$WINDOWS_CERTIFICATE_BASE64" && test -n "$WINDOWS_CERTIFICATE_PASSWORD"
+        run: |
+          if [ -n "$WINDOWS_CERTIFICATE_BASE64" ] && [ -n "$WINDOWS_CERTIFICATE_PASSWORD" ]; then
+            echo "Windows ZIP: Authenticode signed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Windows ZIP: unsigned (no release certificate configured)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Windows release certificate is not configured; publishing an unsigned ZIP."
+          fi
 
-      - name: Require Apple signing credentials for releases
+      - name: Report macOS signing status
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
-          test -n "$MACOS_CERTIFICATE_BASE64"
-          test -n "$MACOS_CERTIFICATE_PASSWORD"
-          test -n "$MACOS_SIGNING_IDENTITY"
-          test -n "$APPLE_ID"
-          test -n "$APPLE_APP_SPECIFIC_PASSWORD"
-          test -n "$APPLE_TEAM_ID"
+          if [ -n "$MACOS_CERTIFICATE_BASE64" ] && [ -n "$MACOS_CERTIFICATE_PASSWORD" ] && [ -n "$MACOS_SIGNING_IDENTITY" ]; then
+            echo "macOS ZIP: Developer ID signed" >> "$GITHUB_STEP_SUMMARY"
+            if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+              echo "macOS app: notarization enabled" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "macOS app: not notarized (Apple notarization credentials not configured)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "macOS ZIP: unsigned and not notarized (no release certificate configured)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::macOS release certificate is not configured; publishing an unsigned, unnotarized ZIP."
+          fi
 
       - name: Install dependencies
         run: |
@@ -158,7 +169,7 @@ jobs:
           xcrun stapler validate packaging/dist/InkHolePet.app
           spctl --assess --type execute --verbose=4 packaging/dist/InkHolePet.app
 
-      # Windows: onedir 产物是文件夹，zip 打包后上传
+      # Windows: onedir 产物是文件夹，zip 打包后上传；无证书时保持未签名并在 Release 标注
       # 用户解压后双击 InkHolePet\InkHolePet.exe 即可，不再解压到 %TEMP%，绕开 Defender 拦截
       - name: Zip Windows dir
         if: runner.os == 'Windows'
@@ -172,7 +183,7 @@ jobs:
         working-directory: packaging/dist
         run: ditto -c -k --sequesterRsrc --keepParent InkHolePet.app InkHolePet-macos.zip
 
-      - name: Create signed Windows update manifest
+      - name: Create Windows update manifest
         if: runner.os == 'Windows'
         working-directory: packaging/dist
         shell: pwsh
@@ -240,6 +251,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: InkHole ${{ github.ref_name }}
+          body: |
+            本版本包含三端构建产物。
+
+            - Android APK：使用项目固定发布密钥签名，可直接安装验证。
+            - Windows ZIP：本次未配置 Authenticode 证书，为未签名压缩包；下载后请解压运行，并按需在 Windows SmartScreen 中确认。
+            - macOS ZIP：本次未配置 Developer ID 证书和 Apple notarization，为未签名、未公证压缩包；首次打开时请在系统安全设置中允许。
+            - Windows/macOS 均附带 SHA-256 校验文件。
+
+            后续配置桌面签名与公证凭据后，同一工作流会自动生成已签名的桌面包。
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

@@ -39,7 +39,9 @@ macOS ZIP 上传同名 `.sha256`；Windows ZIP 上传同名、带 Authenticode �
 EXE 和校验清单使用同一发布证书。
 
 正式标签同时调用 Android 构建；Windows、macOS 和 Android 任一任务失败都不会创建
-Release，三端产物全部通过后才由单一发布任务一次性上传。
+Release，三端产物全部通过后才由单一发布任务一次性上传。Android 标签构建必须使用固定
+发布密钥；Windows/macOS 没有配置桌面证书时仍会发布压缩包，但 Release 正文会明确标注
+为未签名（macOS 同时标注未公证），并提供 SHA-256 校验文件。
 
 仓库需要配置以下 GitHub Actions secrets：
 
@@ -54,11 +56,11 @@ Release，三端产物全部通过后才由单一发布任务一次性上传。
 | `APPLE_APP_SPECIFIC_PASSWORD` | Apple app-specific password |
 | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
-手动运行工作流时，证书 secret 未配置仍可构建测试产物，用于核对 Windows/macOS
-打包结构、ZIP 校验清单和 Android 固定签名 APK；这些未签名桌面产物不能作为正式版
-分发。正式标签缺少任一桌面签名、公证或 Android 发布签名凭据都会失败，且不会创建
-Release。发布前应先在 `main` 手动运行一次 Package 工作流，确认三端验证构建全部成功，
-再创建与 `pyproject.toml`、Python `__version__` 和 Android `versionName` 一致的标签。
+手动运行工作流时，证书 secret 未配置仍可构建产物，用于核对 Windows/macOS 打包结构、
+ZIP 校验清单和 Android APK。正式标签缺少桌面证书不会阻止发布，但对应桌面包会明确标注
+未签名；Android 标签缺少固定发布签名凭据仍会失败，且不会创建 Release。发布前应先在
+`main` 手动运行一次 Package 工作流，确认三端验证构建全部成功，再创建与 `pyproject.toml`、
+Python `__version__` 和 Android `versionName` 一致的标签。
 
 依赖（构建脚本会自动补装）：`PySide6`、`zeroconf`、`cryptography`、`psutil`、`pyinstaller`。生成品牌图标时另需 `Pillow`；macOS 使用 `pyobjc-framework-Cocoa` 提供原生文件/文件夹混选和「挂件常驻所有桌面」，缺少时选择器回退 Qt 版本且跳过 Spaces 增强。
 
