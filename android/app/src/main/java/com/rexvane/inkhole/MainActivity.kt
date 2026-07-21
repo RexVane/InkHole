@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -237,6 +238,37 @@ class MainActivity : ComponentActivity() {
         Text(body, fontSize = 12.sp,
             color = androidx.compose.ui.graphics.Color.Gray)
         Spacer(Modifier.height(12.dp))
+    }
+
+    @Composable
+    private fun HelpAndUpdateSection() {
+        androidx.compose.material3.HorizontalDivider(
+            modifier = Modifier.padding(top = 10.dp, bottom = 8.dp),
+        )
+        Text("帮助与更新", fontSize = 14.sp,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
+        Row {
+            TextButton(onClick = { showUsageGuide.value = true }) {
+                Text("使用说明")
+            }
+            TextButton(onClick = { checkUpdate() }) {
+                Text(if (checkingUpdate.value) "检查中…" else "检查更新")
+            }
+        }
+        TextButton(onClick = {
+            try {
+                startActivity(Intent(
+                    Intent.ACTION_VIEW,
+                    Uri.parse(Updater.REPOSITORY_PAGE),
+                ))
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "无法打开 GitHub: ${e.message}",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }) { Text("GitHub 仓库") }
     }
 
     @androidx.compose.runtime.Composable
@@ -935,17 +967,6 @@ class MainActivity : ComponentActivity() {
             var secretInput by remember { mutableStateOf(secret.value) }
             var encryptionInput by remember { mutableStateOf(encryptionEnabled.value) }
             var trustedInput by remember { mutableStateOf(trustedOnly.value) }
-            var autoClassifyInput by remember {
-                mutableStateOf(prefs.getBoolean(InboxClassification.PREF_ENABLED, false))
-            }
-            val categoryInputs = remember {
-                mutableStateMapOf<String, String>().apply {
-                    InboxClassification.categories.forEach { category ->
-                        put(category, prefs.getString(
-                            InboxClassification.preferenceKey(category), "") ?: "")
-                    }
-                }
-            }
             val trustedDevices = remember {
                 mutableStateMapOf<String, String>().apply {
                     putAll(InkHoleBus.node?.getTrustedDevices().orEmpty())
@@ -997,8 +1018,15 @@ class MainActivity : ComponentActivity() {
                 title = { Text("设置") },
                 text = {
                     Column(
-                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 500.dp),
                     ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .verticalScroll(rememberScrollState()),
+                        ) {
                         // 本机信息
                         val instanceId = prefs.getString("instance_id", "") ?: ""
                         val actualPort = InkHoleBus.node?.getActualPort() ?: 0
@@ -1036,47 +1064,20 @@ class MainActivity : ComponentActivity() {
                         )
 
                         Spacer(Modifier.height(14.dp))
-                        Text("默认目录", fontSize = 14.sp,
+                        Text("存储", fontSize = 14.sp,
                             fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
                         Spacer(Modifier.height(4.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text("自动分类接收文件", fontSize = 14.sp)
-                                Text(
-                                    "文件会保存到 Download/InkHole 下的分类目录；关闭后使用默认目录",
-                                    fontSize = 11.sp,
-                                    color = androidx.compose.ui.graphics.Color.Gray,
-                                )
-                            }
-                            Spacer(Modifier.width(8.dp))
-                            Switch(
-                                checked = autoClassifyInput,
-                                onCheckedChange = { autoClassifyInput = it },
-                            )
-                        }
-                        InboxClassification.categories.forEach { category ->
-                            Spacer(Modifier.height(5.dp))
-                            OutlinedTextField(
-                                value = categoryInputs[category].orEmpty(),
-                                onValueChange = { value ->
-                                    categoryInputs[category] = value
-                                        .filterNot { it.isISOControl() || it == '/' || it == '\\' }
-                                        .take(80)
-                                },
-                                label = {
-                                    Text("${InboxClassification.label(category)}目录名")
-                                },
-                                placeholder = {
-                                    Text(InboxClassification.label(category))
-                                },
-                                singleLine = true,
-                                enabled = autoClassifyInput,
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        }
+                        Text("默认目录", fontSize = 13.sp)
+                        Text(
+                            "Download/InkHole",
+                            fontSize = 12.sp,
+                            color = androidx.compose.ui.graphics.Color.Gray,
+                        )
+                        Text(
+                            "所有接收文件和文件夹统一保存在这里",
+                            fontSize = 11.sp,
+                            color = androidx.compose.ui.graphics.Color.Gray,
+                        )
 
                         Spacer(Modifier.height(14.dp))
                         Text("传输安全", fontSize = 14.sp,
@@ -1482,32 +1483,8 @@ class MainActivity : ComponentActivity() {
                             Text(settingsError, fontSize = 11.sp,
                                 color = androidx.compose.ui.graphics.Color(0xFFF08A7C))
                         }
-
-                        Spacer(Modifier.height(14.dp))
-                        Text("帮助与更新", fontSize = 14.sp,
-                            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                        Row {
-                            TextButton(onClick = {
-                                showUsageGuide.value = true
-                            }) { Text("使用说明") }
-                            TextButton(onClick = { checkUpdate() }) {
-                                Text(if (checkingUpdate.value) "检查中…" else "检查更新")
-                            }
                         }
-                        TextButton(onClick = {
-                            try {
-                                startActivity(Intent(
-                                    Intent.ACTION_VIEW,
-                                    Uri.parse(Updater.REPOSITORY_PAGE),
-                                ))
-                            } catch (e: Exception) {
-                                Toast.makeText(
-                                    this@MainActivity,
-                                    "无法打开 GitHub: ${e.message}",
-                                    Toast.LENGTH_LONG,
-                                ).show()
-                            }
-                        }) { Text("GitHub 仓库") }
+                        HelpAndUpdateSection()
                     }
                 },
                 confirmButton = {
@@ -1582,15 +1559,7 @@ class MainActivity : ComponentActivity() {
                             secret.value = secretInput
                             encryptionEnabled.value = encryptionInput
                             trustedOnly.value = trustedInput
-                            val inboxEditor = prefs.edit()
-                                .putBoolean(InboxClassification.PREF_ENABLED, autoClassifyInput)
-                            InboxClassification.categories.forEach { category ->
-                                inboxEditor.putString(
-                                    InboxClassification.preferenceKey(category),
-                                    categoryInputs[category].orEmpty().trim(),
-                                )
-                            }
-                            inboxEditor
+                            prefs.edit()
                                 .putString("peer_name", normalizedName)
                                 .remove("secret")
                                 .putBoolean("encryption_enabled", encryptionInput)

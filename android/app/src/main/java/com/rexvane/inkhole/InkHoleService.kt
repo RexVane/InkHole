@@ -229,15 +229,13 @@ class InkHoleService : Service() {
         val mime = guessMime(src.name)
         val size = src.length()
         val now = System.currentTimeMillis()
-        val categoryDirectory = publicCategoryDirectory(src)
         if (Build.VERSION.SDK_INT >= 29) {
             var inserted: Uri? = null
             try {
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, src.name)
                     put(MediaStore.MediaColumns.MIME_TYPE, mime)
-                    put(MediaStore.MediaColumns.RELATIVE_PATH,
-                        publicInboxRelativePath(categoryDirectory))
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, publicInboxRelativePath())
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
                 inserted = contentResolver.insert(
@@ -275,7 +273,7 @@ class InkHoleService : Service() {
             try {
                 val dir = File(Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_DOWNLOADS),
-                    publicInboxRelativePath(categoryDirectory)
+                    publicInboxRelativePath()
                         .removePrefix(Environment.DIRECTORY_DOWNLOADS + "/"))
                 if (!dir.exists() && !dir.mkdirs()) throw IOException("无法创建下载目录")
                 val dst = synchronized(exportLock) {
@@ -299,7 +297,6 @@ class InkHoleService : Service() {
     private fun exportFolderToDownloads(src: File): ReceivedFile = synchronized(exportLock) {
         val mime = "inode/directory"
         val now = System.currentTimeMillis()
-        val categoryDirectory = publicCategoryDirectory(src)
         val files = src.walkTopDown().filter { it.isFile }
             .sortedBy { it.relativeTo(src).invariantSeparatorsPath }
             .toList()
@@ -315,14 +312,14 @@ class InkHoleService : Service() {
                 src.deleteRecursively()
                 return@synchronized ReceivedFile(src.name, null, mime, 0, now)
             }
-            val publicRoot = uniqueMediaStoreFolderName(src.name, categoryDirectory)
+            val publicRoot = uniqueMediaStoreFolderName(src.name)
             val inserted = ArrayList<Uri>(files.size)
             try {
                 for (file in files) {
                     val relative = file.relativeTo(src).invariantSeparatorsPath
                     val parent = relative.substringBeforeLast('/', "")
                     val relativePath = buildString {
-                        append(publicInboxRelativePath(categoryDirectory))
+                        append(publicInboxRelativePath())
                         append('/')
                         append(publicRoot)
                         if (parent.isNotEmpty()) {
@@ -369,7 +366,7 @@ class InkHoleService : Service() {
             try {
                 val root = File(Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_DOWNLOADS),
-                    publicInboxRelativePath(categoryDirectory)
+                    publicInboxRelativePath()
                         .removePrefix(Environment.DIRECTORY_DOWNLOADS + "/"))
                 if (!root.isDirectory && !root.mkdirs()) throw IOException("无法创建下载目录")
                 destination = ReceiveFiles.uniqueDirectory(root, src.name)
@@ -385,19 +382,19 @@ class InkHoleService : Service() {
         ReceivedFile(src.name, null, mime, totalSize, now)
     }
 
-    private fun uniqueMediaStoreFolderName(name: String, categoryDirectory: String): String {
+    private fun uniqueMediaStoreFolderName(name: String): String {
         var candidate = name
         var suffix = 2
-        while (mediaStoreFolderExists(candidate, categoryDirectory)) {
+        while (mediaStoreFolderExists(candidate)) {
             candidate = "$name ($suffix)"
             suffix++
         }
         return candidate
     }
 
-    private fun mediaStoreFolderExists(name: String, categoryDirectory: String): Boolean {
+    private fun mediaStoreFolderExists(name: String): Boolean {
         if (Build.VERSION.SDK_INT < 29) return false
-        val prefix = "${publicInboxRelativePath(categoryDirectory)}/$name/"
+        val prefix = "${publicInboxRelativePath()}/$name/"
         return try {
             contentResolver.query(
                 MediaStore.Downloads.EXTERNAL_CONTENT_URI,
@@ -416,24 +413,8 @@ class InkHoleService : Service() {
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
     }
 
-    private fun publicCategoryDirectory(src: File): String {
-        val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean(InboxClassification.PREF_ENABLED, false)) return ""
-        val category = InboxClassification.categoryFor(src.name, src.isDirectory)
-        return InboxClassification.directoryName(
-            category,
-            prefs.getString(InboxClassification.preferenceKey(category), ""),
-        )
-    }
-
-    private fun publicInboxRelativePath(categoryDirectory: String): String = buildString {
-        append(Environment.DIRECTORY_DOWNLOADS)
-        append("/InkHole")
-        if (categoryDirectory.isNotEmpty()) {
-            append('/')
-            append(categoryDirectory)
-        }
-    }
+    private fun publicInboxRelativePath(): String =
+        "${Environment.DIRECTORY_DOWNLOADS}/InkHole"
 
     // ---- 通知 ----
 
