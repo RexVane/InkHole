@@ -120,6 +120,8 @@ class InkHoleNode(
         private const val PROBE_INTERVAL_MS = 5_000L          // 探活轮询间隔
         private const val PROBE_STRIKES = 2                   // 自动发现设备连续失败几轮剔除
         private const val PROBE_STRIKES_MANUAL = 4            // 手动设备双倍容忍(息屏 WiFi 休眠易误判)
+        private const val LAN_CHANGE_CHECK_INTERVAL_MS = 5_000L
+        private const val EMPTY_DISCOVERY_RESTART_TICKS = 6
         // 手动设备探活超时:Tailscale 空闲后懒惰唤醒(打洞/DERP 建链)首次
         // 握手常超 1.2s,太紧会把在线的跨网设备判死或迟迟不上线
         private const val PROBE_TIMEOUT_MANUAL_MS = 3_000
@@ -279,13 +281,29 @@ class InkHoleNode(
         // 重启都会把早已关机的对端"复活"成假在线。改由探活循环首轮(立即执行)
         // 验证,连得上才显示——列表语义收紧为"当前真实在线的设备"。
         startProbeLoop()  // 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留
-        // 发现自愈:NSD 发现流偶尔"卡死"(WiFi 省电丢组播/系统服务抽风),
-        // 表现为对端明明在线列表却空着。列表持续为空时周期性重启发现。
+        // 网络变化与发现自愈。Android 的 NSD 不会稳定地跟随 WiFi/热点接口切换，
+        // 每 5 秒比较一次真实 LAN 链路；变化后立即重启发现。列表持续为空时仍
+        // 每 30 秒重启一次，覆盖 WiFi 省电丢组播/系统服务卡住的情况。
         scope.launch {
+            var previousLinks = lanLinkSignature(currentLanLinks())
+            var emptyTicks = 0
             while (running) {
-                delay(30_000)
+                delay(LAN_CHANGE_CHECK_INTERVAL_MS)
+                val currentLinks = lanLinkSignature(currentLanLinks())
+                if (currentLinks != previousLinks) {
+                    previousLinks = currentLinks
+                    emptyTicks = 0
+                    if (running) {
+                        restartDiscovery()
+                        probeNow()
+                    }
+                    continue
+                }
+                emptyTicks += 1
+                if (emptyTicks < EMPTY_DISCOVERY_RESTART_TICKS) continue
+                emptyTicks = 0
                 val hasDiscoveredPeer = synchronized(peersLock) {
-                    peers.keys.any { !it.startsWith("manual|") }
+                    peers.values.any { !it.manual && it.transport == "lan" }
                 }
                 if (!hasDiscoveredPeer && running) restartDiscovery()
             }
@@ -376,7 +394,8 @@ class InkHoleNode(
                         val probeHosts = if (manualPeer != null) {
                             (listOf(manualPeer.host, peer.host) + peer.hosts).distinct()
                         } else {
-                            LanReachability.hostsOnCurrentLan(peer.hosts, lanLinks)
+                            LanReachability.verifiedPeerCandidates(
+                                peer.hosts, lanLinks, peer.host)
                         }
                         val timeout = if (isManual) PROBE_TIMEOUT_MANUAL_MS
                             else LOST_PROBE_TIMEOUT_MS
@@ -1516,8 +1535,11 @@ class InkHoleNode(
                 repeat(LOST_PROBE_ATTEMPTS) { attempt ->
                     val peer = synchronized(peersLock) { peers[serviceName] }
                         ?: return@launch          // 已被别处移除，无需再探
-                    val hosts = LanReachability.hostsOnCurrentLan(
-                        (listOf(peer.host) + peer.hosts).distinct(), currentLanLinks())
+                    val hosts = LanReachability.verifiedPeerCandidates(
+                        (listOf(peer.host) + peer.hosts).distinct(),
+                        currentLanLinks(),
+                        peer.host,
+                    )
                     try {
                         probePeer(hosts, peer.port, LOST_PROBE_TIMEOUT_MS, peer.instanceId)
                         return@launch  // 还活着，误报忽略
@@ -1760,7 +1782,8 @@ class InkHoleNode(
         // 表现为对端明明关了却一直显示在线。可达性标准与探活循环一致:仅认
         // 当前 WiFi/以太网可达的地址,不给 Tailscale 等 VPN 路径兜底的机会。
         scope.launch {
-            val candidates = LanReachability.hostsOnCurrentLan(hostList, currentLanLinks())
+            val candidates = LanReachability.discoveryCandidates(
+                resolvedHosts.toList(), hostList, currentLanLinks())
             val result = try {
                 probePeer(candidates, info.port, LOST_PROBE_TIMEOUT_MS, txtInstanceId)
             } catch (_: Exception) { return@launch }
@@ -1786,29 +1809,66 @@ class InkHoleNode(
     /** 当前真正的局域网链路；排除蜂窝网络和 Tailscale 等 VPN transport。 */
     @Suppress("DEPRECATION")
     private fun currentLanLinks(): List<LanLink> {
-        return try {
+        val connectivityLinks = try {
             val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
-                as? ConnectivityManager ?: return emptyList()
-            manager.allNetworks.flatMap { network ->
-                val capabilities = manager.getNetworkCapabilities(network)
-                    ?: return@flatMap emptyList()
-                // Android 的 VPN 网络会继承底层网络的 transport(Tailscale 跑在
-                // WiFi 上时同时报告 WIFI + VPN),必须显式排除 VPN,否则 TUN 接口
-                // 地址也会被当成局域网链路。
-                val isLan = (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) &&
-                    !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-                if (!isLan) return@flatMap emptyList()
-                manager.getLinkProperties(network)?.linkAddresses.orEmpty().mapNotNull { link ->
-                    val address = link.address
-                    if (address.isLoopbackAddress || address.isAnyLocalAddress) null
-                    else address.hostAddress?.let { LanLink(it, link.prefixLength) }
-                }
-            }.distinct()
+                as? ConnectivityManager
+            if (manager == null) {
+                emptyList()
+            } else {
+                manager.allNetworks.flatMap { network ->
+                    val capabilities = manager.getNetworkCapabilities(network)
+                        ?: return@flatMap emptyList()
+                    // Android 的 VPN 网络会继承底层网络的 transport(Tailscale 跑在
+                    // WiFi 上时同时报告 WIFI + VPN),必须显式排除 VPN,否则 TUN 接口
+                    // 地址也会被当成局域网链路。
+                    val isLan = (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) &&
+                        !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                    if (!isLan) return@flatMap emptyList()
+                    manager.getLinkProperties(network)?.linkAddresses.orEmpty().mapNotNull { link ->
+                        val address = link.address
+                        if (address.isLoopbackAddress || address.isAnyLocalAddress) null
+                        else address.hostAddress?.let { LanLink(it, link.prefixLength) }
+                    }
+                }.distinct()
+            }
         } catch (_: Exception) {
             emptyList()
         }
+        // 热点提供者的 SoftAP 接口通常不出现在 ConnectivityManager.allNetworks
+        // 中；从 NetworkInterface 补齐 wlan1/ap0 等真实本地接口。点对点、蜂窝
+        // 和隧道接口必须排除，避免把 VPN/代理地址重新当成局域网路径。
+        val interfaceLinks = try {
+            val enumeration = NetworkInterface.getNetworkInterfaces()
+            val interfaces = if (enumeration == null) emptyList()
+                else java.util.Collections.list(enumeration)
+            interfaces.filter { networkInterface ->
+                try {
+                    networkInterface.isUp && !networkInterface.isLoopback &&
+                        !networkInterface.isPointToPoint && networkInterface.supportsMulticast() &&
+                        LanReachability.isLanInterfaceName(networkInterface.name.orEmpty())
+                } catch (_: Exception) {
+                    false
+                }
+            }.flatMap { networkInterface ->
+                networkInterface.interfaceAddresses.mapNotNull { binding ->
+                    val address = binding.address ?: return@mapNotNull null
+                    val host = address.hostAddress ?: return@mapNotNull null
+                    if (address.isAnyLocalAddress || address.isLoopbackAddress ||
+                        address.isMulticastAddress || TailnetAddress.isTailnet(host)) null
+                    else LanLink(host, binding.networkPrefixLength.toInt())
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+        return (connectivityLinks + interfaceLinks).distinct()
     }
+
+    private fun lanLinkSignature(links: List<LanLink>): String = links
+        .map { "${it.address.substringBefore('%')}/${it.prefixLength}" }
+        .sorted()
+        .joinToString("|")
 
     private fun discoverNsd() {
         if (!running) return

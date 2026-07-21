@@ -11,6 +11,58 @@ internal object LanReachability {
             links.any { link -> sameSubnet(host, link.address, link.prefixLength) }
         }
 
+    /**
+     * NSD responses are received from a local multicast link. Android does not expose the
+     * tethering/SoftAP subnet through ConnectivityManager on many devices, so fall back to
+     * private addresses that came from the resolved NSD record itself when no known link
+     * matches. TXT-only addresses are never trusted by this fallback.
+     */
+    fun discoveryCandidates(
+        resolvedHosts: List<String>,
+        advertisedHosts: List<String>,
+        links: List<LanLink>,
+    ): List<String> {
+        val matched = hostsOnCurrentLan(advertisedHosts, links)
+        if (matched.isNotEmpty()) return matched
+        return resolvedHosts.distinct().filter(::isDirectLanAddress)
+    }
+
+    /** Keep a previously WHPC-verified LAN endpoint alive on SoftAP links hidden from Android. */
+    fun verifiedPeerCandidates(
+        hosts: List<String>,
+        links: List<LanLink>,
+        verifiedHost: String,
+    ): List<String> {
+        val matched = hostsOnCurrentLan(hosts, links)
+        if (matched.isNotEmpty()) return matched
+        return listOf(verifiedHost).filter(::isDirectLanAddress)
+    }
+
+    /** Excludes cellular and tunnel interfaces while retaining wlan/ap/ethernet variants. */
+    fun isLanInterfaceName(name: String): Boolean {
+        val normalized = name.trim().lowercase()
+        if (normalized.isEmpty()) return false
+        return listOf(
+            "lo", "tun", "tap", "ppp", "vpn", "wg", "tailscale",
+            "rmnet", "ccmni", "pdp", "wwan", "dummy", "clat",
+        ).none(normalized::startsWith)
+    }
+
+    fun isDirectLanAddress(raw: String): Boolean {
+        if (TailnetAddress.isTailnet(raw)) return false
+        val address = try {
+            InetAddress.getByName(raw.substringBefore('%'))
+        } catch (_: Exception) {
+            return false
+        }
+        if (address.isAnyLocalAddress || address.isLoopbackAddress ||
+            address.isMulticastAddress) return false
+        if (address.isLinkLocalAddress || address.isSiteLocalAddress) return true
+        val bytes = address.address
+        // java.net does not consistently classify IPv6 ULA (fc00::/7) as site-local.
+        return bytes.size == 16 && (bytes[0].toInt() and 0xfe) == 0xfc
+    }
+
     fun sameSubnet(peerAddress: String, localAddress: String, prefixLength: Int): Boolean {
         val peer = addressBytes(peerAddress) ?: return false
         val local = addressBytes(localAddress) ?: return false

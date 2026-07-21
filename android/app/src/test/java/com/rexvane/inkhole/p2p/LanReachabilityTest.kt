@@ -31,4 +31,44 @@ class LanReachabilityTest {
         assertTrue(LanReachability.sameSubnet("fe80::1234%wlan0", "fe80::5678%wlan0", 64))
         assertFalse(LanReachability.sameSubnet("fd00:1::2", "fd00:2::3", 64))
     }
+
+    @Test
+    fun hotspotDiscoveryFallsBackOnlyToResolvedPrivateAddresses() {
+        val resolved = listOf("10.237.115.39", "100.66.227.31", "127.0.0.1")
+        val advertised = resolved + "192.168.50.8"
+        val unrelatedUpstream = listOf(LanLink("192.168.8.5", 24))
+
+        assertEquals(
+            listOf("10.237.115.39"),
+            LanReachability.discoveryCandidates(resolved, advertised, unrelatedUpstream),
+        )
+        assertEquals(
+            listOf("10.237.115.39"),
+            LanReachability.verifiedPeerCandidates(
+                advertised, unrelatedUpstream, "10.237.115.39"),
+        )
+        assertFalse(LanReachability.isDirectLanAddress("8.8.8.8"))
+        assertFalse(LanReachability.isDirectLanAddress("224.0.0.251"))
+    }
+
+    @Test
+    fun normalWifiStillUsesStrictSubnetFiltering() {
+        val resolved = listOf("192.168.8.20", "192.168.9.20")
+        val links = listOf(LanLink("192.168.8.5", 24))
+
+        assertEquals(
+            listOf("192.168.8.20"),
+            LanReachability.discoveryCandidates(resolved, resolved, links),
+        )
+    }
+
+    @Test
+    fun interfaceFilterRetainsWifiAndSoftApButRejectsTunnelsAndCellular() {
+        assertTrue(LanReachability.isLanInterfaceName("wlan0"))
+        assertTrue(LanReachability.isLanInterfaceName("ap0"))
+        assertTrue(LanReachability.isLanInterfaceName("eth0"))
+        assertFalse(LanReachability.isLanInterfaceName("tun0"))
+        assertFalse(LanReachability.isLanInterfaceName("rmnet_data0"))
+        assertFalse(LanReachability.isLanInterfaceName("ppp0"))
+    }
 }
