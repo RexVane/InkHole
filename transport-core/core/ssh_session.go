@@ -23,8 +23,8 @@ import (
 const (
 	sshModePair                 = "IKP1"
 	sshModeData                 = "IKD1"
-	sshKeepaliveInterval        = 15 * time.Second
-	sshKeepaliveTimeout         = 10 * time.Second
+	sshKeepaliveInterval        = 30 * time.Second
+	sshKeepaliveTimeout         = 30 * time.Second
 	sshPeerReconnectWait        = 45 * time.Second
 	sshPeerRetryInterval        = 500 * time.Millisecond
 	sshMuxWriteTimeout          = 30 * time.Second
@@ -102,6 +102,10 @@ func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
 	target, targetToken, err := s.target()
 	if err != nil {
 		return nil, err
+	}
+	if params.NoisePrivate == "" && len(params.Peers) > 0 {
+		return nil, errors.New(
+			"saved SSH Noise identity is unavailable; remove paired devices and pair again")
 	}
 	var key noise.DHKey
 	generated := false
@@ -215,11 +219,11 @@ func (s *sshListenerSession) Close() error {
 		endpoints = append(endpoints, endpoint)
 	}
 	s.mu.Unlock()
-	if reverse != nil {
-		_ = reverse.Close()
-	}
 	if client != nil {
 		_ = client.Close()
+	}
+	if reverse != nil {
+		_ = reverse.Close()
 	}
 	s.notifyStateChanged()
 	for _, endpoint := range endpoints {
@@ -296,10 +300,10 @@ func (s *sshListenerSession) invalidateClient(expected sshSessionClient) bool {
 	s.client = nil
 	s.reverse = nil
 	s.mu.Unlock()
+	_ = expected.Close()
 	if reverse != nil {
 		_ = reverse.Close()
 	}
-	_ = expected.Close()
 	s.notifyStateChanged()
 	return true
 }

@@ -27,7 +27,7 @@ def available() -> bool:
         return False
 
 
-def get_with_status(name: str) -> tuple[bool, str]:
+def get_with_status(name: str, timeout_seconds: float | None = None) -> tuple[bool, str]:
     """Return (read_completed, value) without allowing a Keychain prompt to hang startup."""
     backend = _keyring()
     if backend is None:
@@ -42,7 +42,9 @@ def get_with_status(name: str) -> tuple[bool, str]:
 
     threading.Thread(target=worker, daemon=True).start()
     try:
-        return result.get(timeout=_GET_TIMEOUT_SECONDS)
+        timeout = (_GET_TIMEOUT_SECONDS if timeout_seconds is None
+                   else max(0.0, float(timeout_seconds)))
+        return result.get(timeout=timeout)
     except queue.Empty:
         return False, ""
 

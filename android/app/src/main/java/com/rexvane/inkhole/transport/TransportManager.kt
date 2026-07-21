@@ -312,6 +312,9 @@ object TransportManager {
                 val profileId = current.ssh.profile.id
                 val noisePrivate = SecureStore.get(
                     context, secretName(profileId, "noise_private")).orEmpty()
+                if (noisePrivate.isEmpty() && current.ssh.peers.isNotEmpty()) {
+                    throw TransportException("SSH 身份不可用，请删除旧设备并重新配对")
+                }
                 val result = request("ssh.listen", JSONObject().apply {
                     put("profile", sshProfilePayload(current.ssh.profile))
                     put("remote_port", current.ssh.remotePort)
@@ -326,7 +329,13 @@ object TransportManager {
                     return@Thread
                 }
                 result.optString("noise_private").takeIf { it.isNotEmpty() }?.let {
-                    SecureStore.put(context, secretName(profileId, "noise_private"), it)
+                    try {
+                        SecureStore.put(context, secretName(profileId, "noise_private"), it)
+                    } catch (error: Exception) {
+                        request("session.cancel", JSONObject().put(
+                            "session_id", result.optString("session_id")))
+                        throw TransportException("无法保存 SSH 身份，请重新启用中继", error)
+                    }
                 }
                 sshSessionId = result.getString("session_id")
                 val fresh = config()

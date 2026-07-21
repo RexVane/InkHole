@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -40,6 +41,25 @@ type fakeSSHSessionClient struct {
 	closed      chan struct{}
 	closeOnce   sync.Once
 	closes      atomic.Int32
+}
+
+type listenerBlockedUntilClientClose struct {
+	client *fakeSSHSessionClient
+	closed atomic.Bool
+}
+
+func (l *listenerBlockedUntilClientClose) Accept() (net.Conn, error) {
+	return nil, io.ErrClosedPipe
+}
+
+func (l *listenerBlockedUntilClientClose) Close() error {
+	<-l.client.closed
+	l.closed.Store(true)
+	return nil
+}
+
+func (l *listenerBlockedUntilClientClose) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
 }
 
 func (f *fakeSSHSessionClient) Close() error {
@@ -355,6 +375,36 @@ func TestSSHDataAuthorizationRequiresMatchingEncryptionMode(t *testing.T) {
 	}
 }
 
+func TestSSHListenRejectsMissingIdentityWithSavedPeers(t *testing.T) {
+	service := NewService()
+	defer service.Close()
+	start, _ := json.Marshal(StartParams{
+		LocalTarget: "127.0.0.1:1", LocalToken: "token",
+		DeviceName: "desktop", InstanceID: "desktop-id",
+	})
+	if _, err := service.handle("start", start); err != nil {
+		t.Fatal(err)
+	}
+	peerKey, err := generateNoiseKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	params, _ := json.Marshal(sshListenParams{
+		Profile: SSHProfile{
+			Host: "example.invalid", Port: 22, User: "user", PrivateKey: "invalid",
+			HostKeySHA256: "SHA256:test",
+		},
+		Peers: []SSHPeer{{
+			InstanceID: "phone-id", RemotePort: 23456,
+			NoisePublic: encodeNoisePublic(peerKey.Public),
+		}},
+	})
+	_, err = service.listenSSH(params)
+	if err == nil || !strings.Contains(err.Error(), "saved SSH Noise identity is unavailable") {
+		t.Fatalf("missing saved identity error = %v", err)
+	}
+}
+
 func TestSSHKeepaliveTimeoutInvalidatesBlackholedConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -388,6 +438,30 @@ func TestSSHKeepaliveTimeoutInvalidatesBlackholedConnection(t *testing.T) {
 	}
 	if session.waitForClient(nil, time.Millisecond) != nil {
 		t.Fatal("timed-out SSH client remained available")
+	}
+}
+
+func TestSSHInvalidationClosesClientBeforeReverseListener(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &fakeSSHSessionClient{closed: make(chan struct{})}
+	listener := &listenerBlockedUntilClientClose{client: client}
+	session := &sshListenerSession{
+		ctx: ctx, client: client, reverse: listener,
+		stateChanged: make(chan struct{}, 1),
+	}
+	done := make(chan struct{})
+	go func() {
+		session.invalidateClient(client)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client invalidation deadlocked while closing the reverse listener")
+	}
+	if client.closes.Load() != 1 || !listener.closed.Load() {
+		t.Fatal("SSH client and reverse listener were not both closed")
 	}
 }
 

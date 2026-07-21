@@ -184,3 +184,16 @@ def test_secret_store_read_times_out_without_overwriting(monkeypatch):
     monkeypatch.setattr(secret_store, "_GET_TIMEOUT_SECONDS", 0.01)
 
     assert secret_store.get_with_status("lan_identity_p256") == (False, "")
+
+
+def test_secret_store_allows_longer_background_read(monkeypatch):
+    class SlowBackend:
+        def get_password(self, _service, _name):
+            time.sleep(0.02)
+            return "stored-secret"
+
+    monkeypatch.setattr(secret_store, "_keyring", lambda: _KeyringModule(SlowBackend()))
+    monkeypatch.setattr(secret_store, "_GET_TIMEOUT_SECONDS", 0.001)
+
+    assert secret_store.get_with_status(
+        "ssh:test:noise_private", timeout_seconds=0.1) == (True, "stored-secret")

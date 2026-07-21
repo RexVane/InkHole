@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -26,55 +27,60 @@ func TestSSHRelayRealDataPath(t *testing.T) {
 		HostKeySHA256: hostKey,
 	}
 
-	targetA, tokenA := newEchoTarget(t)
-	targetB, tokenB := newEchoTarget(t)
-	serviceA := NewService()
-	defer serviceA.Close()
-	serviceB := NewService()
-	defer serviceB.Close()
-	startServiceForSSHTest(t, serviceA, "relay-a", targetA, tokenA)
-	startServiceForSSHTest(t, serviceB, "relay-b", targetB, tokenB)
+	for _, endToEnd := range []bool{false, true} {
+		endToEnd := endToEnd
+		t.Run(fmt.Sprintf("end_to_end_%t", endToEnd), func(t *testing.T) {
+			targetA, tokenA := newEchoTarget(t)
+			targetB, tokenB := newEchoTarget(t)
+			serviceA := NewService()
+			t.Cleanup(func() { _ = serviceA.Close() })
+			serviceB := NewService()
+			t.Cleanup(func() { _ = serviceB.Close() })
+			startServiceForSSHTest(t, serviceA, "relay-a", targetA, tokenA)
+			startServiceForSSHTest(t, serviceB, "relay-b", targetB, tokenB)
 
-	sessionA, privateA := startRealSSHSession(t, serviceA, profile)
-	sessionB, privateB := startRealSSHSession(t, serviceB, profile)
-	keyA, err := decodeNoiseKey(privateA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyB, err := decodeNoiseKey(privateB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	peerB, err := sessionA.addPeer(SSHPeer{
-		InstanceID: "relay-b", Name: "relay-b", RemotePort: sessionB.remotePort,
-		NoisePublic: encodeNoisePublic(keyB.Public), EndToEnd: false,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sessionB.addPeer(SSHPeer{
-		InstanceID: "relay-a", Name: "relay-a", RemotePort: sessionA.remotePort,
-		NoisePublic: encodeNoisePublic(keyA.Public), EndToEnd: false,
-	}); err != nil {
-		t.Fatal(err)
-	}
+			sessionA, privateA := startRealSSHSession(t, serviceA, profile)
+			sessionB, privateB := startRealSSHSession(t, serviceB, profile)
+			keyA, err := decodeNoiseKey(privateA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keyB, err := decodeNoiseKey(privateB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peerB, err := sessionA.addPeer(SSHPeer{
+				InstanceID: "relay-b", Name: "relay-b", RemotePort: sessionB.remotePort,
+				NoisePublic: encodeNoisePublic(keyB.Public), EndToEnd: endToEnd,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sessionB.addPeer(SSHPeer{
+				InstanceID: "relay-a", Name: "relay-a", RemotePort: sessionA.remotePort,
+				NoisePublic: encodeNoisePublic(keyA.Public), EndToEnd: endToEnd,
+			}); err != nil {
+				t.Fatal(err)
+			}
 
-	conn, err := net.DialTimeout("tcp", peerB.Endpoint, 10*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	payload := []byte("inkhole-ssh-data-path")
-	if _, err := conn.Write(append([]byte("IKAT"+peerB.EndpointToken), payload...)); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("echo payload = %q", got)
+			conn, err := net.DialTimeout("tcp", peerB.Endpoint, 10*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+			payload := []byte("inkhole-ssh-data-path")
+			if _, err := conn.Write(append([]byte("IKAT"+peerB.EndpointToken), payload...)); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(payload))
+			if _, err := io.ReadFull(conn, got); err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(payload) {
+				t.Fatalf("echo payload = %q", got)
+			}
+		})
 	}
 }
 

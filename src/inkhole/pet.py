@@ -1425,8 +1425,12 @@ def main(argv=None) -> None:
             try:
                 profile = self._ssh_profile_payload(ssh_config["profile"])
                 profile_id = ssh_config["profile"]["id"]
-                noise_private = secret_store.get(
-                    _ssh_secret_name(profile_id, "noise_private"))
+                noise_read_ok, noise_private = secret_store.get_with_status(
+                    _ssh_secret_name(profile_id, "noise_private"), timeout_seconds=30)
+                if not noise_read_ok:
+                    raise ValueError("系统安全存储暂时无法读取 SSH 身份，请稍后重试")
+                if not noise_private and ssh_config.get("peers"):
+                    raise ValueError("SSH 身份不可用，请删除旧设备并重新配对")
                 result = self._require_transport_core().call("ssh.listen", {
                     "profile": profile,
                     "remote_port": int(ssh_config.get("remote_port") or 0),
