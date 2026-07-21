@@ -1216,7 +1216,10 @@ def main(argv=None) -> None:
                         self._remember_ssh_peer(peer)
                 _save_config(self._lan_cfg,
                              cross_network=copy.deepcopy(self._cross_network))
-                self._route_status("SSH 中继已连接")
+                if data.get("connected", True):
+                    self._route_status("SSH 中继已连接")
+                else:
+                    self._route_status("SSH 中继暂时不可用，正在重连")
             elif name in {"ssh.config.error", "ssh.check.error", "ssh.pair.error"}:
                 self._route_status(str(data.get("error") or "SSH 操作失败"))
             elif name == "ssh.disconnected":

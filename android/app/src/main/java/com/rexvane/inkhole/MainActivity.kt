@@ -704,7 +704,11 @@ class MainActivity : ComponentActivity() {
                 sshPairCode.value = sshPairCode.value?.also { it.put("connected", true) }
                 Toast.makeText(this, "SSH 设备已配对", Toast.LENGTH_SHORT).show()
             }
-            "ssh.ready" -> statusMsg.value = "SSH 中继已连接"
+            "ssh.ready" -> statusMsg.value = if (data.optBoolean("connected", true)) {
+                "SSH 中继已连接"
+            } else {
+                "SSH 中继暂时不可用，正在重连"
+            }
             "ssh.disconnected" -> statusMsg.value = "SSH 中继已断开，正在重连"
             "ssh.connected" -> statusMsg.value = "SSH 中继已恢复"
             "ssh.data.error" -> statusMsg.value =

@@ -19,6 +19,9 @@ type Service struct {
 	instanceID  string
 	sessions    map[string]session
 	events      chan Event
+	// sshConnect is injectable for lifecycle tests; production uses the real
+	// SSH reverse-forward connector.
+	sshConnect sshReverseConnector
 }
 
 type session interface {
@@ -28,10 +31,11 @@ type session interface {
 func NewService() *Service {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
-		ctx:      ctx,
-		cancel:   cancel,
-		sessions: make(map[string]session),
-		events:   make(chan Event, 128),
+		ctx:        ctx,
+		cancel:     cancel,
+		sessions:   make(map[string]session),
+		events:     make(chan Event, 128),
+		sshConnect: connectSSHReverse,
 	}
 }
 

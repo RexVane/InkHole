@@ -2,7 +2,10 @@ package core
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net"
@@ -41,6 +44,19 @@ type fakeSSHSessionClient struct {
 	closed      chan struct{}
 	closeOnce   sync.Once
 	closes      atomic.Int32
+}
+
+func testSSHPrivateKey(t *testing.T) string {
+	t.Helper()
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := cryptossh.MarshalPrivateKey(private, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(block))
 }
 
 type listenerBlockedUntilClientClose struct {
@@ -402,6 +418,92 @@ func TestSSHListenRejectsMissingIdentityWithSavedPeers(t *testing.T) {
 	_, err = service.listenSSH(params)
 	if err == nil || !strings.Contains(err.Error(), "saved SSH Noise identity is unavailable") {
 		t.Fatalf("missing saved identity error = %v", err)
+	}
+}
+
+func TestSSHListenKeepsSavedPortDuringInitialOutage(t *testing.T) {
+	service := NewService()
+	defer service.Close()
+	start, _ := json.Marshal(StartParams{
+		LocalTarget: "127.0.0.1:1", LocalToken: "token",
+		DeviceName: "desktop", InstanceID: "desktop-id",
+	})
+	if _, err := service.handle("start", start); err != nil {
+		t.Fatal(err)
+	}
+	reconnected, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reconnected.Close() })
+	var attempts atomic.Int32
+	service.sshConnect = func(
+		context.Context, SSHProfile, int,
+	) (sshSessionClient, net.Listener, int, error) {
+		if attempts.Add(1) == 1 {
+			return nil, nil, 0, errors.New("relay temporarily offline")
+		}
+		return &fakeSSHSessionClient{closed: make(chan struct{})},
+			reconnected, 32577, nil
+	}
+	params, _ := json.Marshal(sshListenParams{
+		Profile: SSHProfile{
+			Host: "relay.example", Port: 22, User: "user", PrivateKey: testSSHPrivateKey(t),
+			HostKeySHA256: "SHA256:test",
+		},
+		RemotePort: 32577,
+	})
+	result, err := service.listenSSH(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := result.(map[string]any)
+	if values["remote_port"] != 32577 || values["connected"] != false {
+		t.Fatalf("unexpected offline result: %+v", values)
+	}
+	if service.getSession(values["session_id"].(string)) == nil {
+		t.Fatal("offline SSH session was not retained for reconnect")
+	}
+	select {
+	case event := <-service.Events():
+		if event.Event != "ssh.disconnected" {
+			t.Fatalf("unexpected event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("offline SSH session did not enter reconnect state")
+	}
+	select {
+	case event := <-service.Events():
+		if event.Event != "ssh.connected" {
+			t.Fatalf("unexpected recovery event: %+v", event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("offline SSH session did not reconnect")
+	}
+}
+
+func TestSSHListenWithoutSavedPortStillRequiresServer(t *testing.T) {
+	service := NewService()
+	defer service.Close()
+	start, _ := json.Marshal(StartParams{
+		LocalTarget: "127.0.0.1:1", LocalToken: "token",
+		DeviceName: "desktop", InstanceID: "desktop-id",
+	})
+	if _, err := service.handle("start", start); err != nil {
+		t.Fatal(err)
+	}
+	service.sshConnect = func(
+		context.Context, SSHProfile, int,
+	) (sshSessionClient, net.Listener, int, error) {
+		return nil, nil, 0, errors.New("relay temporarily offline")
+	}
+	params, _ := json.Marshal(sshListenParams{Profile: SSHProfile{
+		Host: "relay.example", Port: 22, User: "user", PrivateKey: testSSHPrivateKey(t),
+		HostKeySHA256: "SHA256:test",
+	}})
+	if _, err := service.listenSSH(params); err == nil ||
+		!strings.Contains(err.Error(), "temporarily offline") {
+		t.Fatalf("new relay startup error = %v", err)
 	}
 }
 

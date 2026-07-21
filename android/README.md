@@ -1,6 +1,6 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.5.8`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
+墨洞 Android 客户端（当前版本 `1.5.9`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
 
 ## 功能
 
@@ -64,7 +64,7 @@ cd android
 - Magic Wormhole AppID: `com.rexvane.inkhole/transport-v1`。
 - SSH 配对 AppID: `com.rexvane.inkhole/ssh-pair-v1`；数据通道使用 Noise IK 和 yamux。
 
-Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 的 42 项单元测试覆盖协议、加密原语、完成回执与提交日志恢复、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。正式标签由三端打包工作流调用该流程，只有 Windows、macOS 和 Android 全部成功才统一创建 Release。
+Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 的 45 项单元测试覆盖协议、加密原语、完成回执与提交日志恢复、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。正式标签由三端打包工作流调用该流程，只有 Windows、macOS 和 Android 全部成功才统一创建 Release。
 
 ## 权限
 

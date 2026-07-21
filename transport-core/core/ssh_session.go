@@ -38,6 +38,10 @@ type sshSessionClient interface {
 	SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error)
 }
 
+type sshReverseConnector func(
+	context.Context, SSHProfile, int,
+) (sshSessionClient, net.Listener, int, error)
+
 type sshListenParams struct {
 	Profile      SSHProfile `json:"profile"`
 	RemotePort   int        `json:"remote_port,omitempty"`
@@ -76,6 +80,7 @@ type sshListenerSession struct {
 	pairCode     string
 	pairExpiry   time.Time
 	stateChanged chan struct{}
+	connect      sshReverseConnector
 	wg           sync.WaitGroup
 }
 
@@ -107,6 +112,11 @@ func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
 		return nil, errors.New(
 			"saved SSH Noise identity is unavailable; remove paired devices and pair again")
 	}
+	if _, err := parseSSHSigner(params.Profile); err != nil {
+		// Invalid key material is a configuration error, not an outage that can
+		// recover by retrying the same saved reverse port.
+		return nil, err
+	}
 	var key noise.DHKey
 	generated := false
 	if params.NoisePrivate == "" {
@@ -118,9 +128,23 @@ func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, reverse, remotePort, err := connectSSHReverse(s.ctx, params.Profile, params.RemotePort)
-	if err != nil {
-		return nil, err
+	client, reverse, remotePort, connectErr := s.sshConnect(
+		s.ctx, params.Profile, params.RemotePort)
+	if connectErr != nil && params.RemotePort == 0 {
+		// A new relay needs the server to allocate a durable port before the
+		// session can be exposed to clients.
+		return nil, connectErr
+	}
+	if connectErr != nil {
+		// Existing installations already own a fixed reverse port. Keep the
+		// session and its local peer endpoints alive while the supervisor
+		// reconnects, so an outage during application startup self-heals.
+		client = nil
+		reverse = nil
+		remotePort = params.RemotePort
+	}
+	if remotePort == 0 {
+		return nil, errors.New("SSH reverse forwarding returned no port")
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	current := &sshListenerSession{
@@ -137,6 +161,7 @@ func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
 		peers:        make(map[string]SSHPeer),
 		endpoints:    make(map[string]*sshPeerEndpoint),
 		stateChanged: make(chan struct{}, 1),
+		connect:      s.sshConnect,
 	}
 	current.identity = sshIdentity{
 		Name:        s.deviceName,
@@ -161,6 +186,10 @@ func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
 		"remote_port":  remotePort,
 		"noise_public": current.identity.NoisePublic,
 		"peers":        peers,
+		"connected":    connectErr == nil,
+	}
+	if connectErr != nil {
+		result["error"] = errorString(connectErr)
 	}
 	if generated {
 		result["noise_private"] = encodeNoisePrivate(key)
@@ -257,7 +286,12 @@ func (s *sshListenerSession) run() {
 				return
 			case <-time.After(backoff):
 			}
-			newClient, newListener, _, reconnectErr := connectSSHReverse(s.ctx, s.profile, s.remotePort)
+			connector := s.connect
+			if connector == nil {
+				connector = connectSSHReverse
+			}
+			newClient, newListener, _, reconnectErr := connector(
+				s.ctx, s.profile, s.remotePort)
 			if reconnectErr != nil {
 				if backoff < 30*time.Second {
 					backoff *= 2

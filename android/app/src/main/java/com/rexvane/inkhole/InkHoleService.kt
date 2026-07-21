@@ -209,7 +209,11 @@ class InkHoleService : Service() {
 
     private val transportForwarder = TransportEventListener { event, data ->
         val message = when (event) {
-            "ssh.ready" -> "SSH 中继已连接"
+            "ssh.ready" -> if (data.optBoolean("connected", true)) {
+                "SSH 中继已连接"
+            } else {
+                "SSH 中继暂时不可用，正在重连"
+            }
             "ssh.disconnected" -> "SSH 中继已断开，正在重连"
             "ssh.connected" -> "SSH 中继已恢复"
             "ssh.data.error" ->
