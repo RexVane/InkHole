@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -567,7 +566,8 @@ class MainActivity : ComponentActivity() {
             setDesiredBarcodeFormats(ScanOptions.QR_CODE)
             setPrompt("将一次性短码二维码放入框内")
             setBeepEnabled(false)
-            setOrientationLocked(false)
+            setCaptureActivity(PortraitCaptureActivity::class.java)
+            setOrientationLocked(true)
         })
     }
 
@@ -1074,15 +1074,8 @@ class MainActivity : ComponentActivity() {
                 title = { Text("设置") },
                 text = {
                     Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 500.dp),
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
                     ) {
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .verticalScroll(rememberScrollState()),
-                        ) {
                         // 本机信息
                         val instanceId = prefs.getString("instance_id", "") ?: ""
                         val actualPort = InkHoleBus.node?.getActualPort() ?: 0
@@ -1538,7 +1531,6 @@ class MainActivity : ComponentActivity() {
                         if (settingsError.isNotEmpty()) {
                             Text(settingsError, fontSize = 11.sp,
                                 color = androidx.compose.ui.graphics.Color(0xFFF08A7C))
-                        }
                         }
                         HelpAndUpdateSection()
                     }
