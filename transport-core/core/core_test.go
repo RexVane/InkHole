@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	william "github.com/psanford/wormhole-william/wormhole"
+	cryptossh "golang.org/x/crypto/ssh"
 )
 
 type blockingSession struct {
@@ -30,6 +32,42 @@ type countingSession struct{ closes atomic.Int32 }
 func (c *countingSession) Close() error {
 	c.closes.Add(1)
 	return nil
+}
+
+type fakeSSHSessionClient struct {
+	dial        func(network, address string) (net.Conn, error)
+	sendRequest func() error
+	closed      chan struct{}
+	closeOnce   sync.Once
+	closes      atomic.Int32
+}
+
+func (f *fakeSSHSessionClient) Close() error {
+	f.closes.Add(1)
+	f.closeOnce.Do(func() {
+		if f.closed != nil {
+			close(f.closed)
+		}
+	})
+	return nil
+}
+
+func (f *fakeSSHSessionClient) Dial(network, address string) (net.Conn, error) {
+	if f.dial == nil {
+		return nil, io.ErrClosedPipe
+	}
+	return f.dial(network, address)
+}
+
+func (f *fakeSSHSessionClient) Listen(_, _ string) (net.Listener, error) {
+	return nil, io.ErrClosedPipe
+}
+
+func (f *fakeSSHSessionClient) SendRequest(_ string, _ bool, _ []byte) (bool, []byte, error) {
+	if f.sendRequest == nil {
+		return true, nil, nil
+	}
+	return true, nil, f.sendRequest()
 }
 
 func TestServiceProtocol(t *testing.T) {
@@ -283,6 +321,173 @@ func TestSSHPairingPAKE(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	case <-gotResponder:
+	}
+}
+
+func TestSSHDataAuthorizationRequiresMatchingEncryptionMode(t *testing.T) {
+	peerKey, err := generateNoiseKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &sshListenerSession{peers: map[string]SSHPeer{
+		"phone-id": {
+			InstanceID:  "phone-id",
+			NoisePublic: encodeNoisePublic(peerKey.Public),
+			EndToEnd:    true,
+		},
+	}}
+
+	if session.authorizeDataPeer(
+		dataHello{InstanceID: "phone-id", Encrypted: false}, peerKey.Public) {
+		t.Fatal("peer with a mismatched encryption mode was accepted")
+	}
+	if !session.authorizeDataPeer(
+		dataHello{InstanceID: "phone-id", Encrypted: true}, peerKey.Public) {
+		t.Fatal("peer with the expected identity and encryption mode was rejected")
+	}
+	otherKey, err := generateNoiseKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.authorizeDataPeer(
+		dataHello{InstanceID: "phone-id", Encrypted: false}, otherKey.Public) {
+		t.Fatal("peer with the wrong Noise identity was accepted")
+	}
+}
+
+func TestSSHKeepaliveTimeoutInvalidatesBlackholedConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	closed := make(chan struct{})
+	client := &fakeSSHSessionClient{
+		closed: closed,
+		sendRequest: func() error {
+			<-closed
+			return io.ErrClosedPipe
+		},
+	}
+	session := &sshListenerSession{
+		ctx:          ctx,
+		client:       client,
+		stateChanged: make(chan struct{}, 1),
+	}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		session.keepaliveWithTiming(client, done, time.Millisecond, 10*time.Millisecond)
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("blackholed keepalive did not time out")
+	}
+	if client.closes.Load() != 1 {
+		t.Fatalf("blackholed client close count = %d", client.closes.Load())
+	}
+	if session.waitForClient(nil, time.Millisecond) != nil {
+		t.Fatal("timed-out SSH client remained available")
+	}
+}
+
+func TestSSHDataDialWaitsForReplacementConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	badClosed := make(chan struct{})
+	bad := &fakeSSHSessionClient{
+		closed: badClosed,
+		dial: func(_, _ string) (net.Conn, error) {
+			return nil, io.EOF
+		},
+	}
+	remoteResult := make(chan net.Conn, 1)
+	good := &fakeSSHSessionClient{dial: func(_, _ string) (net.Conn, error) {
+		local, remote := net.Pipe()
+		remoteResult <- remote
+		return local, nil
+	}}
+	session := &sshListenerSession{
+		ctx:          ctx,
+		client:       bad,
+		stateChanged: make(chan struct{}, 1),
+	}
+	go func() {
+		<-badClosed
+		session.setConnection(good, nil)
+	}()
+
+	conn, err := session.dialPeer(SSHPeer{RemotePort: 23456})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	_ = (<-remoteResult).Close()
+	if bad.closes.Load() != 1 {
+		t.Fatalf("stale SSH client close count = %d", bad.closes.Load())
+	}
+}
+
+func TestSSHPeerOfflineDoesNotInvalidateHealthyRelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &fakeSSHSessionClient{dial: func(_, _ string) (net.Conn, error) {
+		return nil, &cryptossh.OpenChannelError{
+			Reason:  cryptossh.ConnectionFailed,
+			Message: "peer reverse port is offline",
+		}
+	}}
+	session := &sshListenerSession{
+		ctx:          ctx,
+		client:       client,
+		stateChanged: make(chan struct{}, 1),
+	}
+
+	_, err := session.dialPeerWithTiming(
+		SSHPeer{RemotePort: 23456}, 20*time.Millisecond, time.Millisecond)
+	var channelError *cryptossh.OpenChannelError
+	if !errors.As(err, &channelError) {
+		t.Fatalf("expected channel-open error, got %v", err)
+	}
+	if client.closes.Load() != 0 {
+		t.Fatal("healthy SSH relay was closed because the peer was offline")
+	}
+	if session.waitForClient(nil, time.Millisecond) != client {
+		t.Fatal("healthy SSH relay was removed")
+	}
+}
+
+func TestSSHPeerDialWaitsForReversePortToReturn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var attempts atomic.Int32
+	remoteResult := make(chan net.Conn, 1)
+	client := &fakeSSHSessionClient{dial: func(_, _ string) (net.Conn, error) {
+		if attempts.Add(1) < 3 {
+			return nil, &cryptossh.OpenChannelError{
+				Reason: cryptossh.ConnectionFailed, Message: "peer reverse port is offline",
+			}
+		}
+		local, remote := net.Pipe()
+		remoteResult <- remote
+		return local, nil
+	}}
+	session := &sshListenerSession{
+		ctx: ctx, client: client, stateChanged: make(chan struct{}, 1),
+	}
+
+	conn, err := session.dialPeerWithTiming(
+		SSHPeer{RemotePort: 23456}, time.Second, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	_ = (<-remoteResult).Close()
+	if attempts.Load() != 3 {
+		t.Fatalf("dial attempts = %d", attempts.Load())
+	}
+	if client.closes.Load() != 0 {
+		t.Fatal("healthy SSH relay was invalidated while waiting for the peer")
 	}
 }
 

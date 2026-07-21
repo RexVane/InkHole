@@ -21,9 +21,22 @@ import (
 )
 
 const (
-	sshModePair = "IKP1"
-	sshModeData = "IKD1"
+	sshModePair                 = "IKP1"
+	sshModeData                 = "IKD1"
+	sshKeepaliveInterval        = 15 * time.Second
+	sshKeepaliveTimeout         = 10 * time.Second
+	sshPeerReconnectWait        = 45 * time.Second
+	sshPeerRetryInterval        = 500 * time.Millisecond
+	sshMuxWriteTimeout          = 30 * time.Second
+	sshMuxStreamWindow   uint32 = 4 * 1024 * 1024
 )
+
+type sshSessionClient interface {
+	Close() error
+	Dial(network, address string) (net.Conn, error)
+	Listen(network, address string) (net.Listener, error)
+	SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error)
+}
 
 type sshListenParams struct {
 	Profile      SSHProfile `json:"profile"`
@@ -54,15 +67,16 @@ type sshListenerSession struct {
 	targetToken string
 	identity    sshIdentity
 
-	mu         sync.RWMutex
-	client     *ssh.Client
-	reverse    net.Listener
-	remotePort int
-	peers      map[string]SSHPeer
-	endpoints  map[string]*sshPeerEndpoint
-	pairCode   string
-	pairExpiry time.Time
-	wg         sync.WaitGroup
+	mu           sync.RWMutex
+	client       sshSessionClient
+	reverse      net.Listener
+	remotePort   int
+	peers        map[string]SSHPeer
+	endpoints    map[string]*sshPeerEndpoint
+	pairCode     string
+	pairExpiry   time.Time
+	stateChanged chan struct{}
+	wg           sync.WaitGroup
 }
 
 type sshPeerEndpoint struct {
@@ -106,18 +120,19 @@ func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	current := &sshListenerSession{
-		service:     s,
-		ctx:         ctx,
-		cancel:      cancel,
-		profile:     params.Profile,
-		key:         key,
-		target:      target,
-		targetToken: targetToken,
-		client:      client,
-		reverse:     reverse,
-		remotePort:  remotePort,
-		peers:       make(map[string]SSHPeer),
-		endpoints:   make(map[string]*sshPeerEndpoint),
+		service:      s,
+		ctx:          ctx,
+		cancel:       cancel,
+		profile:      params.Profile,
+		key:          key,
+		target:       target,
+		targetToken:  targetToken,
+		client:       client,
+		reverse:      reverse,
+		remotePort:   remotePort,
+		peers:        make(map[string]SSHPeer),
+		endpoints:    make(map[string]*sshPeerEndpoint),
+		stateChanged: make(chan struct{}, 1),
 	}
 	current.identity = sshIdentity{
 		Name:        s.deviceName,
@@ -149,7 +164,7 @@ func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
 	return result, nil
 }
 
-func connectSSHReverse(ctx context.Context, profile SSHProfile, requestedPort int) (*ssh.Client, net.Listener, int, error) {
+func connectSSHReverse(ctx context.Context, profile SSHProfile, requestedPort int) (sshSessionClient, net.Listener, int, error) {
 	if requestedPort < 0 || requestedPort > 65535 {
 		return nil, nil, 0, errors.New("SSH remote port is invalid")
 	}
@@ -191,17 +206,22 @@ func randomRemotePort() int {
 func (s *sshListenerSession) Close() error {
 	s.cancel()
 	s.mu.Lock()
-	if s.reverse != nil {
-		_ = s.reverse.Close()
-	}
-	if s.client != nil {
-		_ = s.client.Close()
-	}
+	reverse := s.reverse
+	client := s.client
+	s.reverse = nil
+	s.client = nil
 	endpoints := make([]*sshPeerEndpoint, 0, len(s.endpoints))
 	for _, endpoint := range s.endpoints {
 		endpoints = append(endpoints, endpoint)
 	}
 	s.mu.Unlock()
+	if reverse != nil {
+		_ = reverse.Close()
+	}
+	if client != nil {
+		_ = client.Close()
+	}
+	s.notifyStateChanged()
 	for _, endpoint := range endpoints {
 		_ = endpoint.Close()
 	}
@@ -225,13 +245,7 @@ func (s *sshListenerSession) run() {
 			return
 		}
 		s.service.emit("ssh.disconnected", map[string]any{"error": errorString(err)})
-		s.mu.Lock()
-		if s.client != nil {
-			_ = s.client.Close()
-		}
-		s.client = nil
-		s.reverse = nil
-		s.mu.Unlock()
+		s.invalidateClient(client)
 
 		for s.ctx.Err() == nil {
 			select {
@@ -246,10 +260,7 @@ func (s *sshListenerSession) run() {
 				}
 				continue
 			}
-			s.mu.Lock()
-			s.client = newClient
-			s.reverse = newListener
-			s.mu.Unlock()
+			s.setConnection(newClient, newListener)
 			s.service.emit("ssh.connected", map[string]any{"remote_port": s.remotePort})
 			backoff = time.Second
 			break
@@ -257,11 +268,71 @@ func (s *sshListenerSession) run() {
 	}
 }
 
-func (s *sshListenerSession) keepalive(client *ssh.Client, done <-chan struct{}) {
+func (s *sshListenerSession) notifyStateChanged() {
+	select {
+	case s.stateChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (s *sshListenerSession) setConnection(client sshSessionClient, listener net.Listener) {
+	s.mu.Lock()
+	s.client = client
+	s.reverse = listener
+	s.mu.Unlock()
+	s.notifyStateChanged()
+}
+
+func (s *sshListenerSession) invalidateClient(expected sshSessionClient) bool {
+	if expected == nil {
+		return false
+	}
+	s.mu.Lock()
+	if s.client != expected {
+		s.mu.Unlock()
+		return false
+	}
+	reverse := s.reverse
+	s.client = nil
+	s.reverse = nil
+	s.mu.Unlock()
+	if reverse != nil {
+		_ = reverse.Close()
+	}
+	_ = expected.Close()
+	s.notifyStateChanged()
+	return true
+}
+
+func (s *sshListenerSession) waitForClient(previous sshSessionClient, timeout time.Duration) sshSessionClient {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		s.mu.RLock()
+		client := s.client
+		s.mu.RUnlock()
+		if client != nil && (previous == nil || client != previous) {
+			return client
+		}
+		select {
+		case <-s.ctx.Done():
+			return nil
+		case <-timer.C:
+			return nil
+		case <-s.stateChanged:
+		}
+	}
+}
+
+func (s *sshListenerSession) keepalive(client sshSessionClient, done <-chan struct{}) {
+	s.keepaliveWithTiming(client, done, sshKeepaliveInterval, sshKeepaliveTimeout)
+}
+
+func (s *sshListenerSession) keepaliveWithTiming(client sshSessionClient, done <-chan struct{}, interval, timeout time.Duration) {
 	if client == nil {
 		return
 	}
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -270,8 +341,28 @@ func (s *sshListenerSession) keepalive(client *ssh.Client, done <-chan struct{})
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
-				_ = client.Close()
+			result := make(chan error, 1)
+			go func() {
+				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+				result <- err
+			}()
+			timer := time.NewTimer(timeout)
+			select {
+			case <-done:
+				timer.Stop()
+				return
+			case <-s.ctx.Done():
+				timer.Stop()
+				return
+			case err := <-result:
+				timer.Stop()
+				if err == nil {
+					continue
+				}
+				s.invalidateClient(client)
+				return
+			case <-timer.C:
+				s.invalidateClient(client)
 				return
 			}
 		}
@@ -308,20 +399,17 @@ func (s *sshListenerSession) handleIncoming(conn net.Conn) {
 	case sshModeData:
 		secure, peerStatic, payload, send, receive, err := noiseResponder(conn, s.key)
 		if err != nil {
+			s.emitInboundDataError("noise", "", err)
 			return
 		}
 		var hello dataHello
 		if err := json.Unmarshal(payload, &hello); err != nil {
+			s.emitInboundDataError("hello", "", err)
 			return
 		}
-		s.mu.RLock()
-		peer, ok := s.peers[hello.InstanceID]
-		s.mu.RUnlock()
-		if !ok || peer.EndToEnd != hello.Encrypted {
-			return
-		}
-		expected, err := decodeNoisePublic(peer.NoisePublic)
-		if err != nil || subtle.ConstantTimeCompare(expected, peerStatic) != 1 {
+		if !s.authorizeDataPeer(hello, peerStatic) {
+			s.emitInboundDataError("authorize", hello.InstanceID,
+				errors.New("saved peer identity or encryption mode does not match"))
 			return
 		}
 		clearDeadline()
@@ -330,7 +418,7 @@ func (s *sshListenerSession) handleIncoming(conn net.Conn) {
 }
 
 func (s *sshListenerSession) serveRemoteMux(conn net.Conn) {
-	mux, err := yamux.Server(conn, nil)
+	mux, err := yamux.Server(conn, sshMuxConfig())
 	if err != nil {
 		return
 	}
@@ -352,6 +440,17 @@ func (s *sshListenerSession) serveRemoteMux(conn net.Conn) {
 		}
 		go proxyConn(s.ctx, local, stream)
 	}
+}
+
+func (s *sshListenerSession) authorizeDataPeer(hello dataHello, peerStatic []byte) bool {
+	s.mu.RLock()
+	peer, ok := s.peers[hello.InstanceID]
+	s.mu.RUnlock()
+	if !ok || peer.EndToEnd != hello.Encrypted {
+		return false
+	}
+	expected, err := decodeNoisePublic(peer.NoisePublic)
+	return err == nil && subtle.ConstantTimeCompare(expected, peerStatic) == 1
 }
 
 func (s *sshListenerSession) addPeer(peer SSHPeer) (SSHPeer, error) {
@@ -420,6 +519,7 @@ func (e *sshPeerEndpoint) run() {
 			defer e.wg.Done()
 			remote, err := e.owner.openPeerStream(e.peer)
 			if err != nil {
+				e.owner.emitDataError(e.peer, "open", err)
 				_ = local.Close()
 				return
 			}
@@ -441,13 +541,7 @@ func (e *sshPeerEndpoint) Close() error {
 }
 
 func (s *sshListenerSession) openPeerStream(peer SSHPeer) (net.Conn, error) {
-	s.mu.RLock()
-	client := s.client
-	s.mu.RUnlock()
-	if client == nil {
-		return nil, errors.New("SSH relay is reconnecting")
-	}
-	raw, err := client.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(peer.RemotePort)))
+	raw, err := s.dialPeer(peer)
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +563,7 @@ func (s *sshListenerSession) openPeerStream(peer SSHPeer) (net.Conn, error) {
 		return fail(err)
 	}
 	clearDeadline()
-	mux, err := yamux.Client(secure, nil)
+	mux, err := yamux.Client(secure, sshMuxConfig())
 	if err != nil {
 		return fail(err)
 	}
@@ -479,6 +573,84 @@ func (s *sshListenerSession) openPeerStream(peer SSHPeer) (net.Conn, error) {
 		return nil, err
 	}
 	return &muxStreamConn{Conn: stream, mux: mux}, nil
+}
+
+func (s *sshListenerSession) dialPeer(peer SSHPeer) (net.Conn, error) {
+	return s.dialPeerWithTiming(peer, sshPeerReconnectWait, sshPeerRetryInterval)
+}
+
+func (s *sshListenerSession) dialPeerWithTiming(peer SSHPeer, timeout, retryInterval time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	client := s.waitForClient(nil, timeout)
+	if client == nil {
+		return nil, errors.New("SSH relay reconnect timed out")
+	}
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(peer.RemotePort))
+	var lastErr error
+	for time.Now().Before(deadline) {
+		raw, err := client.Dial("tcp", address)
+		if err == nil {
+			return raw, nil
+		}
+		lastErr = err
+		var channelError *ssh.OpenChannelError
+		if errors.As(err, &channelError) {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			wait := retryInterval
+			if wait > remaining {
+				wait = remaining
+			}
+			select {
+			case <-s.ctx.Done():
+				return nil, s.ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+		s.invalidateClient(client)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		client = s.waitForClient(client, remaining)
+		if client == nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("peer reverse port is offline")
+	}
+	return nil, fmt.Errorf("SSH relay data channel unavailable: %w", lastErr)
+}
+
+func (s *sshListenerSession) emitDataError(peer SSHPeer, stage string, err error) {
+	s.service.emit("ssh.data.error", map[string]any{
+		"peer_id":   peer.InstanceID,
+		"peer_name": peer.Name,
+		"stage":     stage,
+		"error":     errorString(err),
+	})
+}
+
+func (s *sshListenerSession) emitInboundDataError(stage, instanceID string, err error) {
+	peer := SSHPeer{InstanceID: instanceID}
+	s.mu.RLock()
+	if saved, ok := s.peers[instanceID]; ok {
+		peer = saved
+	}
+	s.mu.RUnlock()
+	s.emitDataError(peer, stage, err)
+}
+
+func sshMuxConfig() *yamux.Config {
+	config := yamux.DefaultConfig()
+	config.KeepAliveInterval = sshKeepaliveInterval
+	config.ConnectionWriteTimeout = sshMuxWriteTimeout
+	config.MaxStreamWindowSize = sshMuxStreamWindow
+	return config
 }
 
 type muxStreamConn struct {

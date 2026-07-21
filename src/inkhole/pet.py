@@ -1223,6 +1223,10 @@ def main(argv=None) -> None:
                 self._route_status("SSH 中继已断开，正在重连")
             elif name == "ssh.connected":
                 self._route_status("SSH 中继已恢复")
+            elif name == "ssh.data.error":
+                peer_name = str(data.get("peer_name") or "对端")
+                error = str(data.get("error") or "数据通道不可用")
+                self._route_status(f"{peer_name} 的 SSH 传输通道异常：{error}")
             elif name == "core.error":
                 self._route_status(str(data.get("error") or "跨网核心错误"))
 

@@ -212,6 +212,9 @@ class InkHoleService : Service() {
             "ssh.ready" -> "SSH 中继已连接"
             "ssh.disconnected" -> "SSH 中继已断开，正在重连"
             "ssh.connected" -> "SSH 中继已恢复"
+            "ssh.data.error" ->
+                "${data.optString("peer_name", "对端")} 的 SSH 传输通道异常：" +
+                    data.optString("error", "数据通道不可用")
             "ssh.config.error", "ssh.pair.error", "core.error" ->
                 data.optString("error", "跨网操作失败")
             "wormhole.error" -> "一次性短码失败: ${data.optString("error", "连接已结束")}"

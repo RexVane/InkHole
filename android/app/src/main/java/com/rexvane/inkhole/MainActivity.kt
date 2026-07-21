@@ -707,6 +707,9 @@ class MainActivity : ComponentActivity() {
             "ssh.ready" -> statusMsg.value = "SSH 中继已连接"
             "ssh.disconnected" -> statusMsg.value = "SSH 中继已断开，正在重连"
             "ssh.connected" -> statusMsg.value = "SSH 中继已恢复"
+            "ssh.data.error" -> statusMsg.value =
+                "${data.optString("peer_name", "对端")} 的 SSH 传输通道异常：" +
+                    data.optString("error", "数据通道不可用")
         }
     }
 
