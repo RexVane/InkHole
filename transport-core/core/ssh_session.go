@@ -417,27 +417,36 @@ func (s *sshListenerSession) handleIncoming(conn net.Conn) {
 			return
 		}
 		clearDeadline()
-		s.serveRemoteMux(finishNoiseResponder(secure, send, receive, hello.Encrypted))
+		s.serveRemoteMux(
+			finishNoiseResponder(secure, send, receive, hello.Encrypted),
+			hello.InstanceID,
+		)
 	}
 }
 
-func (s *sshListenerSession) serveRemoteMux(conn net.Conn) {
+func (s *sshListenerSession) serveRemoteMux(conn net.Conn, instanceID string) {
 	mux, err := yamux.Server(conn, sshMuxConfig())
 	if err != nil {
+		s.emitInboundDataError("mux", instanceID, err)
 		return
 	}
 	defer mux.Close()
 	for {
 		stream, err := mux.Accept()
 		if err != nil {
+			if s.ctx.Err() == nil && !errors.Is(err, yamux.ErrSessionShutdown) {
+				s.emitInboundDataError("stream", instanceID, err)
+			}
 			return
 		}
 		local, err := net.Dial("tcp", s.target)
 		if err != nil {
+			s.emitInboundDataError("local", instanceID, err)
 			_ = stream.Close()
 			continue
 		}
 		if _, err := local.Write([]byte("IKCI" + s.targetToken)); err != nil {
+			s.emitInboundDataError("ingress", instanceID, err)
 			_ = local.Close()
 			_ = stream.Close()
 			continue
@@ -651,7 +660,11 @@ func (s *sshListenerSession) emitInboundDataError(stage, instanceID string, err 
 
 func sshMuxConfig() *yamux.Config {
 	config := yamux.DefaultConfig()
-	config.KeepAliveInterval = sshKeepaliveInterval
+	// Each SSH data channel owns exactly one short-lived yamux session. WHPP
+	// already enforces an idle deadline, while yamux writes have their own
+	// timeout. A concurrent ping can otherwise sit behind a large file frame
+	// and tear down a healthy transfer with "keepalive timeout".
+	config.EnableKeepAlive = false
 	config.ConnectionWriteTimeout = sshMuxWriteTimeout
 	config.MaxStreamWindowSize = sshMuxStreamWindow
 	return config

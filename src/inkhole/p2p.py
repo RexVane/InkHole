@@ -1796,16 +1796,64 @@ class P2PNode:
             if zip_path:
                 shutil.rmtree(os.path.dirname(zip_path), ignore_errors=True)
 
-    def _connect_for_transfer(self, peer: PeerInfo) -> socket.socket:
+    def _connect_for_transfer(self, peer: PeerInfo,
+                              route_offset: int = 0) -> socket.socket:
+        routes = self._transfer_route_candidates(peer)
+        if len(routes) > 1:
+            offset = route_offset % len(routes)
+            routes = routes[offset:] + routes[:offset]
         last_error: OSError | None = None
-        hosts = sorted(peer.hosts or [peer.host],
-                       key=lambda host: 1 if _is_tailnet_ip(host) else 0)
-        for host in hosts:
-            try:
-                return _connect_peer_socket(peer, host, _CONNECT_TIMEOUT)
-            except OSError as exc:
-                last_error = exc
+        for route in routes:
+            hosts = sorted(route.hosts or [route.host],
+                           key=lambda host: 1 if _is_tailnet_ip(host) else 0)
+            for host in hosts:
+                try:
+                    sock = _connect_peer_socket(route, host, _CONNECT_TIMEOUT)
+                    if route is not peer:
+                        self._status(
+                            f"当前通道不可用，已切换至{self._route_label(route)}")
+                    return sock
+                except OSError as exc:
+                    last_error = exc
         raise last_error if last_error else OSError("无可用地址")
+
+    @staticmethod
+    def _route_label(peer: PeerInfo) -> str:
+        return {
+            "ssh": " SSH 中继",
+            "lan": "局域网",
+            "tailscale": " Tailscale",
+        }.get(peer.transport, "备用通道")
+
+    def _transfer_route_candidates(self, selected: PeerInfo) -> list[PeerInfo]:
+        """Return authenticated routes for the same physical device."""
+        if (not _valid_instance_id(selected.instance_id)
+                or selected.transport == "wormhole"):
+            return [selected]
+        with self._lock:
+            peers = list(self._peers.values())
+        pinned = self.cfg.trusted_peers.get(selected.instance_id, "")
+
+        def usable(candidate: PeerInfo) -> bool:
+            if candidate is selected:
+                return True
+            if candidate.instance_id != selected.instance_id:
+                return False
+            if candidate.transport == "ssh":
+                return bool(candidate.endpoint_token)
+            return (candidate.transport in {"lan", "tailscale"}
+                    and bool(pinned)
+                    and hmac.compare_digest(
+                        candidate.identity_fingerprint, pinned))
+
+        priority = {"ssh": 0, "lan": 1, "tailscale": 2}
+        alternatives = [candidate for candidate in peers if usable(candidate)]
+        alternatives.sort(key=lambda candidate: (
+            0 if candidate is selected else 1,
+            priority.get(candidate.transport, 9),
+            candidate.service_name,
+        ))
+        return alternatives or [selected]
 
     def _outgoing_transfer(self, peer: PeerInfo, local_path: str, kind: str,
                            name: str, plain_size: int, digest: str) -> tuple[str, str]:
@@ -1858,7 +1906,7 @@ class P2PNode:
                 raise _SendCancelled()
             sock = None
             try:
-                sock = self._connect_for_transfer(peer)
+                sock = self._connect_for_transfer(peer, attempt)
                 with self._send_state_lock:
                     self._active_send_sock = sock
                 sock.settimeout(_SEND_IO_TIMEOUT)

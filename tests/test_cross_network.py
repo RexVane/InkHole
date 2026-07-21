@@ -126,6 +126,39 @@ def test_external_endpoint_capability_token_is_sent_first():
     assert received == [b"IKATtokenpayload"]
 
 
+def test_transfer_falls_back_to_paired_ssh_route_for_same_device(
+        tmp_path, monkeypatch):
+    instance_id = "a" * 32
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), enable_mdns=False, peer_name="Mac"))
+    node._on_peer_added(
+        "Android", "100.64.0.2", 34505,
+        service_name="manual|100.64.0.2|34505",
+        instance_id=instance_id, manual=True, transport="tailscale")
+    node.upsert_external_peer(
+        instance_id, "Android", "127.0.0.1", 24000,
+        "ssh", "endpoint-token", instance_id)
+    direct = next(peer for peer in node.peers()
+                  if peer.transport == "tailscale")
+    calls = []
+    expected = object()
+
+    def connect(peer, _host, _timeout):
+        calls.append(peer.transport)
+        if peer.transport == "tailscale":
+            raise OSError("direct route unavailable")
+        return expected
+
+    monkeypatch.setattr("inkhole.p2p._connect_peer_socket", connect)
+
+    assert node._connect_for_transfer(direct) is expected
+    assert calls == ["tailscale", "ssh"]
+
+    calls.clear()
+    assert node._connect_for_transfer(direct, route_offset=1) is expected
+    assert calls == ["ssh"]
+
+
 def test_authenticated_core_ingress_can_deliver_whpp(tmp_path):
     token = "runtime-only-token"
     node = P2PNode(P2PConfig(

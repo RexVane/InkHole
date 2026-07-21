@@ -441,6 +441,16 @@ func TestSSHKeepaliveTimeoutInvalidatesBlackholedConnection(t *testing.T) {
 	}
 }
 
+func TestSSHTransferMuxDoesNotRunCompetingKeepalive(t *testing.T) {
+	config := sshMuxConfig()
+	if config.EnableKeepAlive {
+		t.Fatal("per-transfer yamux keepalive can interrupt an active file stream")
+	}
+	if config.ConnectionWriteTimeout != sshMuxWriteTimeout {
+		t.Fatalf("write timeout = %v", config.ConnectionWriteTimeout)
+	}
+}
+
 func TestSSHInvalidationClosesClientBeforeReverseListener(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -1669,6 +1669,7 @@ def main(argv=None) -> None:
 
         def _route_status(self, msg: str) -> None:
             """出错信息走 persistentHint(持续显示)，普通信息走 hint(2.2s 消失)。"""
+            print(f"[STATUS] {msg}", flush=True)
             self._last_status = msg
             if msg and ("失败" in msg or "无法" in msg or "未开启" in msg):
                 self.errorState.emit(msg)

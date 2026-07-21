@@ -58,6 +58,46 @@ data class Peer(
     val identityFingerprint: String = "",
 )
 
+internal fun transferRouteCandidates(
+    selected: Peer,
+    available: List<Peer>,
+    trustedFingerprints: Map<String, String>,
+): List<Peer> {
+    if (!selected.instanceId.matches(Regex("[0-9a-f]{32}")) ||
+        selected.transport == "wormhole") return listOf(selected)
+    val pinned = trustedFingerprints[selected.instanceId].orEmpty()
+    val priority = mapOf("ssh" to 0, "lan" to 1, "tailscale" to 2)
+    return available.asSequence()
+        .filter { candidate ->
+            candidate === selected ||
+                (candidate.instanceId == selected.instanceId && when (candidate.transport) {
+                    "ssh" -> candidate.endpointToken.isNotEmpty()
+                    "lan", "tailscale" -> pinned.isNotEmpty() &&
+                        candidate.identityFingerprint == pinned
+                    else -> false
+                })
+        }
+        .distinctBy { candidate ->
+            candidate.serviceName.ifEmpty {
+                "${candidate.transport}|${candidate.host}|${candidate.port}"
+            }
+        }
+        .sortedWith(compareBy<Peer>(
+            { if (it === selected) 0 else 1 },
+            { priority[it.transport] ?: 9 },
+            { it.serviceName },
+        ))
+        .toList()
+        .ifEmpty { listOf(selected) }
+}
+
+private fun transferRouteLabel(peer: Peer): String = when (peer.transport) {
+    "ssh" -> "SSH 中继"
+    "lan" -> "局域网"
+    "tailscale" -> "Tailscale"
+    else -> "备用通道"
+}
+
 private data class PeerProbeResult(
     val instanceId: String,
     val peerName: String,
@@ -1199,7 +1239,7 @@ class InkHoleNode(
                 if (cancellationRequested()) throw InterruptedIOException("发送已取消")
                 var socket: Socket? = null
                 try {
-                    socket = connectToPeer(peer)
+                    socket = connectToPeer(peer, attempt)
                     activeSendSocket.set(socket)
                     activeSockets.add(socket)
                     val output = BufferedOutputStream(socket.getOutputStream(), WHPP.BUFFER_SIZE)
@@ -1369,40 +1409,52 @@ class InkHoleNode(
         return if (off == 0) -1 else off
     }
 
-    private fun connectToPeer(peer: Peer): Socket {
+    private fun connectToPeer(peer: Peer, routeOffset: Int = 0): Socket {
         var lastError: Exception? = null
-        val targets = (listOf(peer.host) + peer.hosts)
-            .filter { it.isNotBlank() }
-            .distinct()
-            .flatMap(::resolveHostAddresses)
-            .let(TailnetAddress::order)
-        for (address in targets) {
-            if (!running) throw IOException("墨洞节点已停止")
-            val socket = socketForAddress(address)
-            if (socket == null) {
-                lastError = IOException("Tailscale 未连接，无法到达 $address")
-                continue
-            }
-            // 缓冲必须在 connect 前设置(窗口缩放在握手时协商),发送吞吐靠 sndbuf
-            try { socket.sendBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
-            try { socket.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
-            try {
-                socket.connect(java.net.InetSocketAddress(address, peer.port), 15_000)
-                if (!running) {
-                    socket.close()
-                    throw IOException("墨洞节点已停止")
+        val trusted = synchronized(trustedPeersLock) { LinkedHashMap(trustedPeers) }
+        val candidates = synchronized(peersLock) {
+            transferRouteCandidates(peer, peers.values.toList(), trusted)
+        }
+        val offset = if (candidates.size > 1) routeOffset % candidates.size else 0
+        val routes = candidates.drop(offset) + candidates.take(offset)
+        for (route in routes) {
+            val targets = (listOf(route.host) + route.hosts)
+                .filter { it.isNotBlank() }
+                .distinct()
+                .flatMap(::resolveHostAddresses)
+                .let(TailnetAddress::order)
+            for (address in targets) {
+                if (!running) throw IOException("墨洞节点已停止")
+                val socket = socketForAddress(address)
+                if (socket == null) {
+                    lastError = IOException("Tailscale 未连接，无法到达 $address")
+                    continue
                 }
-                if (peer.endpointToken.isNotEmpty()) {
-                    socket.getOutputStream().apply {
-                        write(AUTH_MAGIC)
-                        write(peer.endpointToken.toByteArray(Charsets.US_ASCII))
-                        flush()
+                // 缓冲必须在 connect 前设置(窗口缩放在握手时协商),发送吞吐靠 sndbuf
+                try { socket.sendBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
+                try { socket.receiveBufferSize = SOCKET_BUFFER } catch (_: Exception) {}
+                try {
+                    socket.connect(java.net.InetSocketAddress(address, route.port), 15_000)
+                    if (!running) {
+                        socket.close()
+                        throw IOException("墨洞节点已停止")
                     }
+                    if (route.endpointToken.isNotEmpty()) {
+                        socket.getOutputStream().apply {
+                            write(AUTH_MAGIC)
+                            write(route.endpointToken.toByteArray(Charsets.US_ASCII))
+                            flush()
+                        }
+                    }
+                    if (route !== peer) {
+                        listener.onStatus(
+                            "当前通道不可用，已切换至${transferRouteLabel(route)}")
+                    }
+                    return socket
+                } catch (e: Exception) {
+                    lastError = e
+                    try { socket.close() } catch (_: IOException) {}
                 }
-                return socket
-            } catch (e: Exception) {
-                lastError = e
-                try { socket.close() } catch (_: IOException) {}
             }
         }
         throw lastError ?: IOException("目标设备没有可用地址")
