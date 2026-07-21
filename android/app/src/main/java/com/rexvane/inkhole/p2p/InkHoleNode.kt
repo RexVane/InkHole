@@ -4,12 +4,15 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import java.io.*
 import java.net.InetAddress
+import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
@@ -101,6 +104,7 @@ class InkHoleNode(
 ) {
     companion object {
         private const val SERVICE_TYPE = "_inkhole._tcp."
+        private const val JMDNS_SERVICE_TYPE = "_inkhole._tcp.local."
         private const val DISK_MARGIN = 256L * 1024 * 1024   // 收完至少还要剩这么多
         private const val PROGRESS_INTERVAL_MS = 250L
         private const val HEADER_TIMEOUT_MS = 15_000
@@ -131,6 +135,8 @@ class InkHoleNode(
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var nsdManager: NsdManager? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var jmDnsDiscovery: JmDnsDiscovery? = null
     private var serverSocket: ServerSocket? = null
     private var tcpStartError: String? = null
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
@@ -176,6 +182,7 @@ class InkHoleNode(
     private val trustedPeers = loadTrustedPeers()
     // onServiceLost 误报兜底：正在 TCP 探活确认的 serviceName，避免并发重复探活
     private val probingLost = java.util.Collections.synchronizedSet(HashSet<String>())
+    private val pendingDiscoveryProbes = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var selectedPeer: String? = null   // 显示名
     @Volatile private var lastSelectedService: String? = null  // 智能保留：记住选中设备的 serviceName
     @Volatile private var running = false
@@ -241,6 +248,30 @@ class InkHoleNode(
         }
     }
 
+    private fun acquireMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        try {
+            val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE)
+                as? WifiManager ?: return
+            multicastLock = wifi.createMulticastLock("inkhole-mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (error: Exception) {
+            multicastLock = null
+            listener.onStatus("局域网组播初始化失败: ${error.message}")
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        try {
+            multicastLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+        } finally {
+            multicastLock = null
+        }
+    }
+
     // ---- 生命周期 ----
 
     fun start() {
@@ -260,6 +291,7 @@ class InkHoleNode(
             })
             return
         }
+        acquireMulticastLock()
         try {
             nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
         } catch (e: Exception) {
@@ -277,6 +309,17 @@ class InkHoleNode(
         } catch (e: Exception) {
             listener.onStatus("NSD 发现启动失败: ${e.message}")
         }
+        jmDnsDiscovery = JmDnsDiscovery(
+            JMDNS_SERVICE_TYPE,
+            onResolved = { record ->
+                handleResolvedRecord(
+                    record.name, record.port, record.addresses, record.attributes)
+            },
+            onLost = { serviceName ->
+                if (running) verifyLostThenRemove(serviceName)
+            },
+        )
+        scope.launch { restartJmDnsDiscovery() }
         // 手动设备不再启动即乐观入列:前台服务被厂商省电反复杀死重启,每次
         // 重启都会把早已关机的对端"复活"成假在线。改由探活循环首轮(立即执行)
         // 验证,连得上才显示——列表语义收紧为"当前真实在线的设备"。
@@ -314,13 +357,16 @@ class InkHoleNode(
         listener.onStatus("墨洞已开启 · $peerName")
     }
 
-    /** 重启 NSD 发现(手动刷新按钮/自愈循环用)。stop 是异步的,稍等再启。 */
+    /** 重启系统 NSD 与显式接口 mDNS 发现。stop 是异步的,稍等再启。 */
     fun restartDiscovery() {
-        val nsd = nsdManager ?: return
         if (!running || !discoveryRestartPending.compareAndSet(false, true)) return
-        try { discoveryListener?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
         scope.launch {
             try {
+                restartJmDnsDiscovery(force = true)
+                val nsd = nsdManager ?: return@launch
+                try {
+                    discoveryListener?.let { nsd.stopServiceDiscovery(it) }
+                } catch (_: Exception) {}
                 delay(400)
                 if (running) try {
                     discoverNsd()
@@ -541,6 +587,9 @@ class InkHoleNode(
             try { discoveryListener?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
             try { registrationListener?.let { nsd.unregisterService(it) } } catch (_: Exception) {}
         }
+        jmDnsDiscovery?.stop()
+        jmDnsDiscovery = null
+        releaseMulticastLock()
         try { serverSocket?.close() } catch (_: IOException) {}
         serverSocket = null
         activeSockets.forEach { socket ->
@@ -1759,13 +1808,29 @@ class InkHoleNode(
         } else {
             info.host?.hostAddress?.let { resolvedHosts.add(it) }
         }
+        val attrs = try {
+            info.attributes.mapValues { (_, value) -> value.toString(Charsets.UTF_8) }
+        } catch (_: Exception) {
+            emptyMap()
+        }
+        handleResolvedRecord(discoveryName, info.port, resolvedHosts.toList(), attrs)
+    }
+
+    private fun handleResolvedRecord(
+        discoveryName: String,
+        port: Int,
+        resolvedValues: List<String>,
+        attrs: Map<String, String>,
+    ) {
+        if (!running || port !in 1..65535) return
+        val resolvedHosts = LinkedHashSet<String>()
+        resolvedValues.map(String::trim).filter(String::isNotEmpty).let(resolvedHosts::addAll)
         val host = resolvedHosts.firstOrNull() ?: return
-        val attrs = try { info.attributes } catch (_: Exception) { emptyMap<String, ByteArray>() }
-        val txtInstanceId = attrs["instance_id"]?.toString(Charsets.UTF_8)?.lowercase()
+        val txtInstanceId = attrs["instance_id"]?.lowercase()
             ?.takeIf { it.matches(Regex("[0-9a-f]{32}")) } ?: return
-        if (attrs["whpc"]?.toString(Charsets.UTF_8) != WHPP.CAP_VERSION.toString()) return
+        if (attrs["whpc"] != WHPP.CAP_VERSION.toString()) return
         if (txtInstanceId == instanceId) return
-        val displayName = attrs["peer_name"]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+        val displayName = attrs["peer_name"]?.takeIf { it.isNotBlank() }
             ?: discoveryName
         // 兜底自我过滤：同名 + 地址是本机 IP，判定为自己的历史注册(旧 instanceId、
         // goodbye 丢包残留)，丢弃不显示。
@@ -1773,7 +1838,7 @@ class InkHoleNode(
         // 对端全部地址：TXT ips(桌面端宣告,多网卡/VPN 全覆盖) + API34 hostAddresses
         val hosts = LinkedHashSet<String>()
         hosts.addAll(resolvedHosts)
-        attrs["ips"]?.toString(Charsets.UTF_8)?.split(",")
+        attrs["ips"]?.split(",")
             ?.map { it.trim() }?.filter { it.isNotEmpty() }?.let { hosts.addAll(it) }
         val hostList = hosts.toList()
         // 发现与更新都先做 WHPC v3 身份验证。系统 mDNS 缓存(Android 13+ 常驻缓存,
@@ -1781,16 +1846,23 @@ class InkHoleNode(
         // 回灌陈旧记录——探活循环刚剔除的下线设备下一秒又被 resolve"复活",
         // 表现为对端明明关了却一直显示在线。可达性标准与探活循环一致:仅认
         // 当前 WiFi/以太网可达的地址,不给 Tailscale 等 VPN 路径兜底的机会。
+        if (!pendingDiscoveryProbes.add(discoveryName)) return
         scope.launch {
-            val candidates = LanReachability.discoveryCandidates(
-                resolvedHosts.toList(), hostList, currentLanLinks())
-            val result = try {
-                probePeer(candidates, info.port, LOST_PROBE_TIMEOUT_MS, txtInstanceId)
-            } catch (_: Exception) { return@launch }
-            if (running) addPeer(
-                discoveryName, displayName, result.connectedAddress, info.port,
-                hostList, result.instanceId, result.capabilities, manual = false,
-                publicKey = result.publicKey, identityFingerprint = result.fingerprint)
+            try {
+                val candidates = LanReachability.discoveryCandidates(
+                    resolvedHosts.toList(), hostList, currentLanLinks())
+                val result = try {
+                    probePeer(candidates, port, LOST_PROBE_TIMEOUT_MS, txtInstanceId)
+                } catch (_: Exception) {
+                    return@launch
+                }
+                if (running) addPeer(
+                    discoveryName, displayName, result.connectedAddress, port,
+                    hostList, result.instanceId, result.capabilities, manual = false,
+                    publicKey = result.publicKey, identityFingerprint = result.fingerprint)
+            } finally {
+                pendingDiscoveryProbes.remove(discoveryName)
+            }
         }
     }
 
@@ -1804,6 +1876,40 @@ class InkHoleNode(
             }
         } catch (_: Exception) {}
         return ips
+    }
+
+    private fun lanNetworkInterfaces(): List<NetworkInterface> = try {
+        val enumeration = NetworkInterface.getNetworkInterfaces()
+        val interfaces = if (enumeration == null) emptyList()
+            else java.util.Collections.list(enumeration)
+        interfaces.filter { networkInterface ->
+            try {
+                networkInterface.isUp && !networkInterface.isLoopback &&
+                    !networkInterface.isPointToPoint &&
+                    LanReachability.isLanInterfaceName(networkInterface.name.orEmpty())
+            } catch (_: Exception) {
+                false
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    private fun currentJmDnsBindAddresses(): List<InetAddress> = lanNetworkInterfaces()
+        .flatMap { networkInterface ->
+            java.util.Collections.list(networkInterface.inetAddresses)
+        }
+        .filterIsInstance<Inet4Address>()
+        .filter { address ->
+            val host = address.hostAddress.orEmpty()
+            !address.isAnyLocalAddress && !address.isLoopbackAddress &&
+                !address.isMulticastAddress && !TailnetAddress.isTailnet(host)
+        }
+        .distinctBy { it.hostAddress }
+
+    private fun restartJmDnsDiscovery(force: Boolean = false) {
+        if (!running) return
+        jmDnsDiscovery?.restart(currentJmDnsBindAddresses(), force)
     }
 
     /** 当前真正的局域网链路；排除蜂窝网络和 Tailscale 等 VPN transport。 */
@@ -1839,18 +1945,7 @@ class InkHoleNode(
         // 中；从 NetworkInterface 补齐 wlan1/ap0 等真实本地接口。点对点、蜂窝
         // 和隧道接口必须排除，避免把 VPN/代理地址重新当成局域网路径。
         val interfaceLinks = try {
-            val enumeration = NetworkInterface.getNetworkInterfaces()
-            val interfaces = if (enumeration == null) emptyList()
-                else java.util.Collections.list(enumeration)
-            interfaces.filter { networkInterface ->
-                try {
-                    networkInterface.isUp && !networkInterface.isLoopback &&
-                        !networkInterface.isPointToPoint && networkInterface.supportsMulticast() &&
-                        LanReachability.isLanInterfaceName(networkInterface.name.orEmpty())
-                } catch (_: Exception) {
-                    false
-                }
-            }.flatMap { networkInterface ->
+            lanNetworkInterfaces().flatMap { networkInterface ->
                 networkInterface.interfaceAddresses.mapNotNull { binding ->
                     val address = binding.address ?: return@mapNotNull null
                     val host = address.hostAddress ?: return@mapNotNull null
@@ -1873,7 +1968,7 @@ class InkHoleNode(
     private fun discoverNsd() {
         if (!running) return
         val nsd = nsdManager ?: return
-        discoveryListener = object : NsdManager.DiscoveryListener {
+        val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {}
             override fun onDiscoveryStopped(serviceType: String) {}
 
@@ -1897,7 +1992,24 @@ class InkHoleNode(
             }
             override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
         }
-        nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+        discoveryListener = listener
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            // Track every non-VPN network instead of only the current/default network. This is
+            // the Android-recommended overload for WiFi reconnects and local-only networks.
+            val request = NetworkRequest.Builder()
+                .clearCapabilities()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            nsd.discoverServices(
+                SERVICE_TYPE,
+                NsdManager.PROTOCOL_DNS_SD,
+                request,
+                context.mainExecutor,
+                listener,
+            )
+        } else {
+            nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+        }
     }
 }
 

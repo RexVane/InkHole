@@ -2482,8 +2482,11 @@ class P2PNode:
         strikes: dict[str, int] = {}   # service_name(或显示名) -> 连续失败轮数
         while self._running:
             with self._lock:
+                # SSH/短码回环端点由跨网核心维护；LAN 子网过滤会固定排除
+                # 127.0.0.1，若在这里探活会把正常的 SSH 配对设备误删。
                 targets = [(p.service_name or n, p, n)
-                           for n, p in self._peers.items()]
+                           for n, p in self._peers.items()
+                           if not (p.service_name or "").startswith("external|")]
             manual_by_key = {
                 self._manual_key(entry): entry
                 for entry in list(self.cfg.manual_peers or [])

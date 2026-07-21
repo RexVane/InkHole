@@ -85,6 +85,23 @@ def test_external_peer_lifecycle_and_validation(tmp_path):
             "ssh", "endpoint-token")
 
 
+def test_lan_probe_does_not_remove_transport_core_peers(tmp_path):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), enable_mdns=False, peer_name="Mac"))
+    node._probe_interval = 0.01
+    node._probe_strikes = 1
+    node.upsert_external_peer(
+        "android-id", "Android", "127.0.0.1", 23456,
+        "ssh", "endpoint-token", "a" * 32)
+
+    node.start()
+    try:
+        time.sleep(0.08)
+        assert [peer.name for peer in node.peers()] == ["Android"]
+    finally:
+        node.stop()
+
+
 def test_external_endpoint_capability_token_is_sent_first():
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))

@@ -11,8 +11,8 @@ android {
         applicationId = "com.rexvane.inkhole"
         minSdk = 24
         targetSdk = 34
-        versionCode = 56
-        versionName = "1.5.4"
+        versionCode = 57
+        versionName = "1.5.5"
     }
 
     // 固定发布签名:CI 从 secrets 解出 keystore 时启用,让每次构建的 APK
@@ -69,6 +69,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+    implementation("org.jmdns:jmdns:3.6.3")
     implementation("com.google.zxing:core:3.5.3")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
