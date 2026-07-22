@@ -363,7 +363,8 @@ def test_desktop_lan_subtitle_uses_instance_id_for_every_discovery_path():
 
     instance_id = "0123456789abcdef0123456789abcdef"
     for service_name in (
-            "Mac-01234567._inkhole._tcp.local.", f"hint|{instance_id}"):
+            "Mac-01234567._inkhole._tcp.local.", f"hint|{instance_id}",
+            "manual|192.168.1.2|41300"):
         peer = SimpleNamespace(
             transport="lan",
             service_name=service_name,
@@ -372,6 +373,15 @@ def test_desktop_lan_subtitle_uses_instance_id_for_every_discovery_path():
             port=41300,
         )
         assert _device_subline(peer) == "01234567"
+
+    tailscale_peer = SimpleNamespace(
+        transport="tailscale",
+        service_name="manual|100.64.0.2|34505",
+        instance_id=instance_id,
+        host="100.64.0.2",
+        port=34505,
+    )
+    assert _device_subline(tailscale_peer) == "100.64.0.2:34505"
 
 
 def test_send_button_uses_native_macos_picker_when_available(

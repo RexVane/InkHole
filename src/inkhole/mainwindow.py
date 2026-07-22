@@ -529,7 +529,7 @@ def _device_subline(peer) -> str:
         return "SSH 中继"
     if transport == "wormhole":
         return "一次性短码"
-    if peer.service_name.startswith("manual|"):
+    if transport == "tailscale":
         return f"{peer.host}:{peer.port}"
     return peer.instance_id[:8] if peer.instance_id else ""
 
