@@ -2010,6 +2010,11 @@ class MainWindow(QWidget):
             "本机监听端口（留空=自动，建议 1024-49151，如 41300）")
         self._sp_port.setValidator(QIntValidator(1, 65535, self._sp_port))
         device_lay.addWidget(self._sp_port)
+        port_hint = QLabel(
+            "局域网传输无需设置，保持自动即可；仅 Tailscale 直连时需要固定端口")
+        port_hint.setWordWrap(True)
+        port_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
+        device_lay.addWidget(port_hint)
         left_col.addWidget(device_group)
 
         # ---- 2. 存储与分类 ----

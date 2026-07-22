@@ -434,6 +434,9 @@ def test_settings_page_opens_and_populates(app):
         for field in window._inbox_category_fields.values()
     )
     assert window._sp_port.labelText() == "本机监听端口（留空=自动，建议 1024-49151，如 41300）"
+    assert "局域网传输无需设置，保持自动即可；仅 Tailscale 直连时需要固定端口" in {
+        label.text() for label in window.findChildren(QLabel)
+    }
     assert window._manual_host.labelText() == "Tailscale IP 或 MagicDNS 名称"
     assert window._local_info_lbl.text().startswith("本机：SMOKE-")
     assert window._version_info_lbl.text() == "版本：v0.0.0"

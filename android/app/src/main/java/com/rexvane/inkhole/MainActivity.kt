@@ -1127,6 +1127,11 @@ class MainActivity : ComponentActivity() {
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        Text(
+                            "局域网传输无需设置，保持自动即可；仅 Tailscale 直连时需要固定端口",
+                            fontSize = 11.sp,
+                            color = androidx.compose.ui.graphics.Color.Gray,
+                        )
 
                         Spacer(Modifier.height(14.dp))
                         Text("存储", fontSize = 14.sp,
