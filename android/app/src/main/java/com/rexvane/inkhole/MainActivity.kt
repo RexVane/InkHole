@@ -1116,6 +1116,17 @@ class MainActivity : ComponentActivity() {
                             label = { Text("设备名称") },
                             singleLine = true,
                         )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = portInput,
+                            onValueChange = {
+                                portInput = it.filter(Char::isDigit).take(5)
+                                settingsError = ""
+                            },
+                            label = { Text("本机监听端口（留空=自动）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
 
                         Spacer(Modifier.height(14.dp))
                         Text("存储", fontSize = 14.sp,
@@ -1177,17 +1188,6 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(8.dp))
                         when (networkTab) {
                             0 -> {
-                                OutlinedTextField(
-                                    value = portInput,
-                                    onValueChange = {
-                                        portInput = it.filter(Char::isDigit).take(5)
-                                        settingsError = ""
-                                    },
-                                    label = { Text("本机监听端口（留空=自动）") },
-                                    singleLine = true,
-                                    modifier = Modifier.fillMaxWidth(),
-                                )
-                                Spacer(Modifier.height(7.dp))
                                 OutlinedTextField(
                                     value = manualName,
                                     onValueChange = { manualName = it.take(60) },

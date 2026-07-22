@@ -2006,6 +2006,10 @@ class MainWindow(QWidget):
                 f"本机：{name or cfg.peer_name}-{cfg.instance_id[:8]}")
         )
         device_lay.addWidget(self._ed_name)
+        self._sp_port = OutlinedLineEdit(
+            "本机监听端口（留空=自动，建议 1024-49151，如 41300）")
+        self._sp_port.setValidator(QIntValidator(1, 65535, self._sp_port))
+        device_lay.addWidget(self._sp_port)
         left_col.addWidget(device_group)
 
         # ---- 2. 存储与分类 ----
@@ -2126,14 +2130,10 @@ class MainWindow(QWidget):
         network_group, network_lay = _settings_group("跨网络配置")
         network_lay.addWidget(_section_label("Tailscale"))
         network_hint = QLabel(
-            "跨网直连时固定本机监听端口（建议 1024-49151，避开系统随机占用的 49152+ 动态区），"
-            "并填写对方 Tailscale IP 或 MagicDNS 名称与监听端口；保存设置后自动生效")
+            "填写对方 Tailscale IP 或 MagicDNS 名称与监听端口；保存设置后自动生效")
         network_hint.setWordWrap(True)
         network_hint.setStyleSheet(f"color:{_TEXT_DIM}; font-size:10.5px;")
         network_lay.addWidget(network_hint)
-        self._sp_port = OutlinedLineEdit("本机监听端口（留空=自动，建议 1024-49151，如 41300）")
-        self._sp_port.setValidator(QIntValidator(1, 65535, self._sp_port))
-        network_lay.addWidget(self._sp_port)
 
         manual_row = QWidget()
         manual_lay = QHBoxLayout(manual_row)
