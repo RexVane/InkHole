@@ -792,6 +792,17 @@ class InkHoleNode(
                     output, instanceId, advertisedPeerName, nonce, deviceIdentity)
                 return
             }
+            if (magic.contentEquals(LanHintProtocol.MAGIC)) {
+                val frame = ByteArray(LanHintProtocol.FRAME_SIZE - magic.size)
+                    .also(din::readFully)
+                LanHintProtocol.decode(magic + frame)?.let { hint ->
+                    val source = conn.inetAddress?.hostAddress?.substringBefore('%')
+                    if (!source.isNullOrBlank()) {
+                        handleLanHint(source, hint.instanceId, hint.port)
+                    }
+                }
+                return
+            }
             if (!magic.contentEquals(WHPP.MAGIC)) return
             val header = WHPP.readHeaderAfterMagic(input)
             conn.soTimeout = RECV_IDLE_TIMEOUT_MS
@@ -1973,6 +1984,45 @@ class InkHoleNode(
                     result.peerName,
                     result.connectedAddress,
                     announcement.port,
+                    listOf(result.connectedAddress),
+                    result.instanceId,
+                    result.capabilities,
+                    manual = false,
+                    publicKey = result.publicKey,
+                    identityFingerprint = result.fingerprint,
+                )
+            } finally {
+                pendingDiscoveryProbes.remove(pendingKey)
+            }
+        }
+    }
+
+    /** A peer that can already reach Android may still be invisible in the reverse
+     * direction when a phone hotspot blocks multicast and broadcast forwarding.
+     * Treat the hint only as an address candidate: the signed WHPC probe below must
+     * succeed with the claimed instance ID before the peer reaches the UI. */
+    private fun handleLanHint(host: String, hintedInstanceId: String, port: Int) {
+        if (!running || hintedInstanceId == instanceId ||
+            !LanReachability.isDirectLanAddress(host)) return
+        val pendingKey = "hint|$hintedInstanceId|$host|$port"
+        if (!pendingDiscoveryProbes.add(pendingKey)) return
+        scope.launch {
+            try {
+                val result = try {
+                    probePeer(
+                        listOf(host),
+                        port,
+                        LOST_PROBE_TIMEOUT_MS,
+                        hintedInstanceId,
+                    )
+                } catch (_: Exception) {
+                    return@launch
+                }
+                if (running) addPeer(
+                    "hint|${result.instanceId}",
+                    result.peerName,
+                    result.connectedAddress,
+                    port,
                     listOf(result.connectedAddress),
                     result.instanceId,
                     result.capabilities,

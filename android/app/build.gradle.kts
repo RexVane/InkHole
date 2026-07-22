@@ -11,8 +11,8 @@ android {
         applicationId = "com.rexvane.inkhole"
         minSdk = 24
         targetSdk = 34
-        versionCode = 63
-        versionName = "1.6.1"
+        versionCode = 64
+        versionName = "1.6.2"
     }
 
     // 固定发布签名:CI 从 secrets 解出 keystore 时启用,让每次构建的 APK

@@ -1,9 +1,9 @@
 # 墨洞文件传输（InkHole）
 
-版本：`1.6.1`
+版本：`1.6.2`
 
 墨洞是 Windows、macOS 和 Android 之间的文件互传工具。局域网内使用
-mDNS 自动发现和 TCP 直连，手机热点下使用 UDP 发现兜底；跨网络保留 Tailscale，并提供 Magic Wormhole
+mDNS 自动发现和 TCP 直连，手机热点下使用 UDP 与已验证 TCP 反向提示兜底；跨网络保留 Tailscale，并提供 Magic Wormhole
 一次性短码和自有 SSH VPS 长期中继。应用没有墨洞云盘，文件不会先上传到
 墨洞服务器。
 

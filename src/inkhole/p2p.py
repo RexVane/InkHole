@@ -51,6 +51,8 @@ from .device_identity import (DeviceIdentity, capability_message,
 _SERVICE_TYPE = "_inkhole._tcp.local."
 _MAGIC = b"WHPP"          # InkHole P2P Protocol magic
 _CAP_MAGIC = b"WHPC"      # capability probe; kept separate from file frames
+_LAN_HINT_MAGIC = b"IKLD"  # reverse LAN discovery over an already reachable peer
+_LAN_HINT_VERSION = 1
 _CORE_MAGIC = b"IKCI"     # authenticated loopback ingress from transport core
 _CAP_VERSION = 3
 _PROTOCOL_VERSION = 3
@@ -239,6 +241,29 @@ def _decode_lan_announcement(payload: bytes) -> tuple[str, int, bool] | None:
             or not 1 <= port <= 65535 or not isinstance(reply, bool)):
         return None
     return instance_id, port, reply
+
+
+def _encode_lan_hint(instance_id: str, port: int) -> bytes:
+    """Encode a reverse-discovery hint; WHPC still authenticates the peer."""
+    if not _valid_instance_id(instance_id) or not 1 <= int(port) <= 65535:
+        raise ValueError("invalid LAN hint")
+    return (_LAN_HINT_MAGIC + bytes([_LAN_HINT_VERSION]) +
+            str(instance_id).lower().encode("ascii") + struct.pack("!H", int(port)))
+
+
+def _decode_lan_hint(payload: bytes) -> tuple[str, int] | None:
+    if len(payload) != 39 or payload[:4] != _LAN_HINT_MAGIC:
+        return None
+    if payload[4] != _LAN_HINT_VERSION:
+        return None
+    try:
+        instance_id = payload[5:37].decode("ascii").lower()
+        port = struct.unpack("!H", payload[37:39])[0]
+    except (UnicodeDecodeError, struct.error):
+        return None
+    if not _valid_instance_id(instance_id) or not 1 <= port <= 65535:
+        return None
+    return instance_id, port
 
 
 def _lan_broadcast_targets(
@@ -1355,7 +1380,24 @@ class P2PNode:
             if now >= next_announcement:
                 packet = _encode_lan_announcement(
                     self._instance_id, self._actual_port)
-                for target in _lan_broadcast_targets(self._local_lan_networks()):
+                targets = _lan_broadcast_targets(self._local_lan_networks())
+                # 热点常允许客户端 -> 手机的 mDNS/UDP，却阻止手机向客户端
+                # 转发广播。Mac 已经通过 mDNS/Android NSD 解析到手机时，
+                # 对该已验证 LAN 地址单播一份提示，打通反向发现方向。
+                with self._lock:
+                    known_hosts = [
+                        host
+                        for peer in self._peers.values()
+                        if not peer.manual
+                        for host in ([peer.host] + list(peer.hosts or []))
+                    ]
+                for host in _resolved_addresses(known_hosts):
+                    parsed = _plain_ip(host)
+                    if (isinstance(parsed, ipaddress.IPv4Address)
+                            and host not in targets
+                            and not _is_tailnet_ip(host)):
+                        targets.append(host)
+                for target in targets:
                     try:
                         sock.sendto(packet, (target, _LAN_DISCOVERY_PORT))
                     except OSError:
@@ -1511,6 +1553,11 @@ class P2PNode:
                     separators=(",", ":"),
                 ).encode("utf-8")
                 conn.sendall(_CAP_MAGIC + struct.pack("!I", len(body)) + body)
+                return
+            if magic == _LAN_HINT_MAGIC:
+                hint = _decode_lan_hint(magic + (_recv_exact(conn, 35) or b""))
+                if hint is not None:
+                    self._handle_lan_hint(str(addr[0]).split("%", 1)[0], *hint)
                 return
             if magic != _MAGIC:
                 return
@@ -2629,6 +2676,22 @@ class P2PNode:
             raise tailnet_error
         raise last_error if last_error else OSError("目标设备没有可用地址")
 
+    def _send_lan_hint(self, host: str, port: int) -> None:
+        """Tell a verified peer how to probe this node on asymmetric hotspots."""
+        try:
+            with socket.create_connection((host, port), self._probe_timeout) as sock:
+                sock.settimeout(self._probe_timeout)
+                sock.sendall(_encode_lan_hint(self._instance_id, self._actual_port))
+        except OSError:
+            pass
+
+    def _handle_lan_hint(self, host: str, instance_id: str, port: int) -> None:
+        """Authenticate a TCP hint by probing its connection source over WHPC."""
+        if not self._running or instance_id == self._instance_id:
+            return
+        self._verify_discovered_peer(
+            "", [host], port, f"hint|{instance_id}", instance_id)
+
     def _verify_discovered_peer(self, name: str, hosts: list[str], port: int,
                                 service_name: str, instance_id: str) -> None:
         """Verify mDNS metadata over WHPC before exposing a peer to the UI."""
@@ -2655,10 +2718,12 @@ class P2PNode:
                     if result.connected_address not in addresses:
                         addresses.insert(0, result.connected_address)
                     self._on_peer_added(
-                        name, result.connected_address, port, service_name,
+                        name or result.peer_name, result.connected_address, port, service_name,
                         addresses, result.instance_id, result.capabilities, False,
                         public_key=result.public_key,
                         identity_fingerprint=result.fingerprint)
+                    if not service_name.startswith("hint|"):
+                        self._send_lan_hint(result.connected_address, port)
             except OSError:
                 pass
             finally:

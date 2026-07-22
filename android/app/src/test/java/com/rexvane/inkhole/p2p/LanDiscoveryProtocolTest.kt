@@ -31,4 +31,14 @@ class LanDiscoveryProtocolTest {
                 listOf(LanLink("10.237.115.7", 24), LanLink("192.168.7.9", 29))),
         )
     }
+
+    @Test
+    fun reverseLanHintMatchesDesktopFrame() {
+        val id = "0123456789abcdef0123456789abcdef"
+        val frame = LanHintProtocol.encode(id, 41300)
+        assertEquals(39, frame.size)
+        assertEquals(LanHint(id, 41300), LanHintProtocol.decode(frame))
+        frame[4] = 2
+        assertNull(LanHintProtocol.decode(frame))
+    }
 }

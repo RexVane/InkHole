@@ -11,12 +11,46 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketException
+import java.nio.ByteBuffer
 
 internal data class LanAnnouncement(
     val instanceId: String,
     val port: Int,
     val isReply: Boolean = false,
 )
+
+internal data class LanHint(val instanceId: String, val port: Int)
+
+/** Fixed-size TCP hint used only to request a signed WHPC callback probe. */
+internal object LanHintProtocol {
+    val MAGIC = "IKLD".toByteArray(Charsets.US_ASCII)
+    const val VERSION = 1
+    const val FRAME_SIZE = 39
+
+    fun encode(instanceId: String, port: Int): ByteArray {
+        require(instanceId.matches(Regex("[0-9a-fA-F]{32}")) && port in 1..65535)
+        return ByteBuffer.allocate(FRAME_SIZE).apply {
+            put(MAGIC)
+            put(VERSION.toByte())
+            put(instanceId.lowercase().toByteArray(Charsets.US_ASCII))
+            putShort(port.toShort())
+        }.array()
+    }
+
+    fun decode(frame: ByteArray): LanHint? {
+        if (frame.size != FRAME_SIZE || !frame.copyOfRange(0, 4).contentEquals(MAGIC)) {
+            return null
+        }
+        val buffer = ByteBuffer.wrap(frame)
+        buffer.position(4)
+        if ((buffer.get().toInt() and 0xff) != VERSION) return null
+        val instanceId = ByteArray(32).also { buffer.get(it) }
+            .toString(Charsets.US_ASCII).lowercase()
+        val port = buffer.short.toInt() and 0xffff
+        if (!instanceId.matches(Regex("[0-9a-f]{32}")) || port !in 1..65535) return null
+        return LanHint(instanceId, port)
+    }
+}
 
 /** Small address hint for Android hotspots that do not expose mDNS to tethered clients. */
 internal object LanDiscoveryProtocol {
