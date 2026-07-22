@@ -392,8 +392,7 @@ def _connect_peer_socket(peer: "PeerInfo", host: str, timeout: float) -> socket.
 
 
 def _probe_peer(host: str, port: int, timeout: float,
-                expected_instance_id: str = "",
-                expected_fingerprint: str = "") -> _ProbeResult:
+                expected_instance_id: str = "") -> _ProbeResult:
     sock = _connect_transfer_socket(host, port, timeout)
     try:
         sock.settimeout(timeout)
@@ -436,9 +435,6 @@ def _probe_peer(host: str, port: int, timeout: float,
             raise _IdentityMismatch("设备身份签名无效")
         if expected_instance_id and instance_id != expected_instance_id.lower():
             raise _IdentityMismatch("设备身份已变化，请删除后重新添加")
-        if (expected_fingerprint
-                and fingerprint != expected_fingerprint.lower()):
-            raise _IdentityMismatch("设备密钥已变化，请撤销信任后重新配对")
         connected = str(sock.getpeername()[0]).split("%", 1)[0]
         return _ProbeResult(instance_id, peer_name, frozenset(caps), connected,
                             public_key, fingerprint)
@@ -460,10 +456,9 @@ class P2PConfig:
     peer_name: str = ""            # 本机显示名；空则用 hostname
     secret: str = ""               # 保存的端到端加密口令(实际是否使用由 encryption_enabled 决定)
     enable_mdns: bool = True       # False = 只起 TCP 不碰 mDNS(测试用，手动注册对端)
-    trusted_only: bool = False     # True = 只接受当前选中目标设备的连接，其余拒收
     instance_id: str = ""          # 32 位本机唯一实例 ID；服务名只使用 8 位短后缀
     # 手动添加的设备(Tailscale/固定 IP 直连用)：mDNS 组播不穿虚拟网卡,
-    # 这些设备靠探测线程维持在线状态。可选 instance_id 为首次信任绑定。
+    # 这些设备靠探测线程维持在线状态。可选 instance_id 用于端点身份绑定。
     manual_peers: list = field(default_factory=list)
     # None = 按旧配置兼容:有口令即启用;显式 False 可保留口令但暂时停用加密
     encryption_enabled: bool | None = None
@@ -473,8 +468,6 @@ class P2PConfig:
     # Production callers load this PKCS#8 key from the OS credential store.
     # Empty values generate an in-memory identity for tests and headless use.
     identity_private_key: str = ""
-    # Public fingerprints are not secrets. They persist explicit device trust.
-    trusted_peers: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.peer_name:
@@ -491,12 +484,6 @@ class P2PConfig:
         self.inbox_category_dirs = {
             category: str(raw_category_dirs.get(category) or "").strip()
             for category in _INBOX_CATEGORIES
-        }
-        self.trusted_peers = {
-            str(instance).lower(): str(fingerprint).lower()
-            for instance, fingerprint in dict(self.trusted_peers or {}).items()
-            if (_valid_instance_id(instance)
-                and _valid_sha256(str(fingerprint).lower()))
         }
 
     @property
@@ -1084,8 +1071,7 @@ class P2PNode:
                  on_peers_changed: Callable[[], None] | None = None,
                  on_progress: Callable[[str, str, int, int], None] | None = None,
                  on_transfer_end: Callable[[str, str, bool], None] | None = None,
-                 on_manual_peer_verified: Callable[[], None] | None = None,
-                 on_trust_changed: Callable[[], None] | None = None):
+                 on_manual_peer_verified: Callable[[], None] | None = None):
         self.cfg = cfg
         self.on_sent = on_sent
         self.on_received = on_received
@@ -1094,7 +1080,6 @@ class P2PNode:
         self.on_progress = on_progress   # (kind:"send"/"recv", 文件名, 已传字节, 总字节)
         self.on_transfer_end = on_transfer_end  # (kind, 文件名, 是否完整完成)
         self.on_manual_peer_verified = on_manual_peer_verified
-        self.on_trust_changed = on_trust_changed
 
         # 本节点唯一实例 ID：进服务名保证唯一(两台设备同名不再冲突)，
         # 进 TXT 属性用于"不发现自己"(比按显示名过滤可靠)。
@@ -1309,9 +1294,7 @@ class P2PNode:
                 b"whpc": str(_CAP_VERSION).encode("ascii"),
                 b"caps": _FOLDER_KIND.encode("ascii"),
                 b"identity": self._identity.fingerprint.encode("ascii"),
-                # 全部本机 IPv4:Android NSD 只解析出一个地址,而本机发出
-                # 连接的源 IP 可能是另一块网卡(VPN/TUN/多网卡)——对端的
-                # "仅接收目标设备"需要完整列表才能正确放行
+                # 全部本机 IPv4:Android NSD 只解析出一个地址,多网卡时供对端回连。
                 b"ips": ",".join(local_ips).encode("ascii"),
             },
         )
@@ -1524,7 +1507,6 @@ class P2PNode:
         ok = False
         transfer_name = ""
         transfer_started = False
-        core_authenticated = False
         try:
             conn.settimeout(_RECV_IDLE_TIMEOUT)
             # Probe connections that close before sending four bytes remain silent.
@@ -1534,7 +1516,6 @@ class P2PNode:
                 supplied = _recv_exact(conn, len(expected)) if expected else None
                 if not supplied or not hmac.compare_digest(supplied, expected):
                     return
-                core_authenticated = True
                 magic = _recv_exact(conn, 4)
             if magic == _CAP_MAGIC:
                 nonce = _recv_exact(conn, 32)
@@ -1610,21 +1591,6 @@ class P2PNode:
             except ValueError:
                 self._status(f"拒收 {filename}：发送设备公钥非法")
                 return
-            if self.cfg.trusted_only and not core_authenticated:
-                with self._lock:
-                    selected = (self._peers.get(self._selected_peer)
-                                if self._selected_peer else None)
-                pinned = self.cfg.trusted_peers.get(sender_instance_id, "")
-                if (selected is None or selected.instance_id != sender_instance_id
-                        or not pinned
-                        or not hmac.compare_digest(pinned, sender_fingerprint)):
-                    self._status(
-                        f"已拒收 {addr[0]} 的传输（发送设备未配对或不是当前目标）")
-                    try:
-                        conn.sendall(_ACK_FAIL)
-                    except OSError:
-                        pass
-                    return
             if (isinstance(modified_ms, bool) or not isinstance(modified_ms, int)
                     or not 0 <= modified_ms <= 0xFFFFFFFFFFFFFFFF):
                 self._status(f"拒收 {filename}：修改时间非法")
@@ -1925,8 +1891,7 @@ class P2PNode:
         for host in hosts:
             try:
                 result = _probe_peer(host, peer.port, _CAP_TIMEOUT,
-                                     peer.instance_id,
-                                     self.cfg.trusted_peers.get(peer.instance_id, ""))
+                                     peer.instance_id)
                 peer.instance_id = result.instance_id
                 peer.capabilities = result.capabilities
                 peer.public_key = result.public_key
@@ -1937,15 +1902,13 @@ class P2PNode:
         return set()
 
     def _ensure_receiver_identity(self, peer: PeerInfo) -> None:
-        """Direct transports require a verified receiver pin before data is sent."""
+        """Direct transports require a freshly verified receiver identity."""
         if peer.transport not in {"lan", "tailscale"}:
             return
-        expected = (peer.identity_fingerprint
-                    or self.cfg.trusted_peers.get(peer.instance_id, ""))
+        expected = peer.identity_fingerprint
         if not peer.instance_id or not expected:
             self._probe_peer_capabilities(peer)
-            expected = (peer.identity_fingerprint
-                        or self.cfg.trusted_peers.get(peer.instance_id, ""))
+            expected = peer.identity_fingerprint
         if not peer.instance_id or not expected:
             raise OSError("接收设备身份尚未验证")
 
@@ -2018,8 +1981,6 @@ class P2PNode:
             return [selected]
         with self._lock:
             peers = list(self._peers.values())
-        pinned = self.cfg.trusted_peers.get(selected.instance_id, "")
-
         def usable(candidate: PeerInfo) -> bool:
             if candidate is selected:
                 return True
@@ -2028,9 +1989,10 @@ class P2PNode:
             if candidate.transport == "ssh":
                 return bool(candidate.endpoint_token)
             return (candidate.transport in {"lan", "tailscale"}
-                    and bool(pinned)
+                    and bool(selected.identity_fingerprint)
                     and hmac.compare_digest(
-                        candidate.identity_fingerprint, pinned))
+                        candidate.identity_fingerprint,
+                        selected.identity_fingerprint))
 
         priority = {"ssh": 0, "lan": 1, "tailscale": 2}
         alternatives = [candidate for candidate in peers if usable(candidate)]
@@ -2149,9 +2111,7 @@ class P2PNode:
                     receiver_fingerprint = public_fingerprint(receiver_public)
                 except (UnicodeDecodeError, ValueError) as exc:
                     raise OSError("接收设备身份响应无效") from exc
-                expected_fingerprint = (peer.identity_fingerprint
-                                        or self.cfg.trusted_peers.get(
-                                            peer.instance_id, ""))
+                expected_fingerprint = peer.identity_fingerprint
                 if (not _valid_instance_id(receiver_instance_id)
                         or (peer.instance_id
                             and receiver_instance_id != peer.instance_id)
@@ -2414,8 +2374,7 @@ class P2PNode:
             return self._selected_peer
 
     def select_peer(self, name: str | None) -> None:
-        """选择发送目标，并固定已验证的设备公钥指纹。"""
-        trust_changed = False
+        """选择发送目标。设备身份只在当前连接中验证，不持久化信任。"""
         with self._lock:
             if name is None:
                 self._selected_peer = None
@@ -2425,31 +2384,7 @@ class P2PNode:
                 peer = self._peers[name]
                 # 智能保留：记住 service_name，离线后重新上线能自动恢复选中
                 self._last_selected_service = peer.service_name
-                if (peer.instance_id and peer.identity_fingerprint
-                        and self.cfg.trusted_peers.get(peer.instance_id)
-                        != peer.identity_fingerprint):
-                    self.cfg.trusted_peers[peer.instance_id] = peer.identity_fingerprint
-                    trust_changed = True
-        if trust_changed and self.on_trust_changed:
-            try:
-                self.on_trust_changed()
-            except Exception:
-                pass
         self._status(f"目标: {name}" if name else "未选择目标")
-
-    def trusted_devices(self) -> dict[str, str]:
-        """Return a copy of the persistent instance-id to fingerprint pins."""
-        return dict(self.cfg.trusted_peers)
-
-    def revoke_trust(self, instance_id: str) -> bool:
-        """Revoke one device pin; the device must be selected again to pair."""
-        removed = self.cfg.trusted_peers.pop(str(instance_id).lower(), None) is not None
-        if removed and self.on_trust_changed:
-            try:
-                self.on_trust_changed()
-            except Exception:
-                pass
-        return removed
 
     def _on_peer_added(self, name: str, host: str, port: int, service_name: str = "",
                        hosts: list[str] | None = None, instance_id: str = "",
@@ -2600,9 +2535,6 @@ class P2PNode:
         if pinned and pinned != result.instance_id:
             raise _IdentityMismatch("设备身份已变化，请删除后重新添加")
         if pinned:
-            trusted = self.cfg.trusted_peers.get(pinned, "")
-            if trusted and trusted != result.fingerprint:
-                raise _IdentityMismatch("设备密钥已变化，请撤销信任后重新配对")
             return
         entry["instance_id"] = result.instance_id
         if self.on_manual_peer_verified:
@@ -2658,14 +2590,12 @@ class P2PNode:
         self._probe_wake.set()
 
     def _probe_hosts(self, hosts: list[str], port: int, timeout: float,
-                     expected_instance_id: str = "",
-                     expected_fingerprint: str = "") -> _ProbeResult:
+                     expected_instance_id: str = "") -> _ProbeResult:
         last_error: OSError | None = None
         tailnet_error: _TailnetUnavailable | None = None
         for host in hosts:
             try:
-                return _probe_peer(host, port, timeout, expected_instance_id,
-                                   expected_fingerprint)
+                return _probe_peer(host, port, timeout, expected_instance_id)
             except _IdentityMismatch:
                 raise
             except _TailnetUnavailable as exc:
@@ -2709,8 +2639,7 @@ class P2PNode:
         def worker() -> None:
             try:
                 result = self._probe_hosts(
-                    candidates, port, self._probe_timeout, instance_id,
-                    self.cfg.trusted_peers.get(instance_id, ""))
+                    candidates, port, self._probe_timeout, instance_id)
                 with self._lock:
                     current = self._pending_discovery_probes.get(service_name)
                 if self._running and current is token:
@@ -2766,8 +2695,7 @@ class P2PNode:
                 tailnet_unavailable = False
                 try:
                     result = self._probe_hosts(
-                        hosts, peer.port, probe_timeout, expected,
-                        self.cfg.trusted_peers.get(expected, ""))
+                        hosts, peer.port, probe_timeout, expected)
                     if entry is not None:
                         self._bind_manual_identity(entry, result)
                         addresses = _resolved_addresses([str(entry["host"])])
@@ -2825,8 +2753,7 @@ class P2PNode:
                 try:
                     expected = str(entry.get("instance_id") or "")
                     result = _probe_peer(str(entry["host"]), int(entry["port"]),
-                                         self._probe_timeout * 2, expected,
-                                         self.cfg.trusted_peers.get(expected, ""))
+                                         self._probe_timeout * 2, expected)
                     self._bind_manual_identity(entry, result)
                 except _IdentityMismatch as exc:
                     if key not in self._identity_errors:

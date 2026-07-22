@@ -1416,49 +1416,6 @@ def test_cancel_active_transfer_ends_both_sides():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---------- 测试 16: 仅接收目标设备(trusted_only) ----------
-def test_trusted_only():
-    print("\n=== 测试 16: 仅接收目标设备 ===")
-    tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
-    try:
-        node_a = make_node(tmpdir, "Alice")
-        node_b = P2PNode(P2PConfig(inbox=os.path.join(tmpdir, "Bob_inbox"),
-                                   peer_name="Bob", enable_mdns=False,
-                                   trusted_only=True))
-        node_a.start()
-        node_b.start()
-        time.sleep(0.3)
-
-        node_a._on_peer_added("Bob", "127.0.0.1", node_b.actual_port)
-        node_a.select_peer("Bob")
-
-        src = os.path.join(tmpdir, "hello.txt")
-        with open(src, "w") as f:
-            f.write("hi")
-
-        # B 没选中任何目标 -> 拒收 A(发送方能感知失败)
-        ok = node_a.send_file(src)
-        check("B 未选目标时 A 发送失败", ok is False)
-        check("B 没收到文件", not os.path.exists(os.path.join(node_b.cfg.inbox, "hello.txt")))
-
-        # B 选中 A(地址 127.0.0.1) -> 放行
-        node_b._on_peer_added(
-            "Alice", "127.0.0.1", node_a.actual_port,
-            instance_id=node_a.cfg.instance_id,
-            public_key=node_a._identity.public_key,
-            identity_fingerprint=node_a._identity.fingerprint)
-        node_b.select_peer("Alice")
-        ok2 = node_a.send_file(src)
-        check("B 选中 A 后发送成功", ok2 is True)
-        recv = wait_for_file(node_b.cfg.inbox, "hello.txt")
-        check("B 收到文件", recv is not None)
-
-        node_a.stop()
-        node_b.stop()
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
 # ---------- 测试 17: 多地址回退连接 ----------
 def test_multi_host_fallback():
     print("\n=== 测试 17: 多地址回退 ===")
@@ -2078,7 +2035,6 @@ if __name__ == "__main__":
         test_send_queue,
         test_send_queue_cancel_discards_pending_items,
         test_cancel_active_transfer_ends_both_sides,
-        test_trusted_only,
         test_multi_host_fallback,
         test_ghost_peer_eviction,
         test_persistent_instance_id,

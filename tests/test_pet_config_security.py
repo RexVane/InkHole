@@ -95,3 +95,22 @@ def test_save_config_cannot_reintroduce_plaintext_secret(tmp_path, monkeypatch):
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert "secret" not in saved
     assert saved["show_pet"] is True
+
+
+def test_build_config_removes_obsolete_device_trust_settings(tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    _write_config(path, {
+        "instance_id": "4" * 32,
+        "trusted_only": True,
+        "trusted_peers": {"5" * 32: "a" * 64},
+    })
+    monkeypatch.setattr(pet, "_config_path", lambda: str(path))
+    _fake_secure_store(monkeypatch, {})
+
+    cfg, _ = pet._build_config([])
+    saved = json.loads(path.read_text(encoding="utf-8"))
+
+    assert not hasattr(cfg, "trusted_only")
+    assert not hasattr(cfg, "trusted_peers")
+    assert "trusted_only" not in saved
+    assert "trusted_peers" not in saved

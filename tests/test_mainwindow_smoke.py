@@ -39,7 +39,6 @@ class _FakeNode:
     def __init__(self):
         self.cfg = P2PConfig(inbox="_smoke_inbox", peer_name="SMOKE")
         self._selected = None
-        self._trusted = {}
 
     def peers(self):
         return []
@@ -49,12 +48,6 @@ class _FakeNode:
 
     def select_peer(self, name):
         self._selected = name
-
-    def trusted_devices(self):
-        return dict(self._trusted)
-
-    def revoke_trust(self, instance_id):
-        return self._trusted.pop(instance_id, None) is not None
 
 
 class FakeBridge(QObject):
@@ -111,10 +104,6 @@ class FakeBridge(QObject):
 
     def recentFiles(self):
         return []
-
-    def toggleTrustedOnly(self):
-        self.node.cfg.trusted_only = not self.node.cfg.trusted_only
-        return self.node.cfg.trusted_only
 
     def setInbox(self, directory):
         self.node.cfg.inbox = directory
@@ -473,23 +462,13 @@ def test_inbox_classification_settings_are_saved(app):
     assert set(directories) == {"media", "archive", "file", "folder"}
 
 
-def test_settings_lists_and_revokes_trusted_device(app):
-    window, bridge = _make_window(app)
-    instance_id = "0123456789abcdef0123456789abcdef"
-    bridge.node._trusted[instance_id] = "ab" * 32
+def test_settings_do_not_expose_persistent_device_trust(app):
+    window, _bridge = _make_window(app)
     window._open_settings()
-    app.processEvents()
 
-    assert window._trusted_list_lay.count() == 1
-    row = window._trusted_list_lay.itemAt(0).widget()
-    revoke_buttons = row.findChildren(QToolButton)
-    assert len(revoke_buttons) == 1
-    assert revoke_buttons[0].toolTip() == "撤销设备信任"
-
-    revoke_buttons[0].click()
-    app.processEvents()
-    assert bridge.node.trusted_devices() == {}
-    assert window._trusted_list_lay.itemAt(0).widget().text() == "尚未配对设备"
+    labels = {label.text() for label in window.findChildren(QLabel)}
+    assert "已信任设备" not in labels
+    assert "仅接收目标设备" not in labels
 
 
 def test_ssh_key_editor_uses_compact_height_for_each_mode(app):

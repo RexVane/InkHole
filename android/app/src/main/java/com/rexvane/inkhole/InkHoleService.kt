@@ -109,6 +109,7 @@ class InkHoleService : Service() {
 
     private fun startNode() {
         val prefs = getSharedPreferences("inkhole", Context.MODE_PRIVATE)
+        prefs.edit().remove("trusted_only").remove("trusted_peers_v1").apply()
         val storedName = prefs.getString("peer_name", Build.MODEL) ?: Build.MODEL
         val name = storedName.filterNot { it.isISOControl() }.trim().take(40)
             .ifEmpty { Build.MODEL }
@@ -122,12 +123,11 @@ class InkHoleService : Service() {
             prefs.edit().putBoolean("encryption_enabled", false).apply()
         }
         val secret = if (encryptionEnabled) storedSecret else ""
-        val trustedOnly = prefs.getBoolean("trusted_only", false)
         val listenPort = prefs.getInt("listen_port", 0)
         val inboxRoot = getExternalFilesDir(null) ?: filesDir
         val inbox = File(inboxRoot, "收件箱")
 
-        val node = InkHoleNode(applicationContext, name, inbox, secret, trustedOnly, listenPort,
+        val node = InkHoleNode(applicationContext, name, inbox, secret, listenPort,
                                listener = forwarder)
         // 设置变更重建时恢复选中目标：对端被重新发现后智能保留会自动选回
         InkHoleBus.pendingSelectedService?.let {

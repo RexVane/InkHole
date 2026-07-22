@@ -44,7 +44,7 @@ class PeerTransportTest {
             endpointToken = "token",
         )
 
-        val routes = transferRouteCandidates(direct, listOf(direct, ssh), emptyMap())
+        val routes = transferRouteCandidates(direct, listOf(direct, ssh))
 
         assertEquals(2, routes.size)
         assertSame(direct, routes[0])
@@ -69,7 +69,7 @@ class PeerTransportTest {
             identityFingerprint = "b".repeat(64),
         )
 
-        val routes = transferRouteCandidates(ssh, listOf(ssh, direct), emptyMap())
+        val routes = transferRouteCandidates(ssh, listOf(ssh, direct))
 
         assertEquals(listOf(ssh), routes)
     }

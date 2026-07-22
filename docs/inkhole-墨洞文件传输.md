@@ -1,6 +1,6 @@
 # 墨洞文件传输（InkHole）
 
-版本：`1.6.4`
+版本：`1.6.5`
 
 墨洞是 Windows、macOS 和 Android 之间的文件互传工具。局域网内使用
 mDNS 自动发现和 TCP 直连，手机热点下使用 UDP 与已验证 TCP 反向提示兜底；跨网络保留 Tailscale，并提供 Magic Wormhole
@@ -88,9 +88,8 @@ Tailscale、短码和 SSH 的文件名、目录结构、强制 ACK/SHA-256、断
 
 ## 安全与限制
 
-- WHPP v3 会校验发送设备的 ECDSA 签名，但局域网默认不要求该设备已被信任；
-  公共 WiFi 应开启“仅接收目标设备”。首次选择设备会固定公钥指纹，设置页
-  可以查看并撤销。
+- WHPP v3 会校验发送设备的 ECDSA 签名，但不保存局域网设备信任列表；公共
+  WiFi 应启用端到端加密口令，或改用一次性短码、Tailscale、SSH 中继。
 - Magic Wormhole 会合服务和 Transit 只看到加密会话元数据，不保存文件。
 - Tailscale 无法点对点时可能经过 DERP 加密中继；SSH 模式由用户自己的 VPS
   转发流量。

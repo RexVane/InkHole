@@ -321,7 +321,7 @@ def _save_config(cfg: P2PConfig, **extra) -> None:
             data = _load_saved_config()
             # Only remove obsolete pre-1.5 relay keys. cross_network is the
             # additive v1.5 schema and is preserved by the read-modify-write.
-            for stale in ("relay", "transport_mode"):
+            for stale in ("relay", "transport_mode", "trusted_only", "trusted_peers"):
                 data.pop(stale, None)
             # Secrets live in the OS credential store. Also scrub the legacy
             # plaintext field whenever any setting is persisted.
@@ -331,10 +331,8 @@ def _save_config(cfg: P2PConfig, **extra) -> None:
                          "inbox": cfg.inbox, "port": cfg.listen_port,
                          "inbox_auto_classify": bool(cfg.inbox_auto_classify),
                          "inbox_category_dirs": dict(cfg.inbox_category_dirs or {}),
-                         "trusted_only": cfg.trusted_only,
                          "instance_id": cfg.instance_id,
-                         "manual_peers": list(cfg.manual_peers or []),
-                         "trusted_peers": dict(cfg.trusted_peers or {})})
+                         "manual_peers": list(cfg.manual_peers or [])})
             data.update(extra)
             data.pop("secret", None)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -684,14 +682,11 @@ def _build_config(argv=None):
         encryption_enabled = bool(secret)
     elif encryption_enabled and not secret:
         encryption_enabled = False
-    trusted_only = bool(saved.get("trusted_only", False))
     inbox_auto_classify = bool(saved.get("inbox_auto_classify", False))
     inbox_category_dirs = (saved.get("inbox_category_dirs")
                            if isinstance(saved.get("inbox_category_dirs"), dict)
                            else {})
     instance_id = str(saved.get("instance_id") or "")   # 空则 P2PConfig 自动生成
-    trusted_peers = (saved.get("trusted_peers")
-                     if isinstance(saved.get("trusted_peers"), dict) else {})
     manual_peers = []
     for m in (saved.get("manual_peers") or []):
         try:
@@ -711,16 +706,16 @@ def _build_config(argv=None):
     cfg = P2PConfig(inbox=inbox, listen_port=port, peer_name=name, secret=secret,
                     inbox_auto_classify=inbox_auto_classify,
                     inbox_category_dirs=inbox_category_dirs,
-                    trusted_only=trusted_only, instance_id=instance_id,
+                    instance_id=instance_id,
                     manual_peers=manual_peers,
                     encryption_enabled=encryption_enabled,
                     core_ingress_token=secrets.token_urlsafe(24),
-                    identity_private_key=identity.export_private_key(),
-                    trusted_peers=trusted_peers)
+                    identity_private_key=identity.export_private_key())
     # 首次运行(配置里还没有 instance_id)时生成一个并落盘，之后重启复用同一 ID
     if (str(saved.get("instance_id") or "").lower() != cfg.instance_id
             or has_legacy_secret
-            or (bool(saved_encryption) and not encryption_enabled)):
+            or (bool(saved_encryption) and not encryption_enabled)
+            or "trusted_only" in saved or "trusted_peers" in saved):
         _save_config(cfg)
     if any(a is not None for a in (args.inbox, args.port, args.name, args.secret)):
         _save_config(cfg)   # 显式 CLI 参数视为用户意图，记住
@@ -1141,7 +1136,6 @@ def main(argv=None) -> None:
                 on_transfer_end=lambda kind, name, completed: self._on_transfer_end(
                     kind, name, completed),
                 on_manual_peer_verified=lambda: _save_config(self._lan_cfg),
-                on_trust_changed=lambda: _save_config(self._lan_cfg),
             )
 
         # ---------- shared cross-network transport core ----------
@@ -1760,17 +1754,6 @@ def main(argv=None) -> None:
         def hasTarget(self) -> bool:
             """QML 用来判断拖入文件时是否该播发送动画。"""
             return self.node.selected_peer() is not None
-
-        @Slot(result=bool)
-        def isTrustedOnly(self) -> bool:
-            return self._lan_cfg.trusted_only
-
-        @Slot(result=bool)
-        def toggleTrustedOnly(self) -> bool:
-            """切换「仅接收目标设备」：拦掉其他设备发来的文件。"""
-            self._lan_cfg.trusted_only = not self._lan_cfg.trusted_only
-            _save_config(self._lan_cfg)
-            return self._lan_cfg.trusted_only
 
         @Slot(result="QVariantList")
         def recentFiles(self) -> list:

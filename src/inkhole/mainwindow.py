@@ -2120,15 +2120,6 @@ class MainWindow(QWidget):
             self._set_encryption_controls_enabled)
         security_lay.addWidget(encrypt_row)
 
-        trusted_row, self._cb_trusted = _toggle_row(
-            "仅接收目标设备", "只允许当前选中的设备向本机发送文件")
-        security_lay.addWidget(trusted_row)
-        security_lay.addWidget(_section_label("已信任设备"))
-        trusted_list = QWidget()
-        self._trusted_list_lay = QVBoxLayout(trusted_list)
-        self._trusted_list_lay.setContentsMargins(0, 0, 0, 0)
-        self._trusted_list_lay.setSpacing(5)
-        security_lay.addWidget(trusted_list)
         left_col.addWidget(security_group)
 
         # ---- 4. 跨网络配置 ----
@@ -2402,8 +2393,6 @@ class MainWindow(QWidget):
         for category, field in self._inbox_category_fields.items():
             field.setText(str(category_dirs.get(category) or ""))
         self._set_category_controls_enabled(self._cb_auto_classify.isChecked())
-        self._cb_trusted.setChecked(cfg.trusted_only)
-        self._refresh_trusted_list()
         self._cb_pet.setChecked(bool(self._ctl["pet_visible"]()))
         self._cb_auto.setChecked(bool(self._ctl["is_autostart"]()))
         actual_port = (self._bridge.actualPort()
@@ -2640,43 +2629,6 @@ class MainWindow(QWidget):
         elif clicked == "release":
             self._bridge.openPath(self._bridge.releasesPage())
 
-    def _refresh_trusted_list(self):
-        while self._trusted_list_lay.count():
-            item = self._trusted_list_lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        node = self._bridge.node
-        trusted = node.trusted_devices()
-        names = {peer.instance_id: peer.name for peer in node.peers()
-                 if peer.instance_id}
-        if not trusted:
-            empty = QLabel("尚未配对设备")
-            empty.setStyleSheet(f"color:{_TEXT_DIM}; font-size:11px;")
-            self._trusted_list_lay.addWidget(empty)
-            return
-        for instance_id, fingerprint in sorted(trusted.items()):
-            row = QWidget()
-            layout = QHBoxLayout(row)
-            layout.setContentsMargins(0, 0, 0, 0)
-            label = QLabel(
-                f"{names.get(instance_id, instance_id[:8])}  ·  {fingerprint[:12]}")
-            label.setStyleSheet(f"color:{_TEXT_SECOND}; font-size:11px;")
-            layout.addWidget(label, 1)
-            revoke = QToolButton()
-            revoke.setObjectName("Win")
-            revoke.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
-            revoke.setFixedSize(28, 28)
-            revoke.setToolTip("撤销设备信任")
-            revoke.setAccessibleName(f"撤销 {names.get(instance_id, instance_id[:8])} 的信任")
-
-            def remove(_checked=False, target=instance_id):
-                node.revoke_trust(target)
-                self._refresh_trusted_list()
-
-            revoke.clicked.connect(remove)
-            layout.addWidget(revoke)
-            self._trusted_list_lay.addWidget(row)
-
     # ---- 手动设备(Tailscale/固定 IP 直连) ----
     def _refresh_manual_list(self):
         while self._manual_list_lay.count():
@@ -2855,8 +2807,6 @@ class MainWindow(QWidget):
         if hasattr(self._bridge, "setInboxClassification"):
             self._bridge.setInboxClassification(
                 self._cb_auto_classify.isChecked(), category_dirs)
-        if self._cb_trusted.isChecked() != self._bridge.lanConfig().trusted_only:
-            self._bridge.toggleTrustedOnly()
         self._ctl["set_pet_visible"](self._cb_pet.isChecked())
         if self._cb_auto.isChecked() != bool(self._ctl["is_autostart"]()):
             self._ctl["set_autostart"](self._cb_auto.isChecked())

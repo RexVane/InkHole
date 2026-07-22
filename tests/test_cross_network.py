@@ -163,7 +163,7 @@ def test_authenticated_core_ingress_can_deliver_whpp(tmp_path):
     token = "runtime-only-token"
     node = P2PNode(P2PConfig(
         inbox=str(tmp_path), enable_mdns=False, peer_name="Receiver",
-        trusted_only=True, core_ingress_token=token))
+        core_ingress_token=token))
     node.start()
     try:
         bad_ack = _send_whpp(

@@ -24,10 +24,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -117,7 +115,6 @@ class MainActivity : ComponentActivity() {
     private val peerName = mutableStateOf(Build.MODEL)
     private val secret = mutableStateOf("")
     private val encryptionEnabled = mutableStateOf(false)
-    private val trustedOnly = mutableStateOf(false)
     private var showSettings = mutableStateOf(false)
     private val showUsageGuide = mutableStateOf(false)
     private var pickerMode = PickerMode.DIRECT
@@ -413,7 +410,6 @@ class MainActivity : ComponentActivity() {
         if (secretLoad.warning.isNotEmpty()) {
             Toast.makeText(this, secretLoad.warning, Toast.LENGTH_LONG).show()
         }
-        trustedOnly.value = prefs.getBoolean("trusted_only", false)
         showUsageGuide.value = !prefs.getBoolean(PREF_USAGE_GUIDE_SEEN, false)
 
         requestNeededPermissions()
@@ -1037,12 +1033,6 @@ class MainActivity : ComponentActivity() {
             var nameInput by remember { mutableStateOf(peerName.value) }
             var secretInput by remember { mutableStateOf(secret.value) }
             var encryptionInput by remember { mutableStateOf(encryptionEnabled.value) }
-            var trustedInput by remember { mutableStateOf(trustedOnly.value) }
-            val trustedDevices = remember {
-                mutableStateMapOf<String, String>().apply {
-                    putAll(InkHoleBus.node?.getTrustedDevices().orEmpty())
-                }
-            }
             val originalPort = remember { prefs.getInt("listen_port", 0) }
             var portInput by remember {
                 mutableStateOf(if (originalPort == 0) "" else originalPort.toString())
@@ -1169,62 +1159,6 @@ class MainActivity : ComponentActivity() {
                             Switch(checked = encryptionInput,
                                 onCheckedChange = { encryptionInput = it })
                         }
-                        Spacer(Modifier.height(12.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text("仅接收目标设备", fontSize = 14.sp)
-                                Text("只允许当前选中的设备向本机发送文件",
-                                    fontSize = 11.sp,
-                                    color = androidx.compose.ui.graphics.Color.Gray)
-                            }
-                            Spacer(Modifier.width(8.dp))
-                            Switch(checked = trustedInput,
-                                onCheckedChange = { trustedInput = it })
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        Text("已信任设备", fontSize = 12.sp,
-                            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold)
-                        Spacer(Modifier.height(4.dp))
-                        if (trustedDevices.isEmpty()) {
-                            Text("尚未配对设备", fontSize = 11.sp,
-                                color = androidx.compose.ui.graphics.Color.Gray)
-                        } else {
-                            val peerNames = peers.associate { it.instanceId to it.name }
-                            trustedDevices.toSortedMap().forEach { (instanceId, fingerprint) ->
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text(
-                                            peerNames[instanceId] ?: instanceId.take(8),
-                                            fontSize = 12.sp,
-                                        )
-                                        androidx.compose.foundation.text.selection.SelectionContainer {
-                                            Text(
-                                                fingerprint.chunked(4).joinToString(" "),
-                                                fontSize = 10.sp,
-                                                color = androidx.compose.ui.graphics.Color.Gray,
-                                            )
-                                        }
-                                    }
-                                    IconButton(onClick = {
-                                        if (InkHoleBus.node?.revokeTrustedPeer(instanceId) == true) {
-                                            trustedDevices.remove(instanceId)
-                                        }
-                                    }) {
-                                        Icon(
-                                            Icons.Outlined.Delete,
-                                            contentDescription = "撤销设备信任",
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
                         // ---- 跨网络配置 ----
                         Spacer(Modifier.height(14.dp))
                         Text("跨网络配置", fontSize = 14.sp,
@@ -1608,7 +1542,6 @@ class MainActivity : ComponentActivity() {
                             val nodeSettingsChanged = normalizedName != peerName.value ||
                                 secretInput != secret.value ||
                                 encryptionInput != encryptionEnabled.value ||
-                                trustedInput != trustedOnly.value ||
                                 portVal != originalPort
                             if (secretInput != secret.value) {
                                 try {
@@ -1621,12 +1554,10 @@ class MainActivity : ComponentActivity() {
                             peerName.value = normalizedName
                             secret.value = secretInput
                             encryptionEnabled.value = encryptionInput
-                            trustedOnly.value = trustedInput
                             prefs.edit()
                                 .putString("peer_name", normalizedName)
                                 .remove("secret")
                                 .putBoolean("encryption_enabled", encryptionInput)
-                                .putBoolean("trusted_only", trustedInput)
                                 .putInt("listen_port", portVal)
                                 .apply()
                             val savedManual = ManualPeers.savePreservingPinnedIdentities(

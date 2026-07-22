@@ -61,19 +61,17 @@ data class Peer(
 internal fun transferRouteCandidates(
     selected: Peer,
     available: List<Peer>,
-    trustedFingerprints: Map<String, String>,
 ): List<Peer> {
     if (!selected.instanceId.matches(Regex("[0-9a-f]{32}")) ||
         selected.transport == "wormhole") return listOf(selected)
-    val pinned = trustedFingerprints[selected.instanceId].orEmpty()
     val priority = mapOf("ssh" to 0, "lan" to 1, "tailscale" to 2)
     return available.asSequence()
         .filter { candidate ->
             candidate === selected ||
                 (candidate.instanceId == selected.instanceId && when (candidate.transport) {
                     "ssh" -> candidate.endpointToken.isNotEmpty()
-                    "lan", "tailscale" -> pinned.isNotEmpty() &&
-                        candidate.identityFingerprint == pinned
+                    "lan", "tailscale" -> selected.identityFingerprint.isNotEmpty() &&
+                        candidate.identityFingerprint == selected.identityFingerprint
                     else -> false
                 })
         }
@@ -138,7 +136,6 @@ class InkHoleNode(
     private val peerName: String,
     private val inboxDir: File,
     private val secret: String = "",
-    private val trustedOnly: Boolean = false,   // true = 只接受当前选中且身份已固定的设备
     private val listenPort: Int = 0,            // 固定监听端口;0 = 系统自动分配(跨网手动直连需固定)
     private val listener: InkHoleListener,
 ) {
@@ -219,8 +216,6 @@ class InkHoleNode(
     private val receiveFileLock = Any()
     private val checkpointGate = CheckpointGate()
     private val outgoingStateLock = Any()
-    private val trustedPeersLock = Any()
-    private val trustedPeers = loadTrustedPeers()
     // onServiceLost 误报兜底：正在 TCP 探活确认的 serviceName，避免并发重复探活
     private val probingLost = java.util.Collections.synchronizedSet(HashSet<String>())
     private val pendingDiscoveryProbes = ConcurrentHashMap.newKeySet<String>()
@@ -235,37 +230,6 @@ class InkHoleNode(
         ManualPeers.load(context.getSharedPreferences("inkhole", Context.MODE_PRIVATE)).toMutableList()
     private val manualPeersLock = Any()
     private val identityErrors = java.util.Collections.synchronizedSet(HashSet<String>())
-
-    private fun loadTrustedPeers(): MutableMap<String, String> {
-        val raw = context.getSharedPreferences("inkhole", Context.MODE_PRIVATE)
-            .getString("trusted_peers_v1", "{}").orEmpty()
-        return try {
-            val json = JSONObject(raw)
-            buildMap {
-                for (key in json.keys()) {
-                    val instance = key.lowercase()
-                    val fingerprint = json.optString(key).lowercase()
-                    if (instance.matches(Regex("[0-9a-f]{32}")) && validSha256(fingerprint)) {
-                        put(instance, fingerprint)
-                    }
-                }
-            }.toMutableMap()
-        } catch (_: Exception) {
-            LinkedHashMap()
-        }
-    }
-
-    private fun saveTrustedPeers() {
-        val json = JSONObject()
-        synchronized(trustedPeersLock) {
-            trustedPeers.forEach { (instance, fingerprint) -> json.put(instance, fingerprint) }
-        }
-        context.getSharedPreferences("inkhole", Context.MODE_PRIVATE).edit()
-            .putString("trusted_peers_v1", json.toString()).apply()
-    }
-
-    private fun trustedFingerprint(instanceId: String): String =
-        synchronized(trustedPeersLock) { trustedPeers[instanceId.lowercase()].orEmpty() }
 
     private fun cleanupTransferArtifacts() {
         val cutoff = System.currentTimeMillis() - CHECKPOINT_MAX_AGE_MS
@@ -777,13 +741,11 @@ class InkHoleNode(
             val output = BufferedOutputStream(conn.getOutputStream(), WHPP.BUFFER_SIZE)
             val dout = DataOutputStream(output)
             var magic = WHPP.readMagic(input)
-            var coreAuthenticated = false
             if (magic.contentEquals(CORE_MAGIC)) {
                 val supplied = ByteArray(coreIngressToken.length)
                 din.readFully(supplied)
                 if (!MessageDigest.isEqual(
                         supplied, coreIngressToken.toByteArray(Charsets.US_ASCII))) return
-                coreAuthenticated = true
                 magic = WHPP.readMagic(input)
             }
             if (magic.contentEquals(WHPP.CAP_MAGIC)) {
@@ -824,24 +786,11 @@ class InkHoleNode(
                 listener.onStatus("拒收 $safeName：对方启用了加密，本机未设口令")
                 return
             }
-
-            val senderFingerprint = try {
+            try {
                 DeviceAuth.fingerprint(header.senderPublicKey)
             } catch (_: Exception) {
                 listener.onStatus("拒收 $safeName：发送设备公钥非法")
                 return
-            }
-            if (trustedOnly && !coreAuthenticated) {
-                val selected = selectedPeer?.let { name ->
-                    synchronized(peersLock) { peers.values.find { it.name == name } }
-                }
-                val pinned = trustedFingerprint(header.senderInstanceId)
-                if (selected == null || selected.instanceId != header.senderInstanceId ||
-                    pinned.isEmpty() || pinned != senderFingerprint) {
-                    listener.onStatus(
-                        "已拒收 ${conn.inetAddress?.hostAddress ?: "?"} 的传输（发送设备未配对或不是当前目标）")
-                    return
-                }
             }
 
             checkpointId = header.transferId
@@ -1222,9 +1171,7 @@ class InkHoleNode(
         }
         val peer = synchronized(peersLock) { peers.values.find { it.name == selected } }
             ?: run { listener.onStatus("目标设备已离线"); return false }
-        val expectedReceiverFingerprint = peer.identityFingerprint.ifEmpty {
-            trustedFingerprint(peer.instanceId)
-        }
+        val expectedReceiverFingerprint = peer.identityFingerprint
         if (peer.transport in setOf("lan", "tailscale") &&
             (!peer.instanceId.matches(Regex("[0-9a-f]{32}")) ||
                 !validSha256(expectedReceiverFingerprint))) {
@@ -1435,9 +1382,8 @@ class InkHoleNode(
 
     private fun connectToPeer(peer: Peer, routeOffset: Int = 0): Socket {
         var lastError: Exception? = null
-        val trusted = synchronized(trustedPeersLock) { LinkedHashMap(trustedPeers) }
         val candidates = synchronized(peersLock) {
-            transferRouteCandidates(peer, peers.values.toList(), trusted)
+            transferRouteCandidates(peer, peers.values.toList())
         }
         val offset = if (candidates.size > 1) routeOffset % candidates.size else 0
         val routes = candidates.drop(offset) + candidates.take(offset)
@@ -1506,32 +1452,12 @@ class InkHoleNode(
             synchronized(peersLock) { peers.values.find { it.name == name } }
         } else null
         lastSelectedService = selected?.serviceName
-        if (selected != null && selected.instanceId.isNotEmpty() &&
-            selected.identityFingerprint.isNotEmpty()) {
-            val changed = synchronized(trustedPeersLock) {
-                if (trustedPeers[selected.instanceId] != selected.identityFingerprint) {
-                    trustedPeers[selected.instanceId] = selected.identityFingerprint
-                    true
-                } else false
-            }
-            if (changed) saveTrustedPeers()
-        }
         listener.onStatus(if (name != null) "目标: $name" else "未选择目标")
     }
-
-    fun getTrustedDevices(): Map<String, String> =
-        synchronized(trustedPeersLock) { LinkedHashMap(trustedPeers) }
 
     internal fun pendingCompletedTransfers(): List<CompletedTransfer> =
         CompletedTransfers.pending(inboxDir)
 
-    fun revokeTrustedPeer(instanceId: String): Boolean {
-        val removed = synchronized(trustedPeersLock) {
-            trustedPeers.remove(instanceId.lowercase()) != null
-        }
-        if (removed) saveTrustedPeers()
-        return removed
-    }
 
     fun getSelectedPeer(): String? = selectedPeer
 
@@ -1764,11 +1690,6 @@ class InkHoleNode(
                         capabilities.instanceId != expectedInstanceId.lowercase()) {
                         throw IdentityMismatchException(
                             "设备身份已变化，请删除后重新添加")
-                    }
-                    val trusted = trustedFingerprint(capabilities.instanceId)
-                    if (trusted.isNotEmpty() && trusted != capabilities.fingerprint) {
-                        throw IdentityMismatchException(
-                            "设备密钥已变化，请撤销信任后重新配对")
                     }
                     return PeerProbeResult(
                         capabilities.instanceId,
