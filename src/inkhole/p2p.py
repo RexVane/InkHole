@@ -81,6 +81,10 @@ _PROBE_TIMEOUT = 1.5               # 探测单个地址的 TCP 连接超时(秒)
 _PROBE_STRIKES = 2                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
 _NET_CHECK_INTERVAL = 5.0          # 网络监控轮询间隔(秒)
 _NET_WAKE_GAP = 20.0               # 单轮 sleep 实际耗时超过此值判定为睡眠唤醒，触发 mDNS 重建
+_LAN_DISCOVERY_MAGIC = "inkhole-lan-v1"
+_LAN_DISCOVERY_PORT = 41301
+_LAN_DISCOVERY_INTERVAL = 2.0
+_LAN_DISCOVERY_MAX_PACKET = 2048
 _CAP_TIMEOUT = 3.0                  # folder-v1 能力探测读写超时
 _MAX_FOLDER_ENTRIES = 100_000       # 防恶意条目数耗尽 inode/内存
 _MAX_FOLDER_PATH = 4096             # 单条 UTF-8 相对路径字节上限
@@ -200,6 +204,53 @@ def _is_cgnat_ip(host: str) -> bool:
 def _valid_instance_id(value: object) -> bool:
     text = str(value or "")
     return len(text) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in text)
+
+
+def _encode_lan_announcement(
+        instance_id: str, port: int, reply: bool = False) -> bytes:
+    """Encode the small unauthenticated hint used when hotspots block mDNS."""
+    if not _valid_instance_id(instance_id) or not 1 <= int(port) <= 65535:
+        raise ValueError("invalid LAN discovery announcement")
+    return json.dumps({
+        "magic": _LAN_DISCOVERY_MAGIC,
+        "version": _CAP_VERSION,
+        "instance_id": str(instance_id).lower(),
+        "port": int(port),
+        "reply": bool(reply),
+    }, separators=(",", ":"), sort_keys=True).encode("ascii")
+
+
+def _decode_lan_announcement(payload: bytes) -> tuple[str, int, bool] | None:
+    if not payload or len(payload) > _LAN_DISCOVERY_MAX_PACKET:
+        return None
+    try:
+        decoded = json.loads(payload.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    instance_id = str(decoded.get("instance_id", "")).lower()
+    port = decoded.get("port")
+    reply = decoded.get("reply", False)
+    if (decoded.get("magic") != _LAN_DISCOVERY_MAGIC
+            or decoded.get("version") != _CAP_VERSION
+            or not _valid_instance_id(instance_id)
+            or isinstance(port, bool) or not isinstance(port, int)
+            or not 1 <= port <= 65535 or not isinstance(reply, bool)):
+        return None
+    return instance_id, port, reply
+
+
+def _lan_broadcast_targets(
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> list[str]:
+    targets = ["255.255.255.255"]
+    for network in networks:
+        if not isinstance(network, ipaddress.IPv4Network):
+            continue
+        target = str(network.broadcast_address)
+        if target not in targets:
+            targets.append(target)
+    return targets
 
 
 def _resolve_endpoints(host: str, port: int) -> list[_ResolvedEndpoint]:
@@ -1052,6 +1103,11 @@ class P2PNode:
         self._last_local_ips: list[str] = []   # 上次建 mDNS 时的本机 IP，用于检测变化
         self._net_monitor_thread: threading.Thread | None = None
 
+        # Android 热点经常不把 mDNS 暴露给热点提供者/客户端。这个 UDP 广播层
+        # 只负责交换地址提示，设备真正入列仍需通过 WHPC v3 签名挑战。
+        self._lan_discovery_sock: socket.socket | None = None
+        self._lan_discovery_thread: threading.Thread | None = None
+
         # TCP 服务器
         self._server_sock: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -1186,6 +1242,8 @@ class P2PNode:
             self._report_started()
             return
 
+        self._start_lan_discovery()
+
         with self._mdns_lock:
             self._setup_mdns()
 
@@ -1261,11 +1319,92 @@ class P2PNode:
         self._service_info = None
         self._listener = None
 
+    def _start_lan_discovery(self) -> None:
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind(("", _LAN_DISCOVERY_PORT))
+            sock.settimeout(0.5)
+        except OSError as exc:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            self._status("热点设备发现启动失败", str(exc))
+            return
+        self._lan_discovery_sock = sock
+        self._lan_discovery_thread = threading.Thread(
+            target=self._lan_discovery_loop, daemon=True)
+        self._lan_discovery_thread.start()
+
+    def _lan_discovery_loop(self) -> None:
+        next_announcement = 0.0
+        while self._running:
+            sock = self._lan_discovery_sock
+            if sock is None:
+                return
+            now = time.monotonic()
+            if now >= next_announcement:
+                packet = _encode_lan_announcement(
+                    self._instance_id, self._actual_port)
+                for target in _lan_broadcast_targets(self._local_lan_networks()):
+                    try:
+                        sock.sendto(packet, (target, _LAN_DISCOVERY_PORT))
+                    except OSError:
+                        pass
+                next_announcement = now + _LAN_DISCOVERY_INTERVAL
+            try:
+                payload, sender = sock.recvfrom(_LAN_DISCOVERY_MAX_PACKET + 1)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            announcement = _decode_lan_announcement(payload)
+            if announcement is None:
+                continue
+            instance_id, port, is_reply = announcement
+            if instance_id == self._instance_id:
+                continue
+            sender_host = str(sender[0]).split("%", 1)[0]
+            if not is_reply:
+                try:
+                    sock.sendto(_encode_lan_announcement(
+                        self._instance_id, self._actual_port, reply=True),
+                        (sender_host, _LAN_DISCOVERY_PORT))
+                except OSError:
+                    pass
+            self._handle_lan_announcement(sender_host, port, instance_id)
+
+    def _handle_lan_announcement(
+            self, host: str, port: int, instance_id: str) -> None:
+        with self._lock:
+            if any(p.transport == "lan" and p.instance_id == instance_id
+                   and p.host == host and p.port == port
+                   for p in self._peers.values()):
+                return
+        self._verify_discovered_peer(
+            host, [host], port, f"broadcast|{instance_id}", instance_id)
+
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
         self._running = False
         self._probe_wake.set()
         self.cancel_send()
+        lan_sock = self._lan_discovery_sock
+        self._lan_discovery_sock = None
+        if lan_sock is not None:
+            try:
+                lan_sock.close()
+            except OSError:
+                pass
         with self._mdns_lock:
             self._teardown_mdns()
         if self._server_sock:
@@ -2282,12 +2421,17 @@ class P2PNode:
             updated = False
             if service_name:
                 for p in self._peers.values():
-                    if p.service_name == service_name:
+                    same_lan_identity = (
+                        bool(instance_id) and p.instance_id == instance_id
+                        and p.transport == "lan" and not manual)
+                    if p.service_name == service_name or same_lan_identity:
+                        stable_service_name = p.service_name or service_name
                         fresh = PeerInfo(p.name, host, port, service_name, hosts,
                                          instance_id, capabilities, manual,
                                          transport, endpoint_token, public_key,
                                          identity_fingerprint)
                         p.host, p.port, p.hosts = fresh.host, fresh.port, fresh.hosts
+                        p.service_name = stable_service_name
                         p.instance_id = fresh.instance_id
                         p.capabilities = fresh.capabilities
                         p.manual = fresh.manual

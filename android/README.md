@@ -1,10 +1,10 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.5.9`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
+墨洞 Android 客户端（当前版本 `1.6.0`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
 
 ## 功能
 
-- 使用 Android NSD 和显式网卡 JmDNS 发现 `_inkhole._tcp` 服务并手动选择发送目标；持有 Wi-Fi 组播锁，支持普通 Wi-Fi 和 Android 手机提供热点两种局域网拓扑。
+- 使用 Android NSD 和显式网卡 JmDNS 发现 `_inkhole._tcp` 服务；手机热点不转发 mDNS 时自动使用 UDP 广播请求和单播回应兜底，支持普通 Wi-Fi 和 Android 手机提供热点两种局域网拓扑。
 - **手动添加设备**（设置内填对方 Tailscale IP 或 MagicDNS 名称 + 对方监听端口）：跨网络传输，离线自动剔除、回线自动恢复。
 - **一次性短码**：选择多个文件后生成 PAKE 安全短码和二维码；接收端先确认设备、数量、大小与名称摘要，再建立 Magic Wormhole 加密会话。文件继续使用 WHPP，不走依赖自带的 ZIP 传输。
 - 一次性接收支持扫描发送端生成的二维码，也可以手动输入短码；扫码仅在点击扫码按钮时请求相机权限，识别后仍需点击“连接并接收”确认。
@@ -56,7 +56,7 @@ cd android
 
 协议实现目标是与桌面版逐字节互通：
 
-- mDNS 服务类型: `_inkhole._tcp`（Android NSD 格式，兼容桌面版 zeroconf）
+- 局域网发现: mDNS 服务类型 `_inkhole._tcp`；热点兜底使用 UDP `41301`，发现提示仍须通过 WHPC v3 验证。
 - WHPP 协议: `[4B "WHPP"] [4B header_len] [JSON header] [文件或 WHF1 文件夹流]`
 - WHPC v3 能力探测：同时校验随机挑战、设备公钥签名、32 位 `instance_id`、设备名和协议能力。
 - AES-256-GCM 加密: PBKDF2-HMAC-SHA256 100k 迭代，格式与桌面版 crypto.py 一致
@@ -64,7 +64,7 @@ cd android
 - Magic Wormhole AppID: `com.rexvane.inkhole/transport-v1`。
 - SSH 配对 AppID: `com.rexvane.inkhole/ssh-pair-v1`；数据通道使用 Noise IK 和 yamux。
 
-Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 的 45 项单元测试覆盖协议、加密原语、完成回执与提交日志恢复、配置、设备类型和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。正式标签由三端打包工作流调用该流程，只有 Windows、macOS 和 Android 全部成功才统一创建 Release。
+Python 端 CI 覆盖 WHPP v3/WHE2 协议行为；Android 的 48 项单元测试覆盖协议、加密原语、完成回执与提交日志恢复、配置、设备类型、热点发现和固定向量，独立工作流会现场构建共享 AAR、运行测试与 Lint，再生成 APK。正式标签由三端打包工作流调用该流程，只有 Windows、macOS 和 Android 全部成功才统一创建 Release。
 
 ## 权限
 

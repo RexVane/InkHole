@@ -1,9 +1,9 @@
 # 墨洞文件传输（InkHole）
 
-版本：`1.5.9`
+版本：`1.6.0`
 
 墨洞是 Windows、macOS 和 Android 之间的文件互传工具。局域网内使用
-mDNS 自动发现和 TCP 直连；跨网络保留 Tailscale，并提供 Magic Wormhole
+mDNS 自动发现和 TCP 直连，手机热点下使用 UDP 发现兜底；跨网络保留 Tailscale，并提供 Magic Wormhole
 一次性短码和自有 SSH VPS 长期中继。应用没有墨洞云盘，文件不会先上传到
 墨洞服务器。
 
@@ -11,7 +11,7 @@ mDNS 自动发现和 TCP 直连；跨网络保留 Tailscale，并提供 Magic Wo
 
 | 方式 | 适合场景 | 连接寿命 | 用户需要准备 |
 | --- | --- | --- | --- |
-| 局域网 mDNS | 同一 WiFi/路由器 | 临时 | 两端打开墨洞 |
+| 局域网自动发现 | 同一 WiFi/路由器/手机热点 | 临时 | 两端打开墨洞 |
 | Tailscale | 自己的固定设备 | 长期 | 两端登录同一 Tailnet，填对方地址和端口 |
 | Magic Wormhole 短码 | 临时给另一台设备发送 | 一次 | 发送端生成码，接收端输入或扫描二维码 |
 | SSH VPS 中继 | 固定设备长期互传 | 长期 | 自有 VPS、SSH 用户和已有私钥 |
@@ -128,7 +128,7 @@ cd ../android
 ```
 
 根目录 `make test` 会依次运行 116 项 Python 桌面测试和 Go 共享核心 race 测试。
-Android CI 会在干净环境安装固定版本的 NDK，现场生成 AAR，再运行 45 项单测、Lint
+Android CI 会在干净环境安装固定版本的 NDK，现场生成 AAR，再运行 48 项单测、Lint
 和 APK 构建。正式标签会等待 Windows、macOS 与 Android 产物全部构建、签名和
 校验成功后再一次性创建 Release。第三方依赖和本地 `wormhole-william` fork 见
 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)。

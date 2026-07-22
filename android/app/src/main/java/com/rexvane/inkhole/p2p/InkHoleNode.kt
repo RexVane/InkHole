@@ -177,6 +177,7 @@ class InkHoleNode(
     private var nsdManager: NsdManager? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var jmDnsDiscovery: JmDnsDiscovery? = null
+    private var lanBroadcastDiscovery: LanBroadcastDiscovery? = null
     private var serverSocket: ServerSocket? = null
     private var tcpStartError: String? = null
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
@@ -360,6 +361,16 @@ class InkHoleNode(
             },
         )
         scope.launch { restartJmDnsDiscovery() }
+        lanBroadcastDiscovery = LanBroadcastDiscovery(
+            scope = scope,
+            instanceId = instanceId,
+            listenPort = actualPort,
+            links = ::currentLanLinks,
+            onAnnouncement = ::handleLanAnnouncement,
+            onError = { detail ->
+                if (running) listener.onStatus("热点设备发现启动失败: $detail")
+            },
+        ).also { it.start() }
         // 手动设备不再启动即乐观入列:前台服务被厂商省电反复杀死重启,每次
         // 重启都会把早已关机的对端"复活"成假在线。改由探活循环首轮(立即执行)
         // 验证,连得上才显示——列表语义收紧为"当前真实在线的设备"。
@@ -629,6 +640,8 @@ class InkHoleNode(
         }
         jmDnsDiscovery?.stop()
         jmDnsDiscovery = null
+        lanBroadcastDiscovery?.stop()
+        lanBroadcastDiscovery = null
         releaseMulticastLock()
         try { serverSocket?.close() } catch (_: IOException) {}
         serverSocket = null
@@ -1530,21 +1543,28 @@ class InkHoleNode(
                 displayName.filterNot { it.isISOControl() }.trim(),
                 200,
             ).ifBlank { host }
-            fun uniqueName(): String {
+            fun uniqueName(ignoredKey: String = serviceName): String {
                 var candidate = baseName
                 var n = 2
                 while (peers.any { (key, peer) ->
-                        key != serviceName && peer.name == candidate
+                        key != ignoredKey && peer.name == candidate
                     }) {
                     candidate = "$baseName (${n++})"
                 }
                 return candidate
             }
-            val existing = peers[serviceName]
-            if (existing != null) {
+            val existingEntry = peers.entries.firstOrNull { it.key == serviceName }
+                ?: if (instanceId.isNotEmpty() && !manual) {
+                    peers.entries.firstOrNull { (_, peer) ->
+                        peer.transport == "lan" && peer.instanceId == instanceId
+                    }
+                } else null
+            val existingKey = existingEntry?.key
+            val existing = existingEntry?.value
+            if (existing != null && existingKey != null) {
                 // 同一服务重新解析：同步地址和对端改名，并保持选中状态。
-                finalName = uniqueName()
-                peers[serviceName] = existing.copy(
+                finalName = uniqueName(existingKey)
+                peers[existingKey] = existing.copy(
                     name = finalName,
                     host = host,
                     port = port,
@@ -1557,7 +1577,8 @@ class InkHoleNode(
                     publicKey = publicKey,
                     identityFingerprint = identityFingerprint,
                 )
-                if (selectedPeer == existing.name && lastSelectedService == serviceName) {
+                if (selectedPeer == existing.name &&
+                    lastSelectedService == existing.serviceName) {
                     selectedPeer = finalName
                 }
             } else {
@@ -1914,6 +1935,50 @@ class InkHoleNode(
                     publicKey = result.publicKey, identityFingerprint = result.fingerprint)
             } finally {
                 pendingDiscoveryProbes.remove(discoveryName)
+            }
+        }
+    }
+
+    private fun handleLanAnnouncement(host: String, announcement: LanAnnouncement) {
+        if (!running || announcement.instanceId == instanceId) return
+        val alreadyKnown = synchronized(peersLock) {
+            peers.values.any { peer ->
+                peer.transport == "lan" && peer.instanceId == announcement.instanceId &&
+                    peer.host == host && peer.port == announcement.port
+            }
+        }
+        if (alreadyKnown) return
+        // Limit unauthenticated broadcast hints to one in-flight probe per source address.
+        val pendingKey = "broadcast-source|$host"
+        if (!pendingDiscoveryProbes.add(pendingKey)) return
+        scope.launch {
+            try {
+                val candidates = LanReachability.discoveryCandidates(
+                    listOf(host), listOf(host), currentLanLinks())
+                val result = try {
+                    probePeer(
+                        candidates,
+                        announcement.port,
+                        LOST_PROBE_TIMEOUT_MS,
+                        announcement.instanceId,
+                    )
+                } catch (_: Exception) {
+                    return@launch
+                }
+                if (running) addPeer(
+                    "broadcast|${result.instanceId}",
+                    result.peerName,
+                    result.connectedAddress,
+                    announcement.port,
+                    listOf(result.connectedAddress),
+                    result.instanceId,
+                    result.capabilities,
+                    manual = false,
+                    publicKey = result.publicKey,
+                    identityFingerprint = result.fingerprint,
+                )
+            } finally {
+                pendingDiscoveryProbes.remove(pendingKey)
             }
         }
     }
