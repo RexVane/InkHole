@@ -491,14 +491,22 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 某些厂商系统会单独终止前台服务而保留 Activity。每次回前台都重新
+        // 触发服务的幂等启动检查，监听层失效时由 Service 重建完整节点。
+        InkHoleService.start(this)
         // 回前台先与节点全量对表,再立即触发一轮探活:息屏期间探活循环随
         // 进程冻结,下线设备的剔除毫无进展,不踢一脚就得干等下个轮询周期,
         // 用户看到的是"设备早就关了还显示在线"。
-        InkHoleBus.node?.let { node ->
+        val node = InkHoleBus.node
+        if (node?.isReady() == true) {
             peers.clear()
             peers.addAll(node.getPeers())
             selectedPeer.value = node.getSelectedPeer()
             node.probeNow()
+        } else {
+            peers.clear()
+            selectedPeer.value = null
+            statusMsg.value = "正在恢复设备发现…"
         }
     }
 

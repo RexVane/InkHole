@@ -1480,6 +1480,9 @@ class InkHoleNode(
     /** 实际监听端口(0=尚未启动)。设置页展示"本机"信息用。 */
     fun getActualPort(): Int = actualPort
 
+    /** Activity 回前台时用于确认厂商系统没有只终止前台服务的监听层。 */
+    fun isReady(): Boolean = running && actualPort > 0 && serverSocket?.isClosed == false
+
     fun getInstanceId(): String = instanceId
 
     /** 仅交给同进程 Go 核心，用于认证其回注到接收端口的连接。 */

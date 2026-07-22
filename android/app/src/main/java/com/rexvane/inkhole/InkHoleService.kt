@@ -94,6 +94,15 @@ class InkHoleService : Service() {
             InkHoleBus.node = null
             InkHoleBus.lastPeers = emptyList()
             startNode()
+        } else if (InkHoleBus.node?.isReady() != true) {
+            // Vivo 等系统可能只结束前台服务的监听层，同时保留 Activity 进程。
+            // Activity 回前台再次 startService 时必须重建节点，不能只依赖
+            // START_STICKY；否则 UI 仍显示旧状态，但 TCP/mDNS/热点 UDP 都已消失。
+            TransportManager.detach()
+            InkHoleBus.node?.stop()
+            InkHoleBus.node = null
+            InkHoleBus.lastPeers = emptyList()
+            startNode()
         }
         return START_STICKY
     }

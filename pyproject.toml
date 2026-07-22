@@ -1,6 +1,6 @@
 [project]
 name = "inkhole"
-version = "1.6.0"
+version = "1.6.1"
 description = "Cross-platform file transfer over LAN, one-time secure codes, Tailscale, and SSH relays."
 requires-python = ">=3.10"
 
