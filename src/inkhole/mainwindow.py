@@ -523,6 +523,17 @@ def format_file_time(timestamp: float, now: float | None = None) -> str:
     return f"{value.tm_mon}月{value.tm_mday}日 {value.tm_hour:02d}:{value.tm_min:02d}"
 
 
+def _device_subline(peer) -> str:
+    transport = getattr(peer, "transport", "lan")
+    if transport == "ssh":
+        return "SSH 中继"
+    if transport == "wormhole":
+        return "一次性短码"
+    if peer.service_name.startswith("manual|"):
+        return f"{peer.host}:{peer.port}"
+    return peer.instance_id[:8] if peer.instance_id else ""
+
+
 class ElidedLabel(QLabel):
     """在可用宽度内省略文本，并通过 tooltip 保留完整内容。"""
 
@@ -2900,14 +2911,7 @@ class MainWindow(QWidget):
             " font-size:13px; font-weight:650;")
         # 副行:局域网(自动发现)显示唯一标识,跨网络(手动)显示 IP:端口。
         # 与安卓 DeviceChip 一致——第一行始终是显示名(手动设备即备注)。
-        if getattr(peer, "transport", "lan") == "ssh":
-            subline = "SSH 中继"
-        elif getattr(peer, "transport", "lan") == "wormhole":
-            subline = "一次性短码"
-        elif peer.service_name.startswith("manual|"):
-            subline = f"{peer.host}:{peer.port}"
-        else:
-            subline = peer.instance_id[:8] if peer.instance_id else ""
+        subline = _device_subline(peer)
         col.addWidget(name)
         if subline:
             host = QLabel(subline)

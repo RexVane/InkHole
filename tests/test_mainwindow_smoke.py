@@ -357,6 +357,23 @@ def test_send_button_uses_one_picker_for_files_and_folders(
     assert bridge.dropped_paths == paths
 
 
+def test_desktop_lan_subtitle_uses_instance_id_for_every_discovery_path():
+    from types import SimpleNamespace
+    from inkhole.mainwindow import _device_subline
+
+    instance_id = "0123456789abcdef0123456789abcdef"
+    for service_name in (
+            "Mac-01234567._inkhole._tcp.local.", f"hint|{instance_id}"):
+        peer = SimpleNamespace(
+            transport="lan",
+            service_name=service_name,
+            instance_id=instance_id,
+            host="192.168.1.2",
+            port=41300,
+        )
+        assert _device_subline(peer) == "01234567"
+
+
 def test_send_button_uses_native_macos_picker_when_available(
         app, monkeypatch, tmp_path):
     import inkhole.mainwindow as mainwindow

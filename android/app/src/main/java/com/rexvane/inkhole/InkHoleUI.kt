@@ -387,6 +387,13 @@ private fun looksLikePhone(name: String): Boolean {
         .any { n.contains(it) }
 }
 
+internal fun deviceSubline(peer: Peer): String = when (peer.transport) {
+    "wormhole" -> "一次性短码"
+    "ssh" -> "SSH 中继"
+    "tailscale" -> "${peer.host}:${peer.port}"
+    else -> peer.instanceId.take(8)
+}
+
 @Composable
 private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
     val bg by animateColorAsState(
@@ -421,15 +428,7 @@ private fun DeviceChip(peer: Peer, selected: Boolean, onClick: () -> Unit) {
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
             // 第二行:手动设备显示 IP(备注在上、IP 在下);自动发现设备显示实例 ID
-            val subline = when (peer.transport) {
-                "wormhole" -> "一次性短码"
-                "ssh" -> "SSH 中继"
-                "tailscale" -> "${peer.host}:${peer.port}"
-                else -> peer.serviceName.takeIf { it.contains("-") }
-                    ?.substringAfterLast("-")
-                    ?.substringBefore(".")
-                    ?: ""
-            }
+            val subline = deviceSubline(peer)
             if (subline.isNotEmpty()) {
                 Text(subline, color = TextDim, fontSize = 10.sp, maxLines = 1)
             }
