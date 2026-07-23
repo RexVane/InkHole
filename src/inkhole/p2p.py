@@ -2402,26 +2402,28 @@ class P2PNode:
         with self._lock:
             updated = False
             if service_name:
-                for p in self._peers.values():
+                for peer_key, p in list(self._peers.items()):
                     same_lan_identity = (
                         bool(instance_id) and p.instance_id == instance_id
                         and p.transport == "lan" and not manual)
                     if p.service_name == service_name or same_lan_identity:
                         stable_service_name = p.service_name or service_name
-                        fresh = PeerInfo(p.name, host, port, service_name, hosts,
+                        display_name = name or p.name
+                        suffix = 2
+                        while (display_name in self._peers
+                               and display_name != peer_key):
+                            display_name = f"{name} ({suffix})"
+                            suffix += 1
+                        fresh = PeerInfo(display_name, host, port,
+                                         stable_service_name, hosts,
                                          instance_id, capabilities, manual,
                                          transport, endpoint_token, public_key,
                                          identity_fingerprint)
-                        p.host, p.port, p.hosts = fresh.host, fresh.port, fresh.hosts
-                        p.service_name = stable_service_name
-                        p.instance_id = fresh.instance_id
-                        p.capabilities = fresh.capabilities
-                        p.manual = fresh.manual
-                        p.transport = fresh.transport
-                        p.endpoint_token = fresh.endpoint_token
-                        p.public_key = fresh.public_key
-                        p.identity_fingerprint = fresh.identity_fingerprint
-                        display_name = p.name
+                        if display_name != peer_key:
+                            del self._peers[peer_key]
+                        self._peers[display_name] = fresh
+                        if self._selected_peer == peer_key:
+                            self._selected_peer = display_name
                         updated = True
                         break
             if not updated:
@@ -2647,7 +2649,7 @@ class P2PNode:
                     if result.connected_address not in addresses:
                         addresses.insert(0, result.connected_address)
                     self._on_peer_added(
-                        name or result.peer_name, result.connected_address, port, service_name,
+                        result.peer_name or name, result.connected_address, port, service_name,
                         addresses, result.instance_id, result.capabilities, False,
                         public_key=result.public_key,
                         identity_fingerprint=result.fingerprint)

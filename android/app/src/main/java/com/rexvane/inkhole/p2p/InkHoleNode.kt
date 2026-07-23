@@ -1865,7 +1865,7 @@ class InkHoleNode(
                     return@launch
                 }
                 if (running) addPeer(
-                    discoveryName, displayName, result.connectedAddress, port,
+                    discoveryName, result.peerName, result.connectedAddress, port,
                     hostList, result.instanceId, result.capabilities, manual = false,
                     publicKey = result.publicKey, identityFingerprint = result.fingerprint)
             } finally {

@@ -77,3 +77,50 @@ def test_reverse_lan_hint_triggers_signed_callback_probe(tmp_path):
     finally:
         sender.stop()
         receiver.stop()
+
+
+def test_verified_peer_name_replaces_stale_mdns_address(tmp_path):
+    sender = P2PNode(P2PConfig(
+        inbox=str(tmp_path / "sender"),
+        peer_name="V2419A",
+        enable_mdns=False,
+    ))
+    receiver = P2PNode(P2PConfig(
+        inbox=str(tmp_path / "receiver"),
+        peer_name="Mac",
+        enable_mdns=False,
+    ))
+    sender._running = True
+    receiver._running = True
+    sender._start_tcp_server()
+    receiver._start_tcp_server()
+    receiver._hosts_on_current_lan = lambda hosts: hosts
+    service_name = "V2419A-df5e129b._inkhole._tcp.local."
+    stale_name = "10.230.74.167"
+    receiver._on_peer_added(
+        stale_name,
+        "127.0.0.1",
+        sender.actual_port,
+        service_name=service_name,
+        instance_id=sender._instance_id,
+    )
+    receiver.select_peer(stale_name)
+
+    try:
+        receiver._verify_discovered_peer(
+            stale_name,
+            ["127.0.0.1"],
+            sender.actual_port,
+            service_name,
+            sender._instance_id,
+        )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and receiver.peer_names() != ["V2419A"]:
+            time.sleep(0.02)
+
+        assert receiver.peer_names() == ["V2419A"]
+        assert receiver.selected_peer() == "V2419A"
+        assert receiver.peers()[0].instance_id == sender._instance_id
+    finally:
+        sender.stop()
+        receiver.stop()
