@@ -2,6 +2,12 @@ name: Package
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to package and publish
+        required: false
+        type: string
+        default: ""
   push:
     tags:
       - "v*"
@@ -10,9 +16,27 @@ on:
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+
 jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft Release for direct platform uploads
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --title "InkHole $RELEASE_TAG"
+          fi
+
   build:
+    needs: prepare-release
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -50,19 +74,19 @@ jobs:
           cache-dependency-path: transport-core/go.sum
 
       - name: Validate desktop release version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         shell: bash
         run: |
           PROJECT_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           PACKAGE_VERSION="$(PYTHONPATH=src python -c 'import inkhole; print(inkhole.__version__)')"
           test "$PROJECT_VERSION" = "$PACKAGE_VERSION"
-          test "v$PROJECT_VERSION" = "${GITHUB_REF##*/}" || {
-            echo "Tag ${GITHUB_REF##*/} does not match desktop version v$PROJECT_VERSION" >&2
+          test "v$PROJECT_VERSION" = "$RELEASE_TAG" || {
+            echo "Tag $RELEASE_TAG does not match desktop version v$PROJECT_VERSION" >&2
             exit 1
           }
 
       - name: Report Windows signing status
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'Windows' && (startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '')
         shell: bash
         run: |
           if [ -n "$WINDOWS_CERTIFICATE_BASE64" ] && [ -n "$WINDOWS_CERTIFICATE_PASSWORD" ]; then
@@ -73,7 +97,7 @@ jobs:
           fi
 
       - name: Report macOS signing status
-        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '')
         shell: bash
         run: |
           if [ -n "$MACOS_CERTIFICATE_BASE64" ] && [ -n "$MACOS_CERTIFICATE_PASSWORD" ] && [ -n "$MACOS_SIGNING_IDENTITY" ]; then
@@ -215,47 +239,65 @@ jobs:
         shell: bash
         run: shasum -a 256 InkHolePet-macos.zip > InkHolePet-macos.zip.sha256
 
+      - name: Upload desktop files directly to draft Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" "${{ matrix.asset }}" "${{ matrix.manifest }}" --clobber
+
       - name: Upload build artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') && inputs.release_tag == '' }}
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
             ${{ matrix.asset }}
             ${{ matrix.manifest }}
+          retention-days: 1
 
   android:
+    needs: prepare-release
     uses: ./.github/workflows/android.yml
+    with:
+      release_tag: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}
     secrets: inherit
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
     needs: [build, android]
     runs-on: ubuntu-latest
     steps:
-      - name: Download verified platform artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: release
-          merge-multiple: true
-
       - name: Require the complete release asset set
-        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test -f release/InkHolePet-windows.zip
-          test -f release/InkHolePet-windows.zip.sha256.ps1
-          test -f release/InkHolePet-macos.zip
-          test -f release/InkHolePet-macos.zip.sha256
-          test "$(find release -maxdepth 1 -type f -name 'InkHole-v*.apk' | wc -l)" -eq 1
+          ASSETS="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+          for REQUIRED in \
+            InkHolePet-windows.zip \
+            InkHolePet-windows.zip.sha256.ps1 \
+            InkHolePet-macos.zip \
+            InkHolePet-macos.zip.sha256 \
+            "InkHole-$RELEASE_TAG.apk"; do
+            grep -Fxq "$REQUIRED" <<<"$ASSETS" || {
+              echo "Missing release asset: $REQUIRED" >&2
+              exit 1
+            }
+          done
 
       - name: Publish complete Release
         uses: softprops/action-gh-release@v2
         with:
-          name: InkHole ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: InkHole ${{ env.RELEASE_TAG }}
+          draft: false
           body: |
             本版本包含三端构建产物。
 
             - Android APK：使用项目固定发布密钥签名，可直接安装验证。
-            - 三端局域网设备格式：Windows、macOS 和 Android 第一行统一显示设备备注/名称，第二行显示 8 位唯一实例 ID；常规 mDNS 与反向发现不再出现不同格式。
+            - 局域网设备名称：优先采用 WHPC 签名验证后的设备名称，并自动修正旧的 IP 名称；第二行继续显示 8 位唯一实例 ID。
             - 手机热点双向发现：当热点阻止 mDNS/UDP 广播反向转发时，已发现安卓的桌面端会通过现有 TCP 通道发送反向发现提示，安卓从真实连接来源地址回连 Mac/Windows。
             - 设备认证不降级：反向提示仅提供地址线索，仍必须通过 WHPC v3 实例 ID 与设备签名验证后才会显示在列表中。
             - 发现兼容性：保留 mDNS、显式网卡 JmDNS、定向广播、UDP 单播回应等原有路径，并增加 TCP 兜底；普通 Wi-Fi 与手机热点均可使用。
@@ -266,10 +308,3 @@ jobs:
 
             后续配置桌面签名与公证凭据后，同一工作流会自动生成已签名的桌面包。
           generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            release/InkHolePet-windows.zip
-            release/InkHolePet-windows.zip.sha256.ps1
-            release/InkHolePet-macos.zip
-            release/InkHolePet-macos.zip.sha256
-            release/InkHole-v*.apk

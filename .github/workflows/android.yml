@@ -2,6 +2,12 @@ name: Android APK
 
 on:
   workflow_call:
+    inputs:
+      release_tag:
+        description: Existing tag whose draft Release receives the signed APK
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
   push:
     branches:
@@ -14,7 +20,7 @@ on:
 # Branch pushes validate Android independently. The Package workflow reuses this
 # workflow for tags and publishes all three platforms only after every job passes.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -83,11 +89,13 @@ jobs:
         run: gradle testDebugUnitTest lintDebug --no-daemon --stacktrace
 
       - name: Validate release version
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           APP_VERSION="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
-          test "v$APP_VERSION" = "${GITHUB_REF##*/}" || {
-            echo "Tag ${GITHUB_REF##*/} does not match Android version v$APP_VERSION" >&2
+          test "v$APP_VERSION" = "$RELEASE_TAG" || {
+            echo "Tag $RELEASE_TAG does not match Android version v$APP_VERSION" >&2
             exit 1
           }
 
@@ -97,8 +105,10 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* && "${{ steps.keystore.outputs.signed }}" != "yes" ]]; then
+          if [[ ("$GITHUB_REF" == refs/tags/* || -n "$RELEASE_TAG") && \
+                "${{ steps.keystore.outputs.signed }}" != "yes" ]]; then
             echo "Release tags require the fixed Android release keystore" >&2
             exit 1
           fi
@@ -111,12 +121,17 @@ jobs:
       # Use an ASCII name (InkHole-<ver>.apk): Release assets do not support
       # non-ASCII filenames. On tag push use the tag, otherwise the versionName.
       - name: Rename APK
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           REF="${GITHUB_REF##*/}"
-          case "$REF" in
-            v*) VER="$REF" ;;
-            *) VER="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)" ;;
-          esac
+          if [[ "$RELEASE_TAG" == v* ]]; then
+            VER="$RELEASE_TAG"
+          elif [[ "$REF" == v* ]]; then
+            VER="$REF"
+          else
+            VER="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          fi
           test -n "$VER"
           mkdir -p dist
           if [ "${{ steps.keystore.outputs.signed }}" = "yes" ]; then
@@ -126,8 +141,19 @@ jobs:
           fi
           cp "$SRC" "dist/InkHole-${VER}.apk"
 
+      - name: Upload signed APK directly to draft Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: gh release upload "$RELEASE_TAG" android/dist/*.apk --clobber
+
       - name: Upload build artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') && inputs.release_tag == '' }}
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: inkhole-android-apk
           path: android/dist/*.apk
+          retention-days: 1
