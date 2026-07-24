@@ -18,7 +18,11 @@ init-gomobile:
 
 build-android:
 	mkdir -p ../android/app/libs
-	GOFLAGS=-mod=mod $(shell go env GOPATH)/bin/gomobile bind -target=android -androidapi 24 \
+	# -checklinkname=0: quic-go 的 Android 网卡枚举依赖(wlynxg/anet)使用
+	# go:linkname 引用标准库内部符号,Go 1.23+ 默认拒绝链接,需显式放行
+	GOFLAGS=-mod=mod PATH="$$PATH:$(shell go env GOPATH)/bin" \
+		$(shell go env GOPATH)/bin/gomobile bind -target=android -androidapi 24 \
+		-ldflags=-checklinkname=0 \
 		-o ../android/app/libs/transportcore.aar ./mobile
 
 vendor:
