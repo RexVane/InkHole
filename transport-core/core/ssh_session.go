@@ -29,6 +29,10 @@ const (
 	sshPeerRetryInterval        = 500 * time.Millisecond
 	sshMuxWriteTimeout          = 30 * time.Second
 	sshMuxStreamWindow   uint32 = 4 * 1024 * 1024
+	// 同一对端的 yamux session 闲置不超过这个时长就复用——跨国链路上省掉
+	// 每次传输的 SSH channel + Noise 握手往返；闲置更久则重建，避免被中间
+	// NAT/防火墙静默掐断的 session 变成黑洞。
+	sshMuxReuseIdle = 60 * time.Second
 )
 
 type sshSessionClient interface {
@@ -91,6 +95,10 @@ type sshPeerEndpoint struct {
 	closed   chan struct{}
 	token    string
 	wg       sync.WaitGroup
+
+	muxMu   sync.Mutex
+	mux     *yamux.Session
+	muxUsed time.Time
 }
 
 func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
@@ -271,9 +279,19 @@ func (s *sshListenerSession) run() {
 		client := s.client
 		s.mu.RUnlock()
 		keepaliveDone := make(chan struct{})
-		go s.keepalive(client, keepaliveDone)
+		keepaliveExited := make(chan struct{})
+		go func() {
+			defer close(keepaliveExited)
+			s.keepalive(client, keepaliveDone)
+		}()
 		err := s.acceptLoop(listener)
 		close(keepaliveDone)
+		// 等待 keepalive goroutine 完全退出，避免 SendRequest 阻塞导致泄漏
+		select {
+		case <-keepaliveExited:
+		case <-time.After(sshKeepaliveTimeout + 5*time.Second):
+			// 如果 keepalive 卡在 SendRequest，超时后继续（记录但不阻塞主循环）
+		}
 		if s.ctx.Err() != nil {
 			return
 		}
@@ -380,9 +398,14 @@ func (s *sshListenerSession) keepaliveWithTiming(client sshSessionClient, done <
 			return
 		case <-ticker.C:
 			result := make(chan error, 1)
+			// 使用带缓冲的 channel 确保 goroutine 不会因为超时而永久泄漏
 			go func() {
 				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
-				result <- err
+				select {
+				case result <- err:
+				default:
+					// 如果主循环已退出，丢弃结果而不阻塞
+				}
 			}()
 			timer := time.NewTimer(timeout)
 			select {
@@ -400,6 +423,7 @@ func (s *sshListenerSession) keepaliveWithTiming(client sshSessionClient, done <
 				s.invalidateClient(client)
 				return
 			case <-timer.C:
+				// 超时不再等待 SendRequest 返回，直接失效客户端并退出
 				s.invalidateClient(client)
 				return
 			}
@@ -564,7 +588,7 @@ func (e *sshPeerEndpoint) run() {
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
-			remote, err := e.owner.openPeerStream(e.peer)
+			remote, err := e.openStream()
 			if err != nil {
 				e.owner.emitDataError(e.peer, "open", err)
 				_ = local.Close()
@@ -584,15 +608,52 @@ func (e *sshPeerEndpoint) Close() error {
 	}
 	err := e.listener.Close()
 	e.wg.Wait()
+	e.muxMu.Lock()
+	if e.mux != nil {
+		_ = e.mux.Close()
+		e.mux = nil
+	}
+	e.muxMu.Unlock()
 	return err
 }
 
-func (s *sshListenerSession) openPeerStream(peer SSHPeer) (net.Conn, error) {
+// openStream 返回一条到对端的 yamux 流。闲置未超 sshMuxReuseIdle 的
+// session 直接复用；失效或过期则整段持锁重建，并发调用共享同一次重建，
+// 不会各自重复完整握手。
+func (e *sshPeerEndpoint) openStream() (net.Conn, error) {
+	e.muxMu.Lock()
+	defer e.muxMu.Unlock()
+	if e.mux != nil && !e.mux.IsClosed() &&
+		time.Since(e.muxUsed) <= sshMuxReuseIdle {
+		if stream, err := e.mux.Open(); err == nil {
+			e.muxUsed = time.Now()
+			return stream, nil
+		}
+	}
+	if e.mux != nil {
+		_ = e.mux.Close()
+		e.mux = nil
+	}
+	mux, err := e.owner.dialPeerMux(e.peer)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := mux.Open()
+	if err != nil {
+		_ = mux.Close()
+		return nil, err
+	}
+	e.mux = mux
+	e.muxUsed = time.Now()
+	return stream, nil
+}
+
+func (s *sshListenerSession) dialPeerMux(peer SSHPeer) (*yamux.Session, error) {
 	raw, err := s.dialPeer(peer)
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (net.Conn, error) {
+	fail := func(err error) (*yamux.Session, error) {
 		_ = raw.Close()
 		return nil, err
 	}
@@ -614,12 +675,7 @@ func (s *sshListenerSession) openPeerStream(peer SSHPeer) (net.Conn, error) {
 	if err != nil {
 		return fail(err)
 	}
-	stream, err := mux.Open()
-	if err != nil {
-		_ = mux.Close()
-		return nil, err
-	}
-	return &muxStreamConn{Conn: stream, mux: mux}, nil
+	return mux, nil
 }
 
 func (s *sshListenerSession) dialPeer(peer SSHPeer) (net.Conn, error) {
@@ -694,25 +750,15 @@ func (s *sshListenerSession) emitInboundDataError(stage, instanceID string, err 
 
 func sshMuxConfig() *yamux.Config {
 	config := yamux.DefaultConfig()
-	// Each SSH data channel owns exactly one short-lived yamux session. WHPP
-	// already enforces an idle deadline, while yamux writes have their own
-	// timeout. A concurrent ping can otherwise sit behind a large file frame
-	// and tear down a healthy transfer with "keepalive timeout".
+	// Reused sessions rely on Open() failure plus the idle cutoff to detect
+	// dead links. WHPP already enforces an idle deadline, while yamux writes
+	// have their own timeout. A concurrent ping can otherwise sit behind a
+	// large file frame and tear down a healthy transfer with "keepalive
+	// timeout", so keepalive stays off.
 	config.EnableKeepAlive = false
 	config.ConnectionWriteTimeout = sshMuxWriteTimeout
 	config.MaxStreamWindowSize = sshMuxStreamWindow
 	return config
-}
-
-type muxStreamConn struct {
-	net.Conn
-	mux *yamux.Session
-}
-
-func (c *muxStreamConn) Close() error {
-	err := c.Conn.Close()
-	_ = c.mux.Close()
-	return err
 }
 
 func errorString(err error) string {

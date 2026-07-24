@@ -149,18 +149,19 @@ class InkHoleNode(
         private const val CHECKPOINT_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
         private const val MAX_INCOMING_CONNECTIONS = 4
         private const val MAX_IDENTITY_FIELD = 512
-        // TCP 收发缓冲(4MB):决定窗口上限,必须在 bind/connect 之前设置——
+        // TCP 收发缓冲(16MB):决定窗口上限,必须在 bind/connect 之前设置——
         // 窗口缩放因子在握手时协商,连接建立后再放大不生效,且显式设置会
         // 禁用内核自动调优,设晚了反而把窗口钉死在小值
-        private const val SOCKET_BUFFER = 4 * 1024 * 1024
+        private const val SOCKET_BUFFER = 16 * 1024 * 1024
         // onServiceLost 误报兜底：探活参数(连续失败才真移除)
-        private const val LOST_PROBE_TIMEOUT_MS = 1200        // 单次 TCP 探活超时
+        // 息屏省电时 WiFi RTT 尖峰可达数秒,超时太紧会周期性把在线设备误判离线
+        private const val LOST_PROBE_TIMEOUT_MS = 3000        // 单次 TCP 探活超时
         private const val LOST_PROBE_ATTEMPTS = 3             // 连续失败几次才判定真离线
         private const val LOST_PROBE_INTERVAL_MS = 1000L      // 两次探活间隔
         // 全量存活探活：定期 TCP 探测所有对端(含自动发现),本机断网/对端崩溃时清残留
         private const val PROBE_INTERVAL_MS = 5_000L          // 探活轮询间隔
-        private const val PROBE_STRIKES = 2                   // 自动发现设备连续失败几轮剔除
-        private const val PROBE_STRIKES_MANUAL = 4            // 手动设备双倍容忍(息屏 WiFi 休眠易误判)
+        private const val PROBE_STRIKES = 4                   // 自动发现设备连续失败几轮剔除
+        private const val PROBE_STRIKES_MANUAL = 4            // 手动设备同等容忍(息屏 WiFi 休眠易误判)
         private const val LAN_CHANGE_CHECK_INTERVAL_MS = 5_000L
         private const val EMPTY_DISCOVERY_RESTART_TICKS = 6
         // 手动设备探活超时:Tailscale 空闲后懒惰唤醒(打洞/DERP 建链)首次

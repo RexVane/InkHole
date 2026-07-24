@@ -61,9 +61,9 @@ _FOLDER_KIND = "folder-v1"
 _RELIABLE_KIND = "reliable-v3"
 _CAPABILITIES = (_FOLDER_KIND, _RELIABLE_KIND)
 _FOLDER_ENTRY = struct.Struct("!BIQQ")  # type, path bytes, file size, mtime ms
-_BUFFER = 256 * 1024      # 256KB 传输块，降低大文件跨网传输的 Python IO 调用开销
-_SOCKET_BUFFER = 4 * 1024 * 1024   # TCP 窗口上限:4MB @ RTT 200ms(DERP) ≈ 20MB/s,
-                                   # @ RTT 60ms(WiFi 抖动) ≈ 66MB/s,高于链路真实能力
+_BUFFER = 1024 * 1024     # 1MB 传输块，降低大文件传输的 Python IO 调用开销
+_SOCKET_BUFFER = 16 * 1024 * 1024  # TCP 窗口上限:16MB @ RTT 200ms(DERP) ≈ 80MB/s,
+                                   # 千兆局域网 @ RTT 2ms 不再是瓶颈；内核按需增长不预占内存
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
 _MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
 _RECV_IDLE_TIMEOUT = 300           # 接收 socket 空闲超时(秒)，防半开连接永久占住线程
@@ -79,8 +79,9 @@ _CHECKPOINT_MAX_AGE = 7 * 24 * 60 * 60
 _CONNECT_TIMEOUT = 10              # 单个地址的连接超时(多地址会逐个尝试)
 _DRAIN_CAP = 8 * 1024 * 1024       # 拒收时最多帮对端消化这么多字节(让回执可靠到达)
 _PROBE_INTERVAL = 5.0              # 对端存活探测间隔(秒)
-_PROBE_TIMEOUT = 1.5               # 探测单个地址的 TCP 连接超时(秒)
-_PROBE_STRIKES = 2                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
+_PROBE_TIMEOUT = 3.0               # 探测单个地址的 TCP 连接超时(秒)；息屏省电的手机
+                                   # WiFi RTT 尖峰可达数秒，1.5s 会周期性误判离线
+_PROBE_STRIKES = 4                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
 _NET_CHECK_INTERVAL = 5.0          # 网络监控轮询间隔(秒)
 _NET_WAKE_GAP = 20.0               # 单轮 sleep 实际耗时超过此值判定为睡眠唤醒，触发 mDNS 重建
 _LAN_DISCOVERY_MAGIC = "inkhole-lan-v1"
@@ -356,6 +357,8 @@ def _connect_transfer_socket(host: str, port: int, timeout: float) -> socket.soc
             if endpoint.is_tailnet:
                 src = _tailnet_source_ip(endpoint.family)
                 if src is None:
+                    if sock is not None:
+                        sock.close()
                     raise _TailnetUnavailable("Tailscale 接口不在线")
                 if endpoint.family == socket.AF_INET6:
                     sock.bind((src, 0, 0, 0))
@@ -660,7 +663,8 @@ def _scan_folder(path: str,
             collision_keys.add(collision_key)
 
             st_result = child.stat(follow_symlinks=False)
-            if child.is_symlink() or _is_reparse_point(st_result):
+            # 直接使用 st_mode 判断符号链接，避免 stat 和 is_symlink 之间的 TOCTOU 竞态
+            if stat.S_ISLNK(st_result.st_mode) or _is_reparse_point(st_result):
                 raise ValueError(f"不支持发送符号链接或联接：{relative}")
             mtime_ms = min(max(0, st_result.st_mtime_ns // 1_000_000), 0xFFFFFFFFFFFFFFFF)
             if stat.S_ISDIR(st_result.st_mode):
@@ -674,9 +678,11 @@ def _scan_folder(path: str,
             entries.append(entry)
             if len(entries) > _MAX_FOLDER_ENTRIES:
                 raise ValueError("文件夹条目过多")
-            plain_size += _FOLDER_ENTRY.size + len(path_bytes) + entry.size
-            if plain_size > _MAX_FILE_SIZE:
+            # 在累加前检查是否会溢出，避免后续 struct.pack 失败
+            entry_overhead = _FOLDER_ENTRY.size + len(path_bytes) + entry.size
+            if plain_size > _MAX_FILE_SIZE - entry_overhead:
                 raise ValueError("文件夹总大小超过 1TB")
+            plain_size += entry_overhead
         stack.extend(reversed(directories))
 
     root_mtime_ms = min(max(0, root_stat.st_mtime_ns // 1_000_000), 0xFFFFFFFFFFFFFFFF)
@@ -1028,11 +1034,12 @@ def _receive_folder_stream(reader, staging: str) -> None:
             raise ValueError("文件夹内文件大小非法")
 
         target = os.path.abspath(os.path.join(staging_abs, *parts))
-        try:
-            if os.path.commonpath((staging_abs, target)) != staging_abs:
-                raise ValueError("文件夹路径越界")
-        except ValueError as exc:
-            raise ValueError("文件夹路径越界") from exc
+        # 使用 realpath 解析符号链接并标准化路径，避免 Windows 跨驱动器时 commonpath 抛出异常
+        target_real = os.path.realpath(target)
+        staging_real = os.path.realpath(staging_abs)
+        # 检查 target_real 是否在 staging_real 内部
+        if not (target_real == staging_real or target_real.startswith(staging_real + os.sep)):
+            raise ValueError("文件夹路径越界")
 
         seen.add(collision_key)
         ancestor_keys.update(parent_keys)
@@ -1185,17 +1192,20 @@ class P2PNode:
                 continue
             if newest >= cutoff:
                 continue
+            # 在锁内标记待删除文件，然后在锁外执行删除，避免删除新传输的活跃文件
+            should_delete = False
             with self._checkpoint_lock:
-                if transfer_id in self._active_checkpoints:
-                    continue
-            for path in paths:
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                    else:
-                        os.remove(path)
-                except OSError:
-                    pass
+                if transfer_id not in self._active_checkpoints:
+                    should_delete = True
+            if should_delete:
+                for path in paths:
+                    try:
+                        if os.path.isdir(path):
+                            shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            os.remove(path)
+                    except OSError:
+                        pass
 
         with self._outgoing_state_lock:
             state = _load_json_file(self._outgoing_state_path)
@@ -1553,6 +1563,10 @@ class P2PNode:
             if not hdr_bytes:
                 return
             header = json.loads(hdr_bytes.decode("utf-8"))
+            # 验证解析结果必须是字典类型，防止列表或字符串导致后续访问异常
+            if not isinstance(header, dict):
+                self._status(f"拒收：无效的消息头格式")
+                return
 
             filename = _safe_filename(str(header.get("filename", "")))
             version = header.get("version")
@@ -2680,7 +2694,6 @@ class P2PNode:
                 for entry in list(self.cfg.manual_peers or [])
             }
             seen = set()
-            auto_removed = False
             for key, peer, display in targets:
                 seen.add(key)
                 entry = manual_by_key.get(key)
@@ -2729,8 +2742,6 @@ class P2PNode:
                 if strikes.get(key, 0) + 1 >= threshold:
                     strikes.pop(key, None)
                     self._on_peer_removed(display)
-                    if not is_manual:
-                        auto_removed = True
                 else:
                     strikes[key] = strikes.get(key, 0) + 1
             # 已经不在对端表里的条目不再计数(正常离线/被 mDNS 先移除)
@@ -2738,10 +2749,9 @@ class P2PNode:
                 if k not in seen:
                     del strikes[k]
 
-            if auto_removed and self.cfg.enable_mdns:
-                threading.Thread(
-                    target=lambda: self._rebuild_mdns("设备离线", announce=False),
-                    daemon=True).start()
+            # 注:设备离线不再触发整层 mDNS 重建。重建会让本机从网络上消失几
+            # 秒,对端探活失败后也剔除并重建,两端互相触发形成震荡;误删的设备
+            # 由持续运行的 ServiceBrowser 通告和 2 秒一轮的 UDP 广播自然找回。
 
             # Offline manual entries are verified before being exposed to the UI.
             with self._lock:
@@ -2897,7 +2907,10 @@ class P2PNode:
         排除 VMware/VirtualBox/Hyper-V 等虚拟网卡，避免 mDNS 广播不可达地址。
         Android NSD API 的 host 字段只返回一个 IP，若拿到虚拟网卡地址会连接失败。
         """
-        ips = [self._get_local_ip()]
+        first = self._get_local_ip()
+        # 无外网路由时 _get_local_ip 拿到 127.0.0.1；宣告出去会让对端优先连
+        # 环回地址(连到它自己)。丢弃它，靠下面的网卡枚举拿真实局域网地址。
+        ips = [] if first.startswith("127.") else [first]
         try:
             # 优先用 psutil 获取网卡详细信息，按名称过滤虚拟网卡
             import psutil
@@ -2923,6 +2936,8 @@ class P2PNode:
                     ips.append(ip)
         except (socket.gaierror, OSError):
             pass
+        if not ips:
+            ips.append("127.0.0.1")  # 完全无网络接口时保底，避免空地址注册失败
         return ips
 
     @property
@@ -3045,6 +3060,8 @@ def _zip_dir(src_dir: str,
     _portable_path_parts(base)
     manifest = _scan_folder(src_dir, should_cancel)
     tmp_root = tempfile.mkdtemp(prefix="inkhole_zip_")
+    # 加固临时目录权限，防止其他用户读取敏感内容
+    os.chmod(tmp_root, 0o700)
     zip_path = os.path.join(tmp_root, base + ".zip")
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
