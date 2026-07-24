@@ -18,7 +18,7 @@ internal object WHF1 {
     const val MAX_ENTRIES = 100_000
     const val MAX_PATH_BYTES = 4096
     private const val MAX_DEPTH = 128
-    private const val COPY_BUFFER = 256 * 1024
+    private const val COPY_BUFFER = 1024 * 1024
     private const val INVALID_CHARS = "<>:\"|?*"
     private val WINDOWS_RESERVED = buildSet {
         addAll(listOf("CON", "PRN", "AUX", "NUL"))

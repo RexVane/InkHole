@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +87,14 @@ type sshListenerSession struct {
 	stateChanged chan struct{}
 	connect      sshReverseConnector
 	wg           sync.WaitGroup
+
+	// QUIC 直连状态(见 quic_direct.go)：证书惰性生成，链路按对端缓存。
+	directMu       sync.Mutex
+	directCert     *tls.Certificate
+	directFP       string
+	directConns    map[string]*quicLink
+	directPending  map[string]bool
+	directCooldown map[string]time.Time
 }
 
 type sshPeerEndpoint struct {
@@ -96,9 +105,24 @@ type sshPeerEndpoint struct {
 	token    string
 	wg       sync.WaitGroup
 
-	muxMu   sync.Mutex
-	mux     *yamux.Session
-	muxUsed time.Time
+	muxMu       sync.Mutex
+	mux         *yamux.Session
+	muxActive   int
+	muxLastIdle time.Time
+	dialMux     func(SSHPeer) (*yamux.Session, error)
+}
+
+type sshMuxStream struct {
+	net.Conn
+	endpoint *sshPeerEndpoint
+	mux      *yamux.Session
+	once     sync.Once
+}
+
+func (s *sshMuxStream) Close() error {
+	err := s.Conn.Close()
+	s.once.Do(func() { s.endpoint.releaseMuxStream(s.mux) })
+	return err
 }
 
 func (s *Service) listenSSH(raw json.RawMessage) (any, error) {
@@ -266,6 +290,7 @@ func (s *sshListenerSession) Close() error {
 	for _, endpoint := range endpoints {
 		_ = endpoint.Close()
 	}
+	s.closeDirect()
 	s.wg.Wait()
 	return nil
 }
@@ -497,20 +522,43 @@ func (s *sshListenerSession) serveRemoteMux(conn net.Conn, instanceID string) {
 			}
 			return
 		}
-		local, err := net.Dial("tcp", s.target)
-		if err != nil {
-			s.emitInboundDataError("local", instanceID, err)
-			_ = stream.Close()
-			continue
-		}
-		if _, err := local.Write([]byte("IKCI" + s.targetToken)); err != nil {
-			s.emitInboundDataError("ingress", instanceID, err)
-			_ = local.Close()
-			_ = stream.Close()
-			continue
-		}
-		go proxyConn(s.ctx, local, stream)
+		go s.routeMuxStream(stream, instanceID)
 	}
+}
+
+// routeMuxStream 先读 4 字节区分流类型：IKQ1 是 QUIC 直连信令，其余按
+// 原样(回写头部)转发给本地应用。旧版对端永远不会发 IKQ1，行为不变。
+func (s *sshListenerSession) routeMuxStream(stream net.Conn, instanceID string) {
+	_ = stream.SetReadDeadline(time.Now().Add(directSignalTimeout))
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(stream, head); err != nil {
+		_ = stream.Close()
+		return
+	}
+	_ = stream.SetReadDeadline(time.Time{})
+	if string(head) == directMagic {
+		s.handleDirectSignal(stream, instanceID)
+		return
+	}
+	local, err := net.Dial("tcp", s.target)
+	if err != nil {
+		s.emitInboundDataError("local", instanceID, err)
+		_ = stream.Close()
+		return
+	}
+	if _, err := local.Write([]byte("IKCI" + s.targetToken)); err != nil {
+		s.emitInboundDataError("ingress", instanceID, err)
+		_ = local.Close()
+		_ = stream.Close()
+		return
+	}
+	if _, err := local.Write(head); err != nil {
+		s.emitInboundDataError("ingress", instanceID, err)
+		_ = local.Close()
+		_ = stream.Close()
+		return
+	}
+	proxyConn(s.ctx, local, stream)
 }
 
 func (s *sshListenerSession) authorizeDataPeer(hello dataHello, peerStatic []byte) bool {
@@ -607,34 +655,64 @@ func (e *sshPeerEndpoint) Close() error {
 		close(e.closed)
 	}
 	err := e.listener.Close()
-	e.wg.Wait()
 	e.muxMu.Lock()
 	if e.mux != nil {
 		_ = e.mux.Close()
 		e.mux = nil
 	}
+	e.muxActive = 0
+	e.muxLastIdle = time.Time{}
 	e.muxMu.Unlock()
+	e.wg.Wait()
 	return err
 }
 
-// openStream 返回一条到对端的 yamux 流。闲置未超 sshMuxReuseIdle 的
-// session 直接复用；失效或过期则整段持锁重建，并发调用共享同一次重建，
-// 不会各自重复完整握手。
+// openStream 返回一条到对端的流：QUIC 直连可用时优先走直连(速度不受中继
+// 限制)，否则走 SSH 中继 yamux，并在中继路径成功后异步触发一次打洞尝试。
 func (e *sshPeerEndpoint) openStream() (net.Conn, error) {
+	if direct := e.owner.directStream(e.peer.InstanceID); direct != nil {
+		return direct, nil
+	}
+	conn, err := e.openRelayStream()
+	if err == nil {
+		e.owner.maybeDirect(e.peer)
+	}
+	return conn, err
+}
+
+// openRelayStream 返回一条 SSH 中继上的 yamux 流。闲置未超 sshMuxReuseIdle
+// 的 session 直接复用；失效或过期则整段持锁重建，并发调用共享同一次重建，
+// 不会各自重复完整握手。
+func (e *sshPeerEndpoint) openRelayStream() (net.Conn, error) {
 	e.muxMu.Lock()
 	defer e.muxMu.Unlock()
+	select {
+	case <-e.closed:
+		return nil, net.ErrClosed
+	default:
+	}
+	now := time.Now()
 	if e.mux != nil && !e.mux.IsClosed() &&
-		time.Since(e.muxUsed) <= sshMuxReuseIdle {
+		(e.muxActive > 0 || e.muxLastIdle.IsZero() ||
+			now.Sub(e.muxLastIdle) <= sshMuxReuseIdle) {
 		if stream, err := e.mux.Open(); err == nil {
-			e.muxUsed = time.Now()
-			return stream, nil
+			e.muxActive++
+			return e.trackMuxStream(stream, e.mux), nil
+		} else if e.muxActive > 0 {
+			// An idle timeout must never tear down streams that are still carrying
+			// data. Let the active streams finish before replacing this session.
+			return nil, err
 		}
 	}
 	if e.mux != nil {
 		_ = e.mux.Close()
 		e.mux = nil
 	}
-	mux, err := e.owner.dialPeerMux(e.peer)
+	dialMux := e.dialMux
+	if dialMux == nil {
+		dialMux = e.owner.dialPeerMux
+	}
+	mux, err := dialMux(e.peer)
 	if err != nil {
 		return nil, err
 	}
@@ -644,8 +722,27 @@ func (e *sshPeerEndpoint) openStream() (net.Conn, error) {
 		return nil, err
 	}
 	e.mux = mux
-	e.muxUsed = time.Now()
-	return stream, nil
+	e.muxActive = 1
+	e.muxLastIdle = time.Time{}
+	return e.trackMuxStream(stream, mux), nil
+}
+
+func (e *sshPeerEndpoint) trackMuxStream(
+	stream net.Conn, mux *yamux.Session,
+) net.Conn {
+	return &sshMuxStream{Conn: stream, endpoint: e, mux: mux}
+}
+
+func (e *sshPeerEndpoint) releaseMuxStream(mux *yamux.Session) {
+	e.muxMu.Lock()
+	defer e.muxMu.Unlock()
+	if e.mux != mux || e.muxActive == 0 {
+		return
+	}
+	e.muxActive--
+	if e.muxActive == 0 {
+		e.muxLastIdle = time.Now()
+	}
 }
 
 func (s *sshListenerSession) dialPeerMux(peer SSHPeer) (*yamux.Session, error) {

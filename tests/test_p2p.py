@@ -1218,7 +1218,7 @@ def test_progress_callback():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---------- 测试 13: 分块加密(WHE2)大文件往返 ----------
+# ---------- 测试 13: 分块加密(WHE3)大文件往返 ----------
 def test_chunked_encryption_roundtrip():
     print("\n=== 测试 13: 分块加密大文件往返 ===")
     tmpdir = tempfile.mkdtemp(prefix="inkhole_test_")
@@ -1290,6 +1290,33 @@ def test_chunked_crypto_tamper():
     # 口令不对 -> 失败
     dec4 = ChunkedDecryptor("wrong", blobs[0])
     check("错误口令被拒", dec4.decrypt_chunk(ct0) is None)
+
+
+def test_chunked_crypto_versioned_vectors():
+    """新发送端使用 WHE3，同时继续接收旧版 WHE2。"""
+    from inkhole.crypto import ChunkedDecryptor
+
+    plain = bytes.fromhex(
+        "496e6b486f6c6520574845332063726f73732d6c616e6775616765")
+    legacy_header = bytes.fromhex(
+        "57484532000102030405060708090a0b0c0d0e0f101112131415161718191a1b")
+    legacy_ciphertext = bytes.fromhex(
+        "df85fc7844c8737be422dba9a27b866ab7f5854dc15e3291fb3bb4150cbaa8e7"
+        "cc58fb5af701253590bc08")
+    current_header = bytes.fromhex(
+        "57484533000102030405060708090a0b0c0d0e0f101112131415161718191a1b")
+    current_ciphertext = bytes.fromhex(
+        "25dffd16279c5bfadec69cd5cd6f661f8c77eb5461898456d174c1914705256b"
+        "134f05ba3060d520b7ef28")
+
+    emitted = next(encrypt_chunks("vector-secret", io.BytesIO(plain)))
+    check("新分块加密流使用 WHE3", emitted[:4] == b"WHE3")
+    check("旧版 WHE2 向后兼容",
+          ChunkedDecryptor("vector-secret", legacy_header).decrypt_chunk(
+              legacy_ciphertext) == plain)
+    check("Python/Android WHE3 向量兼容",
+          ChunkedDecryptor("vector-secret", current_header).decrypt_chunk(
+              current_ciphertext) == plain)
 
 
 # ---------- 测试 15: 发送队列串行 + 批量聚合 ----------
@@ -2032,6 +2059,7 @@ if __name__ == "__main__":
         test_progress_callback,
         test_chunked_encryption_roundtrip,
         test_chunked_crypto_tamper,
+        test_chunked_crypto_versioned_vectors,
         test_send_queue,
         test_send_queue_cancel_discards_pending_items,
         test_cancel_active_transfer_ends_both_sides,

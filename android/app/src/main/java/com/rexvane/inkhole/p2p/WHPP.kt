@@ -16,7 +16,7 @@ object WHPP {
     const val PROTOCOL_VERSION = 3
     const val FOLDER_KIND = "folder-v1"
     const val RELIABLE_KIND = "reliable-v3"
-    const val BUFFER_SIZE = 256 * 1024
+    const val BUFFER_SIZE = 1024 * 1024
     const val MAX_HEADER = 64 * 1024              // header 长度上限(来自网络，不可信)
     const val MAX_FILE_SIZE = 1L shl 40           // 单文件 1TB 上限，防恶意 size 声明
     const val ACK_OK: Int = 0x01                  // 接收方回执：成功落盘
@@ -36,7 +36,7 @@ object WHPP {
         val sha256: String,
         val encrypted: Boolean,
         val wantAck: Boolean = true,
-        val encMode: String = "",   // WHPP v3 加密传输必须为 "chunked"（WHE2）
+        val encMode: String = "",   // WHPP v3 加密传输必须为 "chunked"（WHE2/WHE3）
         val kind: String = "file",
         val modifiedMs: Long = 0,
         val senderInstanceId: String = "",

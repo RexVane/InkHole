@@ -12,18 +12,20 @@ import java.security.SecureRandom
  * AES-256-GCM 端到端加密, 与桌面版 Python crypto.py 逐字节兼容。
  *
  * 整块格式 WHE1(小文件): [4B "WHE1"] [16B salt] [12B nonce] [ct + 16B tag]
- * 分块格式 WHE2(大文件): [4B "WHE2"] [16B salt] [12B base_nonce] + 帧*
+ * 分块格式 WHE2/WHE3(大文件): [4B magic] [16B salt] [12B base_nonce] + 帧*
  *   帧 = [4B 密文长度(BE)] + 密文
  *   第 i 块: nonce_i = base[0:4] + BE64(BE64(base[4:12]) + i)，AAD = BE64(i)
  *   4MB 分块——收发内存峰值恒定，特大文件不再整块进内存。
- * 密钥派生: PBKDF2-HMAC-SHA256, 100000 次迭代, 256-bit。
+ * 密钥派生:兼容 WHE1/WHE2 使用 100000 次，新传输 WHE3 使用 600000 次。
  */
 object Crypto {
     private val MAGIC = "WHE1".toByteArray(Charsets.US_ASCII)
     private val MAGIC2 = "WHE2".toByteArray(Charsets.US_ASCII)
+    private val MAGIC3 = "WHE3".toByteArray(Charsets.US_ASCII)
     private const val SALT_LEN = 16
     private const val NONCE_LEN = 12
-    private const val ITERATIONS = 100_000
+    private const val LEGACY_ITERATIONS = 100_000
+    private const val ITERATIONS = 600_000
     private const val KEY_LEN = 256     // bits
     private const val TAG_LEN = 128     // bits (GCM auth tag)
     const val CHUNK_SIZE = 4 * 1024 * 1024
@@ -37,7 +39,7 @@ object Crypto {
         val sr = SecureRandom()
         val salt = ByteArray(SALT_LEN).also { sr.nextBytes(it) }
         val nonce = ByteArray(NONCE_LEN).also { sr.nextBytes(it) }
-        val key = deriveKey(secret, salt)
+        val key = deriveKey(secret, salt, LEGACY_ITERATIONS)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(TAG_LEN, nonce))
         val ct = cipher.doFinal(plain)
@@ -49,7 +51,7 @@ object Crypto {
         val salt = blob.copyOfRange(4, 4 + SALT_LEN)
         val nonce = blob.copyOfRange(4 + SALT_LEN, 4 + SALT_LEN + NONCE_LEN)
         val ct = blob.copyOfRange(4 + SALT_LEN + NONCE_LEN, blob.size)
-        val key = deriveKey(secret, salt)
+        val key = deriveKey(secret, salt, LEGACY_ITERATIONS)
         return try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(TAG_LEN, nonce))
@@ -59,13 +61,14 @@ object Crypto {
         }
     }
 
-    private fun deriveKey(secret: String, salt: ByteArray): ByteArray {
-        val spec = PBEKeySpec(secret.toCharArray(), salt, ITERATIONS, KEY_LEN)
+    private fun deriveKey(secret: String, salt: ByteArray,
+                          iterations: Int = ITERATIONS): ByteArray {
+        val spec = PBEKeySpec(secret.toCharArray(), salt, iterations, KEY_LEN)
         val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
         return factory.generateSecret(spec).encoded
     }
 
-    // ---------- 分块格式 WHE2 ----------
+    // ---------- 分块格式 WHE2/WHE3 ----------
 
     /** 给定明文大小，返回分块加密后的线上字节总数(发送方写进 header)。 */
     fun chunkedWireSize(plainSize: Long): Long {
@@ -87,7 +90,7 @@ object Crypto {
         private val base = ByteArray(NONCE_LEN).also { SecureRandom().nextBytes(it) }
         private val key = deriveKey(secret, salt)
         private var idx = 0L
-        val streamHeader: ByteArray = MAGIC2 + salt + base
+        val streamHeader: ByteArray = MAGIC3 + salt + base
 
         fun encryptChunk(plain: ByteArray, len: Int = plain.size): ByteArray {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -99,17 +102,21 @@ object Crypto {
         }
     }
 
-    /** 按序解密 WHE2 分块流；口令不对/被篡改/被重排返回 null。 */
+    /** 按序解密 WHE2/WHE3 分块流；口令不对/被篡改/被重排返回 null。 */
     class ChunkedDecryptor(secret: String, streamHeader: ByteArray) {
         private val base: ByteArray
         private val key: ByteArray
         private var idx = 0L
 
         init {
-            require(streamHeader.size == 32 &&
-                    streamHeader.copyOfRange(0, 4).contentEquals(MAGIC2)) { "bad WHE2 header" }
+            require(streamHeader.size == 32) { "bad chunked encryption header" }
+            val magic = streamHeader.copyOfRange(0, 4)
+            require(magic.contentEquals(MAGIC2) || magic.contentEquals(MAGIC3)) {
+                "bad chunked encryption header"
+            }
             base = streamHeader.copyOfRange(20, 32)
-            key = deriveKey(secret, streamHeader.copyOfRange(4, 20))
+            val iterations = if (magic.contentEquals(MAGIC2)) LEGACY_ITERATIONS else ITERATIONS
+            key = deriveKey(secret, streamHeader.copyOfRange(4, 20), iterations)
         }
 
         fun decryptChunk(ct: ByteArray): ByteArray? = try {

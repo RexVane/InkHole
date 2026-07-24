@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	william "github.com/psanford/wormhole-william/wormhole"
 	cryptossh "golang.org/x/crypto/ssh"
 )
@@ -204,6 +205,42 @@ func TestWormholeBridgeCreatedAfterCancellationIsClosed(t *testing.T) {
 	if conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond); err == nil {
 		_ = conn.Close()
 		t.Fatal("rejected bridge listener remained open")
+	}
+}
+
+func TestInstalledWormholeBridgeStaysOpenUntilSessionClose(t *testing.T) {
+	left, right := net.Pipe()
+	bridgeContext, bridgeCancel := context.WithCancel(context.Background())
+	defer bridgeCancel()
+	receiver, err := newReceivingBridge(
+		bridgeContext, right, "127.0.0.1:1", "unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	sender, err := newSendingBridge(bridgeContext, left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := sender.Addr()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	current := &wormholeSession{ctx: ctx, cancel: cancel}
+	if !current.installBridge(sender) {
+		t.Fatal("live session rejected bridge")
+	}
+	conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("installed bridge closed before explicit cancellation: %v", err)
+	}
+	_ = conn.Close()
+
+	if err := current.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("bridge listener remained open after session close")
 	}
 }
 
@@ -550,6 +587,205 @@ func TestSSHTransferMuxDoesNotRunCompetingKeepalive(t *testing.T) {
 	}
 	if config.ConnectionWriteTimeout != sshMuxWriteTimeout {
 		t.Fatalf("write timeout = %v", config.ConnectionWriteTimeout)
+	}
+}
+
+type testMuxDialer struct {
+	t        *testing.T
+	mu       sync.Mutex
+	dials    int
+	servers  []*yamux.Session
+	accepted chan net.Conn
+}
+
+func newTestMuxDialer(t *testing.T) *testMuxDialer {
+	return &testMuxDialer{t: t, accepted: make(chan net.Conn, 8)}
+}
+
+func (d *testMuxDialer) dial(SSHPeer) (*yamux.Session, error) {
+	left, right := net.Pipe()
+	server, err := yamux.Server(right, sshMuxConfig())
+	if err != nil {
+		_ = left.Close()
+		_ = right.Close()
+		return nil, err
+	}
+	client, err := yamux.Client(left, sshMuxConfig())
+	if err != nil {
+		_ = server.Close()
+		return nil, err
+	}
+	d.mu.Lock()
+	d.dials++
+	d.servers = append(d.servers, server)
+	d.mu.Unlock()
+	go func() {
+		for {
+			stream, acceptErr := server.Accept()
+			if acceptErr != nil {
+				return
+			}
+			d.accepted <- stream
+		}
+	}()
+	return client, nil
+}
+
+func (d *testMuxDialer) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.dials
+}
+
+func (d *testMuxDialer) accept() net.Conn {
+	d.t.Helper()
+	select {
+	case conn := <-d.accepted:
+		return conn
+	case <-time.After(time.Second):
+		d.t.Fatal("yamux server did not accept stream")
+		return nil
+	}
+}
+
+func (d *testMuxDialer) close() {
+	d.mu.Lock()
+	servers := append([]*yamux.Session(nil), d.servers...)
+	d.mu.Unlock()
+	for _, server := range servers {
+		_ = server.Close()
+	}
+}
+
+func newTestMuxEndpoint(t *testing.T, dialer *testMuxDialer) *sshPeerEndpoint {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &sshPeerEndpoint{
+		listener: listener,
+		closed:   make(chan struct{}),
+		dialMux:  dialer.dial,
+	}
+}
+
+func TestSSHPeerMuxReusesSequentialStreams(t *testing.T) {
+	dialer := newTestMuxDialer(t)
+	defer dialer.close()
+	endpoint := newTestMuxEndpoint(t, dialer)
+	defer endpoint.Close()
+
+	first, err := endpoint.openRelayStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRemote := dialer.accept()
+	_ = first.Close()
+	_ = firstRemote.Close()
+
+	second, err := endpoint.openRelayStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRemote := dialer.accept()
+	defer second.Close()
+	defer secondRemote.Close()
+	if dialer.count() != 1 {
+		t.Fatalf("sequential streams created %d mux sessions", dialer.count())
+	}
+}
+
+func TestSSHPeerMuxExpiresOnlyAfterBecomingIdle(t *testing.T) {
+	dialer := newTestMuxDialer(t)
+	defer dialer.close()
+	endpoint := newTestMuxEndpoint(t, dialer)
+	defer endpoint.Close()
+
+	first, err := endpoint.openRelayStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRemote := dialer.accept()
+	oldMux := endpoint.mux
+	_ = first.Close()
+	_ = firstRemote.Close()
+	endpoint.muxMu.Lock()
+	endpoint.muxLastIdle = time.Now().Add(-sshMuxReuseIdle - time.Second)
+	endpoint.muxMu.Unlock()
+
+	second, err := endpoint.openRelayStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRemote := dialer.accept()
+	defer second.Close()
+	defer secondRemote.Close()
+	if dialer.count() != 2 {
+		t.Fatalf("expired idle session was reused; dial count = %d", dialer.count())
+	}
+	if !oldMux.IsClosed() {
+		t.Fatal("expired idle mux remained open")
+	}
+}
+
+func TestSSHPeerMuxNeverExpiresWithActiveStream(t *testing.T) {
+	dialer := newTestMuxDialer(t)
+	defer dialer.close()
+	endpoint := newTestMuxEndpoint(t, dialer)
+	defer endpoint.Close()
+
+	first, err := endpoint.openRelayStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRemote := dialer.accept()
+	defer first.Close()
+	defer firstRemote.Close()
+	endpoint.muxMu.Lock()
+	endpoint.muxLastIdle = time.Now().Add(-sshMuxReuseIdle - time.Second)
+	endpoint.muxMu.Unlock()
+
+	second, err := endpoint.openRelayStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRemote := dialer.accept()
+	defer second.Close()
+	defer secondRemote.Close()
+	if dialer.count() != 1 {
+		t.Fatal("opening a second stream replaced a mux with an active stream")
+	}
+
+	_ = first.SetDeadline(time.Now().Add(time.Second))
+	_ = firstRemote.SetDeadline(time.Now().Add(time.Second))
+	if _, err := first.Write([]byte("still-open")); err != nil {
+		t.Fatalf("active stream was closed: %v", err)
+	}
+	got := make([]byte, len("still-open"))
+	if _, err := io.ReadFull(firstRemote, got); err != nil {
+		t.Fatalf("active stream stopped carrying data: %v", err)
+	}
+}
+
+func TestSSHPeerEndpointCloseReleasesCachedMux(t *testing.T) {
+	dialer := newTestMuxDialer(t)
+	defer dialer.close()
+	endpoint := newTestMuxEndpoint(t, dialer)
+	stream, err := endpoint.openRelayStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := dialer.accept()
+	mux := endpoint.mux
+	_ = stream.Close()
+	_ = remote.Close()
+
+	if err := endpoint.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !mux.IsClosed() || endpoint.mux != nil {
+		t.Fatal("endpoint close did not release cached mux")
 	}
 }
 

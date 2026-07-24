@@ -171,13 +171,6 @@ func (s *Service) createWormhole(raw json.RawMessage) (any, error) {
 	s.putSession(id, current)
 
 	go func() {
-		// 确保任何退出路径都清理 session 和 context
-		defer func() {
-			if current := s.getSession(id); current != nil {
-				_ = current.Close()
-			}
-		}()
-
 		opened, ok := <-result
 		if !ok {
 			s.emit("wormhole.error", map[string]any{"session_id": id, "error": "short-code session ended"})
@@ -266,13 +259,6 @@ func (s *Service) startJoinWormhole(raw json.RawMessage) (any, error) {
 	client := newWormholeClient(params.Settings)
 
 	go func() {
-		// 确保任何退出路径都清理 session 和 context
-		defer func() {
-			if current := s.getSession(id); current != nil {
-				_ = current.Close()
-			}
-		}()
-
 		offer, err := client.ReceiveTunnel(ctx, params.Code)
 		if err != nil {
 			if ctx.Err() == nil || errors.Is(ctx.Err(), context.DeadlineExceeded) {

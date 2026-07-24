@@ -149,7 +149,7 @@ class InkHoleNode(
         private const val CHECKPOINT_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
         private const val MAX_INCOMING_CONNECTIONS = 4
         private const val MAX_IDENTITY_FIELD = 512
-        // TCP 收发缓冲(16MB):决定窗口上限,必须在 bind/connect 之前设置——
+        // 请求最高 16MB TCP 收发缓冲(实际值受系统上限约束),必须在 bind/connect 前设置——
         // 窗口缩放因子在握手时协商,连接建立后再放大不生效,且显式设置会
         // 禁用内核自动调优,设晚了反而把窗口钉死在小值
         private const val SOCKET_BUFFER = 16 * 1024 * 1024
@@ -430,9 +430,9 @@ class InkHoleNode(
     }
 
     /** 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留。
-     *  首轮立即执行:手动设备的"验证后上线"也靠它,启动后 ~1s 内在线的手动设备就会出现。
-     *  自动发现的设备:连续失败 PROBE_STRIKES 轮剔除(~10s),误移除后自动重启发现让 NSD 重新找回。
-     *  手动设备:双倍容忍度(息屏 WiFi 休眠易误判);若不在列表但探活成功则自动加回(回线恢复)。 */
+     *  首轮立即执行:手动设备的"验证后上线"也靠它,启动后在线设备很快就会出现。
+     *  自动发现和手动设备均连续失败 4 轮才剔除,以容忍息屏后的 WiFi 延迟尖峰；
+     *  自动发现误移除后重启 NSD 浏览器,手动设备探活成功后自动加回。 */
     private fun startProbeLoop() {
         scope.launch {
             val strikes = HashMap<String, Int>()
@@ -1064,7 +1064,7 @@ class InkHoleNode(
         sendCancelled.set(true)
         activeSendSocket.get()?.let { socket ->
             // 取消要立刻生效:SO_LINGER(0) 让 close 直接 RST 丢弃发送缓冲里
-            // 已排队的数据(最多 4MB),否则内核把缓冲慢慢发完才断开,跨网
+            // 已排队的数据,否则内核把缓冲慢慢发完才断开,跨网
             // 中继链路上对端还要"收"十几秒才看到传输中断
             try { socket.setSoLinger(true, 0) } catch (_: Exception) {}
             try { socket.close() } catch (_: IOException) {}

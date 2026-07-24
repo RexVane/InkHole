@@ -23,7 +23,7 @@
 - Jetpack Compose 主界面、系统文件选择器和最近接收历史。
 - 发送中可随时取消；双方立即清除进度，接收端只保留不可见的续传检查点，不会导出未完成文件。
 - 已知大小的 `content://` 文件直接流式发送，不再为大文件完整复制一份缓存；传输状态显示实时速度。
-- GB 级大文件高速传输：TCP 窗口缓冲在建立连接前按 4MB 协商（设晚了会被钉死在小窗口），收完导出到下载目录使用 1MB 缓冲复制。
+- GB 级大文件高速传输：建立连接前请求最高 16MB TCP 收发缓冲（实际值受系统上限约束），应用层与下载目录导出均使用 1MB 缓冲。
 - 传输状态栏百分比与实时速度前置并支持两行显示，长文件名只截断名字、不遮挡速度。
 - 前台服务维持 P2P 节点，锁屏或切到后台后仍可接收；厂商系统单独终止监听层时，应用回到前台会检测 TCP socket 并自动重建节点、局域网发现和跨网核心。
 - 支持系统 `ACTION_SEND` / `ACTION_SEND_MULTIPLE` 分享入口。
@@ -60,7 +60,7 @@ cd android
 - 局域网发现: mDNS 服务类型 `_inkhole._tcp`；热点兜底使用 UDP `41301`，发现提示仍须通过 WHPC v3 验证。
 - WHPP 协议: `[4B "WHPP"] [4B header_len] [JSON header] [文件或 WHF1 文件夹流]`
 - WHPC v3 能力探测：同时校验随机挑战、设备公钥签名、32 位 `instance_id`、设备名和协议能力。
-- AES-256-GCM 加密: PBKDF2-HMAC-SHA256 100k 迭代，格式与桌面版 crypto.py 一致
+- AES-256-GCM 加密:新传输使用 PBKDF2-HMAC-SHA256 600k 迭代，并兼容接收旧版 100k 格式
 - 共享核心入口认证: 本机发送端点先发 `IKAT + 会话令牌`，核心回注接收节点先发 `IKCI + 节点令牌`。
 - Magic Wormhole AppID: `com.rexvane.inkhole/transport-v1`。
 - SSH 配对 AppID: `com.rexvane.inkhole/ssh-pair-v1`；数据通道使用 Noise IK 和 yamux。

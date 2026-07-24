@@ -1,5 +1,11 @@
 import ipaddress
+import socket
+import sys
+import threading
 import time
+import types
+
+import inkhole.p2p as p2p_module
 
 from inkhole.p2p import (
     _CAP_VERSION,
@@ -36,6 +42,68 @@ def test_lan_broadcast_targets_include_directed_hotspot_broadcast():
         ipaddress.ip_network("10.237.115.0/24"),
         ipaddress.ip_network("192.168.7.8/29"),
     ]) == ["255.255.255.255", "10.237.115.255", "192.168.7.15"]
+
+
+def test_local_ips_ignore_loopback_default_when_lan_address_exists(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+
+    class Address:
+        family = socket.AF_INET
+        address = "192.168.50.7"
+
+    monkeypatch.setattr(node, "_get_local_ip", lambda: "127.0.0.1")
+    monkeypatch.setitem(
+        sys.modules, "psutil",
+        types.SimpleNamespace(net_if_addrs=lambda: {"en0": [Address()]}),
+    )
+
+    assert node._get_local_ips() == ["192.168.50.7"]
+
+
+def test_probe_requires_four_failures_without_rebuilding_mdns(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    node._probe_interval = 0.01
+    node._probe_timeout = 0.01
+    attempts = 0
+    fourth_started = threading.Event()
+    release_fourth = threading.Event()
+    rebuilds = []
+
+    def unavailable(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 4:
+            fourth_started.set()
+            assert release_fourth.wait(1)
+        raise OSError("offline")
+
+    monkeypatch.setattr(node, "_probe_hosts", unavailable)
+    monkeypatch.setattr(node, "_rebuild_mdns", lambda reason: rebuilds.append(reason))
+    node._on_peer_added(
+        "Android", "192.168.50.8", 41300,
+        service_name="Android-test._inkhole._tcp.local.",
+        hosts=["192.168.50.8"],
+        instance_id="a" * 32,
+    )
+    node.start()
+    try:
+        assert fourth_started.wait(1)
+        assert node.peer_names() == ["Android"]
+        release_fourth.set()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and node.peer_names():
+            time.sleep(0.01)
+        assert node.peer_names() == []
+        assert attempts == 4
+        assert rebuilds == []
+        assert p2p_module._PROBE_STRIKES == 4
+    finally:
+        release_fourth.set()
+        node.stop()
 
 
 def test_reverse_lan_hint_round_trip_and_rejects_wrong_version():

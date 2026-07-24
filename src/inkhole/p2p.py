@@ -62,8 +62,7 @@ _RELIABLE_KIND = "reliable-v3"
 _CAPABILITIES = (_FOLDER_KIND, _RELIABLE_KIND)
 _FOLDER_ENTRY = struct.Struct("!BIQQ")  # type, path bytes, file size, mtime ms
 _BUFFER = 1024 * 1024     # 1MB 传输块，降低大文件传输的 Python IO 调用开销
-_SOCKET_BUFFER = 16 * 1024 * 1024  # TCP 窗口上限:16MB @ RTT 200ms(DERP) ≈ 80MB/s,
-                                   # 千兆局域网 @ RTT 2ms 不再是瓶颈；内核按需增长不预占内存
+_SOCKET_BUFFER = 16 * 1024 * 1024  # 请求最高 16MB TCP 缓冲；实际值受系统上限约束
 _MAX_HEADER = 64 * 1024            # header JSON 长度上限(来自网络，不可信)
 _MAX_FILE_SIZE = 1 << 40           # 单文件 1TB 上限，防恶意 size 声明
 _RECV_IDLE_TIMEOUT = 300           # 接收 socket 空闲超时(秒)，防半开连接永久占住线程
@@ -1458,7 +1457,7 @@ class P2PNode:
         if sock is not None:
             try:
                 # 取消要立刻生效:SO_LINGER(0) 让 close 直接 RST 丢弃发送缓冲
-                # 里已排队的数据(最多 4MB)。否则内核会把缓冲慢慢发完才断开,
+                # 里已排队的数据。否则内核会把缓冲慢慢发完才断开,
                 # 跨网中继链路上对端还要"收"十几秒才看到传输中断。
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                                 struct.pack("ii", 1, 0))
