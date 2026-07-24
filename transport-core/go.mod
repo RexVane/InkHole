@@ -13,6 +13,7 @@ require (
 	github.com/quic-go/quic-go v0.60.0
 	golang.org/x/crypto v0.54.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/text v0.40.0
 	salsa.debian.org/vasudev/gospake2 v0.0.0-20210510093858-d91629950ad1
 )
 

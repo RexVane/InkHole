@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -83,12 +84,89 @@ func SendFile(ctx context.Context, target SendTarget, path string,
 	if header.Encrypted {
 		header.EncMode = "chunked"
 	}
+	return sendWithRetries(ctx, target, fileSource(path), header, cfg)
+}
+
+// SendFolder streams a directory as one WHF1 payload over WHPP v3.
+func SendFolder(ctx context.Context, target SendTarget, path string,
+	cfg SenderConfig) error {
+	if cfg.Identity == nil || !ValidInstanceID(strings.ToLower(cfg.InstanceID)) {
+		return errors.New("sender identity and instance id are required")
+	}
+	manifest, err := ScanFolder(path)
+	if err != nil {
+		return err
+	}
+	hasher := sha256.New()
+	reader := NewFolderPayloadReader(manifest)
+	if _, err := io.Copy(hasher, reader); err != nil {
+		_ = reader.Close()
+		return err
+	}
+	_ = reader.Close()
+	digest := hex.EncodeToString(hasher.Sum(nil))
+	name := filepath.Base(manifest.Root)
+	if name == "" || name == "." || name == string(os.PathSeparator) {
+		name = "folder"
+	}
+	header := &TransferHeader{
+		Version:          ProtocolVersion,
+		Filename:         name,
+		PlainSize:        manifest.PlainSize,
+		TransferID:       TransferID(KindFolder, name, manifest.PlainSize, digest),
+		SHA256:           digest,
+		Kind:             KindFolder,
+		MtimeMS:          manifest.RootMtimeMS,
+		Encrypted:        cfg.Secret != "",
+		WantACK:          true,
+		SenderInstanceID: strings.ToLower(cfg.InstanceID),
+		SenderPublicKey:  cfg.Identity.PublicKey,
+	}
+	if header.Encrypted {
+		header.EncMode = "chunked"
+	}
+	return sendWithRetries(ctx, target, folderSource(manifest), header, cfg)
+}
+
+type sourceFactory func(offset int64) (io.ReadCloser, error)
+
+func fileSource(path string) sourceFactory {
+	return func(offset int64) (io.ReadCloser, error) {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		return file, nil
+	}
+}
+
+// folderSource regenerates the WHF1 stream and discards up to the resume
+// offset; the manifest pins sizes so a mid-scan mutation fails loudly.
+func folderSource(manifest *FolderManifest) sourceFactory {
+	return func(offset int64) (io.ReadCloser, error) {
+		reader := NewFolderPayloadReader(manifest)
+		if offset > 0 {
+			if _, err := io.CopyN(io.Discard, reader, offset); err != nil {
+				_ = reader.Close()
+				return nil, err
+			}
+		}
+		return reader, nil
+	}
+}
+
+func sendWithRetries(ctx context.Context, target SendTarget,
+	source sourceFactory, header *TransferHeader, cfg SenderConfig) error {
 	var lastErr error
 	for attempt := 0; attempt < transferRetries; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err := sendOnce(ctx, target, path, header, cfg)
+		err := sendOnce(ctx, target, source, header, cfg)
 		if err == nil {
 			return nil
 		}
@@ -132,7 +210,7 @@ func dialTarget(ctx context.Context, target SendTarget) (net.Conn, error) {
 	return nil, lastErr
 }
 
-func sendOnce(ctx context.Context, target SendTarget, path string,
+func sendOnce(ctx context.Context, target SendTarget, source sourceFactory,
 	header *TransferHeader, cfg SenderConfig) error {
 	conn, err := dialTarget(ctx, target)
 	if err != nil {
@@ -234,7 +312,7 @@ func sendOnce(ctx context.Context, target SendTarget, path string,
 		cfg.OnProgress(header.Filename, offset, header.PlainSize)
 	}
 	if remaining > 0 {
-		if err := sendBody(ctx, conn, path, header, offset, remaining,
+		if err := sendBody(ctx, conn, source, header, offset, remaining,
 			wireSize, cfg); err != nil {
 			return err
 		}
@@ -286,17 +364,14 @@ func readSizedField(conn net.Conn) ([]byte, error) {
 	return readExact(conn, int(size))
 }
 
-func sendBody(ctx context.Context, conn net.Conn, path string,
+func sendBody(ctx context.Context, conn net.Conn, source sourceFactory,
 	header *TransferHeader, offset, remaining, wireSize int64,
 	cfg SenderConfig) error {
-	file, err := os.Open(path)
+	reader, err := source(offset)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
+	defer reader.Close()
 	refreshDeadline := func() { _ = conn.SetDeadline(time.Now().Add(sendIOTimeout)) }
 	progress := func(done int64) {
 		if cfg.OnProgress != nil {
@@ -324,7 +399,7 @@ func sendBody(ctx context.Context, conn net.Conn, path string,
 			if left := remaining - plainDone; left < int64(len(chunk)) {
 				chunk = chunk[:left]
 			}
-			read, err := io.ReadFull(file, chunk)
+			read, err := io.ReadFull(reader, chunk)
 			if err != nil {
 				return fmt.Errorf("发送源数据不完整: %w", err)
 			}
@@ -352,7 +427,7 @@ func sendBody(ctx context.Context, conn net.Conn, path string,
 		if left := remaining - done; left < int64(len(chunk)) {
 			chunk = chunk[:left]
 		}
-		read, err := io.ReadFull(file, chunk)
+		read, err := io.ReadFull(reader, chunk)
 		if err != nil {
 			return fmt.Errorf("发送源数据不完整: %w", err)
 		}

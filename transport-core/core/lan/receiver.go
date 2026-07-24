@@ -1,6 +1,7 @@
 package lan
 
 import (
+	"bufio"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
@@ -232,9 +233,11 @@ func (r *Receiver) receive(conn net.Conn, header *TransferHeader,
 	if header.Version != ProtocolVersion || !header.WantACK {
 		return reject("拒收 %s：需要 WHPP v3", filename)
 	}
-	if header.Kind != KindFile {
-		// Folder streams land in a later milestone; senders fall back to ZIP.
+	if header.Kind != KindFile && header.Kind != KindFolder {
 		return reject("拒收 %s：不支持的传输类型", filename)
+	}
+	if header.Kind == KindFolder && header.PlainSize < 8 {
+		return reject("拒收 %s：文件大小非法", filename)
 	}
 	if header.PlainSize < 0 || header.PlainSize > maxFileSize {
 		return reject("拒收 %s：文件大小非法", filename)
@@ -360,16 +363,37 @@ func (r *Receiver) receive(conn net.Conn, header *TransferHeader,
 	for key, value := range metadata {
 		receipt[key] = value
 	}
-	destination := uniquePath(root, filename)
-	receipt["path"] = destination
-	receipt["completed_at"] = time.Now().Unix()
-	if err := writeJSONAtomic(commitPath, receipt); err != nil {
-		return err
+	var destination string
+	if header.Kind == KindFolder {
+		staging, err := r.extractFolderCheckpoint(root, partPath, metaPath)
+		if err != nil {
+			return err
+		}
+		destination = uniqueDirPath(root, filename)
+		receipt["path"] = destination
+		receipt["completed_at"] = time.Now().Unix()
+		if err := writeJSONAtomic(commitPath, receipt); err != nil {
+			_ = os.RemoveAll(staging)
+			return err
+		}
+		if err := os.Rename(staging, destination); err != nil {
+			_ = os.RemoveAll(staging)
+			return err
+		}
+		applyMtime(destination, header.MtimeMS)
+		_ = os.Remove(partPath)
+	} else {
+		destination = uniquePath(root, filename)
+		receipt["path"] = destination
+		receipt["completed_at"] = time.Now().Unix()
+		if err := writeJSONAtomic(commitPath, receipt); err != nil {
+			return err
+		}
+		if err := os.Rename(partPath, destination); err != nil {
+			return err
+		}
+		applyMtime(destination, header.MtimeMS)
 	}
-	if err := os.Rename(partPath, destination); err != nil {
-		return err
-	}
-	applyMtime(destination, header.MtimeMS)
 	if err := writeJSONAtomic(donePath, receipt); err != nil {
 		return err
 	}
@@ -462,7 +486,16 @@ func (r *Receiver) validCommitDestination(commit map[string]any,
 		return ""
 	}
 	info, err := os.Stat(pathAbs)
-	if err != nil || info.IsDir() {
+	if err != nil {
+		return ""
+	}
+	if kind, _ := metadata["kind"].(string); kind == KindFolder {
+		if !info.IsDir() {
+			return ""
+		}
+		return pathAbs
+	}
+	if info.IsDir() {
 		return ""
 	}
 	size, _ := metadata["plain_size"].(int64)
@@ -474,6 +507,45 @@ func (r *Receiver) validCommitDestination(commit map[string]any,
 		return ""
 	}
 	return pathAbs
+}
+
+// extractFolderCheckpoint unpacks a fully verified WHF1 .part into a fresh
+// staging directory; a malformed stream discards the checkpoint entirely.
+func (r *Receiver) extractFolderCheckpoint(root, partPath,
+	metaPath string) (string, error) {
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	staging := filepath.Join(root,
+		".inkhole-"+hex.EncodeToString(raw)+".folder.part")
+	if err := os.Mkdir(staging, 0o755); err != nil {
+		return "", err
+	}
+	file, err := os.Open(partPath)
+	if err != nil {
+		_ = os.RemoveAll(staging)
+		return "", err
+	}
+	defer file.Close()
+	if err := extractFolderStream(bufio.NewReaderSize(file, recvBuffer),
+		staging); err != nil {
+		_ = os.RemoveAll(staging)
+		_ = os.Remove(partPath)
+		_ = os.Remove(metaPath)
+		return "", err
+	}
+	return staging, nil
+}
+
+func uniqueDirPath(root, name string) string {
+	candidate := filepath.Join(root, name)
+	for counter := 2; ; counter++ {
+		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate
+		}
+		candidate = filepath.Join(root, fmt.Sprintf("%s (%d)", name, counter))
+	}
 }
 
 func (r *Receiver) claimCheckpoint(transferID string) bool {

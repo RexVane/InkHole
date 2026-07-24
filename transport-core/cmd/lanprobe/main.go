@@ -126,7 +126,11 @@ func send(host string, port int, path string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	err = lan.SendFile(context.Background(), lan.SendTarget{
+	sendFunc := lan.SendFile
+	if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+		sendFunc = lan.SendFolder
+	}
+	err = sendFunc(context.Background(), lan.SendTarget{
 		Host:        host,
 		Port:        port,
 		InstanceID:  probed.InstanceID,
@@ -193,7 +197,7 @@ func recv(inbox string) {
 				receiver.HandleWHPP(conn)
 			case "WHPC":
 				_ = lan.RespondProbe(conn, identity, instanceID, "Go接收节点",
-					[]string{lan.CapReliable})
+					[]string{lan.CapReliable, lan.CapFolder})
 				_ = conn.Close()
 			default:
 				_ = conn.Close()
