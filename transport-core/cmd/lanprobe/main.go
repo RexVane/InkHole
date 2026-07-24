@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -30,6 +31,23 @@ func main() {
 		serve()
 	case "discover":
 		discover()
+	case "send":
+		if len(os.Args) != 5 {
+			fmt.Fprintln(os.Stderr, "usage: lanprobe send <host> <port> <file>")
+			os.Exit(2)
+		}
+		var port int
+		if _, err := fmt.Sscanf(os.Args[3], "%d", &port); err != nil {
+			fmt.Fprintln(os.Stderr, "bad port:", err)
+			os.Exit(2)
+		}
+		send(os.Args[2], port, os.Args[4])
+	case "recv":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: lanprobe recv <inbox>")
+			os.Exit(2)
+		}
+		recv(os.Args[2])
 	case "probe":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: lanprobe probe <host> <port>")
@@ -88,6 +106,100 @@ func probe(host string, port int) {
 	}
 	out, _ := json.Marshal(result)
 	fmt.Println(string(out))
+}
+
+// send probes the peer for its verified identity, then transfers one file
+// over WHPP v3 (INKHOLE_SECRET enables end-to-end encryption).
+func send(host string, port int, path string) {
+	identity, err := lan.GenerateIdentity()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	probed, err := lan.ProbePeer(host, port, 5*time.Second, "")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "probe failed:", err)
+		os.Exit(1)
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	err = lan.SendFile(context.Background(), lan.SendTarget{
+		Host:        host,
+		Port:        port,
+		InstanceID:  probed.InstanceID,
+		Fingerprint: probed.Fingerprint,
+	}, path, lan.SenderConfig{
+		Secret:     os.Getenv("INKHOLE_SECRET"),
+		Identity:   identity,
+		InstanceID: hex.EncodeToString(raw),
+		OnStatus:   func(msg string) { fmt.Println("STATUS", msg) },
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "send failed:", err)
+		os.Exit(1)
+	}
+	fmt.Println("SENT")
+}
+
+// recv serves WHPC probes and WHPP transfers into the given inbox.
+func recv(inbox string) {
+	identity, err := lan.GenerateIdentity()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	instanceID := hex.EncodeToString(raw)
+	receiver, err := lan.NewReceiver(lan.ReceiverConfig{
+		InboxDir:   inbox,
+		Secret:     os.Getenv("INKHOLE_SECRET"),
+		Identity:   identity,
+		InstanceID: instanceID,
+		OnReceived: func(path string) { fmt.Println("RECEIVED", path) },
+		OnStatus:   func(msg string) { fmt.Println("STATUS", msg) },
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("PORT %d\n", listener.Addr().(*net.TCPAddr).Port)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go func(conn net.Conn) {
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			head := make([]byte, 4)
+			if _, err := io.ReadFull(conn, head); err != nil {
+				_ = conn.Close()
+				return
+			}
+			_ = conn.SetDeadline(time.Time{})
+			switch string(head) {
+			case "WHPP":
+				receiver.HandleWHPP(conn)
+			case "WHPC":
+				_ = lan.RespondProbe(conn, identity, instanceID, "Go接收节点",
+					[]string{lan.CapReliable})
+				_ = conn.Close()
+			default:
+				_ = conn.Close()
+			}
+		}(conn)
+	}
 }
 
 // discover runs the full discovery stack (mDNS + UDP broadcast + prober)

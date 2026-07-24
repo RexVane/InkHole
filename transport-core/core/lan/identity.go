@@ -22,7 +22,9 @@ import (
 )
 
 const (
-	capDomain = "INKHOLE-WHPC3\x00"
+	capDomain      = "INKHOLE-WHPC3\x00"
+	transferDomain = "INKHOLE-WHPP3-AUTH\x00"
+	receiverDomain = "INKHOLE-WHPP3-RECEIVER\x00"
 
 	maxIdentityField = 0xFFFF
 	nonceSize        = 32
