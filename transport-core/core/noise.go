@@ -16,6 +16,9 @@ import (
 
 const maxSecureRecord = 64 * 1024
 
+// 全局最大帧大小，防止恶意对端发送巨大帧导致内存耗尽
+const maxFrameSize = 4 * 1024 * 1024
+
 var noiseSuite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashBLAKE2s)
 
 func generateNoiseKey() (noise.DHKey, error) {
@@ -198,7 +201,8 @@ func readFrame(r io.Reader, limit int) ([]byte, error) {
 		return nil, err
 	}
 	size := int(binary.BigEndian.Uint32(header))
-	if size < 0 || size > limit {
+	// 检查全局最大值和调用方指定的上下文限制
+	if size < 0 || size > maxFrameSize || size > limit {
 		return nil, fmt.Errorf("invalid frame size: %d", size)
 	}
 	payload := make([]byte, size)

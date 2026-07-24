@@ -171,10 +171,12 @@ func authenticateLoopback(conn net.Conn, token string) bool {
 	if token == "" {
 		return false
 	}
+	// 使用 defer 确保 deadline 被清理，即使在错误路径也不会泄漏
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
 	header := make([]byte, 4+len(token))
 	_, err := io.ReadFull(conn, header)
-	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil || string(header[:4]) != "IKAT" {
 		return false
 	}

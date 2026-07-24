@@ -81,7 +81,8 @@ class TransportCore:
         self._reader = threading.Thread(target=self._read_loop, daemon=True,
                                         name="inkhole-core-reader")
         self._reader.start()
-        self.call("ping", timeout=5)
+        # 延长启动 ping 超时至 10 秒，避免慢速机器上 Go 进程初始化时间过长导致失败
+        self.call("ping", timeout=10)
 
     def close(self) -> None:
         if self._closed.is_set():

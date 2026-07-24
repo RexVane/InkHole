@@ -2108,6 +2108,8 @@ def main(argv=None) -> None:
                     import urllib.request
                     self.status.emit("正在下载新版本…")
                     workdir = tempfile.mkdtemp(prefix="inkhole_update_")
+                    # 加固临时目录权限，防止其他用户读取更新包
+                    os.chmod(workdir, 0o700)
                     zip_path = os.path.join(workdir, "InkHolePet-windows.zip")
                     req = urllib.request.Request(
                         asset_url, headers={"User-Agent": "InkHole-Updater"})

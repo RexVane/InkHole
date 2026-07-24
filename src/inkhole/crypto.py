@@ -26,7 +26,8 @@ _CHUNK_OVERHEAD = 20              # 每帧开销: 4B 长度 + 16B GCM tag
 
 def _derive_key(secret: str, salt: bytes) -> bytes:
     import hashlib
-    return hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 100_000, dklen=32)
+    # 提升迭代次数至 600,000 以抵御现代硬件暴力破解 (OWASP 推荐标准)
+    return hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 600_000, dklen=32)
 
 
 # ---------- 整块格式 WHE1 ----------
