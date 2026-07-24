@@ -6,17 +6,18 @@ replace github.com/psanford/wormhole-william => ./third_party/wormhole-william
 
 require (
 	github.com/flynn/noise v1.1.0
+	github.com/grandcat/zeroconf v1.0.0
 	github.com/hashicorp/yamux v0.1.2
 	github.com/pion/stun/v3 v3.1.6
 	github.com/psanford/wormhole-william v1.0.8
 	github.com/quic-go/quic-go v0.60.0
 	golang.org/x/crypto v0.54.0
+	golang.org/x/sys v0.47.0
 	salsa.debian.org/vasudev/gospake2 v0.0.0-20210510093858-d91629950ad1
 )
 
 require (
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
-	github.com/grandcat/zeroconf v1.0.0 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/miekg/dns v1.1.27 // indirect
 	github.com/pion/dtls/v3 v3.1.4 // indirect
@@ -27,7 +28,6 @@ require (
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	nhooyr.io/websocket v1.8.17 // indirect
 )
