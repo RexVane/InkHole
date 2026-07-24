@@ -6,6 +6,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +28,8 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		serve()
+	case "discover":
+		discover()
 	case "probe":
 		if len(os.Args) != 4 {
 			fmt.Fprintln(os.Stderr, "usage: lanprobe probe <host> <port>")
@@ -84,4 +88,68 @@ func probe(host string, port int) {
 	}
 	out, _ := json.Marshal(result)
 	fmt.Println(string(out))
+}
+
+// discover runs the full discovery stack (mDNS + UDP broadcast + prober)
+// for ~12s alongside a WHPC responder, so real Python/Kotlin nodes on the
+// same network can verify us back. Prints PEERS lines as the list changes.
+func discover() {
+	identity, err := lan.GenerateIdentity()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	instanceID := hex.EncodeToString(raw)
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	caps := []string{"folder-v1", "reliable-v3"}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+				head := make([]byte, 4)
+				if _, err := io.ReadFull(conn, head); err != nil || string(head) != "WHPC" {
+					return
+				}
+				_ = lan.RespondProbe(conn, identity, instanceID, "Go发现节点", caps)
+			}(conn)
+		}
+	}()
+	discovery, err := lan.Start(lan.Config{
+		PeerName:     "Go发现节点",
+		InstanceID:   instanceID,
+		Port:         port,
+		Identity:     identity,
+		Capabilities: caps,
+		LocalIPs:     lan.LocalIPv4s(),
+	}, func(peers []lan.Peer) {
+		out, _ := json.Marshal(peers)
+		fmt.Printf("PEERS %s\n", out)
+	}, func(msg string) {
+		fmt.Printf("STATUS %s\n", msg)
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "discovery failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("READY instance=%s port=%d\n", instanceID, port)
+	time.Sleep(12 * time.Second)
+	final, _ := json.Marshal(discovery.Peers())
+	fmt.Printf("FINAL %s\n", final)
+	discovery.Stop()
 }

@@ -1,0 +1,173 @@
+package lan
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/grandcat/zeroconf"
+)
+
+// mDNS registration/browsing for _inkhole._tcp.local., interoperable with
+// python-zeroconf, Android NSD and JmDNS. Offline detection is NOT driven
+// by mDNS goodbye packets (they are lost too often to be trusted; the git
+// history of ghost-device fixes proves it) — the liveness prober owns peer
+// removal, mDNS only feeds candidates.
+
+const (
+	mdnsService = "_inkhole._tcp"
+	mdnsDomain  = "local."
+)
+
+// ServiceLabel mirrors p2p._service_label: dots swapped out of the display
+// name (DNS label separators), utf-8 truncated to 40 bytes on a rune
+// boundary, then a unique instance suffix.
+func ServiceLabel(name, instanceID string) string {
+	label := strings.ReplaceAll(name, ".", "-")
+	raw := []byte(label)
+	if len(raw) > 40 {
+		raw = raw[:40]
+		for len(raw) > 0 {
+			r, size := utf8.DecodeLastRune(raw)
+			if r == utf8.RuneError && size == 1 {
+				raw = raw[:len(raw)-1]
+				continue
+			}
+			break
+		}
+	}
+	suffix := instanceID
+	if len(suffix) > 8 {
+		suffix = suffix[:8]
+	}
+	return fmt.Sprintf("%s-%s", string(raw), suffix)
+}
+
+// mdnsEntry is one browsed service, normalized from TXT records.
+type mdnsEntry struct {
+	ServiceName string
+	InstanceID  string
+	PeerName    string
+	Port        int
+	Hosts       []string
+}
+
+type mdnsLayer struct {
+	server *zeroconf.Server
+	cancel context.CancelFunc
+}
+
+func parseTXT(text []string) map[string]string {
+	out := make(map[string]string, len(text))
+	for _, item := range text {
+		key, value, found := strings.Cut(item, "=")
+		if found {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+// startMDNS registers this node and browses for peers until ctx ends.
+// Every plausible peer entry is handed to onEntry for WHPC verification.
+func startMDNS(ctx context.Context, cfg Config, localIPs []string,
+	onEntry func(mdnsEntry)) (*mdnsLayer, error) {
+	instance := ServiceLabel(cfg.PeerName, cfg.InstanceID)
+	txt := []string{
+		"peer_name=" + cfg.PeerName,
+		"instance_id=" + cfg.InstanceID,
+		fmt.Sprintf("whpc=%d", CapVersion),
+		"caps=" + strings.Join(cfg.Capabilities, ","),
+		"identity=" + cfg.Identity.Fingerprint,
+		"ips=" + strings.Join(localIPs, ","),
+	}
+	host := "inkhole-" + cfg.InstanceID[:8]
+	server, err := zeroconf.RegisterProxy(instance, mdnsService, mdnsDomain,
+		cfg.Port, host, localIPs, txt, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	browseCtx, cancel := context.WithCancel(ctx)
+	resolver, err := zeroconf.NewResolver(nil)
+	if err != nil {
+		server.Shutdown()
+		cancel()
+		return nil, err
+	}
+	entries := make(chan *zeroconf.ServiceEntry, 16)
+	go func() {
+		for entry := range entries {
+			if entry == nil {
+				continue
+			}
+			decoded := decodeEntry(entry)
+			if decoded == nil || decoded.InstanceID == cfg.InstanceID {
+				continue
+			}
+			onEntry(*decoded)
+		}
+	}()
+	if err := resolver.Browse(browseCtx, mdnsService, mdnsDomain, entries); err != nil {
+		server.Shutdown()
+		cancel()
+		return nil, err
+	}
+	return &mdnsLayer{server: server, cancel: cancel}, nil
+}
+
+func decodeEntry(entry *zeroconf.ServiceEntry) *mdnsEntry {
+	txt := parseTXT(entry.Text)
+	instanceID := strings.ToLower(txt["instance_id"])
+	if !ValidInstanceID(instanceID) ||
+		txt["whpc"] != fmt.Sprintf("%d", CapVersion) {
+		return nil
+	}
+	if entry.Port < 1 || entry.Port > 65535 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var hosts []string
+	push := func(raw string) {
+		host := strings.TrimSpace(raw)
+		if host == "" || seen[host] {
+			return
+		}
+		if ip := net.ParseIP(host); ip == nil || ip.To4() == nil ||
+			ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			return
+		}
+		seen[host] = true
+		hosts = append(hosts, host)
+	}
+	for _, ip := range entry.AddrIPv4 {
+		push(ip.String())
+	}
+	// The txt "ips" list covers Android NSD, which resolves only one address.
+	for _, raw := range strings.Split(txt["ips"], ",") {
+		push(raw)
+	}
+	if len(hosts) == 0 {
+		return nil
+	}
+	name := strings.TrimSpace(txt["peer_name"])
+	if name == "" {
+		name = strings.SplitN(entry.Instance, ".", 2)[0]
+	}
+	return &mdnsEntry{
+		ServiceName: entry.ServiceInstanceName(),
+		InstanceID:  instanceID,
+		PeerName:    name,
+		Port:        entry.Port,
+		Hosts:       hosts,
+	}
+}
+
+func (m *mdnsLayer) stop() {
+	m.cancel()
+	if m.server != nil {
+		m.server.Shutdown()
+	}
+}
