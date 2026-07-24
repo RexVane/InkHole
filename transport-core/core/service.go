@@ -124,6 +124,22 @@ func (s *Service) handle(method string, raw json.RawMessage) (any, error) {
 		return s.createSSHPairing(raw)
 	case "ssh.pair.join":
 		return s.joinSSHPairing(raw)
+	case "lan.start":
+		return s.startLAN(raw)
+	case "lan.stop":
+		var params struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := decodeParams(raw, &params); err != nil {
+			return nil, err
+		}
+		return map[string]any{"stopped": s.removeSession(params.SessionID)}, nil
+	case "lan.peers":
+		return s.lanPeers(raw)
+	case "lan.send":
+		return s.lanSend(raw)
+	case "lan.send.cancel":
+		return s.lanSendCancel(raw)
 	default:
 		return nil, errors.New("unknown method: " + method)
 	}
