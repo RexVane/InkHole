@@ -151,3 +151,89 @@ func TestDirectEstablishRejectsWrongFingerprint(t *testing.T) {
 	_ = sockB.Close()
 	<-serverDone
 }
+
+func TestDirectAttemptBelongsToSessionLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	session := &sshListenerSession{
+		ctx:          ctx,
+		cancel:       cancel,
+		peers:        make(map[string]SSHPeer),
+		endpoints:    make(map[string]*sshPeerEndpoint),
+		stateChanged: make(chan struct{}, 1),
+		directConnect: func(SSHPeer) error {
+			close(started)
+			<-ctx.Done()
+			close(finished)
+			return ctx.Err()
+		},
+	}
+	session.maybeDirect(SSHPeer{InstanceID: "peer"})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("direct attempt did not start")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("session close returned before direct attempt exited")
+	}
+	session.directMu.Lock()
+	defer session.directMu.Unlock()
+	if session.directPending["peer"] {
+		t.Fatal("completed direct attempt remained pending")
+	}
+}
+
+func TestCancelledSessionDoesNotStartDirectAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	session := &sshListenerSession{
+		ctx: ctx,
+		directConnect: func(SSHPeer) error {
+			called = true
+			return nil
+		},
+	}
+	session.maybeDirect(SSHPeer{InstanceID: "peer"})
+	if called {
+		t.Fatal("cancelled session started a direct attempt")
+	}
+}
+
+func TestDirectPublicEndpointStopsWhenContextIsCancelled(t *testing.T) {
+	server := testUDPSocket(t)
+	defer server.Close()
+	oldServers := directSTUNServers
+	directSTUNServers = []string{server.LocalAddr().String()}
+	defer func() { directSTUNServers = oldServers }()
+
+	sock := testUDPSocket(t)
+	defer sock.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if endpoint, ok := directPublicEndpoint(ctx, sock); ok || endpoint != "" {
+			t.Errorf("cancelled STUN lookup returned %q, %v", endpoint, ok)
+		}
+	}()
+
+	buf := make([]byte, 1500)
+	_ = server.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := server.ReadFromUDP(buf); err != nil {
+		t.Fatalf("STUN server did not receive request: %v", err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled STUN lookup did not stop")
+	}
+}

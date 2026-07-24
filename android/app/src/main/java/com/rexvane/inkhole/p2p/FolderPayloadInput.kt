@@ -54,7 +54,9 @@ internal class ChunkedFolderInputStream(
     private var chunkOffset = 0
 
     init {
-        if (wireSize < 32 || plainSize < 0) throw IllegalArgumentException("bad WHE2 size")
+        if (wireSize < 32 || plainSize < 0) {
+            throw IllegalArgumentException("bad chunked encryption size")
+        }
         val header = ByteArray(32)
         input.readFully(header)
         wireConsumed = 32

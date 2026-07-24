@@ -905,7 +905,7 @@ def _validated_commit_destination(commit: dict, metadata: dict,
 
 
 class _FolderWireReader:
-    """Expose an exact WHF1 plaintext stream from clear or WHE2 wire data."""
+    """Expose an exact WHF1 plaintext stream from clear or WHE2/WHE3 wire data."""
 
     def __init__(self, conn: socket.socket, wire_size: int, plain_size: int,
                  secret: str, encrypted: bool, progress):

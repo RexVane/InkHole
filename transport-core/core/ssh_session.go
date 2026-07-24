@@ -95,6 +95,9 @@ type sshListenerSession struct {
 	directConns    map[string]*quicLink
 	directPending  map[string]bool
 	directCooldown map[string]time.Time
+	directClosed   bool
+	directConnect  func(SSHPeer) error
+	directWG       sync.WaitGroup
 }
 
 type sshPeerEndpoint struct {
@@ -270,6 +273,9 @@ func randomRemotePort() int {
 
 func (s *sshListenerSession) Close() error {
 	s.cancel()
+	s.directMu.Lock()
+	s.directClosed = true
+	s.directMu.Unlock()
 	s.mu.Lock()
 	reverse := s.reverse
 	client := s.client
@@ -290,6 +296,7 @@ func (s *sshListenerSession) Close() error {
 	for _, endpoint := range endpoints {
 		_ = endpoint.Close()
 	}
+	s.directWG.Wait()
 	s.closeDirect()
 	s.wg.Wait()
 	return nil
@@ -522,7 +529,11 @@ func (s *sshListenerSession) serveRemoteMux(conn net.Conn, instanceID string) {
 			}
 			return
 		}
-		go s.routeMuxStream(stream, instanceID)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.routeMuxStream(stream, instanceID)
+		}()
 	}
 }
 
@@ -670,6 +681,11 @@ func (e *sshPeerEndpoint) Close() error {
 // openStream 返回一条到对端的流：QUIC 直连可用时优先走直连(速度不受中继
 // 限制)，否则走 SSH 中继 yamux，并在中继路径成功后异步触发一次打洞尝试。
 func (e *sshPeerEndpoint) openStream() (net.Conn, error) {
+	select {
+	case <-e.closed:
+		return nil, net.ErrClosed
+	default:
+	}
 	if direct := e.owner.directStream(e.peer.InstanceID); direct != nil {
 		return direct, nil
 	}

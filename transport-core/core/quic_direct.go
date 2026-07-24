@@ -140,11 +140,24 @@ func directQUICConfig() *quic.Config {
 
 // directPublicEndpoint 从传输将要使用的同一个 UDP socket 发 STUN 查询，
 // 拿到的公网映射端口才与后续 QUIC 流量一致。
-func directPublicEndpoint(sock *net.UDPConn) (string, bool) {
+func directPublicEndpoint(ctx context.Context, sock *net.UDPConn) (string, bool) {
 	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
 	buf := make([]byte, 1500)
-	defer func() { _ = sock.SetReadDeadline(time.Time{}) }()
+	cancelDone := make(chan struct{})
+	cancelRead := context.AfterFunc(ctx, func() {
+		_ = sock.SetReadDeadline(time.Now())
+		close(cancelDone)
+	})
+	defer func() {
+		if !cancelRead() {
+			<-cancelDone
+		}
+		_ = sock.SetReadDeadline(time.Time{})
+	}()
 	for _, server := range directSTUNServers {
+		if ctx.Err() != nil {
+			return "", false
+		}
 		addr, err := net.ResolveUDPAddr("udp4", server)
 		if err != nil {
 			continue
@@ -153,6 +166,9 @@ func directPublicEndpoint(sock *net.UDPConn) (string, bool) {
 			continue
 		}
 		deadline := time.Now().Add(directStunTimeout)
+		if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+			deadline = contextDeadline
+		}
 		_ = sock.SetReadDeadline(deadline)
 		for time.Now().Before(deadline) {
 			n, from, err := sock.ReadFromUDP(buf)
@@ -369,8 +385,15 @@ func (s *sshListenerSession) directStream(instanceID string) net.Conn {
 
 // maybeDirect 是发起方的节流入口：已有直连、正在尝试或冷却中都直接返回。
 func (s *sshListenerSession) maybeDirect(peer SSHPeer) {
+	if s.ctx.Err() != nil {
+		return
+	}
 	s.directMu.Lock()
 	s.ensureDirectState()
+	if s.directClosed || s.ctx.Err() != nil {
+		s.directMu.Unlock()
+		return
+	}
 	if link := s.directConns[peer.InstanceID]; link != nil {
 		select {
 		case <-link.conn.Context().Done():
@@ -387,9 +410,15 @@ func (s *sshListenerSession) maybeDirect(peer SSHPeer) {
 		return
 	}
 	s.directPending[peer.InstanceID] = true
+	attempt := s.directConnect
+	if attempt == nil {
+		attempt = s.tryDirect
+	}
+	s.directWG.Add(1)
 	s.directMu.Unlock()
 	go func() {
-		err := s.tryDirect(peer)
+		defer s.directWG.Done()
+		err := attempt(peer)
 		s.directMu.Lock()
 		delete(s.directPending, peer.InstanceID)
 		if err != nil {
@@ -421,7 +450,7 @@ func (s *sshListenerSession) tryDirect(peer SSHPeer) error {
 		}
 	}()
 	candidates := directLocalCandidates(sock)
-	if public, ok := directPublicEndpoint(sock); ok {
+	if public, ok := directPublicEndpoint(s.ctx, sock); ok {
 		candidates = append([]string{public}, candidates...)
 	}
 	if len(candidates) == 0 {
@@ -554,7 +583,7 @@ func (s *sshListenerSession) handleDirectSignal(stream net.Conn, instanceID stri
 		}
 	}()
 	candidates := directLocalCandidates(sock)
-	if public, ok := directPublicEndpoint(sock); ok {
+	if public, ok := directPublicEndpoint(s.ctx, sock); ok {
 		candidates = append([]string{public}, candidates...)
 	}
 	if len(candidates) == 0 {
@@ -580,7 +609,16 @@ func (s *sshListenerSession) handleDirectSignal(stream net.Conn, instanceID stri
 }
 
 func (s *sshListenerSession) adoptDirect(instanceID string, link *quicLink) {
+	if s.ctx.Err() != nil {
+		link.close("session closed")
+		return
+	}
 	s.directMu.Lock()
+	if s.ctx.Err() != nil {
+		s.directMu.Unlock()
+		link.close("session closed")
+		return
+	}
 	s.ensureDirectState()
 	if old := s.directConns[instanceID]; old != nil {
 		old.close("replaced")
