@@ -227,21 +227,42 @@ async function sendPaths(paths: string[]): Promise<void> {
     }
 }
 
+let recvIdleTimer = 0;
+
+function hideTransferStrip(): void {
+    if (activeSendID) return;
+    byID("transferStrip").hidden = true;
+    animation.active = false;
+    animation.progress = -1;
+}
+
 function setProgress(data: Record<string, any>): void {
+    const kind = String(data.kind || "send");
+    // 发送进行中时发送条优先，接收进度不抢显示。
+    if (kind !== "send" && activeSendID) return;
     const total = Number(data.total || 0);
     const done = Number(data.done || 0);
     const ratio = total > 0 ? Math.max(0, Math.min(1, done / total)) : 0;
     byID("transferStrip").hidden = false;
-    byID("transferName").textContent = String(data.filename || "正在传输");
+    byID("transferName").textContent =
+        (kind === "recv" ? "接收 · " : "") + String(data.filename || "正在传输");
     byID("transferDetail").textContent = `${formatBytes(done)} / ${formatBytes(total)} · ${Math.round(ratio * 100)}%`;
     byID<HTMLProgressElement>("transferProgress").value = ratio;
     animation.active = true;
     animation.progress = ratio;
+    if (kind === "recv") {
+        // 接收没有 transfer-finished 收尾事件：完成后短暂展示即收起，
+        // 对端中途取消则在无进度 8 秒后收起，避免进度条永久卡住。
+        window.clearTimeout(recvIdleTimer);
+        recvIdleTimer = window.setTimeout(hideTransferStrip,
+            total > 0 && done >= total ? 2200 : 8000);
+    }
 }
 
 function finishProgress(data: Record<string, any>): void {
     const succeeded = Number(data.succeeded || 0);
     const total = Number(data.total || 0);
+    window.clearTimeout(recvIdleTimer);
     byID("transferName").textContent = succeeded === total ? "传输完成" : "传输结束";
     byID("transferDetail").textContent = `${succeeded} / ${total} 项成功`;
     byID<HTMLProgressElement>("transferProgress").value = total > 0 ? succeeded / total : 0;
