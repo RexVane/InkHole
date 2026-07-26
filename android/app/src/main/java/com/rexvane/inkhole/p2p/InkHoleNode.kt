@@ -1182,8 +1182,11 @@ class InkHoleNode(
                     capabilities = result.capabilities,
                     publicKey = result.publicKey,
                     identityFingerprint = result.fingerprint)
+                // peers 以 serviceName 作键(显示名可能带 " (2)" 后缀)。
                 synchronized(peersLock) {
-                    if (peers.containsKey(peer.name)) peers[peer.name] = peer
+                    if (peers.containsKey(peer.serviceName)) {
+                        peers[peer.serviceName] = peer
+                    }
                 }
             } catch (_: Exception) {}
         }
