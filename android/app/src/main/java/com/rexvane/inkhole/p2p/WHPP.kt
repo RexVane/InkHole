@@ -16,6 +16,8 @@ object WHPP {
     const val PROTOCOL_VERSION = 3
     const val FOLDER_KIND = "folder-v1"
     const val RELIABLE_KIND = "reliable-v3"
+    /** HKDF 每流派生加密；只对声明此能力的对端发送 WHE4。 */
+    const val WHE4_CAP = "whe4"
     const val BUFFER_SIZE = 1024 * 1024
     const val MAX_HEADER = 64 * 1024              // header 长度上限(来自网络，不可信)
     const val MAX_FILE_SIZE = 1L shl 40           // 单文件 1TB 上限，防恶意 size 声明
@@ -131,7 +133,7 @@ object WHPP {
     /** WHPC v3 response: signed random challenge + identity and capabilities. */
     fun writeCapabilities(out: OutputStream, instanceId: String, peerName: String,
                           nonce: ByteArray, identity: DeviceIdentity) {
-        val capabilities = listOf(FOLDER_KIND, RELIABLE_KIND)
+        val capabilities = listOf(FOLDER_KIND, RELIABLE_KIND, WHE4_CAP)
         val body = JSONObject().apply {
             put("version", CAP_VERSION)
             put("caps", JSONArray(capabilities))

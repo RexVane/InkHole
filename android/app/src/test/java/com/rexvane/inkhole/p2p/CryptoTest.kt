@@ -85,6 +85,49 @@ class CryptoTest {
         }
     }
 
+    @Test
+    fun decryptsWhe4KnownAnswerVector() {
+        // 与 transport-core whe_test.go、tests/test_whe4.py 共用同一向量，
+        // 三端解出同一明文，防实现漂移。
+        val stream = (
+            "57484534303132333435363738396162636465664b41546e6f6e63652f313242" +
+                "000000359ffa94d1a917a59c125e3cb007bbc7c4fea5ec27c482e87d9417ef98" +
+                "f5363211904eea1ba1f6147c5daf8a44400d341e6e7eec3e24"
+            ).hexBytes()
+        val header = stream.copyOfRange(0, 32)
+        val frame = stream.copyOfRange(36, stream.size)
+        assertArrayEquals(
+            "墨洞 WHE4 known-answer test payload".toByteArray(Charsets.UTF_8),
+            Crypto.ChunkedDecryptor("kat-秘密-2026", header).decryptChunk(frame),
+        )
+    }
+
+    @Test
+    fun whe4RoundTripReplayAndWrongSecret() {
+        val payload = "whe4-负载".toByteArray(Charsets.UTF_8)
+        val encryptor = Crypto.ChunkedEncryptor("回环口令", useWhe4 = true)
+        assertArrayEquals(
+            "WHE4".toByteArray(Charsets.US_ASCII),
+            encryptor.streamHeader.copyOfRange(0, 4),
+        )
+        val frame = encryptor.encryptChunk(payload)
+        val decryptor = Crypto.ChunkedDecryptor("回环口令", encryptor.streamHeader)
+        assertArrayEquals(payload, decryptor.decryptChunk(frame))
+        assertNull(decryptor.decryptChunk(frame)) // 重放
+        assertNull(
+            Crypto.ChunkedDecryptor("错口令", encryptor.streamHeader).decryptChunk(frame),
+        )
+    }
+
+    @Test
+    fun encryptorDefaultsToWhe3WithoutNegotiation() {
+        val encryptor = Crypto.ChunkedEncryptor("口令")
+        assertArrayEquals(
+            "WHE3".toByteArray(Charsets.US_ASCII),
+            encryptor.streamHeader.copyOfRange(0, 4),
+        )
+    }
+
     private fun String.hexBytes(): ByteArray =
         chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }

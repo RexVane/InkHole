@@ -1170,8 +1170,23 @@ class InkHoleNode(
             listener.onStatus("请先选择目标设备")
             return false
         }
-        val peer = synchronized(peersLock) { peers.values.find { it.name == selected } }
+        var peer = synchronized(peersLock) { peers.values.find { it.name == selected } }
             ?: run { listener.onStatus("目标设备已离线"); return false }
+        if (peer.endpointToken.isNotEmpty() && peer.identityFingerprint.isEmpty()) {
+            // 跨网端点(短码/SSH)：发送前尽力探测一次真实能力，让 WHE4
+            // 也能在跨网通道协商；旧对端探测失败时安全回退 WHE3。
+            try {
+                val result = probePeer(listOf(peer.host), peer.port,
+                    LOST_PROBE_TIMEOUT_MS, peer.instanceId, peer.endpointToken)
+                peer = peer.copy(instanceId = result.instanceId,
+                    capabilities = result.capabilities,
+                    publicKey = result.publicKey,
+                    identityFingerprint = result.fingerprint)
+                synchronized(peersLock) {
+                    if (peers.containsKey(peer.name)) peers[peer.name] = peer
+                }
+            } catch (_: Exception) {}
+        }
         val expectedReceiverFingerprint = peer.identityFingerprint
         if (peer.transport in setOf("lan", "tailscale") &&
             (!peer.instanceId.matches(Regex("[0-9a-f]{32}")) ||
@@ -1281,7 +1296,8 @@ class InkHoleNode(
                         useSendInput(inputFactory) { source ->
                             skipExactly(source, offset, ::cancellationRequested)
                             if (encrypted) {
-                                val encryptor = Crypto.ChunkedEncryptor(secret)
+                                val encryptor = Crypto.ChunkedEncryptor(
+                                    secret, WHPP.WHE4_CAP in peer.capabilities)
                                 dout.write(encryptor.streamHeader)
                                 var sentWire = encryptor.streamHeader.size.toLong()
                                 var sentPlain = 0L
@@ -1664,7 +1680,8 @@ class InkHoleNode(
     }
 
     private fun probePeer(hosts: List<String>, port: Int, timeoutMs: Int,
-                          expectedInstanceId: String = ""): PeerProbeResult {
+                          expectedInstanceId: String = "",
+                          endpointToken: String = ""): PeerProbeResult {
         var lastError: Exception? = null
         var identityError: IdentityMismatchException? = null
         var tailnetUnavailable: TailnetUnavailableException? = null
@@ -1682,6 +1699,12 @@ class InkHoleNode(
                     it.soTimeout = timeoutMs
                     val nonce = ByteArray(32).also(SecureRandom()::nextBytes)
                     it.getOutputStream().apply {
+                        if (endpointToken.isNotEmpty()) {
+                            // 跨网桥接端点(短码/SSH)：先过 IKAT 鉴权；桥接为
+                            // 每个连接开独立通道，探测不影响随后的 WHPP 连接。
+                            write("IKAT".toByteArray(Charsets.US_ASCII))
+                            write(endpointToken.toByteArray(Charsets.US_ASCII))
+                        }
                         write(WHPP.CAP_MAGIC)
                         write(nonce)
                         flush()
