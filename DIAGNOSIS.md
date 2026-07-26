@@ -83,4 +83,29 @@
 
 ---
 
-*本文档由深度代码审查生成，所有结论附代码位置可复核。*
+## 四、2026-07-25 统一核心深度审查修复记录
+
+对新 LAN 栈（`core/lan/` + `lan_service.go`）与 Wails 桌面壳（`desktop/`）的深度审查发现并修复：
+
+| # | 问题 | 位置 | 修复 |
+|---|------|------|------|
+| P0-1 | acceptLoop 清 deadline 后读 IKCI token / WHPC nonce，半开连接永久挂 goroutine；Close 的 `wg.Wait` 只关 listener 不关连接 → `lan.stop` / desktop `Stop()` 挂死 | lan_service.go, desktop/inkhole.go | 握手 deadline 保持到分发完成；跟踪活动连接，Close 时统一关闭。回归测试 `TestLANStopWithStalledHandshakes` 锁死该行为 |
+| P0-2 | desktop 手动设备探测单轮失败即下线（Android 端有 `PROBE_STRIKES_MANUAL=4`，新壳丢了）| desktop/inkhole.go | `manualProbeStrikes=4`，失败期间保留上次运行时条目 |
+| P0-3 | 事件通道满 128 条静默丢弃，会丢 `lan.sent`/`wormhole.ready` 等一次性关键事件 | core/service.go | 分级：`lan.progress/status/peers` 快照可丢，其余阻塞送达（服务关闭兜底）|
+| P1-5 | 伪造 UDP announcement 可无限触发 3s 超时的验证 goroutine（DoS）| core/lan/discovery.go | 验证并发信号量（8），超限丢弃待下轮 |
+| P1-6 | 同一设备经 mDNS 与广播两个 key 重复进设备列表 | core/lan/discovery.go | 按 InstanceID 合并地址进已有条目 |
+| P1-7 | yamux 断开后 acceptLocal 静默退出，悬空 listener 吞连接 | core/bridge.go | 失败即 cancel 整个 bridge |
+| P1-8 | `Start` 后台 startSSH 与 SaveSSHConfig 的 restartSSH 并发调 `ssh.listen`，泄漏会话 | desktop/transport.go | `sshMu` 串行化 |
+| 去重 | desktop 壳复制了一份 acceptLoop 分发逻辑，与 lan_service.go 已出现行为分歧 | core/lan/inbound.go（新）| 下沉为 `lan.HandleInbound`，两壳共用 |
+
+**后续协议演进**：WHE4 已在三端实施（2026-07-25）——口令经 600k PBKDF2 对固定应用盐派生主密钥并缓存（每进程每口令一次），每流经 HKDF-SHA256(master, salt=流盐, info) 派生流密钥；通过签名的 WHPC `whe4` capability 协商，只有接收端明确声明能力时发送端才使用 WHE4，旧端自动回退 WHE3，无协议破坏。Go（whe.go + lan_service/desktop 接线）、Python（crypto.py/p2p.py）、Kotlin（Crypto.kt/WHPP.kt/InkHoleNode.kt）均已声明能力并支持收发，三端共用同一 known-answer 向量锁定字节兼容（whe_test.go / tests/test_whe4.py / CryptoTest.kt）。仍遗留：WHE1 小文件路径保留 100k PBKDF2，仅用于历史跨端兼容且 Go 生产路径不调用；SendFolder 因 header 需预知整流 SHA-256 仍需两遍读盘，留待下一版分块哈希协议处理。
+
+验证：`go vet` + `go test ./core/... -race` 全过（含新回归测试与 WHE4 KAT）、desktop `go build` 通过、Python 套件 132 passed、Android `testDebugUnitTest` 全过。
+
+**2026-07-26 复查收尾**（跨网 WHE4 + 缓存加固）：
+
+| # | 问题 | 位置 | 修复 |
+|---|------|------|------|
+| F-1 | SSH / 一次性短码端点能力写死 `folder-v1`，跨网传输永远回退 WHE3；Python 外部端点探测不带 IKAT 令牌被桥接拒绝，文件夹只能走 ZIP 兜底 | desktop/inkhole.go, src/inkhole/p2p.py, InkHoleNode.kt | 三端 WHPC 探测支持端点令牌（Go `lan.ProbeEndpoint`、Python `_probe_peer(endpoint_token=)`、Kotlin `probePeer(endpointToken=)`），发送前透过桥接探测一次真实能力再决定 WHE4，同时钉住对端身份指纹；旧对端探测失败安全回退 WHE3。desktop 的 Tailscale 手动设备也把探测到的能力带进 `PeerView.Capabilities` 参与 WHE4 协商。测试 `TestProbeEndpointNegotiatesWHE4ThroughBridgeAuth` 覆盖令牌鉴权与能力透传 |
+| F-2 | Python/Kotlin WHE4 主密钥缓存用明文口令做键，换掉的旧口令长期留存进程内存 | src/inkhole/crypto.py, Crypto.kt | 与 Go masterCache 同设计：进程随机 HMAC-SHA256 摘要作缓存键，明文口令不再作为键留存（tests/test_whe4.py 断言缓存键非明文）|
+| F-3 | 桌宠恢复位置时未吸附坐标不做越界校正，外接屏拔掉后桌宠停在屏幕外（如 x=2721 vs 屏宽 1440）| desktop/frontend/src/pet.ts | 恢复后按当前屏幕工作区 clamp（含 edge=-1），并修复旧版错误保存的边缘状态；桌宠拖动/吸附已改为 macOS 原生窗口拖动 + Go 端动画 |
