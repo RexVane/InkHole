@@ -22,9 +22,13 @@ type streamBridge struct {
 	wg       sync.WaitGroup
 }
 
+// newSendingBridge multiplexes the wormhole tunnel with the same tuned yamux
+// config as the SSH data plane: the default 256KB stream window caps a
+// 200ms-RTT relay at ~1.25MB/s, while 4MB windows lift that to ~20MB/s.
+// Window sizes are per-receiver declarations, so older peers stay compatible.
 func newSendingBridge(parent context.Context, conn net.Conn) (*streamBridge, error) {
 	ctx, cancel := context.WithCancel(parent)
-	mux, err := yamux.Client(conn, nil)
+	mux, err := yamux.Client(conn, sshMuxConfig())
 	if err != nil {
 		cancel()
 		_ = conn.Close()
@@ -46,7 +50,7 @@ func newSendingBridge(parent context.Context, conn net.Conn) (*streamBridge, err
 
 func newReceivingBridge(parent context.Context, conn net.Conn, target, targetToken string) (*streamBridge, error) {
 	ctx, cancel := context.WithCancel(parent)
-	mux, err := yamux.Server(conn, nil)
+	mux, err := yamux.Server(conn, sshMuxConfig())
 	if err != nil {
 		cancel()
 		_ = conn.Close()
