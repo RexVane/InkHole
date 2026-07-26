@@ -2,8 +2,10 @@ package core
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -115,4 +117,63 @@ func TestLANServiceTransfer(t *testing.T) {
 	}
 	lanCall(t, receiver, "lan.stop", map[string]any{
 		"session_id": restart["session_id"]})
+}
+
+// TestLANStopWithStalledHandshakes locks in the accept-loop deadline fix:
+// connections that send a partial handshake (or nothing) and then go
+// silent must not park handler goroutines, and lan.stop must close them
+// out instead of hanging on wg.Wait.
+func TestLANStopWithStalledHandshakes(t *testing.T) {
+	service := NewService()
+	t.Cleanup(func() { _ = service.Close() })
+	// start installs the local ingress token so the IKCI branch actually
+	// reaches its token read.
+	lanCall(t, service, "start", map[string]any{
+		"local_target": "127.0.0.1:1",
+		"local_token":  "stall-test-token",
+		"device_name":  "挂死测试",
+		"instance_id":  "dddddddddddddddddddddddddddddddd",
+	})
+	start := lanCall(t, service, "lan.start", map[string]any{
+		"peer_name":    "挂死测试",
+		"instance_id":  "dddddddddddddddddddddddddddddddd",
+		"inbox":        t.TempDir(),
+		"disable_mdns": true,
+		"disable_udp":  true,
+	})
+	port := int(start["port"].(float64))
+
+	// Three stall shapes: silent, IKCI without a token, WHPC without a nonce.
+	for _, prefix := range []string{"", "IKCI", "WHPC"} {
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if prefix != "" {
+			if _, err := conn.Write([]byte(prefix)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Let the accept loop pick all three up before stopping.
+	time.Sleep(300 * time.Millisecond)
+
+	done := make(chan string, 1)
+	go func() {
+		raw, _ := json.Marshal(map[string]any{
+			"id": "t-stop", "method": "lan.stop",
+			"params": map[string]any{"session_id": start["session_id"]},
+		})
+		done <- service.HandleJSON(string(raw))
+	}()
+	select {
+	case reply := <-done:
+		var response Response
+		if err := json.Unmarshal([]byte(reply), &response); err != nil || !response.OK {
+			t.Fatalf("lan.stop failed: %s", reply)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("lan.stop hung on stalled handshake connections")
+	}
 }

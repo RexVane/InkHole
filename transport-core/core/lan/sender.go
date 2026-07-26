@@ -31,16 +31,20 @@ var ErrReceiverRejected = errors.New("receiver rejected the transfer")
 
 // SendTarget identifies one verified peer endpoint.
 type SendTarget struct {
-	Host        string
-	Hosts       []string
-	Port        int
-	InstanceID  string // pins the receiver identity when non-empty
-	Fingerprint string // pins the receiver key when non-empty
+	Host          string
+	Hosts         []string
+	Port          int
+	InstanceID    string // pins the receiver identity when non-empty
+	Fingerprint   string // pins the receiver key when non-empty
+	EndpointToken string // authenticates loopback SSH/wormhole bridge endpoints
+	// UseWHE4 records that this receiver advertised CapWHE4; encrypted
+	// sends then use the HKDF-per-stream format instead of WHE3.
+	UseWHE4 bool
 }
 
 // SenderConfig wires one send operation to its environment.
 type SenderConfig struct {
-	Secret     string // non-empty enables WHE3 end-to-end encryption
+	Secret     string // non-empty enables end-to-end encryption
 	Identity   *Identity
 	InstanceID string
 	OnProgress func(filename string, done, total int64)
@@ -200,6 +204,11 @@ func dialTarget(ctx context.Context, target SendTarget) (net.Conn, error) {
 		conn, err := dialer.DialContext(ctx, "tcp",
 			net.JoinHostPort(host, strconv.Itoa(target.Port)))
 		if err == nil {
+			if err := authenticateEndpoint(conn, target.EndpointToken); err != nil {
+				_ = conn.Close()
+				lastErr = err
+				continue
+			}
 			return conn, nil
 		}
 		lastErr = err
@@ -208,6 +217,24 @@ func dialTarget(ctx context.Context, target SendTarget) (net.Conn, error) {
 		lastErr = errors.New("no reachable address")
 	}
 	return nil, lastErr
+}
+
+func authenticateEndpoint(conn net.Conn, token string) error {
+	if token == "" {
+		return nil
+	}
+	if len(token) > 256 {
+		return errors.New("transport endpoint token is invalid")
+	}
+	for _, value := range []byte(token) {
+		if value < 0x21 || value > 0x7e {
+			return errors.New("transport endpoint token is invalid")
+		}
+	}
+	if _, err := conn.Write(append([]byte("IKAT"), token...)); err != nil {
+		return fmt.Errorf("authenticate transport endpoint: %w", err)
+	}
+	return nil
 }
 
 func sendOnce(ctx context.Context, target SendTarget, source sourceFactory,
@@ -313,7 +340,7 @@ func sendOnce(ctx context.Context, target SendTarget, source sourceFactory,
 	}
 	if remaining > 0 {
 		if err := sendBody(ctx, conn, source, header, offset, remaining,
-			wireSize, cfg); err != nil {
+			wireSize, target.UseWHE4, cfg); err != nil {
 			return err
 		}
 	}
@@ -366,7 +393,7 @@ func readSizedField(conn net.Conn) ([]byte, error) {
 
 func sendBody(ctx context.Context, conn net.Conn, source sourceFactory,
 	header *TransferHeader, offset, remaining, wireSize int64,
-	cfg SenderConfig) error {
+	useWHE4 bool, cfg SenderConfig) error {
 	reader, err := source(offset)
 	if err != nil {
 		return err
@@ -379,7 +406,7 @@ func sendBody(ctx context.Context, conn net.Conn, source sourceFactory,
 		}
 	}
 	if header.Encrypted {
-		encryptor, err := NewChunkedEncryptor(cfg.Secret)
+		encryptor, err := NewChunkedEncryptor(cfg.Secret, useWHE4)
 		if err != nil {
 			return err
 		}

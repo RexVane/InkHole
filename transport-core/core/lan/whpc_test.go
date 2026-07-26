@@ -173,6 +173,69 @@ func TestProbeLoopback(t *testing.T) {
 	}
 }
 
+// startTokenProbeServer mimics a transport-core bridge endpoint: it consumes
+// the "IKAT"+token prefix before answering WHPC, and drops connections that
+// present a wrong token — exactly like streamBridge.authenticateLoopback.
+func startTokenProbeServer(t *testing.T, identity *Identity, token string,
+	caps []string) *net.TCPAddr {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				prefix := make([]byte, 4+len(token))
+				if _, err := io.ReadFull(conn, prefix); err != nil ||
+					string(prefix) != "IKAT"+token {
+					return
+				}
+				head := make([]byte, 4)
+				if _, err := io.ReadFull(conn, head); err != nil ||
+					string(head) != capMagic {
+					return
+				}
+				_ = RespondProbe(conn, identity, vecInstanceID, "跨网设备", caps)
+			}(conn)
+		}
+	}()
+	return listener.Addr().(*net.TCPAddr)
+}
+
+func TestProbeEndpointNegotiatesWHE4ThroughBridgeAuth(t *testing.T) {
+	identity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := startTokenProbeServer(t, identity, "bridge-token",
+		[]string{CapFolder, CapReliable, CapWHE4})
+	result, err := ProbeEndpoint("127.0.0.1", addr.Port, "bridge-token",
+		3*time.Second, vecInstanceID)
+	if err != nil {
+		t.Fatalf("ProbeEndpoint: %v", err)
+	}
+	if !SupportsWHE4(result.Capabilities) {
+		t.Fatalf("whe4 capability lost through the endpoint: %+v", result)
+	}
+	if result.Fingerprint != identity.Fingerprint {
+		t.Fatal("fingerprint mismatch")
+	}
+	// A wrong token is dropped by the bridge; the probe must fail instead
+	// of silently succeeding.
+	if _, err := ProbeEndpoint("127.0.0.1", addr.Port, "wrong-token",
+		3*time.Second, ""); err == nil {
+		t.Fatal("probe with a wrong endpoint token succeeded")
+	}
+}
+
 func TestProbeRejectsWrongNonceSignature(t *testing.T) {
 	signer, err := GenerateIdentity()
 	if err != nil {

@@ -19,6 +19,10 @@ type Service struct {
 	instanceID  string
 	sessions    map[string]session
 	events      chan Event
+	eventMu     sync.Mutex
+	eventCond   *sync.Cond
+	eventQueue  []Event
+	eventWG     sync.WaitGroup
 	// sshConnect is injectable for lifecycle tests; production uses the real
 	// SSH reverse-forward connector.
 	sshConnect sshReverseConnector
@@ -30,17 +34,24 @@ type session interface {
 
 func NewService() *Service {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Service{
+	service := &Service{
 		ctx:        ctx,
 		cancel:     cancel,
 		sessions:   make(map[string]session),
 		events:     make(chan Event, 128),
 		sshConnect: connectSSHReverse,
 	}
+	service.eventCond = sync.NewCond(&service.eventMu)
+	service.eventWG.Add(1)
+	go service.dispatchEvents()
+	return service
 }
 
 func (s *Service) Close() error {
 	s.cancel()
+	s.eventMu.Lock()
+	s.eventCond.Broadcast()
+	s.eventMu.Unlock()
 	s.mu.Lock()
 	sessions := s.sessions
 	s.sessions = make(map[string]session)
@@ -48,17 +59,69 @@ func (s *Service) Close() error {
 	for _, current := range sessions {
 		_ = current.Close()
 	}
+	s.eventWG.Wait()
 	return nil
 }
 
 func (s *Service) Events() <-chan Event { return s.events }
 
+// droppableEvent lists the high-frequency snapshot events a slow consumer
+// may lose without harm: progress repeats every chunk, status lines are
+// advisory, and lan.peers always carries the full verified list again on
+// the next change. Everything else (completion receipts, wormhole/ssh
+// lifecycle) fires once and must be delivered.
+func droppableEvent(name string) bool {
+	switch name {
+	case "lan.progress", "lan.status", "lan.peers":
+		return true
+	}
+	return false
+}
+
 func (s *Service) emit(name string, data any) {
-	select {
-	case s.events <- Event{Event: name, Data: data}:
-	default:
-		// Status events must never stall data forwarding. The clients refresh
-		// authoritative session state after reconnecting to the control channel.
+	event := Event{Event: name, Data: data}
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	if s.ctx.Err() != nil {
+		return
+	}
+	if droppableEvent(name) && len(s.eventQueue) >= cap(s.events) {
+		// Bound queued snapshots while a client is not consuming them. The
+		// next update supersedes the dropped one.
+		return
+	}
+	s.eventQueue = append(s.eventQueue, event)
+	s.eventCond.Signal()
+}
+
+// dispatchEvents decouples transfer/session goroutines from UI event
+// consumption. Snapshot traffic is bounded by emit; one-shot events stay in
+// this ordered queue until the client consumes them or the service closes.
+func (s *Service) dispatchEvents() {
+	defer s.eventWG.Done()
+	for {
+		s.eventMu.Lock()
+		for len(s.eventQueue) == 0 && s.ctx.Err() == nil {
+			s.eventCond.Wait()
+		}
+		if s.ctx.Err() != nil {
+			s.eventMu.Unlock()
+			return
+		}
+		event := s.eventQueue[0]
+		if len(s.eventQueue) == 1 {
+			s.eventQueue = nil
+		} else {
+			s.eventQueue[0] = Event{}
+			s.eventQueue = s.eventQueue[1:]
+		}
+		s.eventMu.Unlock()
+
+		select {
+		case s.events <- event:
+		case <-s.ctx.Done():
+			return
+		}
 	}
 }
 

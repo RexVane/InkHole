@@ -43,6 +43,9 @@ const (
 
 	CapReliable = "reliable-v3"
 	CapFolder   = KindFolder
+	// CapWHE4 advertises the HKDF-per-stream encryption format. Senders
+	// use WHE4 only for receivers listing it; everyone else gets WHE3.
+	CapWHE4 = "whe4"
 
 	maxHeaderSize    = 64 * 1024
 	maxFileSize      = int64(1) << 40
@@ -116,6 +119,17 @@ func appendJSONString(buffer []byte, value string) []byte {
 
 func appendInt(buffer []byte, value int64) []byte {
 	return fmt.Appendf(buffer, "%d", value)
+}
+
+// SupportsWHE4 reports whether a verified peer advertised the WHE4
+// encryption capability.
+func SupportsWHE4(capabilities []string) bool {
+	for _, capability := range capabilities {
+		if capability == CapWHE4 {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidSHA256 mirrors p2p._valid_sha256.

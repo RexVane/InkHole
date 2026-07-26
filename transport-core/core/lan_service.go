@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/rexvane/inkhole/transport-core/core/lan"
 )
@@ -34,28 +32,33 @@ type lanStartParams struct {
 }
 
 type lanSendParams struct {
-	SessionID   string `json:"session_id"`
-	Path        string `json:"path"`
-	InstanceID  string `json:"instance_id,omitempty"`
-	Host        string `json:"host,omitempty"`
-	Port        int    `json:"port,omitempty"`
-	Fingerprint string `json:"fingerprint,omitempty"`
+	SessionID     string `json:"session_id"`
+	Path          string `json:"path"`
+	InstanceID    string `json:"instance_id,omitempty"`
+	Host          string `json:"host,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	Fingerprint   string `json:"fingerprint,omitempty"`
+	EndpointToken string `json:"endpoint_token,omitempty"`
 }
 
 type lanSession struct {
-	service    *Service
-	ctx        context.Context
-	cancel     context.CancelFunc
-	sessionID  string
-	identity   *lan.Identity
-	instanceID string
-	secret     string
-	listener   net.Listener
-	receiver   *lan.Receiver
-	discovery  *lan.Discovery
+	service                *Service
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	sessionID              string
+	identity               *lan.Identity
+	instanceID             string
+	secret                 string
+	advertisedName         string
+	advertisedCapabilities []string
+	ingressToken           string
+	listener               net.Listener
+	receiver               *lan.Receiver
+	discovery              *lan.Discovery
 
 	mu    sync.Mutex
 	sends map[string]context.CancelFunc
+	conns map[net.Conn]struct{}
 	wg    sync.WaitGroup
 }
 
@@ -74,7 +77,7 @@ func (s *Service) startLAN(raw json.RawMessage) (any, error) {
 		return nil, err
 	}
 	if len(params.Capabilities) == 0 {
-		params.Capabilities = []string{lan.CapReliable, lan.CapFolder}
+		params.Capabilities = []string{lan.CapReliable, lan.CapFolder, lan.CapWHE4}
 	}
 	listener, err := net.Listen("tcp",
 		net.JoinHostPort("", strconv.Itoa(params.ListenPort)))
@@ -86,15 +89,19 @@ func (s *Service) startLAN(raw json.RawMessage) (any, error) {
 	ctx, cancel := context.WithCancel(s.ctx)
 	id := randomID("lan")
 	current := &lanSession{
-		service:    s,
-		ctx:        ctx,
-		cancel:     cancel,
-		sessionID:  id,
-		identity:   identity,
-		instanceID: params.InstanceID,
-		secret:     params.Secret,
-		listener:   listener,
-		sends:      make(map[string]context.CancelFunc),
+		service:                s,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		sessionID:              id,
+		identity:               identity,
+		instanceID:             params.InstanceID,
+		secret:                 params.Secret,
+		advertisedName:         params.PeerName,
+		advertisedCapabilities: append([]string(nil), params.Capabilities...),
+		ingressToken:           s.localIngressToken(),
+		listener:               listener,
+		sends:                  make(map[string]context.CancelFunc),
+		conns:                  make(map[net.Conn]struct{}),
 	}
 	receiver, err := lan.NewReceiver(lan.ReceiverConfig{
 		InboxDir:   params.Inbox,
@@ -203,8 +210,9 @@ func (l *lanSession) emit(name string, data map[string]any) {
 	l.service.emit(name, data)
 }
 
-// acceptLoop dispatches inbound connections by magic: WHPC probes answer
-// inline, WHPP transfers hand off to the receiver.
+// acceptLoop tracks inbound connections and hands each one to the shared
+// lan.HandleInbound dispatcher; tracking lets Close unblock stalled
+// handshakes so wg.Wait cannot hang.
 func (l *lanSession) acceptLoop() {
 	defer l.wg.Done()
 	for {
@@ -212,41 +220,60 @@ func (l *lanSession) acceptLoop() {
 		if err != nil {
 			return
 		}
+		if !l.trackConn(conn) {
+			_ = conn.Close()
+			return
+		}
 		l.wg.Add(1)
 		go func(conn net.Conn) {
 			defer l.wg.Done()
-			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-			head := make([]byte, 4)
-			if _, err := io.ReadFull(conn, head); err != nil {
-				_ = conn.Close()
-				return
-			}
-			_ = conn.SetDeadline(time.Time{})
-			switch string(head) {
-			case "WHPC":
-				_ = lan.RespondProbe(conn, l.identity, l.instanceID,
-					l.peerName(), l.capabilities())
-				_ = conn.Close()
-			case "WHPP":
-				l.receiver.HandleWHPP(conn)
-			default:
-				_ = conn.Close()
-			}
+			defer l.untrackConn(conn)
+			lan.HandleInbound(conn, lan.InboundConfig{
+				IngressToken: l.ingressToken,
+				Identity:     l.identity,
+				InstanceID:   l.instanceID,
+				PeerName:     l.peerName,
+				Capabilities: l.capabilities,
+				Receiver:     l.receiver,
+			})
 		}(conn)
 	}
 }
 
+// trackConn registers a live inbound connection; false after Close began.
+func (l *lanSession) trackConn(conn net.Conn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conns == nil {
+		return false
+	}
+	l.conns[conn] = struct{}{}
+	return true
+}
+
+func (l *lanSession) untrackConn(conn net.Conn) {
+	l.mu.Lock()
+	if l.conns != nil {
+		delete(l.conns, conn)
+	}
+	l.mu.Unlock()
+}
+
 func (l *lanSession) peerName() string {
-	l.service.mu.RLock()
-	defer l.service.mu.RUnlock()
-	if l.service.deviceName != "" {
-		return l.service.deviceName
+	if l.advertisedName != "" {
+		return l.advertisedName
 	}
 	return "InkHole"
 }
 
 func (l *lanSession) capabilities() []string {
-	return []string{lan.CapReliable, lan.CapFolder}
+	return append([]string(nil), l.advertisedCapabilities...)
+}
+
+func (s *Service) localIngressToken() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.localToken
 }
 
 func (l *lanSession) Close() error {
@@ -259,6 +286,12 @@ func (l *lanSession) Close() error {
 	for _, cancel := range l.sends {
 		cancel()
 	}
+	// Closing live connections unblocks any handler mid-read so wg.Wait
+	// below cannot hang on a stalled peer.
+	for conn := range l.conns {
+		_ = conn.Close()
+	}
+	l.conns = nil
 	l.mu.Unlock()
 	l.wg.Wait()
 	return nil
@@ -363,16 +396,20 @@ func (current *lanSession) resolveTarget(params lanSendParams) (lan.SendTarget, 
 					Port:        peer.Port,
 					InstanceID:  peer.InstanceID,
 					Fingerprint: peer.Fingerprint,
+					UseWHE4:     lan.SupportsWHE4(peer.Capabilities),
 				}, nil
 			}
 		}
 	}
 	if params.Host != "" && params.Port > 0 {
+		// Manual endpoints carry no verified capability list, so encrypted
+		// sends stay on WHE3, which every v3 peer accepts.
 		return lan.SendTarget{
-			Host:        params.Host,
-			Port:        params.Port,
-			InstanceID:  params.InstanceID,
-			Fingerprint: params.Fingerprint,
+			Host:          params.Host,
+			Port:          params.Port,
+			InstanceID:    params.InstanceID,
+			Fingerprint:   params.Fingerprint,
+			EndpointToken: params.EndpointToken,
 		}, nil
 	}
 	return lan.SendTarget{}, errors.New("target device is not available")

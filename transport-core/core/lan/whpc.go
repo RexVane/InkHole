@@ -55,6 +55,21 @@ type probeBody struct {
 // A non-empty expectedInstanceID additionally pins the peer identity.
 func ProbePeer(host string, port int, timeout time.Duration,
 	expectedInstanceID string) (*ProbeResult, error) {
+	return probeAddr(host, port, "", timeout, expectedInstanceID)
+}
+
+// ProbeEndpoint runs one WHPC v3 challenge through an authenticated
+// loopback bridge endpoint (SSH relay / one-time wormhole). The bridge
+// multiplexes one fresh stream per connection, so probing costs a single
+// relay round-trip and lets cross-network sends negotiate WHE4; peers that
+// never answer simply keep the WHE3 fallback.
+func ProbeEndpoint(host string, port int, endpointToken string,
+	timeout time.Duration, expectedInstanceID string) (*ProbeResult, error) {
+	return probeAddr(host, port, endpointToken, timeout, expectedInstanceID)
+}
+
+func probeAddr(host string, port int, endpointToken string,
+	timeout time.Duration, expectedInstanceID string) (*ProbeResult, error) {
 	conn, err := net.DialTimeout("tcp",
 		net.JoinHostPort(host, strconv.Itoa(port)), timeout)
 	if err != nil {
@@ -62,6 +77,9 @@ func ProbePeer(host string, port int, timeout time.Duration,
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if err := authenticateEndpoint(conn, endpointToken); err != nil {
+		return nil, err
+	}
 	nonce := make([]byte, nonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err

@@ -20,6 +20,11 @@ const (
 	probeInterval = 5 * time.Second
 	probeTimeout  = 3 * time.Second
 	probeStrikes  = 4
+	// maxConcurrentVerifications bounds the goroutines candidate
+	// verification may spawn. Without it a hostile host can flood the
+	// discovery port with announcements carrying ever-new instance ids,
+	// each costing a TCP probe with a multi-second timeout.
+	maxConcurrentVerifications = 8
 )
 
 // Config configures one LAN discovery node.
@@ -73,6 +78,10 @@ type Discovery struct {
 	verinstr map[string]bool // in-flight verification probes
 	reported map[string]bool // identity errors already reported
 
+	verifySem chan struct{}
+	stopping  bool
+	stopOnce  sync.Once
+
 	broadcast *broadcaster
 	mdns      *mdnsLayer
 	wg        sync.WaitGroup
@@ -108,6 +117,8 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 		strike:   make(map[string]int),
 		verinstr: map[string]bool{},
 		reported: map[string]bool{},
+
+		verifySem: make(chan struct{}, maxConcurrentVerifications),
 	}
 	if d.interval <= 0 {
 		d.interval = probeInterval
@@ -135,11 +146,7 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 	if !cfg.DisableMDNS {
 		mdns, err := startMDNS(ctx, cfg, cfg.LocalIPs, d.handleEntry)
 		if err != nil {
-			cancel()
-			d.wg.Wait()
-			if d.broadcast != nil {
-				d.broadcast.close()
-			}
+			d.Stop()
 			return nil, err
 		}
 		d.mdns = mdns
@@ -154,13 +161,18 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 
 // Stop tears the stack down and waits for every goroutine.
 func (d *Discovery) Stop() {
-	d.cancel()
-	if d.mdns != nil {
-		d.mdns.stop()
-	}
-	if d.broadcast != nil {
-		d.broadcast.close()
-	}
+	d.stopOnce.Do(func() {
+		d.mu.Lock()
+		d.stopping = true
+		d.cancel()
+		d.mu.Unlock()
+		if d.mdns != nil {
+			d.mdns.stop()
+		}
+		if d.broadcast != nil {
+			d.broadcast.close()
+		}
+	})
 	d.wg.Wait()
 }
 
@@ -240,22 +252,28 @@ func (d *Discovery) handleEntry(entry mdnsEntry) {
 }
 
 // verifyCandidate probes a discovered candidate before it may enter the
-// peer list; at most one verification per key runs at a time.
+// peer list; at most one verification per key runs at a time, and the
+// total in flight is capped. A candidate that finds the cap exhausted is
+// simply dropped — mDNS and the broadcast loop will offer it again.
 func (d *Discovery) verifyCandidate(key, name string, hosts []string,
 	port int, instanceID string) {
-	if d.ctx.Err() != nil {
+	d.mu.Lock()
+	if d.stopping || d.verinstr[key] {
+		d.mu.Unlock()
 		return
 	}
-	d.mu.Lock()
-	if d.verinstr[key] {
+	select {
+	case d.verifySem <- struct{}{}:
+	default:
 		d.mu.Unlock()
 		return
 	}
 	d.verinstr[key] = true
-	d.mu.Unlock()
 	d.wg.Add(1)
+	d.mu.Unlock()
 	go func() {
 		defer d.wg.Done()
+		defer func() { <-d.verifySem }()
 		defer func() {
 			d.mu.Lock()
 			delete(d.verinstr, key)
@@ -267,22 +285,45 @@ func (d *Discovery) verifyCandidate(key, name string, hosts []string,
 		}
 		addresses := dedupeStrings(append([]string{connected}, hosts...))
 		d.mu.Lock()
-		d.peers[key] = &Peer{
-			InstanceID:   result.InstanceID,
-			Name:         firstNonEmpty(result.PeerName, name),
-			Host:         connected,
-			Hosts:        addresses,
-			Port:         port,
-			Capabilities: result.Capabilities,
-			PublicKey:    result.PublicKey,
-			Fingerprint:  result.Fingerprint,
-			ServiceName:  key,
+		if existingKey, existing := d.peerByInstanceLocked(result.InstanceID); existing != nil &&
+			existingKey != key {
+			// The same device already entered through the other discovery
+			// source (mDNS vs broadcast). Merge addresses instead of showing
+			// a duplicate entry.
+			existing.Name = firstNonEmpty(result.PeerName, existing.Name)
+			existing.Hosts = dedupeStrings(append(existing.Hosts, addresses...))
+			existing.Capabilities = result.Capabilities
+			existing.PublicKey = result.PublicKey
+			existing.Fingerprint = result.Fingerprint
+			delete(d.strike, existingKey)
+		} else {
+			d.peers[key] = &Peer{
+				InstanceID:   result.InstanceID,
+				Name:         firstNonEmpty(result.PeerName, name),
+				Host:         connected,
+				Hosts:        addresses,
+				Port:         port,
+				Capabilities: result.Capabilities,
+				PublicKey:    result.PublicKey,
+				Fingerprint:  result.Fingerprint,
+				ServiceName:  key,
+			}
+			delete(d.strike, key)
+			delete(d.reported, key)
 		}
-		delete(d.strike, key)
-		delete(d.reported, key)
 		d.mu.Unlock()
 		d.emitPeers()
 	}()
+}
+
+// peerByInstanceLocked finds the entry holding a verified instance id.
+func (d *Discovery) peerByInstanceLocked(instanceID string) (string, *Peer) {
+	for key, peer := range d.peers {
+		if peer.InstanceID == instanceID {
+			return key, peer
+		}
+	}
+	return "", nil
 }
 
 // probeHosts tries every candidate address until one verifies. Identity

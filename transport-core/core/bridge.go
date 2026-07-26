@@ -101,7 +101,10 @@ func (b *streamBridge) acceptLocal(ctx context.Context) {
 		}
 		remote, err := b.session.Open()
 		if err != nil {
+			// The mux is gone; tear the whole bridge down instead of
+			// leaving a listener that accepts and then strands clients.
 			_ = local.Close()
+			b.cancel()
 			return
 		}
 		b.wg.Add(1)

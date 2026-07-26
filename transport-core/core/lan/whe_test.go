@@ -105,9 +105,12 @@ func TestDecryptPythonWHE3Stream(t *testing.T) {
 }
 
 func TestChunkedRoundTripAndWireSize(t *testing.T) {
-	encryptor, err := NewChunkedEncryptor(wheSecret)
+	encryptor, err := NewChunkedEncryptor(wheSecret, false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := string(encryptor.Header()[:4]); got != "WHE3" {
+		t.Fatalf("fallback stream magic = %q, want WHE3", got)
 	}
 	chunks := [][]byte{
 		bytes.Repeat([]byte("A"), 1000),
@@ -147,5 +150,111 @@ func TestChunkedRoundTripAndWireSize(t *testing.T) {
 	}
 	if got := ChunkedWireSize(0); got != 32 {
 		t.Fatalf("ChunkedWireSize(0) = %d, want 32", got)
+	}
+}
+
+func TestWHE4RoundTripRejectsWrongSecretAndTamper(t *testing.T) {
+	encryptor, err := NewChunkedEncryptor(wheSecret, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := append([]byte(nil), encryptor.Header()...)
+	if got := string(header[:4]); got != "WHE4" {
+		t.Fatalf("negotiated stream magic = %q, want WHE4", got)
+	}
+	frame := encryptor.EncryptChunk([]byte("WHE4 authenticated payload"))
+	ciphertext := frame[4:]
+
+	decryptor, err := NewChunkedDecryptor(wheSecret, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, ok := decryptor.DecryptChunk(ciphertext)
+	if !ok || string(plain) != "WHE4 authenticated payload" {
+		t.Fatalf("WHE4 round trip = %q, %v", plain, ok)
+	}
+
+	wrong, err := NewChunkedDecryptor("wrong secret", header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wrong.DecryptChunk(ciphertext); ok {
+		t.Fatal("WHE4 accepted the wrong secret")
+	}
+
+	tampered := append([]byte(nil), ciphertext...)
+	tampered[len(tampered)-1] ^= 1
+	tamperCheck, err := NewChunkedDecryptor(wheSecret, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tamperCheck.DecryptChunk(tampered); ok {
+		t.Fatal("WHE4 accepted tampered ciphertext")
+	}
+}
+
+func TestSupportsWHE4RequiresExactCapability(t *testing.T) {
+	if SupportsWHE4(nil) || SupportsWHE4([]string{"WHE4", "whe4-preview"}) {
+		t.Fatal("WHE4 enabled without the exact negotiated capability")
+	}
+	if !SupportsWHE4([]string{CapReliable, CapWHE4}) {
+		t.Fatal("WHE4 capability was not recognized")
+	}
+}
+
+// TestWHE4RoundTrip covers the negotiated HKDF-per-stream format and its
+// coexistence with WHE3 on the same secret.
+func TestWHE4RoundTrip(t *testing.T) {
+	encryptor, err := NewChunkedEncryptor(wheSecret, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encryptor.Header()[:4]) != "WHE4" {
+		t.Fatalf("expected WHE4 magic, got %q", encryptor.Header()[:4])
+	}
+	payload := bytes.Repeat([]byte("whe4-负载"), 300)
+	stream := append([]byte(nil), encryptor.Header()...)
+	stream = append(stream, encryptor.EncryptChunk(payload)...)
+	header, frames := consumeChunkedStream(t, stream)
+	decryptor, err := NewChunkedDecryptor(wheSecret, header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, ok := decryptor.DecryptChunk(frames[0])
+	if !ok || !bytes.Equal(plain, payload) {
+		t.Fatal("WHE4 round-trip failed")
+	}
+	if _, ok := decryptor.DecryptChunk(frames[0]); ok {
+		t.Fatal("WHE4 replayed chunk accepted")
+	}
+	// Wrong secret must fail cleanly.
+	bad, err := NewChunkedDecryptor("wrong-secret", header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bad.DecryptChunk(frames[0]); ok {
+		t.Fatal("WHE4 accepted a wrong secret")
+	}
+}
+
+// TestWHE4KnownAnswer pins the cross-stack vector; crypto.py and Crypto.kt
+// assert the identical bytes so the three stacks cannot drift.
+func TestWHE4KnownAnswer(t *testing.T) {
+	const streamHex = "57484534303132333435363738396162636465664b41546e6f6e63652f313242000000359ffa94d1a917a59c125e3cb007bbc7c4fea5ec27c482e87d9417ef98f5363211904eea1ba1f6147c5daf8a44400d341e6e7eec3e24"
+	stream, err := hex.DecodeString(streamHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, frames := consumeChunkedStream(t, stream)
+	decryptor, err := NewChunkedDecryptor("kat-秘密-2026", header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, ok := decryptor.DecryptChunk(frames[0])
+	if !ok {
+		t.Fatal("known-answer stream failed to decrypt")
+	}
+	if string(plain) != "墨洞 WHE4 known-answer test payload" {
+		t.Fatalf("known-answer plaintext mismatch: %q", plain)
 	}
 }

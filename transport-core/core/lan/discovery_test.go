@@ -1,8 +1,11 @@
 package lan
 
 import (
+	"fmt"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -203,4 +206,97 @@ func TestDiscoveryDropsUnverifiableCandidate(t *testing.T) {
 		t.Fatalf("unverifiable candidate surfaced: %+v", peers)
 	case <-time.After(1200 * time.Millisecond):
 	}
+}
+
+func TestDiscoveryMergesSamePeerFromMDNSAndBroadcast(t *testing.T) {
+	peerIdentity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				head := make([]byte, 4)
+				if _, readErr := io.ReadFull(conn, head); readErr != nil || string(head) != capMagic {
+					return
+				}
+				_ = RespondProbe(conn, peerIdentity, vecInstanceID,
+					"双路径节点", []string{CapFolder})
+			}(conn)
+		}
+	}()
+
+	updates := make(chan []Peer, 16)
+	discovery := startTestDiscovery(t, updates)
+	port := listener.Addr().(*net.TCPAddr).Port
+	discovery.handleEntry(mdnsEntry{ServiceName: "mdns-peer", PeerName: "双路径节点",
+		Hosts: []string{"127.0.0.1"}, Port: port, InstanceID: vecInstanceID})
+	waitForPeerCount(t, updates, 1, 5*time.Second)
+
+	discovery.handleAnnouncement("localhost", &Announcement{
+		InstanceID: vecInstanceID, Port: port})
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		peers := discovery.Peers()
+		if len(peers) == 1 && containsString(peers[0].Hosts, "127.0.0.1") &&
+			containsString(peers[0].Hosts, "localhost") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("dual-source peer was not merged: %+v", discovery.Peers())
+}
+
+func TestDiscoveryStopRacesCandidateVerification(t *testing.T) {
+	identity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := Start(Config{
+		PeerName:         "停止竞态测试",
+		InstanceID:       strings.Repeat("e", 32),
+		Port:             1,
+		Identity:         identity,
+		DisableMDNS:      true,
+		DisableBroadcast: true,
+		ProbeTimeout:     10 * time.Millisecond,
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var callers sync.WaitGroup
+	for index := 0; index < 64; index++ {
+		callers.Add(1)
+		go func(index int) {
+			defer callers.Done()
+			discovery.verifyCandidate(fmt.Sprintf("candidate-%d", index), "",
+				[]string{"127.0.0.1"}, 1, "")
+		}(index)
+	}
+	discovery.Stop()
+	callers.Wait()
+	// Stop is intentionally idempotent; desktop setting changes can race
+	// with application shutdown and call it more than once.
+	discovery.Stop()
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

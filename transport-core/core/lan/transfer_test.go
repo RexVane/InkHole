@@ -111,6 +111,43 @@ func (h *transferHarness) senderConfig(secret string) SenderConfig {
 	}
 }
 
+func TestDialTargetAuthenticatesTransportEndpoint(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	token := "test-endpoint-token"
+	received := make(chan string, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		header := make([]byte, len("IKAT")+len(token))
+		_, _ = io.ReadFull(conn, header)
+		received <- string(header)
+	}()
+
+	addr := listener.Addr().(*net.TCPAddr)
+	conn, err := dialTarget(context.Background(), SendTarget{
+		Host: "127.0.0.1", Port: addr.Port, EndpointToken: token,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	select {
+	case got := <-received:
+		if got != "IKAT"+token {
+			t.Fatalf("endpoint authentication = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("endpoint authentication was not received")
+	}
+}
+
 func writeTempFile(t *testing.T, size int) (string, []byte) {
 	t.Helper()
 	payload := make([]byte, size)
@@ -176,6 +213,18 @@ func TestSendReceiveEncrypted(t *testing.T) {
 	if err := SendFile(context.Background(), h.target(), path,
 		h.senderConfig("共享口令")); err != nil {
 		t.Fatalf("SendFile: %v", err)
+	}
+	assertDelivered(t, h, payload)
+}
+
+func TestSendReceiveEncryptedWHE4(t *testing.T) {
+	h := startTransferHarness(t, "共享口令")
+	path, payload := writeTempFile(t, 5_000_000)
+	target := h.target()
+	target.UseWHE4 = true
+	if err := SendFile(context.Background(), target, path,
+		h.senderConfig("共享口令")); err != nil {
+		t.Fatalf("SendFile with WHE4: %v", err)
 	}
 	assertDelivered(t, h, payload)
 }
