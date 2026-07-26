@@ -1,0 +1,32 @@
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>CFBundlePackageType</key>
+            <string>APPL</string>
+        <key>CFBundleName</key>
+            <string>墨洞 InkHole</string>
+        <key>CFBundleExecutable</key>
+            <string>InkHole</string>
+        <key>CFBundleIdentifier</key>
+            <string>com.rexvane.inkhole</string>
+        <key>CFBundleVersion</key>
+            <string>1.6.8</string>
+        <key>CFBundleGetInfoString</key>
+            <string>轻量、安全的跨平台文件传输工具</string>
+        <key>CFBundleShortVersionString</key>
+            <string>1.6.8</string>
+        <key>CFBundleIconFile</key>
+            <string>icons</string>
+        <key>LSMinimumSystemVersion</key>
+            <string>12.0.0</string>
+        <key>NSHighResolutionCapable</key>
+            <string>true</string>
+        <key>NSHumanReadableCopyright</key>
+            <string>Copyright 2026 RexVane</string>
+        <key>NSAppTransportSecurity</key>
+        <dict>
+            <key>NSAllowsLocalNetworking</key>
+            <true/>
+        </dict>
+    </dict>
+</plist>

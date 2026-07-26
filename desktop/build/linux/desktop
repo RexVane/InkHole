@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=墨洞 InkHole
+Comment=轻量、安全的跨平台文件传输工具
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/InkHole %u
+Terminal=false
+Type=Application
+Icon=InkHole
+Categories=Utility;
+StartupWMClass=InkHole
+
+ 

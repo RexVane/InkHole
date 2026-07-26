@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <title>墨洞</title>
+    <style>
+        html, body {
+            margin: 0; padding: 0; background: transparent; overflow: hidden;
+            width: 100%; height: 100%;
+        }
+        body { --wails-draggable: no-drag; user-select: none; }
+        #petTarget { position: relative; width: 100%; height: 100%; --wails-draggable: no-drag; }
+        #hole { width: 100vw; height: 100vh; display: block; cursor: grab; --wails-draggable: no-drag; touch-action: none; --custom-contextmenu: petMenu; }
+        #petTarget.file-drop-target-active #hole { cursor: copy; }
+        #petStatus {
+            position: absolute; left: 18px; right: 18px; bottom: 8px;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            color: rgba(235, 255, 252, .82); font: 10px/1.3 -apple-system, "PingFang SC", sans-serif;
+            text-align: center; text-shadow: 0 1px 4px #000; pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+<div id="petTarget" data-file-drop-target>
+    <canvas id="hole"></canvas>
+    <div id="petStatus"></div>
+</div>
+<script type="module" src="/src/pet.ts"></script>
+</body>
+</html>

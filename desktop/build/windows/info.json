@@ -1,0 +1,15 @@
+{
+	"fixed": {
+		"file_version": "1.6.8"
+	},
+	"info": {
+		"0000": {
+			"ProductVersion": "1.6.8",
+			"CompanyName": "RexVane",
+			"FileDescription": "轻量、安全的跨平台文件传输工具",
+			"LegalCopyright": "Copyright 2026 RexVane",
+			"ProductName": "墨洞 InkHole",
+			"Comments": "InkHole desktop client"
+		}
+	}
+}

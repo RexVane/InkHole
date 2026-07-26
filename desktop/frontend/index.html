@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>墨洞 InkHole</title>
+    <link rel="stylesheet" href="/style.css"/>
+</head>
+<body>
+<header class="titlebar">
+    <svg class="brand-mark" viewBox="0 0 30 30" aria-hidden="true">
+        <circle cx="15" cy="15" r="8.5" fill="#06090a"/>
+        <path d="M24.53 9.5 A11 11 0 1 0 21.95 23.43" fill="none" stroke="rgba(90,216,192,.82)" stroke-width="2" stroke-linecap="round"/>
+        <path d="M8.87 20.14 A8 8 0 0 0 20.66 20.66" fill="none" stroke="rgba(233,189,114,.75)" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    <div class="brand-copy">
+        <strong>墨洞</strong>
+        <span>INKHOLE</span>
+    </div>
+    <div class="titlebar-spacer"></div>
+    <div class="window-controls">
+        <button class="title-control settings-button" id="openSettings" type="button"
+                title="打开设置" aria-label="设置">⚙</button>
+        <button class="title-control" id="minimiseWindow" type="button"
+                title="最小化" aria-label="最小化">−</button>
+        <button class="title-control close-control" id="hideWindow" type="button"
+                title="隐藏到托盘" aria-label="隐藏到托盘">×</button>
+    </div>
+</header>
+
+<main class="app-shell">
+    <section class="transfer-pane" data-file-drop-target id="dropzone">
+        <div class="target-heading">
+            <span class="section-label">发送目标</span>
+            <div class="target-line">
+                <h1 id="targetName">正在发现设备</h1>
+                <span class="route-badge" id="targetRoute" hidden></span>
+            </div>
+            <p id="targetMeta">等待附近的墨洞上线</p>
+        </div>
+
+        <div class="send-stage">
+            <canvas id="hole"></canvas>
+            <div class="stage-copy">
+                <strong id="stageTitle">等待选择设备</strong>
+                <span id="stageSubtitle">局域网、Tailscale 与中继设备会汇总显示</span>
+            </div>
+        </div>
+
+        <div class="send-actions">
+            <div class="send-picker">
+                <button class="primary-button" id="chooseFiles" type="button"><span aria-hidden="true">▤</span>选择文件</button>
+                <button class="primary-button folder-button" id="chooseFolder" type="button" title="选择文件夹" aria-label="选择文件夹">▣</button>
+            </div>
+            <button class="danger-button compact" id="cancelSend" type="button" hidden>取消发送</button>
+            <span class="selection-note" id="selectionNote">未选择目标设备</span>
+        </div>
+
+        <div class="transfer-strip" id="transferStrip" hidden>
+            <div class="transfer-copy">
+                <strong id="transferName">准备传输</strong>
+                <span id="transferDetail"></span>
+            </div>
+            <progress id="transferProgress" max="1" value="0"></progress>
+        </div>
+
+        <div class="sidebar-status" id="sidebarStatus">正在启动共享传输核心</div>
+        <div class="drop-overlay" id="dropOverlay">松开发送</div>
+    </section>
+
+    <aside class="info-side">
+        <section class="device-section">
+            <div class="section-heading">
+                <h2>设备</h2>
+                <div class="heading-actions">
+                    <span class="scan-indicator" aria-hidden="true"></span>
+                    <span class="count-badge" id="deviceCount">0</span>
+                </div>
+            </div>
+            <ul class="device-list" id="peerList">
+                <li class="empty-state">正在发现设备 · 跨网设备可在设置中手动添加</li>
+            </ul>
+        </section>
+
+        <div class="side-divider"></div>
+
+        <section class="recent-section">
+            <div class="recent-heading">
+                <h2>最近接收</h2>
+                <div class="heading-actions">
+                    <span class="count-badge" id="recentCount">0</span>
+                    <button class="inbox-button" id="openInbox" type="button" title="打开默认目录" aria-label="打开默认目录">▤</button>
+                </div>
+            </div>
+            <ul class="recent-list" id="receivedList">
+                <li class="empty-state">暂无接收记录</li>
+            </ul>
+            <button class="clear-recent" id="clearRecent" type="button">清空记录</button>
+        </section>
+    </aside>
+</main>
+
+<dialog id="settings" class="settings-dialog">
+    <div class="dialog-shell">
+        <header class="dialog-header">
+            <div><h2>设置</h2><p id="settingsVersion"></p></div>
+            <button class="icon-button" id="closeSettings" type="button" title="关闭" aria-label="关闭">×</button>
+        </header>
+        <div class="settings-scroll">
+            <section class="settings-section">
+                <div class="section-title"><h3>设备</h3><p>本机在其他设备上的名称与监听方式</p></div>
+                <div class="form-grid two-columns">
+                    <label class="field"><span>设备名称</span><input id="cfgName" type="text" maxlength="40" autocomplete="off"/></label>
+                    <label class="field"><span>唯一标识</span><input id="cfgInstance" type="text" readonly/></label>
+                    <label class="field"><span>本机监听端口</span><input id="cfgPort" type="number" min="0" max="65535"/></label>
+                    <div class="field field-note"><span>局域网传输一般无需修改</span><small id="actualPort"></small></div>
+                </div>
+                <label class="toggle-row"><input id="cfgShowPet" type="checkbox"/><span class="toggle"></span><span>显示桌宠</span></label>
+            </section>
+
+            <section class="settings-section">
+                <div class="section-title"><h3>存储</h3><p>接收到的文件统一保存到默认目录</p></div>
+                <label class="field"><span>默认目录</span><div class="input-action"><input id="cfgInbox" type="text" autocomplete="off"/><button id="chooseInbox" type="button">选择</button></div></label>
+            </section>
+
+            <section class="settings-section">
+                <div class="section-title"><h3>传输安全</h3><p id="secretState">未设置端到端口令</p></div>
+                <label class="toggle-row"><input id="cfgEncrypt" type="checkbox"/><span class="toggle"></span><span>启用端到端加密</span></label>
+                <label class="field"><span>端到端加密口令</span><input id="cfgSecret" type="password" placeholder="留空保持不变" autocomplete="new-password"/></label>
+                <label class="check-row"><input id="cfgClearSecret" type="checkbox"/>清除已保存的口令</label>
+            </section>
+
+            <section class="settings-section cross-section">
+                <div class="section-title"><h3>跨网络</h3><p>选择与你当前网络环境匹配的通道</p></div>
+                <div class="segmented" role="tablist" aria-label="跨网络通道">
+                    <button class="active" type="button" role="tab" data-cross-tab="manual">Tailscale</button>
+                    <button type="button" role="tab" data-cross-tab="wormhole">一次性短码</button>
+                    <button type="button" role="tab" data-cross-tab="ssh">SSH 中继</button>
+                </div>
+
+                <div class="tab-panel active" data-cross-panel="manual">
+                    <div class="panel-toolbar"><div><strong>固定地址设备</strong><span>适用于 Tailscale、NetBird 或自建 VPN</span></div><button id="addManualPeer" type="button">添加</button></div>
+                    <div class="manual-peer-list" id="manualPeerList"></div>
+                </div>
+
+                <div class="tab-panel" data-cross-panel="wormhole">
+                    <div class="one-time-grid">
+                        <div class="operation-block">
+                            <strong>发送</strong>
+                            <p>生成仅本次有效的接收短码</p>
+                            <div class="inline-actions"><button id="createOneTime" type="button">选择文件</button><button id="createOneTimeFolder" type="button">选择文件夹</button></div>
+                            <div class="code-result" id="sendCodeResult" hidden>
+                                <code id="sendCode"></code>
+                                <button id="copySendCode" class="quiet-button" type="button">复制</button>
+                                <button id="cancelOneTime" class="quiet-button" type="button">取消</button>
+                            </div>
+                        </div>
+                        <div class="operation-block">
+                            <strong>接收</strong>
+                            <p>输入发送端显示的短码</p>
+                            <div class="input-action"><input id="receiveCode" type="text" autocomplete="off" placeholder="短码"/><button id="joinOneTime" type="button">连接</button></div>
+                            <div class="offer-result" id="offerResult" hidden>
+                                <strong id="offerTitle"></strong><span id="offerSummary"></span>
+                                <div><button id="acceptOffer" type="button">接收</button><button id="rejectOffer" class="quiet-button" type="button">拒绝</button></div>
+                            </div>
+                        </div>
+                    </div>
+                    <details class="advanced-settings">
+                        <summary>服务地址</summary>
+                        <div class="form-grid">
+                            <label class="field"><span>Rendezvous URL</span><input id="wormholeRendezvous" type="text" autocomplete="off"/></label>
+                            <label class="field"><span>Transit Relay</span><input id="wormholeRelay" type="text" autocomplete="off"/></label>
+                        </div>
+                    </details>
+                </div>
+
+                <div class="tab-panel" data-cross-panel="ssh">
+                    <label class="toggle-row"><input id="sshEnabled" type="checkbox"/><span class="toggle"></span><span>启用 SSH 中继</span><small id="sshState"></small></label>
+                    <div class="form-grid ssh-grid">
+                        <label class="field"><span>主机</span><input id="sshHost" type="text" autocomplete="off"/></label>
+                        <label class="field small-field"><span>端口</span><input id="sshPort" type="number" min="1" max="65535"/></label>
+                        <label class="field"><span>用户</span><input id="sshUser" type="text" autocomplete="off"/></label>
+                    </div>
+                    <label class="field"><span>私钥来源</span><select id="sshKeyMode"><option value="file">私钥文件</option><option value="paste">粘贴私钥</option></select></label>
+                    <div id="sshFileFields"><label class="field"><span>私钥文件</span><div class="input-action"><input id="sshKeyPath" type="text" autocomplete="off"/><button id="chooseSSHKey" type="button">选择</button></div></label></div>
+                    <div id="sshPasteFields" hidden><label class="field"><span>私钥内容</span><textarea id="sshPastedKey" rows="4" autocomplete="off"></textarea></label></div>
+                    <div class="form-grid two-columns">
+                        <label class="field"><span>私钥口令</span><input id="sshPassphrase" type="password" placeholder="留空保持不变" autocomplete="new-password"/></label>
+                        <label class="field"><span>主机指纹</span><input id="sshFingerprint" type="text" readonly/></label>
+                    </div>
+                    <label class="check-row"><input id="sshClearPassphrase" type="checkbox"/>清除已保存的私钥口令</label>
+                    <div class="panel-toolbar"><button id="checkSSH" type="button">检测并确认指纹</button><span id="sshCheckResult"></span></div>
+                    <div class="pairing-area">
+                        <div class="panel-toolbar"><div><strong>配对设备</strong><span>配对后自动通过中继或 QUIC 直连</span></div><button id="createSSHPairing" type="button">生成配对码</button></div>
+                        <div class="input-action"><input id="sshPairCode" type="text" autocomplete="off" placeholder="配对码"/><button id="joinSSHPairing" type="button">配对</button></div>
+                        <div class="code-result" id="sshPairResult" hidden><code id="sshPairCreatedCode"></code><button id="copySSHPairCode" class="quiet-button" type="button">复制</button></div>
+                        <ul class="paired-list" id="sshPeerList"></ul>
+                    </div>
+                </div>
+            </section>
+
+            <section class="settings-section help-section">
+                <div class="section-title"><h3>帮助与更新</h3><p id="updateState">当前版本</p></div>
+                <div class="help-actions"><button id="checkUpdate" type="button">检查更新</button><button id="openRepository" type="button">项目主页</button></div>
+            </section>
+        </div>
+        <footer class="dialog-footer">
+            <span id="settingsMessage"></span>
+            <button class="quiet-button" id="cancelSettings" type="button">取消</button>
+            <button class="primary-button" id="saveSettings" type="button">保存设置</button>
+        </footer>
+    </div>
+</dialog>
+
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
