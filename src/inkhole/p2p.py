@@ -59,7 +59,8 @@ _PROTOCOL_VERSION = 3
 _FOLDER_MAGIC = b"WHF1"   # streamed folder payload magic
 _FOLDER_KIND = "folder-v1"
 _RELIABLE_KIND = "reliable-v3"
-_CAPABILITIES = (_FOLDER_KIND, _RELIABLE_KIND)
+_WHE4_CAP = "whe4"                 # HKDF 每流派生加密；对端声明才发 WHE4
+_CAPABILITIES = (_FOLDER_KIND, _RELIABLE_KIND, _WHE4_CAP)
 _FOLDER_ENTRY = struct.Struct("!BIQQ")  # type, path bytes, file size, mtime ms
 _BUFFER = 1024 * 1024     # 1MB 传输块，降低大文件传输的 Python IO 调用开销
 _SOCKET_BUFFER = 16 * 1024 * 1024  # 请求最高 16MB TCP 缓冲；实际值受系统上限约束
@@ -394,10 +395,18 @@ def _connect_peer_socket(peer: "PeerInfo", host: str, timeout: float) -> socket.
 
 
 def _probe_peer(host: str, port: int, timeout: float,
-                expected_instance_id: str = "") -> _ProbeResult:
+                expected_instance_id: str = "",
+                endpoint_token: str = "") -> _ProbeResult:
     sock = _connect_transfer_socket(host, port, timeout)
     try:
         sock.settimeout(timeout)
+        if endpoint_token:
+            # 跨网桥接端点(短码/SSH)：先过 IKAT 鉴权，桥接为每个连接
+            # 开独立通道，探测不影响随后的 WHPP 传输连接。
+            try:
+                sock.sendall(b"IKAT" + endpoint_token.encode("ascii"))
+            except UnicodeEncodeError as exc:
+                raise OSError("跨网端点令牌无效") from exc
         nonce = os.urandom(32)
         sock.sendall(_CAP_MAGIC + nonce)
         if _recv_exact(sock, 4) != _CAP_MAGIC:
@@ -1904,7 +1913,8 @@ class P2PNode:
         for host in hosts:
             try:
                 result = _probe_peer(host, peer.port, _CAP_TIMEOUT,
-                                     peer.instance_id)
+                                     peer.instance_id,
+                                     endpoint_token=peer.endpoint_token)
                 peer.instance_id = result.instance_id
                 peer.capabilities = result.capabilities
                 peer.public_key = result.public_key
@@ -1917,6 +1927,11 @@ class P2PNode:
     def _ensure_receiver_identity(self, peer: PeerInfo) -> None:
         """Direct transports require a freshly verified receiver identity."""
         if peer.transport not in {"lan", "tailscale"}:
+            # 跨网端点(短码/SSH)：信任来自桥接通道本身(PAKE/Noise)，
+            # 身份不强制；仍尽力探测一次真实能力，让跨网传输也能协商
+            # WHE4 与文件夹流。旧对端探测失败时安全回退 WHE3。
+            if not peer.identity_fingerprint:
+                self._probe_peer_capabilities(peer)
             return
         expected = peer.identity_fingerprint
         if not peer.instance_id or not expected:
@@ -2151,7 +2166,9 @@ class P2PNode:
                         source = _ProgressReader(raw_source, progress, offset)
                         if encrypted:
                             sent = 0
-                            for blob in encrypt_chunks(self.cfg.active_secret, source):
+                            for blob in encrypt_chunks(
+                                    self.cfg.active_secret, source,
+                                    use_whe4=_WHE4_CAP in peer.capabilities):
                                 if cancellation_requested():
                                     raise _SendCancelled()
                                 sock.sendall(blob)
