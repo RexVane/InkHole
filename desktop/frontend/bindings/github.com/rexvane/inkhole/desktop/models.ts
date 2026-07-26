@@ -17,6 +17,7 @@ export interface PeerView {
     "fingerprint": string;
     "transport": string;
     "routes": string[] | null;
+    "capabilities"?: string[] | null;
 }
 
 export interface SSHSettingsInput {

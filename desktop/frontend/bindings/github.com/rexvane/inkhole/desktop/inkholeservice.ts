@@ -80,8 +80,11 @@ export function DisablePet(): $CancellablePromise<void> {
 
 /**
  * DragPet performs a native window drag and returns when the mouse button is
- * released. This gives the frontend a reliable drag-finished boundary on
- * platforms where Wails consumes the corresponding DOM mouseup event.
+ * released. performWindowDragWithEvent hands the window to the window server
+ * and returns immediately, so the release boundary must come from polling the
+ * global button state — the WebView never sees the mouseup once the native
+ * drag owns the event stream, and returning early made snap() fight the
+ * still-running drag from the start position.
  */
 export function DragPet(): $CancellablePromise<void> {
     return $Call.ByID(3952069318);
