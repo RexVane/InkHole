@@ -109,3 +109,16 @@
 | F-1 | SSH / 一次性短码端点能力写死 `folder-v1`，跨网传输永远回退 WHE3；Python 外部端点探测不带 IKAT 令牌被桥接拒绝，文件夹只能走 ZIP 兜底 | desktop/inkhole.go, src/inkhole/p2p.py, InkHoleNode.kt | 三端 WHPC 探测支持端点令牌（Go `lan.ProbeEndpoint`、Python `_probe_peer(endpoint_token=)`、Kotlin `probePeer(endpointToken=)`），发送前透过桥接探测一次真实能力再决定 WHE4，同时钉住对端身份指纹；旧对端探测失败安全回退 WHE3。desktop 的 Tailscale 手动设备也把探测到的能力带进 `PeerView.Capabilities` 参与 WHE4 协商。测试 `TestProbeEndpointNegotiatesWHE4ThroughBridgeAuth` 覆盖令牌鉴权与能力透传 |
 | F-2 | Python/Kotlin WHE4 主密钥缓存用明文口令做键，换掉的旧口令长期留存进程内存 | src/inkhole/crypto.py, Crypto.kt | 与 Go masterCache 同设计：进程随机 HMAC-SHA256 摘要作缓存键，明文口令不再作为键留存（tests/test_whe4.py 断言缓存键非明文）|
 | F-3 | 桌宠恢复位置时未吸附坐标不做越界校正，外接屏拔掉后桌宠停在屏幕外（如 x=2721 vs 屏宽 1440）| desktop/frontend/src/pet.ts | 恢复后按当前屏幕工作区 clamp（含 edge=-1），并修复旧版错误保存的边缘状态；桌宠拖动/吸附已改为 macOS 原生窗口拖动 + Go 端动画 |
+
+**2026-07-27 全功能活体测试与加强**（对运行中的应用直接跑真实协议）：
+
+| # | 问题 | 位置 | 修复 |
+|---|------|------|------|
+| F-4 | Android 端点探测结果按显示名回写 peers（map 实际按 serviceName 作键），缓存永不生效，每次发送重复探测 | InkHoleNode.kt | 按 `peer.serviceName` 回写 |
+| F-5 | 三端 WHE4 主密钥缓存无容量上限；desktop 每批次都重复桥接探测（最坏 6s 中继往返/批） | whe.go, crypto.py, Crypto.kt, desktop/inkhole.go | 三端缓存封顶 8 条（驱逐后重派生，各配驱逐正确性测试）；desktop 按对端实例缓存探测结果，Stop 清空。新增 Python 模拟桥接探测测试（tests/test_endpoint_probe.py） |
+| F-6 | wormhole 桥接用 yamux 默认 256KB 流窗口，200ms RTT 中继链路无论带宽多大都卡在 ~1.25MB/s | core/bridge.go | 复用 SSH 数据面的调优配置（4MB 窗口），同 RTT 理论上限 ~20MB/s；窗口是接收方声明，混版本互通不受影响 |
+| F-7 | 桌宠拖动：`performWindowDragWithEvent` 立即返回，DragPet 过早 resolve 导致按起点吸附、动画与系统拖动抢窗口；设置页「发布页面」按钮没挂事件 | desktop/inkhole.go, pet_drag_darwin.go(新), main.ts | DragPet 轮询 `NSEvent.pressedMouseButtons` 直到真正松手（非 darwin 用位置稳定启发式）；补挂按钮事件 |
+| F-8 | 主窗口进度处理不分方向：接收进度劫持发送传输条，且接收不发 transfer-finished → 进度条永久卡在 100%、动画停不下来 | desktop/frontend/src/main.ts | 接收进度带「接收 ·」前缀展示，发送优先；完成 2.2s 收起、对端取消 8s 无进度超时收起 |
+| F-9 | 错口令拒收：接收端发 ackFail 后立刻 close，RST 冲掉回执，发送端当"连接中断"无谓重试 3 次且报错误导（connection reset 而非口令不一致）；Python `_drain` 死代码从未接线 | 三端收发两侧 | 接收端拒绝后半关写向+限时排空（8MB/2s）；发送端 body 写失败后限时补读回执，读到 ackFail 归类为明确拒绝。错口令从 1.7s/3 次重试 → 0.2s/1 次，报错可指导用户改口令 |
+
+活体测试记录（对运行中的 desktop 应用直接执行）：WHPC 签名探测（能力含 whe4）；60MB 明文 WHPP 传输 0.23s/265MB/s 含 SHA-256 回执；WHF1 文件夹流含子目录落盘；传输中取消 + 断点续传 0.16s；WHE4/WHE3 加密收发与错口令拒绝；UDP 广播发现（应用对假节点完成验证探测）；一次性短码全链路（真实 rendezvous 短码 → join/accept → 桥接端点探测透传 whe4 → WHE4 加密 9MB 穿桥落盘）。性能基准：WHE4 首流派生 ~100ms、后续流 8µs（WHE3 每流 67ms）；AES-GCM 数据面 3.7GB/s。未覆盖：需第二台真机的 Tailscale/SSH 实地链路（协议路径已被活体与集成测试覆盖；探测时 vivo 离线）。
