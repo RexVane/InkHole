@@ -341,6 +341,13 @@ func sendOnce(ctx context.Context, target SendTarget, source sourceFactory,
 	if remaining > 0 {
 		if err := sendBody(ctx, conn, source, header, offset, remaining,
 			wireSize, target.UseWHE4, cfg); err != nil {
+			// A mid-body write failure often means the receiver already
+			// refused (wrong secret) and its ackFail is sitting in our
+			// receive buffer. Surface the refusal instead of a generic
+			// connection error so callers do not retry a hopeless send.
+			if ctx.Err() == nil && senderSawRejection(conn) {
+				return fmt.Errorf("%w: 接收方校验或落盘失败", ErrReceiverRejected)
+			}
 			return err
 		}
 	}
@@ -365,6 +372,17 @@ func sendOnce(ctx context.Context, target SendTarget, source sourceFactory,
 		return errors.New("接收方 SHA-256 回执不一致")
 	}
 	return nil
+}
+
+// senderSawRejection makes a short best-effort attempt to read the receiver's
+// ack after a body write failed. true means an explicit ackFail arrived.
+func senderSawRejection(conn net.Conn) bool {
+	_ = conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(conn, ack); err != nil {
+		return false
+	}
+	return ack[0] == ackFail
 }
 
 // encodeHeaderJSON marshals without HTML escaping so filenames survive

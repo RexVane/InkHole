@@ -1039,6 +1039,10 @@ class InkHoleNode(
             if (transferStarted && !ackSent) {
                 try {
                     conn.getOutputStream().apply { write(WHPP.ACK_FAIL); flush() }
+                    // 半关写向并限时排空在途数据：立刻 close 会 RST 冲掉
+                    // 刚写出的回执，发送方只能看到"连接错误"并无谓重试。
+                    try { conn.shutdownOutput() } catch (_: IOException) {}
+                    drainAfterReject(conn)
                 } catch (_: IOException) {}
             }
             try { conn.close() } catch (_: IOException) {}
@@ -1361,6 +1365,11 @@ class InkHoleNode(
                 } catch (error: Exception) {
                     lastError = error
                     if (cancellationRequested()) throw InterruptedIOException("发送已取消")
+                    // 写身体途中失败常见于对方已明确拒绝(口令不一致)：限时
+                    // 补读回执，读到 ACK_FAIL 直接判拒绝，不再无谓重试。
+                    if (rejectionArrived(socket)) {
+                        throw ReceiverRejectedException("接收方校验或落盘失败")
+                    }
                     if (attempt < 2) {
                         listener.onStatus("连接中断，正在恢复传输（${attempt + 2}/3）")
                         Thread.sleep(500L * (attempt + 1))
@@ -1398,6 +1407,32 @@ class InkHoleNode(
             off += n
         }
         return if (off == 0) -1 else off
+    }
+
+    /** body 写失败后限时补读回执；true 表示对方已明确拒绝。 */
+    private fun rejectionArrived(socket: Socket?): Boolean {
+        if (socket == null || socket.isClosed) return false
+        return try {
+            socket.soTimeout = 1500
+            socket.getInputStream().read() == WHPP.ACK_FAIL
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** 拒收后把对端在途数据限量读掉再关连接（防 RST 冲掉回执）。 */
+    private fun drainAfterReject(conn: Socket) {
+        try {
+            conn.soTimeout = 2000
+            val input = conn.getInputStream()
+            val buffer = ByteArray(64 * 1024)
+            var drained = 0L
+            while (drained < 8L * 1024 * 1024) {
+                val n = input.read(buffer)
+                if (n < 0) return
+                drained += n
+            }
+        } catch (_: IOException) {}
     }
 
     private fun connectToPeer(peer: Peer, routeOffset: Int = 0): Socket {

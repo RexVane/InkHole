@@ -201,6 +201,28 @@ func (r *Receiver) HandleWHPP(conn net.Conn) {
 		}
 		if transferStarted {
 			_, _ = conn.Write([]byte{ackFail})
+			drainAfterReject(conn)
+		}
+	}
+}
+
+// drainAfterReject keeps a rejected connection readable long enough for the
+// sender to notice the ackFail byte. Closing immediately RSTs the socket
+// while the sender is still writing body frames, which can destroy the
+// queued ack and turn an explicit "wrong secret" refusal into a generic
+// connection-reset that the sender then uselessly retries.
+func drainAfterReject(conn net.Conn) {
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buffer := make([]byte, 64*1024)
+	var drained int64
+	for drained < 8*1024*1024 {
+		n, err := conn.Read(buffer)
+		drained += int64(n)
+		if err != nil {
+			return
 		}
 	}
 }

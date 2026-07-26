@@ -1882,6 +1882,13 @@ class P2PNode:
             if transfer_started and not ack_sent:
                 try:
                     conn.sendall(_ACK_FAIL)
+                    # 半关写向并排空对端在途数据：立刻 close 会 RST 冲掉
+                    # 刚写出的回执，发送方只能看到"连接错误"并无谓重试。
+                    try:
+                        conn.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    _drain(conn, 8 * 1024 * 1024)
                 except OSError:
                     pass
             try:
@@ -2202,6 +2209,10 @@ class P2PNode:
             except (_ReceiverRejected, _SendCancelled):
                 raise
             except (ConnectionError, EOFError, socket.timeout, OSError) as exc:
+                # 写身体途中失败常见于对方已明确拒绝(口令不一致)：限时
+                # 补读回执，读到 ACK_FAIL 直接判拒绝，不再无谓重试。
+                if sock is not None and _rejection_arrived(sock):
+                    raise _ReceiverRejected("接收方校验或落盘失败") from exc
                 last_error = exc
                 if cancellation_requested():
                     raise _SendCancelled() from exc
@@ -3138,6 +3149,15 @@ def _recv_exact_cancellable(sock: socket.socket, n: int, should_cancel,
             return None
         data.extend(chunk)
     return bytes(data)
+
+
+def _rejection_arrived(sock: socket.socket) -> bool:
+    """body 写失败后限时补读回执；True 表示对方已明确拒绝。"""
+    try:
+        sock.settimeout(1.5)
+        return sock.recv(1) == _ACK_FAIL
+    except OSError:
+        return False
 
 
 def _drain(sock: socket.socket, n: int) -> None:
