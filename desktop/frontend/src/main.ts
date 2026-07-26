@@ -610,6 +610,7 @@ byID("checkUpdate").addEventListener("click", () => void run(async () => {
     const latest = String(result?.latest || "");
     byID("updateState").textContent = result?.available ? `发现新版本 v${latest}，当前 v${current}` : `已是最新版本 v${current}`;
 }, "更新检查完成"));
+byID("openReleases").addEventListener("click", () => void run(() => Service.OpenReleases()));
 byID("openRepository").addEventListener("click", () => void run(() => Service.OpenRepository()));
 
 Events.On("peers", (event) => {

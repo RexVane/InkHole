@@ -124,8 +124,11 @@ func (s *InkHoleService) CancelPetMotion() {
 }
 
 // DragPet performs a native window drag and returns when the mouse button is
-// released. This gives the frontend a reliable drag-finished boundary on
-// platforms where Wails consumes the corresponding DOM mouseup event.
+// released. performWindowDragWithEvent hands the window to the window server
+// and returns immediately, so the release boundary must come from polling the
+// global button state — the WebView never sees the mouseup once the native
+// drag owns the event stream, and returning early made snap() fight the
+// still-running drag from the start position.
 func (s *InkHoleService) DragPet() error {
 	window := s.currentPetWindow()
 	if window == nil {
@@ -133,6 +136,29 @@ func (s *InkHoleService) DragPet() error {
 	}
 	s.CancelPetMotion()
 	window.HandleMessage("wails:drag")
+	deadline := time.Now().Add(30 * time.Second)
+	if dragEndPollSupported {
+		for leftMouseButtonDown() && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		return nil
+	}
+	// 没有全局按键状态的平台退化为位置稳定启发式：窗口连续 300ms 不动
+	// 即视为拖动结束。
+	lastX, lastY := window.Position()
+	stableSince := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		x, y := window.Position()
+		if x != lastX || y != lastY {
+			lastX, lastY = x, y
+			stableSince = time.Now()
+			continue
+		}
+		if time.Since(stableSince) >= 300*time.Millisecond {
+			return nil
+		}
+	}
 	return nil
 }
 
