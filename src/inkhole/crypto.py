@@ -35,6 +35,7 @@ _CHUNK_OVERHEAD = 20              # 每帧开销: 4B 长度 + 16B GCM tag
 
 _master_lock = threading.Lock()
 _master_cache: dict[bytes, bytes] = {}
+_MASTER_CACHE_MAX = 8             # 进程一般只有一两个口令；上限防病态增长
 # 进程随机 HMAC 键：缓存键是口令摘要而非明文口令，内存检查/诊断转储里
 # 不会长期留存换掉的旧口令本身(与 Go masterCache 相同的设计)。
 _master_cache_key = os.urandom(32)
@@ -62,6 +63,8 @@ def _master_key(secret: str) -> bytes:
         return cached
     derived = _derive_key(secret, _WHE4_MASTER_SALT)
     with _master_lock:
+        while len(_master_cache) >= _MASTER_CACHE_MAX:
+            _master_cache.pop(next(iter(_master_cache)))
         _master_cache[cache_id] = derived
     return derived
 

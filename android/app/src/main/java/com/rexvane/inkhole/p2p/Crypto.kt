@@ -40,6 +40,7 @@ object Crypto {
     private const val CHUNK_OVERHEAD = 20L   // 每帧: 4B 长度 + 16B tag
 
     private val masterCache = ConcurrentHashMap<String, ByteArray>()
+    private const val MASTER_CACHE_MAX = 8  // 进程一般只有一两个口令；上限防病态增长
 
     // 进程随机 HMAC 键：缓存键是口令摘要而非明文口令，堆转储/诊断里
     // 不会长期留存换掉的旧口令本身(与 Go masterCache 相同的设计)。
@@ -53,8 +54,14 @@ object Crypto {
     }
 
     /** WHE4 主密钥：每口令一次 60 万次 PBKDF2，进程内缓存。 */
-    private fun masterKey(secret: String): ByteArray =
-        masterCache.getOrPut(masterCacheId(secret)) { deriveKey(secret, WHE4_MASTER_SALT) }
+    private fun masterKey(secret: String): ByteArray {
+        val cacheId = masterCacheId(secret)
+        masterCache[cacheId]?.let { return it }
+        val derived = deriveKey(secret, WHE4_MASTER_SALT)
+        if (masterCache.size >= MASTER_CACHE_MAX) masterCache.clear()
+        masterCache[cacheId] = derived
+        return derived
+    }
 
     /** RFC 5869 HKDF-SHA256；32 字节输出恰好一轮 expand。 */
     private fun streamKeyWhe4(secret: String, salt: ByteArray): ByteArray {

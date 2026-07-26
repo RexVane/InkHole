@@ -73,6 +73,10 @@ type InkHoleService struct {
 	manualRuntime     map[string]PeerView
 	manualStrikes     map[string]int
 	sshRuntime        map[string]runtimeSSHPeer
+	// endpointWHE4 caches per-instance bridge probe outcomes for the node
+	// session, so repeated batches to the same SSH peer skip the relay
+	// round-trip. Cleared on Stop; a peer upgrade is picked up on restart.
+	endpointWHE4 map[string]bool
 	selected          string
 	sends             map[string]context.CancelFunc
 
@@ -93,6 +97,7 @@ func NewInkHoleService() *InkHoleService {
 		manualRuntime:   make(map[string]PeerView),
 		manualStrikes:   make(map[string]int),
 		sshRuntime:      make(map[string]runtimeSSHPeer),
+		endpointWHE4:    make(map[string]bool),
 		sends:           make(map[string]context.CancelFunc),
 		pendingWormhole: make(map[string][]string),
 	}
@@ -590,6 +595,7 @@ func (s *InkHoleService) Stop() {
 	s.manualRuntime = make(map[string]PeerView)
 	s.manualStrikes = make(map[string]int)
 	s.sshRuntime = make(map[string]runtimeSSHPeer)
+	s.endpointWHE4 = make(map[string]bool)
 	s.sends = make(map[string]context.CancelFunc)
 	s.mu.Unlock()
 }
@@ -824,6 +830,15 @@ func (s *InkHoleService) resolveEndpointRoutes(ctx context.Context, routes []lan
 		if target.EndpointToken == "" || target.UseWHE4 {
 			continue
 		}
+		if target.InstanceID != "" {
+			s.mu.Lock()
+			cached, known := s.endpointWHE4[target.InstanceID]
+			s.mu.Unlock()
+			if known {
+				target.UseWHE4 = cached
+				continue
+			}
+		}
 		probe, err := lan.ProbeEndpoint(target.Host, target.Port,
 			target.EndpointToken, 6*time.Second, target.InstanceID)
 		if err != nil {
@@ -836,6 +851,9 @@ func (s *InkHoleService) resolveEndpointRoutes(ctx context.Context, routes []lan
 		if target.Fingerprint == "" {
 			target.Fingerprint = probe.Fingerprint
 		}
+		s.mu.Lock()
+		s.endpointWHE4[target.InstanceID] = target.UseWHE4
+		s.mu.Unlock()
 	}
 }
 

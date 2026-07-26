@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"testing"
 )
 
@@ -204,6 +205,35 @@ func TestSupportsWHE4RequiresExactCapability(t *testing.T) {
 
 // TestWHE4RoundTrip covers the negotiated HKDF-per-stream format and its
 // coexistence with WHE3 on the same secret.
+func TestWHE4MasterCacheBoundedAndEvictionSafe(t *testing.T) {
+	// Overflow the per-secret cache: the map must stay bounded, and an
+	// evicted secret must still decrypt (re-derivation, not data loss).
+	first := "边界口令-0"
+	encryptor, err := NewChunkedEncryptor(first, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := encryptor.EncryptChunk([]byte("payload"))
+	for index := 1; index < wheMasterCacheMax+2; index++ {
+		if _, err := NewChunkedEncryptor(fmt.Sprintf("边界口令-%d", index), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	masterCache.Lock()
+	size := len(masterCache.masters)
+	masterCache.Unlock()
+	if size > wheMasterCacheMax {
+		t.Fatalf("master cache grew to %d entries (max %d)", size, wheMasterCacheMax)
+	}
+	decryptor, err := NewChunkedDecryptor(first, encryptor.Header())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain, ok := decryptor.DecryptChunk(frame[4:]); !ok || string(plain) != "payload" {
+		t.Fatal("evicted secret no longer decrypts")
+	}
+}
+
 func TestWHE4RoundTrip(t *testing.T) {
 	encryptor, err := NewChunkedEncryptor(wheSecret, true)
 	if err != nil {

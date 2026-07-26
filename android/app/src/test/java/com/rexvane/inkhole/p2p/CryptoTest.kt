@@ -120,6 +120,21 @@ class CryptoTest {
     }
 
     @Test
+    fun whe4MasterCacheEvictionKeepsDecryptionWorking() {
+        // 越过缓存容量(8)触发驱逐:被逐出的口令重新派生后必须仍能解密。
+        val first = "边界口令-0"
+        val encryptor = Crypto.ChunkedEncryptor(first, useWhe4 = true)
+        val frame = encryptor.encryptChunk("payload".toByteArray())
+        for (index in 1..9) {
+            Crypto.ChunkedEncryptor("边界口令-$index", useWhe4 = true)
+        }
+        assertArrayEquals(
+            "payload".toByteArray(),
+            Crypto.ChunkedDecryptor(first, encryptor.streamHeader).decryptChunk(frame),
+        )
+    }
+
+    @Test
     fun encryptorDefaultsToWhe3WithoutNegotiation() {
         val encryptor = Crypto.ChunkedEncryptor("口令")
         assertArrayEquals(

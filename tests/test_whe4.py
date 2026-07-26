@@ -59,3 +59,16 @@ def test_whe4_round_trip_and_master_cache():
 def test_whe4_defaults_to_whe3_without_negotiation():
     stream = b"".join(encrypt_chunks("口令", io.BytesIO(b"x")))
     assert stream[:4] == b"WHE3"
+
+
+def test_master_cache_is_bounded_and_survives_eviction():
+    from inkhole.crypto import _MASTER_CACHE_MAX
+    first = "边界口令-0"
+    stream = b"".join(encrypt_chunks(first, io.BytesIO(b"payload"), use_whe4=True))
+    # 塞满并越过容量上限，第一个口令必然被逐出
+    for index in range(1, _MASTER_CACHE_MAX + 2):
+        b"".join(encrypt_chunks(f"边界口令-{index}", io.BytesIO(b"x"), use_whe4=True))
+    assert len(_master_cache) <= _MASTER_CACHE_MAX
+    # 逐出只影响缓存，不影响正确性：重新派生后仍能解开旧流
+    header, frames = _split_stream(stream)
+    assert ChunkedDecryptor(first, header).decrypt_chunk(frames[0]) == b"payload"

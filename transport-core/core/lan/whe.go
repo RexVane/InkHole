@@ -46,6 +46,10 @@ const (
 	wheMasterSalt  = "INKHOLE-WHE4-MASTER-V1"
 	wheStreamInfo  = "INKHOLE-WHE4-STREAM-V1"
 	wheMasterBytes = 32
+	// wheMasterCacheMax bounds the per-secret master cache. A process only
+	// ever uses one or two secrets; the bound just keeps a pathological
+	// caller from growing the map without limit.
+	wheMasterCacheMax = 8
 )
 
 var (
@@ -96,6 +100,12 @@ func masterKey(secret string) []byte {
 	var key [wheMasterBytes]byte
 	copy(key[:], derived)
 	if cacheOK {
+		if len(masterCache.masters) >= wheMasterCacheMax {
+			for stale := range masterCache.masters {
+				delete(masterCache.masters, stale)
+				break
+			}
+		}
 		masterCache.masters[cacheKey] = key
 	}
 	return key[:]
