@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val buildAbiSplits = providers.gradleProperty("inkholeAbiSplits")
+    .orNull
+    .toBoolean()
+
 android {
     namespace = "com.rexvane.inkhole"
     compileSdk = 34
@@ -11,8 +15,19 @@ android {
         applicationId = "com.rexvane.inkhole"
         minSdk = 24
         targetSdk = 34
-        versionCode = 71
-        versionName = "1.7.0"
+        versionCode = 72
+        versionName = "1.7.1"
+    }
+
+    // GitHub Releases distributes installable APKs directly. Release builds opt
+    // into one APK per ABI so phones do not download four copies of the Go core.
+    splits {
+        abi {
+            isEnable = buildAbiSplits
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = false
+        }
     }
 
     // 固定发布签名:CI 从 secrets 解出 keystore 时启用,让每次构建的 APK

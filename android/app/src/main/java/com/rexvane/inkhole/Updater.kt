@@ -20,6 +20,7 @@ object Updater {
     const val RELEASES_PAGE = "https://github.com/RexVane/InkHole/releases/latest"
     private const val API = "https://api.github.com/repos/RexVane/InkHole/releases/latest"
     private const val MAX_APK_SIZE = 250L * 1024 * 1024
+    private val RELEASE_ABIS = setOf("arm64-v8a", "armeabi-v7a", "x86_64")
 
     data class Info(val version: String, val apkUrl: String, val notes: String)
 
@@ -73,11 +74,31 @@ object Updater {
         return false
     }
 
+    /** Pick the APK matching this device, with a generic fallback for legacy releases. */
+    internal fun selectApkUrl(
+        tag: String,
+        assets: Map<String, String>,
+        supportedAbis: List<String>,
+    ): String {
+        val prefix = "InkHole-$tag-"
+        val hasAbiSplits = assets.keys.any {
+            it.startsWith(prefix) && it.endsWith(".apk")
+        }
+        if (hasAbiSplits) {
+            for (abi in supportedAbis) {
+                if (abi !in RELEASE_ABIS) continue
+                assets["$prefix$abi.apk"]?.let { return it }
+            }
+            return ""
+        }
+        return assets["InkHole-$tag.apk"].orEmpty()
+    }
+
     /** 拉取最新 Release(阻塞,调用方放线程)。失败抛异常。
      *
      * GitHub API 匿名限流按出口 IP 计,挂代理极易 403;API 失败后回退
      * 读 releases/latest 的重定向 Location 解析 tag(网页端无限流),
-     * APK 地址按 CI 命名规则 InkHole-<tag>.apk 直接构造,更新说明为空。
+     * APK 地址按设备 ABI 和 CI 命名规则直接构造,更新说明为空。
      */
     fun fetchLatest(): Info {
         return try {
@@ -103,17 +124,18 @@ object Updater {
                 val tag = data.optString("tag_name").trim()
                 require(tag.isNotEmpty()) { "最新版本号为空" }
                 val notes = summarizeReleaseNotes(data.optString("body"))
-                var apk = ""
+                val apkAssets = linkedMapOf<String, String>()
                 val assets = data.optJSONArray("assets")
                 if (assets != null) {
                     for (i in 0 until assets.length()) {
                         val a = assets.optJSONObject(i) ?: continue
-                        if (a.optString("name").endsWith(".apk")) {
-                            apk = a.optString("browser_download_url")
-                            break
+                        val name = a.optString("name")
+                        if (name.endsWith(".apk")) {
+                            apkAssets[name] = a.optString("browser_download_url")
                         }
                     }
                 }
+                val apk = selectApkUrl(tag, apkAssets, Build.SUPPORTED_ABIS.toList())
                 return Info(tag, apk, notes)
             }
         } finally {
@@ -131,7 +153,16 @@ object Updater {
         conn.disconnect()
         val tag = location.trimEnd('/').substringAfterLast("/tag/", "")
         require(tag.isNotEmpty() && "/" !in tag) { "无法解析最新版本号" }
-        val apk = "https://github.com/RexVane/InkHole/releases/download/$tag/InkHole-$tag.apk"
+        val preferredAbi = Build.SUPPORTED_ABIS.firstOrNull { it in RELEASE_ABIS }
+        val apkName = when (preferredAbi) {
+            // The stable legacy filename remains an arm64 alias.
+            "arm64-v8a" -> "InkHole-$tag.apk"
+            null -> ""
+            else -> "InkHole-$tag-$preferredAbi.apk"
+        }
+        val apk = if (apkName.isEmpty()) "" else {
+            "https://github.com/RexVane/InkHole/releases/download/$tag/$apkName"
+        }
         return Info(tag, apk, "")
     }
 

@@ -281,7 +281,10 @@ jobs:
             InkHolePet-windows.zip.sha256.ps1 \
             InkHolePet-macos.zip \
             InkHolePet-macos.zip.sha256 \
-            "InkHole-$RELEASE_TAG.apk"; do
+            "InkHole-$RELEASE_TAG.apk" \
+            "InkHole-$RELEASE_TAG-arm64-v8a.apk" \
+            "InkHole-$RELEASE_TAG-armeabi-v7a.apk" \
+            "InkHole-$RELEASE_TAG-x86_64.apk"; do
             grep -Fxq "$REQUIRED" <<<"$ASSETS" || {
               echo "Missing release asset: $REQUIRED" >&2
               exit 1
@@ -295,7 +298,7 @@ jobs:
           name: InkHole ${{ env.RELEASE_TAG }}
           draft: false
           body: |
-            InkHole v1.7.0 完成统一传输核心与轻量桌面端升级。
+            InkHole ${{ env.RELEASE_TAG }} 完成统一传输核心与轻量桌面端升级。
 
             - Windows/macOS：使用 Wails v3 新桌面端，替代旧 PySide6 打包版本。
             - 统一核心：局域网发现、设备身份验证与 WHPP 传输由 Go 核心统一实现。
@@ -303,6 +306,7 @@ jobs:
             - 加密性能：新增 WHE4 主密钥缓存与 HKDF 流密钥派生，并兼容旧协议。
             - 传输可靠性：强制 ACK 与 SHA-256 校验，支持中断续传和原子落盘。
             - 局域网稳定性：改善省电状态探活、手机热点双向发现与设备名称显示。
+            - Android：按 CPU 架构提供独立 APK，手机下载体积显著降低；更新器会自动选择匹配设备的安装包。
             - Android：修复局域网发现、跨网设置滚动布局与一次性短码扫码体验。
             - 桌宠：恢复原有墨洞外观、原生拖动、屏幕边缘吸附与菜单栏体验。
 

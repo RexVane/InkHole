@@ -120,7 +120,7 @@ VPS 只需运行 SSH，并允许 TCP forwarding。两端填写 VPS 地址、SSH 
 |------|------|------|
 | Windows | `InkHolePet-windows.zip` | 解压后双击 `InkHolePet\InkHolePet.exe` |
 | macOS | `InkHolePet-macos.zip` | 解压拖进"应用程序" |
-| Android | `InkHole-v*.apk` | 传到手机安装 |
+| Android | `InkHole-v*.apk` | 64 位 ARM 手机直接安装；其他架构选择带 ABI 后缀的 APK |
 
 也可以自行打包：
 
