@@ -10,11 +10,11 @@
         <key>CFBundleIdentifier</key>
             <string>com.rexvane.inkhole</string>
         <key>CFBundleVersion</key>
-            <string>1.6.8</string>
+            <string>1.7.0</string>
         <key>CFBundleGetInfoString</key>
             <string>轻量、安全的跨平台文件传输工具</string>
         <key>CFBundleShortVersionString</key>
-            <string>1.6.8</string>
+            <string>1.7.0</string>
         <key>CFBundleIconFile</key>
             <string>icons</string>
         <key>LSMinimumSystemVersion</key>

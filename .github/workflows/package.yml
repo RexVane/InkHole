@@ -69,11 +69,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: transport-core/go.mod
-          cache-dependency-path: transport-core/go.sum
+          go-version-file: desktop/go.mod
+          cache-dependency-path: |
+            desktop/go.sum
+            transport-core/go.sum
 
       - name: Validate desktop release version
         if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
@@ -81,7 +88,9 @@ jobs:
         run: |
           PROJECT_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           PACKAGE_VERSION="$(PYTHONPATH=src python -c 'import inkhole; print(inkhole.__version__)')"
+          DESKTOP_VERSION="$(sed -n 's/.*appVersion *= *"\([^"]*\)".*/\1/p' desktop/config.go | head -n 1)"
           test "$PROJECT_VERSION" = "$PACKAGE_VERSION"
+          test "$PROJECT_VERSION" = "$DESKTOP_VERSION"
           test "v$PROJECT_VERSION" = "$RELEASE_TAG" || {
             echo "Tag $RELEASE_TAG does not match desktop version v$PROJECT_VERSION" >&2
             exit 1
@@ -114,21 +123,8 @@ jobs:
             echo "::warning::macOS release certificate is not configured; publishing an unsigned, unnotarized ZIP."
           fi
 
-      - name: Install dependencies
-        run: |
-          pip install PySide6 zeroconf cryptography psutil keyring "qrcode[pil]" pyinstaller
-          pip install pyobjc-framework-Cocoa || true
-
-      - name: Build shared transport core
-        working-directory: transport-core
-        shell: bash
-        run: |
-          mkdir -p bin
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            go build -trimpath -ldflags="-s -w" -o bin/inkhole-core.exe ./cmd/inkhole-core
-          else
-            go build -trimpath -ldflags="-s -w" -o bin/inkhole-core ./cmd/inkhole-core
-          fi
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.117
 
       - name: Import macOS signing certificate
         if: runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != ''
@@ -147,9 +143,15 @@ jobs:
           security list-keychain -d user -s "$keychain_path" login.keychain-db
           echo "INKHOLE_SIGNING_KEYCHAIN=$keychain_path" >> "$GITHUB_ENV"
 
-      - name: Build
-        working-directory: packaging
-        run: pyinstaller inkhole-pet.spec --noconfirm --clean
+      - name: Build Wails desktop
+        working-directory: desktop
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            wails3 task build
+          else
+            wails3 task package
+          fi
 
       - name: Sign Windows executables
         if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE_BASE64 != ''
@@ -160,11 +162,8 @@ jobs:
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
             Sort-Object FullName | Select-Object -Last 1
           if (-not $signtool) { throw "signtool.exe was not found" }
-          $targets = @(
-            "packaging\dist\InkHolePet\InkHolePet.exe"
-          ) + @(Get-ChildItem "packaging\dist\InkHolePet" -Recurse -Filter "inkhole-core.exe" |
-            ForEach-Object FullName)
-          foreach ($target in $targets | Select-Object -Unique) {
+          $targets = @("desktop\bin\InkHole.exe")
+          foreach ($target in $targets) {
             & $signtool.FullName sign /fd SHA256 /td SHA256 /tr "http://timestamp.digicert.com" /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD $target
             if ($LASTEXITCODE -ne 0) { throw "Signing failed: $target" }
             & $signtool.FullName verify /pa /all $target
@@ -178,8 +177,8 @@ jobs:
         run: |
           codesign --force --deep --options runtime --timestamp \
             --keychain "$INKHOLE_SIGNING_KEYCHAIN" \
-            --sign "$MACOS_SIGNING_IDENTITY" packaging/dist/InkHolePet.app
-          codesign --verify --deep --strict --verbose=2 packaging/dist/InkHolePet.app
+            --sign "$MACOS_SIGNING_IDENTITY" desktop/bin/InkHole.app
+          codesign --verify --deep --strict --verbose=2 desktop/bin/InkHole.app
 
       - name: Notarize and staple macOS app
         if: >-
@@ -187,27 +186,27 @@ jobs:
           env.APPLE_ID != '' && env.APPLE_APP_SPECIFIC_PASSWORD != '' && env.APPLE_TEAM_ID != ''
         shell: bash
         run: |
-          ditto -c -k --keepParent packaging/dist/InkHolePet.app "$RUNNER_TEMP/InkHolePet-notary.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/InkHolePet-notary.zip" --wait \
+          ditto -c -k --keepParent desktop/bin/InkHole.app "$RUNNER_TEMP/InkHole-notary.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/InkHole-notary.zip" --wait \
             --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID"
-          xcrun stapler staple packaging/dist/InkHolePet.app
-          xcrun stapler validate packaging/dist/InkHolePet.app
-          spctl --assess --type execute --verbose=4 packaging/dist/InkHolePet.app
+          xcrun stapler staple desktop/bin/InkHole.app
+          xcrun stapler validate desktop/bin/InkHole.app
+          spctl --assess --type execute --verbose=4 desktop/bin/InkHole.app
 
-      # Windows: onedir 产物是文件夹，zip 打包后上传；无证书时保持未签名并在 Release 标注
-      # 用户解压后双击 InkHolePet\InkHolePet.exe 即可，不再解压到 %TEMP%，绕开 Defender 拦截
-      - name: Zip Windows dir
+      # Keep the historical asset names so existing update checks continue to work.
+      - name: Zip Windows app
         if: runner.os == 'Windows'
-        working-directory: packaging/dist
         shell: pwsh
-        run: Compress-Archive -Path InkHolePet -DestinationPath InkHolePet-windows.zip
+        run: |
+          New-Item -ItemType Directory -Force packaging\dist | Out-Null
+          Compress-Archive -Path desktop\bin\InkHole.exe -DestinationPath packaging\dist\InkHolePet-windows.zip
 
-      # macOS: onedir → .app（BUNDLE 格式本身就是目录），zip 保留符号链接
       - name: Zip macOS app
         if: runner.os == 'macOS'
-        working-directory: packaging/dist
-        run: ditto -c -k --sequesterRsrc --keepParent InkHolePet.app InkHolePet-macos.zip
+        run: |
+          mkdir -p packaging/dist
+          ditto -c -k --sequesterRsrc --keepParent desktop/bin/InkHole.app packaging/dist/InkHolePet-macos.zip
 
       - name: Create Windows update manifest
         if: runner.os == 'Windows'
@@ -296,17 +295,16 @@ jobs:
           name: InkHole ${{ env.RELEASE_TAG }}
           draft: false
           body: |
-            本版本包含三端构建产物。
+            InkHole v1.7.0 完成统一传输核心与轻量桌面端升级。
 
-            - Android APK：使用项目固定发布密钥签名，可直接安装验证。
-            - 局域网设备名称：优先采用 WHPC 签名验证后的设备名称，并自动修正旧的 IP 名称；第二行继续显示 8 位唯一实例 ID。
-            - 手机热点双向发现：当热点阻止 mDNS/UDP 广播反向转发时，已发现安卓的桌面端会通过现有 TCP 通道发送反向发现提示，安卓从真实连接来源地址回连 Mac/Windows。
-            - 设备认证不降级：反向提示仅提供地址线索，仍必须通过 WHPC v3 实例 ID 与设备签名验证后才会显示在列表中。
-            - 发现兼容性：保留 mDNS、显式网卡 JmDNS、定向广播、UDP 单播回应等原有路径，并增加 TCP 兜底；普通 Wi-Fi 与手机热点均可使用。
-            - 可靠续传：文件完成仍必须收到 ACK 和一致的 SHA-256 回执；中断时保留检查点并从已落盘偏移恢复。
-            - Windows ZIP：本次未配置 Authenticode 证书，为未签名压缩包；下载后请解压运行，并按需在 Windows SmartScreen 中确认。
-            - macOS ZIP：本次未配置 Developer ID 证书和 Apple notarization，为未签名、未公证压缩包；首次打开时请在系统安全设置中允许。
-            - Windows/macOS 均附带 SHA-256 校验文件。
+            - Windows/macOS：使用 Wails v3 新桌面端，替代旧 PySide6 打包版本。
+            - 统一核心：局域网发现、设备身份验证与 WHPP 传输由 Go 核心统一实现。
+            - 跨网传输：支持 SSH 中继通道复用、QUIC 直连打洞与失败自动回退。
+            - 加密性能：新增 WHE4 主密钥缓存与 HKDF 流密钥派生，并兼容旧协议。
+            - 传输可靠性：强制 ACK 与 SHA-256 校验，支持中断续传和原子落盘。
+            - 局域网稳定性：改善省电状态探活、手机热点双向发现与设备名称显示。
+            - Android：修复局域网发现、跨网设置滚动布局与一次性短码扫码体验。
+            - 桌宠：恢复原有墨洞外观、原生拖动、屏幕边缘吸附与菜单栏体验。
 
-            后续配置桌面签名与公证凭据后，同一工作流会自动生成已签名的桌面包。
+            Android APK 使用项目固定发布密钥签名。Windows/macOS 提供 ZIP 与 SHA-256 校验文件；桌面签名和公证状态以本次构建结果为准。
           generate_release_notes: true

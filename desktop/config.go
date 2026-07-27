@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	appVersion         = "1.6.8"
+	appVersion         = "1.7.0"
 	identityCredential = "lan_identity_p256"
 	transferCredential = "transfer_secret_v1"
 	maximumRecentFiles = 50
