@@ -105,12 +105,16 @@ func TestConfigMigratesEarlyDesktopFieldsAndCredentials(t *testing.T) {
 			t.Fatalf("saved config still contains %q", forbidden)
 		}
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		t.Fatalf("config permissions are too broad: %o", info.Mode().Perm())
+	// Windows reports synthetic POSIX mode bits (typically 0666); access is
+	// controlled by ACLs and cannot be validated through os.FileMode.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("config permissions are too broad: %o", info.Mode().Perm())
+		}
 	}
 }
 
