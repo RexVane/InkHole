@@ -68,6 +68,12 @@ type directAnswer struct {
 	CertFP     string   `json:"cert_fp,omitempty"`
 }
 
+var errDirectCollision = errors.New("simultaneous direct-link attempt")
+
+func keepOutboundDirectOffer(localInstanceID, remoteInstanceID string) bool {
+	return localInstanceID <= remoteInstanceID
+}
+
 // quicLink 拥有连接与其底层 Transport(UDP socket)；两者必须一起关闭。
 type quicLink struct {
 	conn *quic.Conn
@@ -421,11 +427,11 @@ func (s *sshListenerSession) maybeDirect(peer SSHPeer) {
 		err := attempt(peer)
 		s.directMu.Lock()
 		delete(s.directPending, peer.InstanceID)
-		if err != nil {
+		if err != nil && !errors.Is(err, errDirectCollision) {
 			s.directCooldown[peer.InstanceID] = time.Now().Add(directCooldown)
 		}
 		s.directMu.Unlock()
-		if err != nil && s.ctx.Err() == nil {
+		if err != nil && !errors.Is(err, errDirectCollision) && s.ctx.Err() == nil {
 			s.service.emit("ssh.direct.failed", map[string]any{
 				"peer_id": peer.InstanceID,
 				"error":   errorString(err),
@@ -494,6 +500,9 @@ func (s *sshListenerSession) tryDirect(peer SSHPeer) error {
 		if reason == "" {
 			reason = "declined"
 		}
+		if reason == "busy" || reason == "collision" {
+			return fmt.Errorf("%w: %s", errDirectCollision, reason)
+		}
 		return errors.New("peer declined direct link: " + reason)
 	}
 	targets := directResolveCandidates(answer.Candidates)
@@ -553,18 +562,27 @@ func (s *sshListenerSession) handleDirectSignal(stream net.Conn, instanceID stri
 			return
 		}
 	}
-	if s.directPending[instanceID] {
-		s.directMu.Unlock()
-		decline("busy")
-		return
+	ownedPending := !s.directPending[instanceID]
+	if !ownedPending {
+		// Both peers may finish a relay send at the same time and initiate
+		// direct signaling together. The lexicographically smaller instance id
+		// keeps its outbound offer; the larger side yields and handles that offer.
+		if keepOutboundDirectOffer(s.identity.InstanceID, instanceID) {
+			s.directMu.Unlock()
+			decline("collision")
+			return
+		}
+	} else {
+		s.directPending[instanceID] = true
 	}
-	s.directPending[instanceID] = true
 	s.directMu.Unlock()
-	defer func() {
-		s.directMu.Lock()
-		delete(s.directPending, instanceID)
-		s.directMu.Unlock()
-	}()
+	if ownedPending {
+		defer func() {
+			s.directMu.Lock()
+			delete(s.directPending, instanceID)
+			s.directMu.Unlock()
+		}()
+	}
 
 	cert, fp, err := s.directIdentity()
 	if err != nil {
@@ -624,6 +642,7 @@ func (s *sshListenerSession) adoptDirect(instanceID string, link *quicLink) {
 		old.close("replaced")
 	}
 	s.directConns[instanceID] = link
+	delete(s.directCooldown, instanceID)
 	s.directMu.Unlock()
 	s.service.emit("ssh.direct.up", map[string]any{"peer_id": instanceID})
 	s.wg.Add(1)

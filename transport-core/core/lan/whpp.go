@@ -72,7 +72,12 @@ type TransferHeader struct {
 	SenderPublicKey  string `json:"sender_public_key"`
 }
 
-// TransferID mirrors p2p._transfer_id: sha256 of the canonical JSON array
+// TransferID returns the legacy deterministic id used by early WHPP v3
+// senders. New user sends use NewTransferID so repeating the same content is a
+// distinct transaction; this helper remains for compatibility vectors and
+// callers that need to identify an existing checkpoint.
+//
+// It mirrors p2p._transfer_id: sha256 of the canonical JSON array
 // ["WHPP3", kind, name, plain_size, digest] encoded the way Python
 // json.dumps(ensure_ascii=False, separators=(",", ":")) does — raw UTF-8,
 // escaping only quotes, backslashes and control characters.

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -204,6 +205,42 @@ func TestCancelledSessionDoesNotStartDirectAttempt(t *testing.T) {
 	session.maybeDirect(SSHPeer{InstanceID: "peer"})
 	if called {
 		t.Fatal("cancelled session started a direct attempt")
+	}
+}
+
+func TestDirectCollisionDoesNotEnterCooldown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	session := &sshListenerSession{
+		ctx: ctx,
+		directConnect: func(SSHPeer) error {
+			return fmt.Errorf("%w: collision", errDirectCollision)
+		},
+	}
+	session.maybeDirect(SSHPeer{InstanceID: "peer"})
+	go func() {
+		session.directWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("collision attempt did not finish")
+	}
+	session.directMu.Lock()
+	defer session.directMu.Unlock()
+	if until := session.directCooldown["peer"]; !until.IsZero() {
+		t.Fatalf("simultaneous offer entered cooldown until %v", until)
+	}
+}
+
+func TestSimultaneousDirectOffersChooseOneInitiator(t *testing.T) {
+	if !keepOutboundDirectOffer("1111", "2222") {
+		t.Fatal("smaller instance id did not keep its outbound offer")
+	}
+	if keepOutboundDirectOffer("2222", "1111") {
+		t.Fatal("larger instance id did not yield to the peer offer")
 	}
 }
 

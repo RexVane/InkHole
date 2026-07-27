@@ -84,6 +84,7 @@ type sshListenerSession struct {
 	endpoints    map[string]*sshPeerEndpoint
 	pairCode     string
 	pairExpiry   time.Time
+	closed       bool
 	stateChanged chan struct{}
 	connect      sshReverseConnector
 	wg           sync.WaitGroup
@@ -272,11 +273,14 @@ func randomRemotePort() int {
 }
 
 func (s *sshListenerSession) Close() error {
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.directMu.Lock()
 	s.directClosed = true
 	s.directMu.Unlock()
 	s.mu.Lock()
+	s.closed = true
 	reverse := s.reverse
 	client := s.client
 	s.reverse = nil
@@ -611,14 +615,19 @@ func (s *sshListenerSession) addPeer(peer SSHPeer) (SSHPeer, error) {
 	peer.EndpointToken = endpoint.token
 	endpoint.peer = peer
 	s.mu.Lock()
+	if s.closed || (s.ctx != nil && s.ctx.Err() != nil) {
+		s.mu.Unlock()
+		_ = listener.Close()
+		return SSHPeer{}, net.ErrClosed
+	}
 	old := s.endpoints[peer.InstanceID]
 	s.peers[peer.InstanceID] = peer
 	s.endpoints[peer.InstanceID] = endpoint
+	endpoint.wg.Add(1)
 	s.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
 	}
-	endpoint.wg.Add(1)
 	go endpoint.run()
 	return peer, nil
 }

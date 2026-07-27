@@ -295,6 +295,34 @@ func TestWormholeOfferCanOnlyBeClaimedOnce(t *testing.T) {
 	_ = current.Close()
 }
 
+func TestClosedSSHSessionRejectsNewPeerEndpoint(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	key, err := generateNoiseKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &sshListenerSession{
+		ctx: ctx, cancel: cancel,
+		peers: make(map[string]SSHPeer), endpoints: make(map[string]*sshPeerEndpoint),
+		stateChanged: make(chan struct{}, 1),
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = session.addPeer(SSHPeer{
+		InstanceID:  "33333333333333333333333333333333",
+		RemotePort:  32000,
+		NoisePublic: encodeNoisePublic(key.Public),
+		EndToEnd:    true,
+	})
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed SSH session accepted a peer: %v", err)
+	}
+	if len(session.endpoints) != 0 {
+		t.Fatal("closed SSH session retained a peer endpoint")
+	}
+}
+
 func TestCapabilityToken(t *testing.T) {
 	for _, valid := range []bool{true, false} {
 		server, client := net.Pipe()

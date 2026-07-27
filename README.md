@@ -114,7 +114,7 @@ VPS 只需运行 SSH，并允许 TCP forwarding。两端填写 VPS 地址、SSH 
 
 前往 [Releases](https://github.com/RexVane/InkHole/releases) 下载：
 
-版本标签只有在 Windows、macOS 和 Android 构建、签名与校验全部成功后才会创建 Release，避免下载到缺少平台产物的半成品版本。
+版本标签只有在 Windows、macOS 和 Android 构建与校验全部成功后才会创建 Release，避免下载到缺少平台产物的半成品版本。Android 正式包强制使用固定发布密钥；Windows/macOS 仅在仓库配置了对应证书时签名，具体状态以该版本发布说明和构建摘要为准。
 
 | 平台 | 文件 | 用法 |
 |------|------|------|
@@ -149,9 +149,7 @@ cd android && ./gradlew assembleDebug     # 产物:android/app/build/outputs/apk
 
 ### macOS：提示"无法验证开发者"或"已损坏，无法打开"
 
-正式 Release 使用 Developer ID 签名并经过 Apple notarization。若正式包仍出现该提示，
-应重新下载并核对同名 `.sha256`，不要通过移除 quarantine 属性绕过系统验证；自行构建的
-未签名版本不具备 notarization。
+配置了 Apple 发布凭据的 Release 会使用 Developer ID 签名并经过 notarization；未配置凭据的版本会明确标注为未签名、未公证，macOS 可能阻止直接打开。先核对同名 `.sha256` 和发布说明；对确认可信的未签名包可在 Finder 中按住 Control 点击应用并选择“打开”。不要直接移除整个下载目录的 quarantine 属性。
 
 ### 找不到其他设备
 

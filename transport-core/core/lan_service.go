@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ type lanSession struct {
 	identity               *lan.Identity
 	instanceID             string
 	secret                 string
+	outgoingStatePath      string
 	advertisedName         string
 	advertisedCapabilities []string
 	ingressToken           string
@@ -96,6 +98,7 @@ func (s *Service) startLAN(raw json.RawMessage) (any, error) {
 		identity:               identity,
 		instanceID:             params.InstanceID,
 		secret:                 params.Secret,
+		outgoingStatePath:      filepath.Join(params.Inbox, ".inkhole-outgoing.json"),
 		advertisedName:         params.PeerName,
 		advertisedCapabilities: append([]string(nil), params.Capabilities...),
 		ingressToken:           s.localIngressToken(),
@@ -355,9 +358,10 @@ func (s *Service) lanSend(raw json.RawMessage) (any, error) {
 			cancel()
 		}()
 		cfg := lan.SenderConfig{
-			Secret:     current.secret,
-			Identity:   current.identity,
-			InstanceID: current.instanceID,
+			Secret:            current.secret,
+			Identity:          current.identity,
+			InstanceID:        current.instanceID,
+			OutgoingStatePath: current.outgoingStatePath,
 			OnProgress: func(filename string, done, total int64) {
 				current.emit("lan.progress", map[string]any{
 					"kind": "send", "filename": filename,

@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -42,7 +44,7 @@ func startTransferHarness(t *testing.T, secret string) *transferHarness {
 		t.Fatal(err)
 	}
 	inbox := t.TempDir()
-	received := make(chan string, 4)
+	received := make(chan string, 64)
 	receiver, err := NewReceiver(ReceiverConfig{
 		InboxDir:   inbox,
 		Secret:     secret,
@@ -239,17 +241,21 @@ func TestSendRejectedOnSecretMismatch(t *testing.T) {
 	}
 }
 
-func TestSendIdempotentResend(t *testing.T) {
+func TestExplicitRetryIDIsIdempotent(t *testing.T) {
 	h := startTransferHarness(t, "")
 	path, payload := writeTempFile(t, 100_000)
-	if err := SendFile(context.Background(), h.target(), path,
-		h.senderConfig("")); err != nil {
+	cfg := h.senderConfig("")
+	var err error
+	cfg.TransferID, err = NewTransferID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SendFile(context.Background(), h.target(), path, cfg); err != nil {
 		t.Fatal(err)
 	}
 	assertDelivered(t, h, payload)
-	// A full resend (lost-ACK replay) must succeed without a second copy.
-	if err := SendFile(context.Background(), h.target(), path,
-		h.senderConfig("")); err != nil {
+	// A retry of the same transaction must replay the receipt without a copy.
+	if err := SendFile(context.Background(), h.target(), path, cfg); err != nil {
 		t.Fatalf("idempotent resend: %v", err)
 	}
 	entries, err := filepath.Glob(filepath.Join(h.inbox, "样本文件*"))
@@ -258,6 +264,112 @@ func TestSendIdempotentResend(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("resend duplicated the file: %v", entries)
+	}
+}
+
+func TestRepeatedUserSendCreatesNewCopy(t *testing.T) {
+	h := startTransferHarness(t, "")
+	path, payload := writeTempFile(t, 100_000)
+	if err := SendFile(context.Background(), h.target(), path,
+		h.senderConfig("")); err != nil {
+		t.Fatal(err)
+	}
+	first := assertDelivered(t, h, payload)
+	if err := SendFile(context.Background(), h.target(), path,
+		h.senderConfig("")); err != nil {
+		t.Fatal(err)
+	}
+	second := assertDelivered(t, h, payload)
+	if first == second || filepath.Base(second) != "样本文件 v1 (2).bin" {
+		t.Fatalf("second user send did not create a distinct copy: %q, %q", first, second)
+	}
+}
+
+func TestOutgoingTransferStateReusesOnlyIncompleteSend(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".inkhole-outgoing.json")
+	source := filepath.Join(t.TempDir(), "sample.bin")
+	target := SendTarget{Host: "127.0.0.1", Port: 1234, InstanceID: recvInstanceID}
+	cfg := SenderConfig{OutgoingStatePath: statePath}
+	id1, key1, err := transferIDForSend(
+		cfg, target, source, KindFile, "sample.bin", 12, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, key2, err := transferIDForSend(
+		cfg, target, source, KindFile, "sample.bin", 12, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 != id2 || key1 != key2 {
+		t.Fatal("incomplete outgoing transfer did not reuse its persisted id")
+	}
+	if err := completeOutgoingTransfer(statePath, key1); err != nil {
+		t.Fatal(err)
+	}
+	id3, _, err := transferIDForSend(
+		cfg, target, source, KindFile, "sample.bin", 12, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id3 == id1 {
+		t.Fatal("completed user send reused its old transfer id")
+	}
+}
+
+func TestReceiverStartupCleansOnlyStaleTransferArtifacts(t *testing.T) {
+	inbox := t.TempDir()
+	oldID, err := NewTransferID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshID, err := NewTransferID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPaths := []string{
+		filepath.Join(inbox, ".inkhole-"+oldID+".part"),
+		filepath.Join(inbox, ".inkhole-"+oldID+".done.json"),
+		filepath.Join(inbox, ".inkhole-abandoned.folder.part"),
+	}
+	for _, path := range oldPaths {
+		if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-transferArtifactMaxAge - time.Hour)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := filepath.Join(inbox, ".inkhole-"+freshID+".part")
+	if err := os.WriteFile(fresh, []byte("fresh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outgoing := filepath.Join(inbox, ".inkhole-outgoing.json")
+	if err := os.WriteFile(outgoing, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-transferArtifactMaxAge - time.Hour)
+	if err := os.Chtimes(outgoing, old, old); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewReceiver(ReceiverConfig{
+		InboxDir: inbox, Identity: identity, InstanceID: recvInstanceID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range oldPaths {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale transfer artifact survived cleanup: %s", path)
+		}
+	}
+	for _, path := range []string{fresh, outgoing} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("live state was removed during cleanup: %s: %v", path, err)
+		}
 	}
 }
 
@@ -361,11 +473,64 @@ func TestResumeAfterInterruptedTransfer(t *testing.T) {
 	}
 
 	// A normal SendFile now resumes from the checkpoint and completes.
-	if err := SendFile(context.Background(), h.target(), path,
-		h.senderConfig("")); err != nil {
+	cfg := h.senderConfig("")
+	cfg.TransferID = header.TransferID
+	if err := SendFile(context.Background(), h.target(), path, cfg); err != nil {
 		t.Fatalf("resume send: %v", err)
 	}
 	assertDelivered(t, h, payload)
+}
+
+func TestConcurrentSameNameTransfersDoNotOverwrite(t *testing.T) {
+	h := startTransferHarness(t, "")
+	const count = 12
+	paths := make([]string, count)
+	want := make(map[string]bool, count)
+	for index := range count {
+		payload := []byte(fmt.Sprintf("payload-%02d-%s", index, strings.Repeat("x", 4096)))
+		path := filepath.Join(t.TempDir(), "same-name.txt")
+		if err := os.WriteFile(path, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		paths[index] = path
+		want[string(payload)] = true
+	}
+	start := make(chan struct{})
+	errorsOut := make(chan error, count)
+	var group sync.WaitGroup
+	for _, path := range paths {
+		group.Add(1)
+		go func(path string) {
+			defer group.Done()
+			<-start
+			errorsOut <- SendFile(context.Background(), h.target(), path, h.senderConfig(""))
+		}(path)
+	}
+	close(start)
+	group.Wait()
+	close(errorsOut)
+	for err := range errorsOut {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := make(map[string]bool, count)
+	for range count {
+		path := waitReceived(t, h)
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[string(payload)] = true
+	}
+	if len(got) != count {
+		t.Fatalf("concurrent commits lost content: got %d of %d", len(got), count)
+	}
+	for payload := range want {
+		if !got[payload] {
+			t.Fatal("concurrent same-name transfer was overwritten")
+		}
+	}
 }
 
 func TestSendRefusesWrongReceiverIdentity(t *testing.T) {

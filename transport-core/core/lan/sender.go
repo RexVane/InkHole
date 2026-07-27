@@ -44,11 +44,13 @@ type SendTarget struct {
 
 // SenderConfig wires one send operation to its environment.
 type SenderConfig struct {
-	Secret     string // non-empty enables end-to-end encryption
-	Identity   *Identity
-	InstanceID string
-	OnProgress func(filename string, done, total int64)
-	OnStatus   func(msg string)
+	Secret            string // non-empty enables end-to-end encryption
+	Identity          *Identity
+	InstanceID        string
+	TransferID        string // optional fixed id for an explicit retry
+	OutgoingStatePath string // persists failed sends across process restarts
+	OnProgress        func(filename string, done, total int64)
+	OnStatus          func(msg string)
 }
 
 // SendFile transfers one file over WHPP v3 with resume across retries.
@@ -72,11 +74,16 @@ func SendFile(ctx context.Context, target SendTarget, path string,
 		return err
 	}
 	filename := filepath.Base(path)
+	transferID, outgoingKey, err := transferIDForSend(
+		cfg, target, path, KindFile, filename, info.Size(), digest)
+	if err != nil {
+		return err
+	}
 	header := &TransferHeader{
 		Version:          ProtocolVersion,
 		Filename:         filename,
 		PlainSize:        info.Size(),
-		TransferID:       TransferID(KindFile, filename, info.Size(), digest),
+		TransferID:       transferID,
 		SHA256:           digest,
 		Kind:             KindFile,
 		MtimeMS:          info.ModTime().UnixMilli(),
@@ -88,7 +95,14 @@ func SendFile(ctx context.Context, target SendTarget, path string,
 	if header.Encrypted {
 		header.EncMode = "chunked"
 	}
-	return sendWithRetries(ctx, target, fileSource(path), header, cfg)
+	err = sendWithRetries(ctx, target, fileSource(path), header, cfg)
+	if err == nil {
+		if stateErr := completeOutgoingTransfer(
+			cfg.OutgoingStatePath, outgoingKey); stateErr != nil {
+			return fmt.Errorf("transfer completed but outgoing state could not be updated: %w", stateErr)
+		}
+	}
+	return err
 }
 
 // SendFolder streams a directory as one WHF1 payload over WHPP v3.
@@ -113,11 +127,16 @@ func SendFolder(ctx context.Context, target SendTarget, path string,
 	if name == "" || name == "." || name == string(os.PathSeparator) {
 		name = "folder"
 	}
+	transferID, outgoingKey, err := transferIDForSend(
+		cfg, target, path, KindFolder, name, manifest.PlainSize, digest)
+	if err != nil {
+		return err
+	}
 	header := &TransferHeader{
 		Version:          ProtocolVersion,
 		Filename:         name,
 		PlainSize:        manifest.PlainSize,
-		TransferID:       TransferID(KindFolder, name, manifest.PlainSize, digest),
+		TransferID:       transferID,
 		SHA256:           digest,
 		Kind:             KindFolder,
 		MtimeMS:          manifest.RootMtimeMS,
@@ -129,7 +148,14 @@ func SendFolder(ctx context.Context, target SendTarget, path string,
 	if header.Encrypted {
 		header.EncMode = "chunked"
 	}
-	return sendWithRetries(ctx, target, folderSource(manifest), header, cfg)
+	err = sendWithRetries(ctx, target, folderSource(manifest), header, cfg)
+	if err == nil {
+		if stateErr := completeOutgoingTransfer(
+			cfg.OutgoingStatePath, outgoingKey); stateErr != nil {
+			return fmt.Errorf("transfer completed but outgoing state could not be updated: %w", stateErr)
+		}
+	}
+	return err
 }
 
 type sourceFactory func(offset int64) (io.ReadCloser, error)

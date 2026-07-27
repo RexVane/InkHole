@@ -37,3 +37,47 @@ jobs:
       - name: Run shared transport-core tests
         working-directory: transport-core
         run: go test -race ./...
+
+  desktop:
+    name: Desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: desktop/go.mod
+          cache-dependency-path: |
+            desktop/go.sum
+            transport-core/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install frontend dependencies
+        working-directory: desktop/frontend
+        run: npm install --no-audit --no-fund
+
+      - name: Build frontend
+        working-directory: desktop/frontend
+        run: npm run build
+
+      - name: Test desktop
+        working-directory: desktop
+        run: go test -race ./...
+
+      - name: Vet desktop
+        working-directory: desktop
+        run: go vet ./...
+
+      - name: Build desktop executable
+        working-directory: desktop
+        run: go build .

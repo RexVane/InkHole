@@ -42,6 +42,10 @@ func (s *Service) createSSHPairing(raw json.RawMessage) (any, error) {
 	code := fmt.Sprintf("%d-%s", current.remotePort, wordlist.ChooseWords(2))
 	expires := time.Now().Add(10 * time.Minute)
 	current.mu.Lock()
+	if current.closed || (current.ctx != nil && current.ctx.Err() != nil) {
+		current.mu.Unlock()
+		return nil, net.ErrClosed
+	}
 	current.pairCode = code
 	current.pairExpiry = expires
 	current.mu.Unlock()
@@ -90,7 +94,9 @@ func (s *Service) joinSSHPairing(raw json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.emit("ssh.paired", map[string]any{"session_id": params.SessionID, "peer": peer})
+	if !current.emitPaired(params.SessionID, peer) {
+		return nil, net.ErrClosed
+	}
 	return map[string]any{"peer": peer}, nil
 }
 
@@ -110,8 +116,9 @@ func (s *sshListenerSession) handlePair(conn net.Conn) {
 	s.mu.RLock()
 	code := s.pairCode
 	expires := s.pairExpiry
+	closed := s.closed
 	s.mu.RUnlock()
-	if code == "" || time.Now().After(expires) {
+	if closed || code == "" || time.Now().After(expires) {
 		return
 	}
 	peerIdentity, err := runPairResponder(conn, code, s.identity)
@@ -128,7 +135,22 @@ func (s *sshListenerSession) handlePair(conn net.Conn) {
 		s.pairExpiry = time.Time{}
 	}
 	s.mu.Unlock()
-	s.service.emit("ssh.paired", map[string]any{"peer": peer})
+	_ = s.emitPaired("", peer)
+}
+
+func (s *sshListenerSession) emitPaired(sessionID string, peer SSHPeer) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	current, ok := s.peers[peer.InstanceID]
+	if s.closed || !ok || current.EndpointToken != peer.EndpointToken || s.service == nil {
+		return false
+	}
+	payload := map[string]any{"peer": peer}
+	if sessionID != "" {
+		payload["session_id"] = sessionID
+	}
+	s.service.emit("ssh.paired", payload)
+	return true
 }
 
 func identityPeer(identity sshIdentity) SSHPeer {

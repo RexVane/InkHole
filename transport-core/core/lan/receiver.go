@@ -45,6 +45,10 @@ type Receiver struct {
 	busy map[string]bool
 }
 
+// Selecting a unique destination and publishing the verified checkpoint must
+// be one process-wide operation. Multiple LAN sessions may share an inbox.
+var receiveCommitMu sync.Mutex
+
 func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
 	if cfg.Identity == nil || !ValidInstanceID(strings.ToLower(cfg.InstanceID)) {
 		return nil, errors.New("receiver identity and instance id are required")
@@ -53,6 +57,10 @@ func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
 		return nil, errors.New("inbox directory is required")
 	}
 	cfg.InstanceID = strings.ToLower(cfg.InstanceID)
+	if err := os.MkdirAll(cfg.InboxDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create inbox directory: %w", err)
+	}
+	cleanupTransferArtifacts(cfg.InboxDir, time.Now())
 	receiver := &Receiver{cfg: cfg, busy: make(map[string]bool)}
 	receiver.cond = sync.NewCond(&receiver.mu)
 	return receiver, nil
@@ -391,30 +399,38 @@ func (r *Receiver) receive(conn net.Conn, header *TransferHeader,
 		if err != nil {
 			return err
 		}
+		receiveCommitMu.Lock()
 		destination = uniqueDirPath(root, filename)
 		receipt["path"] = destination
 		receipt["completed_at"] = time.Now().Unix()
 		if err := writeJSONAtomic(commitPath, receipt); err != nil {
+			receiveCommitMu.Unlock()
 			_ = os.RemoveAll(staging)
 			return err
 		}
 		if err := os.Rename(staging, destination); err != nil {
+			receiveCommitMu.Unlock()
 			_ = os.RemoveAll(staging)
 			return err
 		}
 		applyMtime(destination, header.MtimeMS)
+		receiveCommitMu.Unlock()
 		_ = os.Remove(partPath)
 	} else {
+		receiveCommitMu.Lock()
 		destination = uniquePath(root, filename)
 		receipt["path"] = destination
 		receipt["completed_at"] = time.Now().Unix()
 		if err := writeJSONAtomic(commitPath, receipt); err != nil {
+			receiveCommitMu.Unlock()
 			return err
 		}
 		if err := os.Rename(partPath, destination); err != nil {
+			receiveCommitMu.Unlock()
 			return err
 		}
 		applyMtime(destination, header.MtimeMS)
+		receiveCommitMu.Unlock()
 	}
 	if err := writeJSONAtomic(donePath, receipt); err != nil {
 		return err
@@ -433,6 +449,53 @@ func (r *Receiver) receive(conn net.Conn, header *TransferHeader,
 	}
 	r.status("已接收并校验：%s", filepath.Base(destination))
 	return nil
+}
+
+func cleanupTransferArtifacts(root string, now time.Time) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	cutoff := now.Add(-transferArtifactMaxAge)
+	groups := make(map[string][]string)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, ".inkhole-") || name == ".inkhole-outgoing.json" {
+			continue
+		}
+		path := filepath.Join(root, name)
+		rest := strings.TrimPrefix(name, ".inkhole-")
+		transferID := strings.SplitN(rest, ".", 2)[0]
+		if ValidSHA256(transferID) {
+			groups[transferID] = append(groups[transferID], path)
+			continue
+		}
+		if info, statErr := entry.Info(); statErr == nil && info.ModTime().Before(cutoff) {
+			if entry.IsDir() {
+				_ = os.RemoveAll(path)
+			} else {
+				_ = os.Remove(path)
+			}
+		}
+	}
+	for _, paths := range groups {
+		newest := time.Time{}
+		for _, path := range paths {
+			if info, statErr := os.Stat(path); statErr == nil && info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+		if newest.IsZero() || !newest.Before(cutoff) {
+			continue
+		}
+		for _, path := range paths {
+			if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+				_ = os.RemoveAll(path)
+			} else {
+				_ = os.Remove(path)
+			}
+		}
+	}
 }
 
 // finishIdempotent replays the committed outcome for retries of an already

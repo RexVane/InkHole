@@ -72,13 +72,15 @@ type InkHoleService struct {
 	lanPeers          map[string]lan.Peer
 	manualRuntime     map[string]PeerView
 	manualStrikes     map[string]int
+	manualProbeGen    uint64
+	manualProbe       func(string, int, time.Duration, string) (*lan.ProbeResult, error)
 	sshRuntime        map[string]runtimeSSHPeer
 	// endpointWHE4 caches per-instance bridge probe outcomes for the node
 	// session, so repeated batches to the same SSH peer skip the relay
 	// round-trip. Cleared on Stop; a peer upgrade is picked up on restart.
 	endpointWHE4 map[string]bool
-	selected          string
-	sends             map[string]context.CancelFunc
+	selected     string
+	sends        map[string]context.CancelFunc
 
 	transport       *transportcore.Service
 	sshMu           sync.Mutex
@@ -733,6 +735,7 @@ func (s *InkHoleService) SendPaths(instanceID string, paths []string) (string, e
 		return "", errors.New("目标设备不在线")
 	}
 	identity, selfID, secret := s.identity, s.cfg.InstanceID, s.secret
+	outgoingStatePath := filepath.Join(s.cfg.Inbox, ".inkhole-outgoing.json")
 	ctx, cancel := context.WithCancel(s.ctx)
 	sendID := fmt.Sprintf("send-%d", time.Now().UnixNano())
 	s.sends[sendID] = cancel
@@ -743,7 +746,8 @@ func (s *InkHoleService) SendPaths(instanceID string, paths []string) (string, e
 		s.finishSend(sendID)
 		return "", err
 	}
-	go s.runSendBatch(ctx, sendID, normalized, routes, identity, selfID, secret)
+	go s.runSendBatch(ctx, sendID, normalized, routes, identity, selfID, secret,
+		outgoingStatePath)
 	return sendID, nil
 }
 
@@ -793,7 +797,7 @@ func normalizeSendPaths(paths []string) ([]string, error) {
 
 func (s *InkHoleService) runSendBatch(ctx context.Context, sendID string,
 	paths []string, routes []lan.SendTarget, identity *lan.Identity,
-	instanceID, secret string) {
+	instanceID, secret, outgoingStatePath string) {
 	defer s.finishSend(sendID)
 	s.resolveEndpointRoutes(ctx, routes)
 	s.emit("transfer-start", map[string]any{"sendId": sendID, "total": len(paths)})
@@ -807,6 +811,7 @@ func (s *InkHoleService) runSendBatch(ctx context.Context, sendID string,
 			}
 			cfg := lan.SenderConfig{
 				Secret: secret, Identity: identity, InstanceID: instanceID,
+				OutgoingStatePath: outgoingStatePath,
 				OnProgress: func(filename string, done, total int64) {
 					s.emit("progress", map[string]any{"kind": "send", "sendId": sendID,
 						"filename": filename, "done": done, "total": total})
@@ -1059,24 +1064,33 @@ func (s *InkHoleService) probeManualPeers() {
 	s.mu.Lock()
 	peers := append([]ManualPeerConfig(nil), s.cfg.ManualPeers...)
 	running := s.running
+	if running {
+		s.manualProbeGen++
+	}
+	generation := s.manualProbeGen
+	probePeer := s.manualProbe
 	s.mu.Unlock()
 	if !running {
 		return
 	}
+	if probePeer == nil {
+		probePeer = lan.ProbePeer
+	}
 	type result struct {
-		index int
-		peer  PeerView
+		key        string
+		configured ManualPeerConfig
+		peer       PeerView
 	}
 	results := make(chan result, len(peers))
 	var wg sync.WaitGroup
-	for index, configured := range peers {
+	for _, configured := range peers {
 		if configured.Host == "" || configured.Port < 1 || configured.Port > 65535 {
 			continue
 		}
 		wg.Add(1)
-		go func(index int, configured ManualPeerConfig) {
+		go func(configured ManualPeerConfig) {
 			defer wg.Done()
-			probe, err := lan.ProbePeer(configured.Host, configured.Port,
+			probe, err := probePeer(configured.Host, configured.Port,
 				3*time.Second, configured.InstanceID)
 			if err != nil {
 				return
@@ -1085,33 +1099,40 @@ func (s *InkHoleService) probeManualPeers() {
 			if strings.TrimSpace(name) == "" {
 				name = probe.PeerName
 			}
-			results <- result{index: index, peer: PeerView{InstanceID: probe.InstanceID,
-				Name: name, Host: configured.Host, Port: configured.Port,
-				Fingerprint: probe.Fingerprint, Transport: "Tailscale/固定地址",
-				Capabilities: probe.Capabilities}}
-		}(index, configured)
+			results <- result{key: manualPeerKey(configured), configured: configured,
+				peer: PeerView{InstanceID: probe.InstanceID,
+					Name: name, Host: configured.Host, Port: configured.Port,
+					Fingerprint: probe.Fingerprint, Transport: "Tailscale/固定地址",
+					Capabilities: probe.Capabilities}}
+		}(configured)
 	}
 	wg.Wait()
 	close(results)
+	probeResults := make(map[string]result, len(peers))
+	for value := range results {
+		probeResults[value.key] = value
+	}
 	runtimePeers := make(map[string]PeerView)
-	succeeded := make(map[int]bool)
 	changed := false
 	s.mu.Lock()
-	for value := range results {
-		runtimePeers[value.peer.InstanceID] = value.peer
-		succeeded[value.index] = true
-		if value.index < len(s.cfg.ManualPeers) &&
-			(s.cfg.ManualPeers[value.index].InstanceID != value.peer.InstanceID ||
-				s.cfg.ManualPeers[value.index].Fingerprint != value.peer.Fingerprint) {
-			s.cfg.ManualPeers[value.index].InstanceID = value.peer.InstanceID
-			s.cfg.ManualPeers[value.index].Fingerprint = value.peer.Fingerprint
-			changed = true
-		}
+	if generation != s.manualProbeGen {
+		s.mu.Unlock()
+		return
 	}
-	strikes := make(map[string]int, len(peers))
-	for index, configured := range peers {
-		key := strings.ToLower(configured.Host) + ":" + strconv.Itoa(configured.Port)
-		if succeeded[index] {
+	strikes := make(map[string]int, len(s.cfg.ManualPeers))
+	for index := range s.cfg.ManualPeers {
+		configured := &s.cfg.ManualPeers[index]
+		key := manualPeerKey(*configured)
+		if value, ok := probeResults[key]; ok &&
+			configured.InstanceID == value.configured.InstanceID &&
+			configured.Fingerprint == value.configured.Fingerprint {
+			runtimePeers[value.peer.InstanceID] = value.peer
+			if configured.InstanceID != value.peer.InstanceID ||
+				configured.Fingerprint != value.peer.Fingerprint {
+				configured.InstanceID = value.peer.InstanceID
+				configured.Fingerprint = value.peer.Fingerprint
+				changed = true
+			}
 			continue
 		}
 		strikes[key] = s.manualStrikes[key] + 1
@@ -1130,6 +1151,10 @@ func (s *InkHoleService) probeManualPeers() {
 	views := s.peerViewsLocked()
 	s.mu.Unlock()
 	s.emit("peers", views)
+}
+
+func manualPeerKey(peer ManualPeerConfig) string {
+	return strings.ToLower(strings.TrimSpace(peer.Host)) + ":" + strconv.Itoa(peer.Port)
 }
 
 func (s *InkHoleService) ManualPeers() []ManualPeerConfig {
@@ -1164,6 +1189,7 @@ func (s *InkHoleService) SaveManualPeers(peers []ManualPeerConfig) error {
 		normalized = append(normalized, peer)
 	}
 	s.mu.Lock()
+	s.manualProbeGen++
 	s.cfg.ManualPeers = normalized
 	err := s.saveConfigLocked()
 	s.mu.Unlock()

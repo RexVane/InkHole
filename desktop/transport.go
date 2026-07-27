@@ -654,13 +654,15 @@ func (s *InkHoleService) startEndpointSend(paths []string, target lan.SendTarget
 		return "", errors.New("墨洞未开启")
 	}
 	identity, selfID, secret := s.identity, s.cfg.InstanceID, s.secret
+	outgoingStatePath := filepath.Join(s.cfg.Inbox, ".inkhole-outgoing.json")
 	ctx, cancel := context.WithCancel(s.ctx)
 	sendID := fmt.Sprintf("send-%d", time.Now().UnixNano())
 	s.sends[sendID] = cancel
 	s.sendWG.Add(1)
 	s.mu.Unlock()
 	go func() {
-		s.runSendBatch(ctx, sendID, normalized, []lan.SendTarget{target}, identity, selfID, secret)
+		s.runSendBatch(ctx, sendID, normalized, []lan.SendTarget{target}, identity,
+			selfID, secret, outgoingStatePath)
 		if after != nil {
 			after()
 		}
