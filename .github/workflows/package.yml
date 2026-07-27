@@ -89,8 +89,14 @@ jobs:
           PROJECT_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           PACKAGE_VERSION="$(PYTHONPATH=src python -c 'import inkhole; print(inkhole.__version__)')"
           DESKTOP_VERSION="$(sed -n 's/.*appVersion *= *"\([^"]*\)".*/\1/p' desktop/config.go | head -n 1)"
+          BUILD_CONFIG_VERSION="$(sed -n 's/^  version: *"\([^"]*\)".*/\1/p' desktop/build/config.yml | head -n 1)"
+          WINDOWS_VERSION="$(python -c 'import json; print(json.load(open("desktop/build/windows/info.json", encoding="utf-8"))["fixed"]["file_version"])')"
+          MACOS_VERSION="$(python -c 'import plistlib; print(plistlib.load(open("desktop/build/darwin/Info.plist", "rb"))["CFBundleShortVersionString"])')"
           test "$PROJECT_VERSION" = "$PACKAGE_VERSION"
           test "$PROJECT_VERSION" = "$DESKTOP_VERSION"
+          test "$PROJECT_VERSION" = "$BUILD_CONFIG_VERSION"
+          test "$PROJECT_VERSION" = "$WINDOWS_VERSION"
+          test "$PROJECT_VERSION" = "$MACOS_VERSION"
           test "v$PROJECT_VERSION" = "$RELEASE_TAG" || {
             echo "Tag $RELEASE_TAG does not match desktop version v$PROJECT_VERSION" >&2
             exit 1
