@@ -211,7 +211,7 @@ def _valid_instance_id(value: object) -> bool:
 
 
 def _encode_lan_announcement(
-        instance_id: str, port: int, reply: bool = False) -> bytes:
+        instance_id: str, port: int, reply: bool = False, bye: bool = False) -> bytes:
     """Encode the small unauthenticated hint used when hotspots block mDNS."""
     if not _valid_instance_id(instance_id) or not 1 <= int(port) <= 65535:
         raise ValueError("invalid LAN discovery announcement")
@@ -221,10 +221,11 @@ def _encode_lan_announcement(
         "instance_id": str(instance_id).lower(),
         "port": int(port),
         "reply": bool(reply),
+        "bye": bool(bye),
     }, separators=(",", ":"), sort_keys=True).encode("ascii")
 
 
-def _decode_lan_announcement(payload: bytes) -> tuple[str, int, bool] | None:
+def _decode_lan_announcement(payload: bytes) -> tuple[str, int, bool, bool] | None:
     if not payload or len(payload) > _LAN_DISCOVERY_MAX_PACKET:
         return None
     try:
@@ -236,13 +237,15 @@ def _decode_lan_announcement(payload: bytes) -> tuple[str, int, bool] | None:
     instance_id = str(decoded.get("instance_id", "")).lower()
     port = decoded.get("port")
     reply = decoded.get("reply", False)
+    bye = decoded.get("bye", False)
     if (decoded.get("magic") != _LAN_DISCOVERY_MAGIC
             or decoded.get("version") != _CAP_VERSION
             or not _valid_instance_id(instance_id)
             or isinstance(port, bool) or not isinstance(port, int)
-            or not 1 <= port <= 65535 or not isinstance(reply, bool)):
+            or not 1 <= port <= 65535 or not isinstance(reply, bool)
+            or not isinstance(bye, bool)):
         return None
-    return instance_id, port, reply
+    return instance_id, port, reply, bye
 
 
 def _encode_lan_hint(instance_id: str, port: int) -> bytes:
@@ -393,6 +396,37 @@ def _connect_peer_socket(peer: "PeerInfo", host: str, timeout: float) -> socket.
             sock.close()
             raise
     return sock
+
+
+def _is_definite_refusal(error: OSError) -> bool:
+    """区分明确拒绝（连接被拒/路由不可达）与模糊超时。
+
+    超时不是确定信息：息屏的手机和已离线的手机都超时，把两者等同会导致
+    设备列表忽隐忽现。只有明确拒绝才能快速下线，超时需容忍多轮。
+    """
+    import errno
+    if isinstance(error, TimeoutError):
+        return False
+    if not isinstance(error, OSError):
+        return False
+    # 常见的明确拒绝错误码
+    definite_errors = {
+        errno.ECONNREFUSED,   # 连接被拒
+        errno.EHOSTUNREACH,   # 主机不可达
+        errno.ENETUNREACH,    # 网络不可达
+        errno.ECONNRESET,     # 连接重置
+    }
+    # 某些平台可能还有这些
+    try:
+        definite_errors.add(errno.EHOSTDOWN)
+    except AttributeError:
+        pass
+    try:
+        definite_errors.add(errno.ENETDOWN)
+    except AttributeError:
+        pass
+
+    return error.errno in definite_errors
 
 
 def _probe_peer(host: str, port: int, timeout: float,
@@ -1414,10 +1448,16 @@ class P2PNode:
             announcement = _decode_lan_announcement(payload)
             if announcement is None:
                 continue
-            instance_id, port, is_reply = announcement
+            instance_id, port, is_reply, is_bye = announcement
             if instance_id == self._instance_id:
                 continue
             sender_host = str(sender[0]).split("%", 1)[0]
+
+            # Handle goodbye message: probe to confirm departure before removing
+            if is_bye:
+                self._handle_lan_goodbye(sender_host, port, instance_id)
+                continue
+
             if not is_reply:
                 try:
                     sock.sendto(_encode_lan_announcement(
@@ -1437,11 +1477,57 @@ class P2PNode:
         self._verify_discovered_peer(
             host, [host], port, f"broadcast|{instance_id}", instance_id)
 
+    def _handle_lan_goodbye(
+            self, host: str, port: int, instance_id: str) -> None:
+        """Handle goodbye message: probe to confirm departure before removing."""
+        with self._lock:
+            peer_key = None
+            peer_hosts = []
+            for key, peer in self._peers.items():
+                if (peer.transport == "lan" and
+                    peer.instance_id == instance_id and
+                    host in ([peer.host] + list(peer.hosts or []))):
+                    peer_key = key
+                    peer_hosts = [peer.host] + list(peer.hosts or [])
+                    break
+            if peer_key is None:
+                return  # Unknown peer
+
+        # Probe to confirm the peer is really gone
+        try:
+            result = self._probe_peer(peer_hosts, port, instance_id)
+            if result is None:
+                # Confirmed gone - remove immediately
+                with self._lock:
+                    if peer_key in self._peers:
+                        del self._peers[peer_key]
+                        if peer_key in self._strikes:
+                            del self._strikes[peer_key]
+                self._emit_peers()
+        except Exception:
+            pass  # Probe failed, let normal strike policy handle it
+
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
         self._running = False
         self._probe_wake.set()
         self.cancel_send()
+
+        # Send goodbye message before stopping
+        sock = self._lan_discovery_sock
+        if sock is not None:
+            try:
+                goodbye = _encode_lan_announcement(
+                    self._instance_id, self._actual_port, bye=True)
+                targets = _lan_broadcast_targets(self._local_lan_networks())
+                for target in targets:
+                    try:
+                        sock.sendto(goodbye, (target, _LAN_DISCOVERY_PORT))
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
         lan_sock = self._lan_discovery_sock
         self._lan_discovery_sock = None
         if lan_sock is not None:
@@ -2764,7 +2850,11 @@ class P2PNode:
                     continue
                 except OSError as exc:
                     tailnet_unavailable = isinstance(exc, _TailnetUnavailable)
+                    definite_refusal = _is_definite_refusal(exc)
+
+                # 分级离线判定：明确拒绝立即下线，模糊超时需多轮容忍
                 threshold = (1 if is_manual and tailnet_unavailable
+                             else 1 if definite_refusal  # 连接被拒/不可达立即下线
                              else self._probe_strikes * 2
                              if is_manual else self._probe_strikes)
                 if strikes.get(key, 0) + 1 >= threshold:
