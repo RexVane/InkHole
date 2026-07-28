@@ -281,10 +281,11 @@ func (s *Service) localIngressToken() string {
 
 func (l *lanSession) Close() error {
 	l.cancel()
+	// Close listener BEFORE sending goodbye, so peers' probe confirms departure
+	_ = l.listener.Close()
 	if l.discovery != nil {
 		l.discovery.Stop()
 	}
-	_ = l.listener.Close()
 	l.mu.Lock()
 	for _, cancel := range l.sends {
 		cancel()

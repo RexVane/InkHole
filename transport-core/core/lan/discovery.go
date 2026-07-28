@@ -107,6 +107,8 @@ type Discovery struct {
 	// wake nudges the probe loop out of its wait; buffered so a burst of
 	// triggers collapses into one extra round.
 	wake chan struct{}
+	// queryWake nudges the mDNS query loop out of its wait
+	queryWake chan struct{}
 
 	verifySem chan struct{}
 	stopping  bool
@@ -153,6 +155,7 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 
 		localNets:       localNetworks(),
 		wake:            make(chan struct{}, 1),
+		queryWake:       make(chan struct{}, 1),
 		goodbyeHandling: make(map[string]time.Time),
 
 		verifySem: make(chan struct{}, maxConcurrentVerifications),
@@ -324,18 +327,9 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 		return
 	}
 
-	// Throttle goodbye handling to prevent DoS via rapid goodbye flooding.
-	// Allow at most one goodbye per instance per 500ms.
-	if last, ok := d.goodbyeHandling[announcement.InstanceID]; ok {
-		if time.Since(last) < 500*time.Millisecond {
-			d.mu.Unlock()
-			return
-		}
-	}
-	d.goodbyeHandling[announcement.InstanceID] = time.Now()
-
 	key, peer := d.peerByInstanceLocked(announcement.InstanceID)
 	if peer == nil {
+		// Unknown peer - don't add to throttle map to prevent DoS
 		d.mu.Unlock()
 		return
 	}
@@ -348,6 +342,17 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 		d.mu.Unlock()
 		return
 	}
+
+	// Throttle goodbye handling to prevent DoS via rapid goodbye flooding.
+	// Allow at most one goodbye per instance per 500ms.
+	if last, ok := d.goodbyeHandling[announcement.InstanceID]; ok {
+		if time.Since(last) < 500*time.Millisecond {
+			d.mu.Unlock()
+			return
+		}
+	}
+	d.goodbyeHandling[announcement.InstanceID] = time.Now()
+
 	nets := append([]*net.IPNet(nil), d.localNets...)
 	d.wg.Add(1)
 	d.mu.Unlock()
@@ -483,6 +488,11 @@ func (d *Discovery) Refresh() {
 		broadcast.bump()
 	}
 	d.kick()
+	// Wake the mDNS query loop immediately
+	select {
+	case d.queryWake <- struct{}{}:
+	default:
+	}
 }
 
 func (d *Discovery) bumpActiveLocked() {
@@ -540,6 +550,9 @@ func (d *Discovery) queryLoop() {
 		case <-d.ctx.Done():
 			timer.Stop()
 			return
+		case <-d.queryWake:
+			timer.Stop()
+			// Refresh triggered - run another sweep immediately
 		case <-timer.C:
 		}
 	}
@@ -834,9 +847,15 @@ func localNetworks() []*net.IPNet {
 }
 
 func networksFingerprint(nets []*net.IPNet) string {
-	parts := make([]string, 0, len(nets))
+	// Include both network CIDRs and actual IPs to detect same-subnet changes
+	parts := make([]string, 0, len(nets)*2)
 	for _, network := range nets {
 		parts = append(parts, network.String())
+	}
+	// Add local IPs
+	ips := LocalIPv4s()
+	for _, ip := range ips {
+		parts = append(parts, "ip:"+ip)
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ",")

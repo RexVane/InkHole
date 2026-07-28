@@ -24,7 +24,7 @@ def test_lan_announcement_round_trip():
     instance_id = "0123456789abcdef0123456789abcdef"
     assert _decode_lan_announcement(
         _encode_lan_announcement(instance_id, 41300)
-    ) == (instance_id, 41300, False)
+    ) == (instance_id, 41300, False, False)
 
 
 def test_lan_announcement_rejects_bad_metadata():

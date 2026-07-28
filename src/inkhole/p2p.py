@@ -1495,17 +1495,16 @@ class P2PNode:
 
         # Probe to confirm the peer is really gone
         try:
-            result = self._probe_peer(peer_hosts, port, instance_id)
-            if result is None:
-                # Confirmed gone - remove immediately
-                with self._lock:
-                    if peer_key in self._peers:
-                        del self._peers[peer_key]
-                        if peer_key in self._strikes:
-                            del self._strikes[peer_key]
-                self._emit_peers()
+            result = self._probe_hosts(peer_hosts, port, _LAN_PROBE_TIMEOUT, instance_id)
+            # If probe succeeds, peer is still alive - ignore goodbye
         except Exception:
-            pass  # Probe failed, let normal strike policy handle it
+            # Probe failed - confirmed gone, remove immediately
+            with self._lock:
+                if peer_key in self._peers:
+                    del self._peers[peer_key]
+                    if peer_key in self._strikes:
+                        del self._strikes[peer_key]
+            self._emit_peers()
 
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
@@ -1513,7 +1512,15 @@ class P2PNode:
         self._probe_wake.set()
         self.cancel_send()
 
-        # Send goodbye message before stopping
+        # Close listener BEFORE sending goodbye, so peers' probe confirms departure
+        if self._server_sock:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+            self._server_sock = None
+
+        # Send goodbye message after closing listener
         sock = self._lan_discovery_sock
         if sock is not None:
             try:
@@ -1537,12 +1544,7 @@ class P2PNode:
                 pass
         with self._mdns_lock:
             self._teardown_mdns()
-        if self._server_sock:
-            try:
-                self._server_sock.close()
-            except Exception:
-                pass
-            self._server_sock = None
+        # server_sock already closed above before sending goodbye
 
     def cancel_send(self) -> bool:
         """Cancel only the active outbound transfer; inbound transfers keep running."""
@@ -2723,6 +2725,8 @@ class P2PNode:
                      expected_instance_id: str = "") -> _ProbeResult:
         last_error: OSError | None = None
         tailnet_error: _TailnetUnavailable | None = None
+        saw_definite_refusal = False
+        saw_timeout = False
         for host in hosts:
             try:
                 return _probe_peer(host, port, timeout, expected_instance_id)
@@ -2732,8 +2736,17 @@ class P2PNode:
                 tailnet_error = exc
             except OSError as exc:
                 last_error = exc
+                if _is_definite_refusal(exc):
+                    saw_definite_refusal = True
+                else:
+                    saw_timeout = True
         if tailnet_error is not None:
             raise tailnet_error
+        # Preserve error classification: if any address timed out, the failure
+        # is ambiguous and should not trigger fast eviction
+        if saw_timeout and last_error and not _is_definite_refusal(last_error):
+            # Replace with a timeout-like error to prevent fast eviction
+            raise TimeoutError("部分地址超时，设备可能仍在线")
         raise last_error if last_error else OSError("目标设备没有可用地址")
 
     def _send_lan_hint(self, host: str, port: int) -> None:

@@ -90,6 +90,10 @@ func (m *mdnsLayer) reannounce(cfg Config, localIPs []string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Check if already stopped to prevent race with Stop()
+	if m.server == nil && m.ips == nil {
+		return nil
+	}
 	if sameStrings(m.ips, localIPs) {
 		return nil
 	}
@@ -254,4 +258,6 @@ func (m *mdnsLayer) stop() {
 		m.server.Shutdown()
 		m.server = nil
 	}
+	// Mark as stopped to prevent reannounce race
+	m.ips = nil
 }

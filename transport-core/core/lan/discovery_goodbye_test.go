@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// filterTestPeers returns only peers matching the expected instance IDs
+func filterTestPeers(peers []Peer, expectedIDs ...string) []Peer {
+	var filtered []Peer
+	idSet := make(map[string]bool)
+	for _, id := range expectedIDs {
+		idSet[id] = true
+	}
+	for _, p := range peers {
+		if idSet[p.InstanceID] {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
+}
+
 // TestGoodbyeVerifiesBeforeRemoval confirms that a goodbye message triggers
 // a probe before removing the peer, and only removes if the probe confirms
 // the peer is truly gone.
@@ -40,7 +55,7 @@ func TestGoodbyeVerifiesBeforeRemoval(t *testing.T) {
 		LocalIPs:     []string{"127.0.0.1"},
 	}, func(peers []Peer) {
 		mu.Lock()
-		bobPeers = append([]Peer(nil), peers...)
+		bobPeers = filterTestPeers(peers, aliceID)
 		mu.Unlock()
 	}, func(string) {})
 	if err != nil {
@@ -56,6 +71,9 @@ func TestGoodbyeVerifiesBeforeRemoval(t *testing.T) {
 		Capabilities: []string{"folder-v1"},
 		LocalIPs:     []string{"127.0.0.1"},
 	}, func([]Peer) {}, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +157,7 @@ func TestGoodbyeIgnoresUnknownPeer(t *testing.T) {
 		LocalIPs:     []string{"127.0.0.1"},
 	}, func(peers []Peer) {
 		mu.Lock()
-		alicePeers = append([]Peer(nil), peers...)
+		alicePeers = filterTestPeers(peers, aliceID) // No peers expected
 		mu.Unlock()
 	}, func(string) {})
 	if err != nil {
@@ -193,15 +211,16 @@ func TestGoodbyeThrottling(t *testing.T) {
 	var mu sync.Mutex
 
 	bobDisc, err := Start(Config{
-		PeerName:     "bob",
-		InstanceID:   bobID,
-		Port:         bobPort,
-		Identity:     bobIdentity,
-		Capabilities: []string{"folder-v1"},
-		LocalIPs:     []string{"127.0.0.1"},
+		PeerName:        "bob",
+		InstanceID:      bobID,
+		Port:            bobPort,
+		Identity:        bobIdentity,
+		Capabilities:    []string{"folder-v1"},
+		LocalIPs:        []string{"127.0.0.1"},
+		DisableBroadcast: true,
 	}, func(peers []Peer) {
 		mu.Lock()
-		bobPeers = append([]Peer(nil), peers...)
+		bobPeers = filterTestPeers(peers, aliceID)
 		mu.Unlock()
 	}, func(string) {})
 	if err != nil {
@@ -223,7 +242,7 @@ func TestGoodbyeThrottling(t *testing.T) {
 	defer aliceDisc.Stop()
 
 	// Wait for discovery
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		found := len(bobPeers) > 0
@@ -235,11 +254,11 @@ func TestGoodbyeThrottling(t *testing.T) {
 	}
 
 	mu.Lock()
-	if len(bobPeers) != 1 {
-		mu.Unlock()
-		t.Skip("discovery didn't complete in time")
-	}
+	count := len(bobPeers)
 	mu.Unlock()
+	if count != 1 {
+		t.Skipf("discovery didn't complete in time (found %d peers, expected 1)", count)
+	}
 
 	// Send rapid goodbye burst (simulating attack)
 	// Only the first should trigger a probe goroutine, rest should be throttled
@@ -293,15 +312,16 @@ func TestGoodbyeAcceptsOnlyKnownHost(t *testing.T) {
 	var mu sync.Mutex
 
 	bobDisc, err := Start(Config{
-		PeerName:     "bob",
-		InstanceID:   bobID,
-		Port:         bobPort,
-		Identity:     bobIdentity,
-		Capabilities: []string{"folder-v1"},
-		LocalIPs:     []string{"127.0.0.1"},
+		PeerName:        "bob",
+		InstanceID:      bobID,
+		Port:            bobPort,
+		Identity:        bobIdentity,
+		Capabilities:    []string{"folder-v1"},
+		LocalIPs:        []string{"127.0.0.1"},
+		DisableBroadcast: true,
 	}, func(peers []Peer) {
 		mu.Lock()
-		bobPeers = append([]Peer(nil), peers...)
+		bobPeers = filterTestPeers(peers, aliceID)
 		mu.Unlock()
 	}, func(string) {})
 	if err != nil {

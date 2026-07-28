@@ -607,11 +607,12 @@ func (s *InkHoleService) Stop() {
 	if cancel != nil {
 		cancel()
 	}
-	if discovery != nil {
-		discovery.Stop()
-	}
+	// Close listener BEFORE stopping discovery, so goodbye probe confirms departure
 	if listener != nil {
 		_ = listener.Close()
+	}
+	if discovery != nil {
+		discovery.Stop()
 	}
 	if transport != nil {
 		_ = transport.Close()
