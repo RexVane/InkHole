@@ -1869,7 +1869,6 @@ class InkHoleNode(
         var sawSilence = false
         val targets = TailnetAddress.order(hosts.flatMap(::resolveHostAddresses))
             .distinct()
-            .take(MAX_PARALLEL_PROBE_ADDRESSES)
         if (targets.isEmpty()) throw IOException("目标设备没有可用地址")
 
         val localSockets = ConcurrentHashMap.newKeySet<Socket>()

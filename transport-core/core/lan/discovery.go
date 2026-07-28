@@ -40,11 +40,11 @@ const (
 	activeProbeInterval = 800 * time.Millisecond
 	// idleQueryInterval paces mDNS sweeps once the active window closes.
 	idleQueryInterval = 8 * time.Second
-	// netPollInterval bounds how long a Wi-Fi switch can go unnoticed. An
-	// interface enumeration costs tens of microseconds, so polling five
-	// times a second is far cheaper than the multi-second staleness it
-	// replaces.
-	netPollInterval = 200 * time.Millisecond
+	// netPollInterval bounds how long a Wi-Fi switch can go unnoticed. While
+	// interface enumeration is cheap, frequent polling increases CPU wakeups
+	// and power consumption on battery devices. 2-second polling provides
+	// acceptable latency while minimizing resource usage.
+	netPollInterval = 2 * time.Second
 )
 
 // Config configures one LAN discovery node.
@@ -104,9 +104,6 @@ type Discovery struct {
 	localNets []*net.IPNet
 	// activeUntil marks the end of the current hot window.
 	activeUntil time.Time
-	// fastEvict makes the next probe round evict on a single failure,
-	// because a network change already told us the topology moved.
-	fastEvict bool
 	// wake nudges the probe loop out of its wait; buffered so a burst of
 	// triggers collapses into one extra round.
 	wake chan struct{}
@@ -114,6 +111,9 @@ type Discovery struct {
 	verifySem chan struct{}
 	stopping  bool
 	stopOnce  sync.Once
+
+	// goodbyeThrottle prevents DoS via rapid goodbye messages
+	goodbyeHandling map[string]time.Time
 
 	broadcast *broadcaster
 	mdns      *mdnsLayer
@@ -151,8 +151,9 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 		verinstr: map[string]bool{},
 		reported: map[string]bool{},
 
-		localNets: localNetworks(),
-		wake:      make(chan struct{}, 1),
+		localNets:       localNetworks(),
+		wake:            make(chan struct{}, 1),
+		goodbyeHandling: make(map[string]time.Time),
 
 		verifySem: make(chan struct{}, maxConcurrentVerifications),
 	}
@@ -322,22 +323,42 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 		d.mu.Unlock()
 		return
 	}
+
+	// Throttle goodbye handling to prevent DoS via rapid goodbye flooding.
+	// Allow at most one goodbye per instance per 500ms.
+	if last, ok := d.goodbyeHandling[announcement.InstanceID]; ok {
+		if time.Since(last) < 500*time.Millisecond {
+			d.mu.Unlock()
+			return
+		}
+	}
+	d.goodbyeHandling[announcement.InstanceID] = time.Now()
+
 	key, peer := d.peerByInstanceLocked(announcement.InstanceID)
 	if peer == nil {
 		d.mu.Unlock()
 		return
 	}
 	snapshot := *peer
+	knownHosts := dedupeStrings(append([]string{snapshot.Host},
+		snapshot.Hosts...))
+	if !stringInSlice(host, knownHosts) {
+		// A goodbye is unauthenticated UDP. Only accept it from an address
+		// already tied to this signed WHPC identity.
+		d.mu.Unlock()
+		return
+	}
 	nets := append([]*net.IPNet(nil), d.localNets...)
 	d.wg.Add(1)
 	d.mu.Unlock()
 	go func() {
 		defer d.wg.Done()
-		hosts := dedupeStrings(append([]string{snapshot.Host},
-			snapshot.Hosts...))
-		_, _, verdict := d.probePeerHosts(hosts, snapshot.Port,
+		_, _, verdict := d.probePeerHosts(knownHosts, snapshot.Port,
 			snapshot.InstanceID, nets)
-		if verdict == hostAlive || d.ctx.Err() != nil {
+		if (verdict != hostGone && verdict != hostMismatch) ||
+			d.ctx.Err() != nil {
+			// Silence is still ambiguous: an asleep phone produces the same
+			// timeout as a departed one. Let the normal strike policy decide.
 			return
 		}
 		d.mu.Lock()
@@ -348,6 +369,7 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 		}
 		delete(d.peers, key)
 		delete(d.strike, key)
+		delete(d.goodbyeHandling, snapshot.InstanceID)
 		d.mu.Unlock()
 		d.emitPeers()
 	}()
@@ -455,9 +477,10 @@ func (d *Discovery) Refresh() {
 		return
 	}
 	d.bumpActiveLocked()
+	broadcast := d.broadcast
 	d.mu.Unlock()
-	if d.broadcast != nil {
-		d.broadcast.bump()
+	if broadcast != nil {
+		broadcast.bump()
 	}
 	d.kick()
 }
@@ -504,11 +527,15 @@ func (d *Discovery) queryLoop() {
 		if d.ctx.Err() != nil {
 			return
 		}
+		var wait time.Duration
 		if d.isActive() {
-			// Back-to-back sweeps; the sweep window is its own pacing.
-			continue
+			// Active period: sweep more frequently, but not back-to-back
+			// to avoid excessive socket churn and mDNS traffic.
+			wait = 500 * time.Millisecond
+		} else {
+			wait = idleQueryInterval
 		}
-		timer := time.NewTimer(idleQueryInterval)
+		timer := time.NewTimer(wait)
 		select {
 		case <-d.ctx.Done():
 			timer.Stop()
@@ -555,7 +582,6 @@ func (d *Discovery) onNetworkChange(current, lost []*net.IPNet) {
 		return
 	}
 	d.localNets = current
-	d.fastEvict = true
 	removed := 0
 	for key, peer := range d.peers {
 		if peerStrandedBy(peer, lost) {
@@ -570,7 +596,9 @@ func (d *Discovery) onNetworkChange(current, lost []*net.IPNet) {
 		d.emitPeers()
 	}
 	if d.mdns != nil {
-		d.mdns.reannounce(d.cfg, LocalIPv4s())
+		if err := d.mdns.reannounce(d.cfg, LocalIPv4s()); err != nil {
+			d.status("mDNS 重新宣告失败: " + err.Error())
+		}
 	}
 	if d.broadcast != nil {
 		d.broadcast.bump()
@@ -598,8 +626,6 @@ func (d *Discovery) probeLoop() {
 
 func (d *Discovery) probeRound() {
 	d.mu.Lock()
-	fast := d.fastEvict
-	d.fastEvict = false
 	nets := append([]*net.IPNet(nil), d.localNets...)
 	type target struct {
 		key  string
@@ -665,10 +691,11 @@ func (d *Discovery) probeRound() {
 				changed = true
 			}
 			delete(d.strike, out.key)
-		case out.verdict == hostGone || fast:
-			// Every address actively refused us, or the local network just
-			// moved. Either way this is knowledge, not a guess, so the
-			// four-strike tolerance meant for a dozing phone does not apply.
+		case out.verdict == hostGone:
+			// Every address actively refused us. This is knowledge rather
+			// than a timeout guess, so the dozing-phone tolerance does not
+			// apply. A network change already removed peers stranded on its
+			// departed subnet in onNetworkChange.
 			delete(d.peers, out.key)
 			delete(d.strike, out.key)
 			changed = true
@@ -768,8 +795,13 @@ func localNetworks() []*net.IPNet {
 		return nil
 	}
 	var out []*net.IPNet
+	seen := make(map[string]bool)
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagPointToPoint != 0 ||
+			!isLANInterfaceName(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -789,9 +821,15 @@ func localNetworks() []*net.IPNet {
 			if masked == nil {
 				continue
 			}
-			out = append(out, &net.IPNet{IP: masked, Mask: ipNet.Mask})
+			network := &net.IPNet{IP: masked, Mask: ipNet.Mask}
+			key := network.String()
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, network)
+			}
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
 	return out
 }
 
@@ -850,7 +888,6 @@ func peerStrandedBy(peer *Peer, lost []*net.IPNet) bool {
 	return true
 }
 
-
 func dedupeStrings(values []string) []string {
 	seen := make(map[string]bool, len(values))
 	out := make([]string, 0, len(values))
@@ -864,6 +901,15 @@ func dedupeStrings(values []string) []string {
 	return out
 }
 
+func stringInSlice(want string, values []string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -873,9 +919,29 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// isLANInterfaceName rejects tunnel, overlay and VM-only interfaces. Those
+// paths remain available through manual/cross-network transports, but must not
+// make a peer look local and receive the 700ms LAN probe budget.
+func isLANInterfaceName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if normalized == "" {
+		return false
+	}
+	for _, prefix := range []string{
+		"utun", "tun", "tap", "wg", "tailscale", "zerotier", "zt",
+		"ppp", "ipsec", "gif", "stf", "docker", "veth", "virbr", "vmnet",
+		"vmware", "vethernet", "virtualbox", "vbox", "hyper-v",
+	} {
+		if strings.HasPrefix(normalized, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
 // LocalIPv4s enumerates announceable IPv4 addresses: non-loopback,
-// non-link-local, virtual interfaces excluded by the caller's judgment.
-// Loopback never enters the list (see the 127.0.0.1 announcement bug).
+// non-link-local and attached to a physical LAN-capable interface. Loopback
+// never enters the list (see the 127.0.0.1 announcement bug).
 func LocalIPv4s() []string {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -885,6 +951,10 @@ func LocalIPv4s() []string {
 	seen := make(map[string]bool)
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagPointToPoint != 0 ||
+			!isLANInterfaceName(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -907,5 +977,6 @@ func LocalIPv4s() []string {
 			}
 		}
 	}
+	sort.Strings(out)
 	return out
 }

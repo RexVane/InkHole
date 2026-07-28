@@ -82,8 +82,9 @@ _PROBE_INTERVAL = 5.0              # 对端存活探测间隔(秒)
 _PROBE_TIMEOUT = 3.0               # 探测单个地址的 TCP 连接超时(秒)；息屏省电的手机
                                    # WiFi RTT 尖峰可达数秒，1.5s 会周期性误判离线
 _PROBE_STRIKES = 4                 # 连续失败这么多轮才判离线(防瞬时网络抖动误杀)
-_NET_CHECK_INTERVAL = 5.0          # 网络监控轮询间隔(秒)
+_NET_CHECK_INTERVAL = 0.5            # 网络监控轮询间隔(秒)
 _NET_WAKE_GAP = 20.0               # 单轮 sleep 实际耗时超过此值判定为睡眠唤醒，触发 mDNS 重建
+_LAN_PROBE_TIMEOUT = 0.7           # 同网段对端的探测预算（秒）
 _LAN_DISCOVERY_MAGIC = "inkhole-lan-v1"
 _LAN_DISCOVERY_PORT = 41301
 _LAN_DISCOVERY_INTERVAL = 2.0

@@ -110,7 +110,6 @@ func DecodeAnnouncement(payload []byte) *Announcement {
 	}
 }
 
-
 // broadcastTargets returns the directed broadcast address of every non-
 // virtual IPv4 network plus the limited broadcast address.
 func broadcastTargets() []string {
@@ -122,6 +121,10 @@ func broadcastTargets() []string {
 	seen := map[string]bool{"255.255.255.255": true}
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagPointToPoint != 0 ||
+			!isLANInterfaceName(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -312,7 +315,6 @@ func (b *broadcaster) run(ctx context.Context) {
 		}
 	}
 }
-
 
 // reusePortControl lets several nodes on one machine share the discovery
 // port (tests, desktop + CLI side by side), matching SO_REUSEADDR/REUSEPORT

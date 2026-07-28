@@ -3,6 +3,7 @@ package lan
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -242,6 +243,77 @@ func TestSubtractNetsFindsDepartedSubnet(t *testing.T) {
 	lost := subtractNets(before, after)
 	if len(lost) != 1 || lost[0].String() != "192.168.5.0/24" {
 		t.Fatalf("lost = %v", lost)
+	}
+}
+
+func TestNetworkChangeKeepsSilentRoutedPeerOnStrikePolicy(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		request := make([]byte, len(capMagic)+nonceSize)
+		_, _ = io.ReadFull(conn, request)
+		time.Sleep(250 * time.Millisecond)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	key := "routed-peer"
+	discovery := &Discovery{
+		ctx:      ctx,
+		cancel:   cancel,
+		peers:    map[string]*Peer{},
+		strike:   map[string]int{},
+		reported: map[string]bool{},
+		timeout:  40 * time.Millisecond,
+		strikes:  4,
+		wake:     make(chan struct{}, 1),
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+	discovery.peers[key] = &Peer{
+		InstanceID: vecInstanceID,
+		Name:       "仍可路由设备",
+		Host:       addr.IP.String(),
+		Hosts:      []string{addr.IP.String()},
+		Port:       addr.Port,
+	}
+
+	// A topology event may only remove peers on a subnet proven lost. The
+	// next unrelated timeout remains ambiguous and consumes one strike.
+	discovery.onNetworkChange(nil, nil)
+	discovery.probeRound()
+	if len(discovery.Peers()) != 1 {
+		t.Fatal("network change evicted a silent peer outside a lost subnet")
+	}
+	if got := discovery.strike[key]; got != 1 {
+		t.Fatalf("silent peer strikes = %d, want 1", got)
+	}
+}
+
+func TestLANInterfaceNameFilter(t *testing.T) {
+	for _, name := range []string{
+		"en0", "en7", "eth0", "wlan0", "Wi-Fi", "Ethernet", "bridge100",
+		"Local Area Connection",
+	} {
+		if !isLANInterfaceName(name) {
+			t.Errorf("physical LAN interface %q was rejected", name)
+		}
+	}
+	for _, name := range []string{
+		"utun4", "tun0", "tap0", "wg0", "tailscale0", "ztabc123",
+		"vmnet8", "VMware Network Adapter", "vEthernet (WSL)", "docker0",
+		"veth1234", "virbr0", "ppp0",
+	} {
+		if isLANInterfaceName(name) {
+			t.Errorf("virtual interface %q was accepted as LAN", name)
+		}
 	}
 }
 

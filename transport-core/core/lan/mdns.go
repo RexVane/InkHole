@@ -60,6 +60,7 @@ type mdnsLayer struct {
 	server *zeroconf.Server
 	cancel context.CancelFunc
 	ips    []string
+	wg     sync.WaitGroup
 }
 
 // registerService publishes this node under the current address set.
@@ -83,25 +84,30 @@ func registerService(cfg Config, localIPs []string) (*zeroconf.Server, error) {
 // registration keeps advertising an IP nobody can reach — and the TXT "ips"
 // list that Android NSD relies on would stay stale for the life of the
 // process. Only re-registering fixes that.
-func (m *mdnsLayer) reannounce(cfg Config, localIPs []string) {
+func (m *mdnsLayer) reannounce(cfg Config, localIPs []string) error {
 	if len(localIPs) == 0 {
-		return
+		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if sameStrings(m.ips, localIPs) {
-		return
+		return nil
 	}
-	if m.server != nil {
-		m.server.Shutdown()
-		m.server = nil
-	}
+	// Register the replacement before retiring the current responder. If the
+	// new interface is still settling and registration fails, the old service
+	// remains alive and the next network event can retry instead of leaving
+	// discovery permanently unpublished.
 	server, err := registerService(cfg, localIPs)
 	if err != nil {
-		return
+		return err
 	}
+	previous := m.server
 	m.server = server
 	m.ips = append([]string(nil), localIPs...)
+	if previous != nil {
+		previous.Shutdown()
+	}
+	return nil
 }
 
 func sameStrings(left, right []string) bool {
@@ -147,28 +153,40 @@ func startMDNS(ctx context.Context, cfg Config, localIPs []string,
 		return nil, err
 	}
 	entries := make(chan *zeroconf.ServiceEntry, 16)
-	go func() {
-		for entry := range entries {
-			if entry == nil {
-				continue
-			}
-			decoded := decodeEntry(entry)
-			if decoded == nil || decoded.InstanceID == cfg.InstanceID {
-				continue
-			}
-			onEntry(*decoded)
-		}
-	}()
-	if err := resolver.Browse(browseCtx, mdnsService, mdnsDomain, entries); err != nil {
-		server.Shutdown()
-		cancel()
-		return nil, err
-	}
-	return &mdnsLayer{
+	layer := &mdnsLayer{
 		server: server,
 		cancel: cancel,
 		ips:    append([]string(nil), localIPs...),
-	}, nil
+	}
+	layer.wg.Add(1)
+	go func() {
+		defer layer.wg.Done()
+		for {
+			select {
+			case <-browseCtx.Done():
+				return
+			case entry, ok := <-entries:
+				if !ok {
+					return
+				}
+				if entry == nil {
+					continue
+				}
+				decoded := decodeEntry(entry)
+				if decoded == nil || decoded.InstanceID == cfg.InstanceID {
+					continue
+				}
+				onEntry(*decoded)
+			}
+		}
+	}()
+	if err := resolver.Browse(browseCtx, mdnsService, mdnsDomain, entries); err != nil {
+		cancel()
+		layer.wg.Wait()
+		server.Shutdown()
+		return nil, err
+	}
+	return layer, nil
 }
 
 func decodeEntry(entry *zeroconf.ServiceEntry) *mdnsEntry {
@@ -229,6 +247,7 @@ func buildEntry(serviceInstance, label string, port int, addrs []net.IP,
 
 func (m *mdnsLayer) stop() {
 	m.cancel()
+	m.wg.Wait()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.server != nil {

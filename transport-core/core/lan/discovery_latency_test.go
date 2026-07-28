@@ -157,10 +157,8 @@ func TestLiveDiscoveryLatency(t *testing.T) {
 			return samples[i] < samples[j]
 		})
 		p50 := samples[len(samples)/2]
-		p95 := samples[len(samples)*95/100]
-		if p95 >= time.Duration(len(samples)) {
-			p95 = samples[len(samples)-1]
-		}
+		// Nearest-rank percentile: ceil(0.95*n)-1, always a valid index.
+		p95 := samples[(len(samples)*95-1)/100]
 		lines := make([]string, 0, len(samples))
 		for _, sample := range samples {
 			lines = append(lines, fmt.Sprintf("%.0fms",
