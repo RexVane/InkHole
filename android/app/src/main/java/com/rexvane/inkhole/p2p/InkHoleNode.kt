@@ -186,7 +186,9 @@ class InkHoleNode(
         // 同网段对端的探活预算。局域网往返是个位数毫秒，3 秒是给 Tailscale
         // 和息屏手机留的余量，用在本地地址上只会让陈旧地址白白拖慢一整轮。
         private const val LAN_PROBE_TIMEOUT_MS = 700
-        private const val MAX_PARALLEL_PROBE_ADDRESSES = 8
+        // 地址探测并发度。10 个设备 × 3 地址/设备 = 30 并发探测；8 线程会串行化
+        // 部分探测并延长探测轮时间。提高到 24 以支持典型多设备场景。
+        private const val MAX_PARALLEL_PROBE_ADDRESSES = 24
         private const val EMPTY_DISCOVERY_RESTART_TICKS = 6
         // 手动设备探活超时:Tailscale 空闲后懒惰唤醒(打洞/DERP 建链)首次
         // 握手常超 1.2s,太紧会把在线的跨网设备判死或迟迟不上线
