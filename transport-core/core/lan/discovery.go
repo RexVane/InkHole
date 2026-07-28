@@ -25,6 +25,26 @@ const (
 	// discovery port with announcements carrying ever-new instance ids,
 	// each costing a TCP probe with a multi-second timeout.
 	maxConcurrentVerifications = 8
+
+	// lanProbeTimeout is the connect budget for a peer that shares one of our
+	// own subnets. Such a peer answers in single-digit milliseconds, so the
+	// tolerant remote budget bought nothing and cost a lot: a peer carrying
+	// two stale addresses burned six seconds before the live one was tried.
+	// Peers reached over Tailscale or a sleeping phone keep the full
+	// probeTimeout, which is what stopped the original flapping.
+	lanProbeTimeout = 700 * time.Millisecond
+	// activeWindow is how long discovery runs hot after a start, a network
+	// change or an explicit Refresh. Long enough to cover a Wi-Fi handover,
+	// short enough that idle machines fall back to the quiet cadence.
+	activeWindow        = 6 * time.Second
+	activeProbeInterval = 800 * time.Millisecond
+	// idleQueryInterval paces mDNS sweeps once the active window closes.
+	idleQueryInterval = 8 * time.Second
+	// netPollInterval bounds how long a Wi-Fi switch can go unnoticed. An
+	// interface enumeration costs tens of microseconds, so polling five
+	// times a second is far cheaper than the multi-second staleness it
+	// replaces.
+	netPollInterval = 200 * time.Millisecond
 )
 
 // Config configures one LAN discovery node.
@@ -78,6 +98,19 @@ type Discovery struct {
 	verinstr map[string]bool // in-flight verification probes
 	reported map[string]bool // identity errors already reported
 
+	// localNets is the set of IPv4 networks this host currently sits on,
+	// refreshed by netmonLoop. It decides which peers get the fast LAN
+	// probe budget and which ones a lost subnet makes instantly unreachable.
+	localNets []*net.IPNet
+	// activeUntil marks the end of the current hot window.
+	activeUntil time.Time
+	// fastEvict makes the next probe round evict on a single failure,
+	// because a network change already told us the topology moved.
+	fastEvict bool
+	// wake nudges the probe loop out of its wait; buffered so a burst of
+	// triggers collapses into one extra round.
+	wake chan struct{}
+
 	verifySem chan struct{}
 	stopping  bool
 	stopOnce  sync.Once
@@ -118,6 +151,9 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 		verinstr: map[string]bool{},
 		reported: map[string]bool{},
 
+		localNets: localNetworks(),
+		wake:      make(chan struct{}, 1),
+
 		verifySem: make(chan struct{}, maxConcurrentVerifications),
 	}
 	if d.interval <= 0 {
@@ -131,7 +167,7 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 	}
 	if !cfg.DisableBroadcast {
 		broadcast, err := newBroadcaster(cfg.InstanceID, cfg.Port,
-			d.handleAnnouncement, d.knownLANHosts)
+			d.handleAnnouncement, d.handleGoodbye, d.knownLANHosts)
 		if err != nil {
 			d.status("热点设备发现启动失败: " + err.Error())
 		} else {
@@ -150,18 +186,37 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 			return nil, err
 		}
 		d.mdns = mdns
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			d.queryLoop()
+		}()
 	}
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		d.netmonLoop()
+	}()
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
 		d.probeLoop()
 	}()
+	// Start hot: the first seconds after launch are exactly when the user is
+	// staring at an empty device list.
+	d.Refresh()
 	return d, nil
 }
 
 // Stop tears the stack down and waits for every goroutine.
 func (d *Discovery) Stop() {
 	d.stopOnce.Do(func() {
+		// Announce departure while the socket and the network are still up,
+		// so peers drop us in milliseconds instead of waiting out four
+		// strikes. Ordering matters: cancelling the context closes the socket.
+		if d.broadcast != nil {
+			d.broadcast.sayGoodbye()
+		}
 		d.mu.Lock()
 		d.stopping = true
 		d.cancel()
@@ -247,8 +302,55 @@ func (d *Discovery) handleAnnouncement(host string, announcement *Announcement) 
 }
 
 func (d *Discovery) handleEntry(entry mdnsEntry) {
+	// Our own registration comes back on both the browse channel and the
+	// active query sweep; without this the node verifies itself, succeeds,
+	// and lists itself as a peer.
+	if entry.InstanceID == d.cfg.InstanceID {
+		return
+	}
 	d.verifyCandidate(entry.ServiceName, entry.PeerName, entry.Hosts,
 		entry.Port, entry.InstanceID)
+}
+
+// handleGoodbye reacts to a departure notice. Anyone on the segment can forge
+// one, so it is a hint rather than an order: confirm with a probe, and only
+// then drop the device. That still retires a peer in a few hundred
+// milliseconds instead of the four strikes silence would have cost.
+func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return
+	}
+	key, peer := d.peerByInstanceLocked(announcement.InstanceID)
+	if peer == nil {
+		d.mu.Unlock()
+		return
+	}
+	snapshot := *peer
+	nets := append([]*net.IPNet(nil), d.localNets...)
+	d.wg.Add(1)
+	d.mu.Unlock()
+	go func() {
+		defer d.wg.Done()
+		hosts := dedupeStrings(append([]string{snapshot.Host},
+			snapshot.Hosts...))
+		_, _, verdict := d.probePeerHosts(hosts, snapshot.Port,
+			snapshot.InstanceID, nets)
+		if verdict == hostAlive || d.ctx.Err() != nil {
+			return
+		}
+		d.mu.Lock()
+		current, ok := d.peers[key]
+		if !ok || current.InstanceID != snapshot.InstanceID {
+			d.mu.Unlock()
+			return
+		}
+		delete(d.peers, key)
+		delete(d.strike, key)
+		d.mu.Unlock()
+		d.emitPeers()
+	}()
 }
 
 // verifyCandidate probes a discovered candidate before it may enter the
@@ -326,133 +428,428 @@ func (d *Discovery) peerByInstanceLocked(instanceID string) (string, *Peer) {
 	return "", nil
 }
 
-// probeHosts tries every candidate address until one verifies. Identity
-// mismatches are terminal for the whole candidate set.
+// probeHosts races every candidate address; the first that verifies wins.
+// Identity mismatches are terminal for the whole candidate set.
 func (d *Discovery) probeHosts(hosts []string, port int,
 	expectedInstanceID string) (*ProbeResult, string) {
-	for _, host := range hosts {
-		if d.ctx.Err() != nil {
-			return nil, ""
-		}
-		result, err := ProbePeer(host, port, d.timeout, expectedInstanceID)
-		if err == nil {
-			connected := result.ConnectedIP
-			if connected == "" {
-				connected = host
-			}
-			return result, connected
-		}
-		if errors.Is(err, ErrIdentityMismatch) {
-			return nil, ""
-		}
+	d.mu.Lock()
+	nets := append([]*net.IPNet(nil), d.localNets...)
+	d.mu.Unlock()
+	result, connected, verdict := d.probePeerHosts(hosts, port,
+		expectedInstanceID, nets)
+	if verdict != hostAlive {
+		return nil, ""
 	}
-	return nil, ""
+	return result, connected
 }
 
-// probeLoop is the authority on peer removal: every interval it reprobes
-// all peers in parallel; probeStrikes consecutive full failures evict.
-func (d *Discovery) probeLoop() {
-	ticker := time.NewTicker(d.interval)
+// Refresh drives discovery hard for the next few seconds: it re-arms the
+// active window, fires an announcement burst, wakes the prober and lets the
+// mDNS sweeper run back to back. The desktop calls it when its window comes
+// forward or the user opens the device list, which is when a stale list is
+// most visible and most annoying.
+func (d *Discovery) Refresh() {
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return
+	}
+	d.bumpActiveLocked()
+	d.mu.Unlock()
+	if d.broadcast != nil {
+		d.broadcast.bump()
+	}
+	d.kick()
+}
+
+func (d *Discovery) bumpActiveLocked() {
+	deadline := time.Now().Add(activeWindow)
+	if deadline.After(d.activeUntil) {
+		d.activeUntil = deadline
+	}
+}
+
+func (d *Discovery) isActive() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return time.Now().Before(d.activeUntil)
+}
+
+// kick asks the probe loop for one extra round without waiting out its timer.
+func (d *Discovery) kick() {
+	select {
+	case d.wake <- struct{}{}:
+	default:
+	}
+}
+
+// nextProbeDelay shortens the cadence inside the active window, but never
+// beyond the configured interval — tests drive this far faster than any
+// production setting and must not be slowed down by the hot path.
+func (d *Discovery) nextProbeDelay() time.Duration {
+	if !d.isActive() {
+		return d.interval
+	}
+	if activeProbeInterval < d.interval {
+		return activeProbeInterval
+	}
+	return d.interval
+}
+
+// queryLoop keeps asking the network who is out there. See mdns_query.go for
+// why the zeroconf browser cannot be trusted to do this on its own.
+func (d *Discovery) queryLoop() {
+	for {
+		querySweep(d.ctx, d.handleEntry)
+		if d.ctx.Err() != nil {
+			return
+		}
+		if d.isActive() {
+			// Back-to-back sweeps; the sweep window is its own pacing.
+			continue
+		}
+		timer := time.NewTimer(idleQueryInterval)
+		select {
+		case <-d.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// netmonLoop watches for the local addressing changing under us — a Wi-Fi
+// handover, a VPN coming up, an ethernet cable going in. macOS gives no
+// portable event for this, and polling the interface table is cheap enough
+// that an event API would buy only tens of milliseconds.
+func (d *Discovery) netmonLoop() {
+	ticker := time.NewTicker(netPollInterval)
 	defer ticker.Stop()
+	previous := localNetworks()
+	fingerprint := networksFingerprint(previous)
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
 		case <-ticker.C:
 		}
-		d.mu.Lock()
-		type target struct {
-			key  string
-			peer Peer
-		}
-		targets := make([]target, 0, len(d.peers))
-		for key, peer := range d.peers {
-			targets = append(targets, target{key: key, peer: *peer})
-		}
-		d.mu.Unlock()
-		if len(targets) == 0 {
+		current := localNetworks()
+		next := networksFingerprint(current)
+		if next == fingerprint {
 			continue
 		}
-		type outcome struct {
-			key      string
-			result   *ProbeResult
-			conn     string
-			identity bool
+		lost := subtractNets(previous, current)
+		previous, fingerprint = current, next
+		d.onNetworkChange(current, lost)
+	}
+}
+
+// onNetworkChange reacts to new local addressing. Peers that lived only on a
+// subnet we just left are unreachable by definition and go immediately;
+// everything else — Tailscale, routed subnets — survives to be re-probed at
+// the fast cadence rather than being guessed away.
+func (d *Discovery) onNetworkChange(current, lost []*net.IPNet) {
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return
+	}
+	d.localNets = current
+	d.fastEvict = true
+	removed := 0
+	for key, peer := range d.peers {
+		if peerStrandedBy(peer, lost) {
+			delete(d.peers, key)
+			delete(d.strike, key)
+			removed++
 		}
-		results := make(chan outcome, len(targets))
-		for _, item := range targets {
-			go func(item target) {
-				hosts := dedupeStrings(append([]string{item.peer.Host},
-					item.peer.Hosts...))
-				for _, host := range hosts {
-					if d.ctx.Err() != nil {
-						break
-					}
-					result, err := ProbePeer(host, item.peer.Port,
-						d.timeout, item.peer.InstanceID)
-					if err == nil {
-						results <- outcome{key: item.key, result: result,
-							conn: result.ConnectedIP}
-						return
-					}
-					if errors.Is(err, ErrIdentityMismatch) {
-						results <- outcome{key: item.key, identity: true}
-						return
-					}
-				}
-				results <- outcome{key: item.key}
-			}(item)
+	}
+	d.bumpActiveLocked()
+	d.mu.Unlock()
+	if removed > 0 {
+		d.emitPeers()
+	}
+	if d.mdns != nil {
+		d.mdns.reannounce(d.cfg, LocalIPv4s())
+	}
+	if d.broadcast != nil {
+		d.broadcast.bump()
+	}
+	d.kick()
+	d.status("网络已切换，正在重新发现设备")
+}
+
+// probeLoop is the authority on peer removal: it reprobes every peer in
+// parallel and evicts on the strike policy probeRound applies.
+func (d *Discovery) probeLoop() {
+	for {
+		timer := time.NewTimer(d.nextProbeDelay())
+		select {
+		case <-d.ctx.Done():
+			timer.Stop()
+			return
+		case <-d.wake:
+			timer.Stop()
+		case <-timer.C:
 		}
-		changed := false
-		for range targets {
-			var out outcome
-			select {
-			case <-d.ctx.Done():
-				return
-			case out = <-results:
+		d.probeRound()
+	}
+}
+
+func (d *Discovery) probeRound() {
+	d.mu.Lock()
+	fast := d.fastEvict
+	d.fastEvict = false
+	nets := append([]*net.IPNet(nil), d.localNets...)
+	type target struct {
+		key  string
+		peer Peer
+	}
+	targets := make([]target, 0, len(d.peers))
+	for key, peer := range d.peers {
+		targets = append(targets, target{key: key, peer: *peer})
+	}
+	d.mu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+	type outcome struct {
+		key     string
+		result  *ProbeResult
+		conn    string
+		verdict hostVerdict
+	}
+	results := make(chan outcome, len(targets))
+	for _, item := range targets {
+		go func(item target) {
+			hosts := dedupeStrings(append([]string{item.peer.Host},
+				item.peer.Hosts...))
+			result, conn, verdict := d.probePeerHosts(hosts, item.peer.Port,
+				item.peer.InstanceID, nets)
+			results <- outcome{key: item.key, result: result, conn: conn,
+				verdict: verdict}
+		}(item)
+	}
+	changed := false
+	for range targets {
+		var out outcome
+		select {
+		case <-d.ctx.Done():
+			return
+		case out = <-results:
+		}
+		d.mu.Lock()
+		peer, alive := d.peers[out.key]
+		switch {
+		case !alive:
+			// Removed elsewhere while probing; nothing to do.
+		case out.verdict == hostMismatch:
+			delete(d.peers, out.key)
+			delete(d.strike, out.key)
+			changed = true
+			if !d.reported[out.key] {
+				d.reported[out.key] = true
+				d.mu.Unlock()
+				d.status(peer.Name + " 身份验证失败")
+				d.mu.Lock()
 			}
-			d.mu.Lock()
-			peer, alive := d.peers[out.key]
-			switch {
-			case !alive:
-				// Removed elsewhere while probing; nothing to do.
-			case out.identity:
+		case out.verdict == hostAlive && out.result != nil:
+			peer.Name = firstNonEmpty(out.result.PeerName, peer.Name)
+			peer.Capabilities = out.result.Capabilities
+			peer.PublicKey = out.result.PublicKey
+			peer.Fingerprint = out.result.Fingerprint
+			if out.conn != "" && out.conn != peer.Host {
+				peer.Host = out.conn
+				peer.Hosts = dedupeStrings(
+					append([]string{out.conn}, peer.Hosts...))
+				changed = true
+			}
+			delete(d.strike, out.key)
+		case out.verdict == hostGone || fast:
+			// Every address actively refused us, or the local network just
+			// moved. Either way this is knowledge, not a guess, so the
+			// four-strike tolerance meant for a dozing phone does not apply.
+			delete(d.peers, out.key)
+			delete(d.strike, out.key)
+			changed = true
+		default:
+			d.strike[out.key]++
+			if d.strike[out.key] >= d.strikes {
 				delete(d.peers, out.key)
 				delete(d.strike, out.key)
 				changed = true
-				if !d.reported[out.key] {
-					d.reported[out.key] = true
-					d.mu.Unlock()
-					d.status(peer.Name + " 身份验证失败")
-					d.mu.Lock()
-				}
-			case out.result != nil:
-				peer.Name = firstNonEmpty(out.result.PeerName, peer.Name)
-				peer.Capabilities = out.result.Capabilities
-				peer.PublicKey = out.result.PublicKey
-				peer.Fingerprint = out.result.Fingerprint
-				if out.conn != "" && out.conn != peer.Host {
-					peer.Host = out.conn
-					peer.Hosts = dedupeStrings(
-						append([]string{out.conn}, peer.Hosts...))
-					changed = true
-				}
-				delete(d.strike, out.key)
-			default:
-				d.strike[out.key]++
-				if d.strike[out.key] >= d.strikes {
-					delete(d.peers, out.key)
-					delete(d.strike, out.key)
-					changed = true
-				}
 			}
-			d.mu.Unlock()
 		}
-		if changed {
-			d.emitPeers()
-		}
+		d.mu.Unlock()
+	}
+	if changed {
+		d.emitPeers()
 	}
 }
+
+// hostVerdict summarizes what a peer's addresses told us.
+type hostVerdict int
+
+const (
+	// hostSilent is the ambiguous case — a timeout, which a sleeping phone
+	// produces just as readily as a departed one — and keeps the tolerant
+	// strike count. It is the zero value so an unset verdict never evicts.
+	hostSilent hostVerdict = iota
+	hostAlive
+	hostGone
+	hostMismatch
+)
+
+// probePeerHosts races every known address of one peer. Probing serially was
+// the other half of the slow-discovery problem: a peer remembered under a
+// stale address paid that address's full timeout before the live one was even
+// attempted.
+func (d *Discovery) probePeerHosts(hosts []string, port int,
+	expectedInstanceID string, nets []*net.IPNet) (*ProbeResult, string,
+	hostVerdict) {
+	if len(hosts) == 0 {
+		return nil, "", hostGone
+	}
+	type attempt struct {
+		result  *ProbeResult
+		host    string
+		verdict hostVerdict
+	}
+	results := make(chan attempt, len(hosts))
+	for _, host := range hosts {
+		go func(host string) {
+			timeout := d.timeout
+			if onLocalNet(host, nets) && lanProbeTimeout < timeout {
+				timeout = lanProbeTimeout
+			}
+			result, err := ProbePeer(host, port, timeout, expectedInstanceID)
+			switch {
+			case err == nil:
+				connected := result.ConnectedIP
+				if connected == "" {
+					connected = host
+				}
+				results <- attempt{result: result, host: connected,
+					verdict: hostAlive}
+			case errors.Is(err, ErrIdentityMismatch):
+				results <- attempt{verdict: hostMismatch}
+			case isDefiniteRefusal(err):
+				results <- attempt{verdict: hostGone}
+			default:
+				results <- attempt{verdict: hostSilent}
+			}
+		}(host)
+	}
+	// hostGone only survives if every address agrees; one silent address is
+	// enough to fall back to the tolerant path.
+	worst := hostGone
+	for range hosts {
+		select {
+		case <-d.ctx.Done():
+			return nil, "", hostSilent
+		case item := <-results:
+			switch item.verdict {
+			case hostAlive:
+				return item.result, item.host, hostAlive
+			case hostMismatch:
+				return nil, "", hostMismatch
+			case hostSilent:
+				worst = hostSilent
+			}
+		}
+	}
+	return nil, "", worst
+}
+
+// localNetworks snapshots the IPv4 networks this host currently sits on.
+func localNetworks() []*net.IPNet {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []*net.IPNet
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			masked := ip.Mask(ipNet.Mask)
+			if masked == nil {
+				continue
+			}
+			out = append(out, &net.IPNet{IP: masked, Mask: ipNet.Mask})
+		}
+	}
+	return out
+}
+
+func networksFingerprint(nets []*net.IPNet) string {
+	parts := make([]string, 0, len(nets))
+	for _, network := range nets {
+		parts = append(parts, network.String())
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+// subtractNets returns the networks present in before but gone from after.
+func subtractNets(before, after []*net.IPNet) []*net.IPNet {
+	keep := make(map[string]bool, len(after))
+	for _, network := range after {
+		keep[network.String()] = true
+	}
+	var out []*net.IPNet
+	for _, network := range before {
+		if !keep[network.String()] {
+			out = append(out, network)
+		}
+	}
+	return out
+}
+
+func onLocalNet(host string, nets []*net.IPNet) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, network := range nets {
+		if network != nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// peerStrandedBy reports whether every address of a peer sat on a subnet we
+// just lost, which makes it unreachable without probing anything.
+func peerStrandedBy(peer *Peer, lost []*net.IPNet) bool {
+	if len(lost) == 0 {
+		return false
+	}
+	addresses := dedupeStrings(append([]string{peer.Host}, peer.Hosts...))
+	if len(addresses) == 0 {
+		return false
+	}
+	for _, host := range addresses {
+		if !onLocalNet(host, lost) {
+			return false
+		}
+	}
+	return true
+}
+
 
 func dedupeStrings(values []string) []string {
 	seen := make(map[string]bool, len(values))

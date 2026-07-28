@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/grandcat/zeroconf"
@@ -55,8 +56,64 @@ type mdnsEntry struct {
 }
 
 type mdnsLayer struct {
+	mu     sync.Mutex
 	server *zeroconf.Server
 	cancel context.CancelFunc
+	ips    []string
+}
+
+// registerService publishes this node under the current address set.
+func registerService(cfg Config, localIPs []string) (*zeroconf.Server, error) {
+	instance := ServiceLabel(cfg.PeerName, cfg.InstanceID)
+	txt := []string{
+		"peer_name=" + cfg.PeerName,
+		"instance_id=" + cfg.InstanceID,
+		fmt.Sprintf("whpc=%d", CapVersion),
+		"caps=" + strings.Join(cfg.Capabilities, ","),
+		"identity=" + cfg.Identity.Fingerprint,
+		"ips=" + strings.Join(localIPs, ","),
+	}
+	host := "inkhole-" + cfg.InstanceID[:8]
+	return zeroconf.RegisterProxy(instance, mdnsService, mdnsDomain,
+		cfg.Port, host, localIPs, txt, nil)
+}
+
+// reannounce republishes the service under a new address set. mDNS carries
+// addresses inside the records themselves, so after a Wi-Fi handover the old
+// registration keeps advertising an IP nobody can reach — and the TXT "ips"
+// list that Android NSD relies on would stay stale for the life of the
+// process. Only re-registering fixes that.
+func (m *mdnsLayer) reannounce(cfg Config, localIPs []string) {
+	if len(localIPs) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sameStrings(m.ips, localIPs) {
+		return
+	}
+	if m.server != nil {
+		m.server.Shutdown()
+		m.server = nil
+	}
+	server, err := registerService(cfg, localIPs)
+	if err != nil {
+		return
+	}
+	m.server = server
+	m.ips = append([]string(nil), localIPs...)
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func parseTXT(text []string) map[string]string {
@@ -72,20 +129,12 @@ func parseTXT(text []string) map[string]string {
 
 // startMDNS registers this node and browses for peers until ctx ends.
 // Every plausible peer entry is handed to onEntry for WHPC verification.
+//
+// The browser is only half the story: see mdns_query.go for why this package
+// also drives its own queries instead of trusting zeroconf's probe loop.
 func startMDNS(ctx context.Context, cfg Config, localIPs []string,
 	onEntry func(mdnsEntry)) (*mdnsLayer, error) {
-	instance := ServiceLabel(cfg.PeerName, cfg.InstanceID)
-	txt := []string{
-		"peer_name=" + cfg.PeerName,
-		"instance_id=" + cfg.InstanceID,
-		fmt.Sprintf("whpc=%d", CapVersion),
-		"caps=" + strings.Join(cfg.Capabilities, ","),
-		"identity=" + cfg.Identity.Fingerprint,
-		"ips=" + strings.Join(localIPs, ","),
-	}
-	host := "inkhole-" + cfg.InstanceID[:8]
-	server, err := zeroconf.RegisterProxy(instance, mdnsService, mdnsDomain,
-		cfg.Port, host, localIPs, txt, nil)
+	server, err := registerService(cfg, localIPs)
 	if err != nil {
 		return nil, err
 	}
@@ -115,17 +164,30 @@ func startMDNS(ctx context.Context, cfg Config, localIPs []string,
 		cancel()
 		return nil, err
 	}
-	return &mdnsLayer{server: server, cancel: cancel}, nil
+	return &mdnsLayer{
+		server: server,
+		cancel: cancel,
+		ips:    append([]string(nil), localIPs...),
+	}, nil
 }
 
 func decodeEntry(entry *zeroconf.ServiceEntry) *mdnsEntry {
-	txt := parseTXT(entry.Text)
+	return buildEntry(entry.ServiceInstanceName(), entry.Instance, entry.Port,
+		entry.AddrIPv4, entry.Text)
+}
+
+// buildEntry normalizes one browsed or queried service into an mdnsEntry.
+// Both the zeroconf browser and the active querier in mdns_query.go funnel
+// through here so the two paths cannot drift in what they accept.
+func buildEntry(serviceInstance, label string, port int, addrs []net.IP,
+	text []string) *mdnsEntry {
+	txt := parseTXT(text)
 	instanceID := strings.ToLower(txt["instance_id"])
 	if !ValidInstanceID(instanceID) ||
 		txt["whpc"] != fmt.Sprintf("%d", CapVersion) {
 		return nil
 	}
-	if entry.Port < 1 || entry.Port > 65535 {
+	if port < 1 || port > 65535 {
 		return nil
 	}
 	seen := make(map[string]bool)
@@ -142,7 +204,7 @@ func decodeEntry(entry *zeroconf.ServiceEntry) *mdnsEntry {
 		seen[host] = true
 		hosts = append(hosts, host)
 	}
-	for _, ip := range entry.AddrIPv4 {
+	for _, ip := range addrs {
 		push(ip.String())
 	}
 	// The txt "ips" list covers Android NSD, which resolves only one address.
@@ -154,20 +216,23 @@ func decodeEntry(entry *zeroconf.ServiceEntry) *mdnsEntry {
 	}
 	name := strings.TrimSpace(txt["peer_name"])
 	if name == "" {
-		name = strings.SplitN(entry.Instance, ".", 2)[0]
+		name = strings.SplitN(label, ".", 2)[0]
 	}
 	return &mdnsEntry{
-		ServiceName: entry.ServiceInstanceName(),
+		ServiceName: serviceInstance,
 		InstanceID:  instanceID,
 		PeerName:    name,
-		Port:        entry.Port,
+		Port:        port,
 		Hosts:       hosts,
 	}
 }
 
 func (m *mdnsLayer) stop() {
 	m.cancel()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.server != nil {
 		m.server.Shutdown()
+		m.server = nil
 	}
 }

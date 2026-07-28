@@ -8,6 +8,7 @@ require (
 	github.com/flynn/noise v1.1.0
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/hashicorp/yamux v0.1.2
+	github.com/miekg/dns v1.1.27
 	github.com/pion/stun/v3 v3.1.6
 	github.com/psanford/wormhole-william v1.0.8
 	github.com/quic-go/quic-go v0.60.0
@@ -20,7 +21,6 @@ require (
 require (
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
-	github.com/miekg/dns v1.1.27 // indirect
 	github.com/pion/dtls/v3 v3.1.4 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/transport/v4 v4.0.2 // indirect

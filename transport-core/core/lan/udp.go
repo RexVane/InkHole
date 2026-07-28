@@ -29,6 +29,12 @@ const (
 	broadcastMaxPacket   = 2048
 	broadcastInterval    = 2 * time.Second
 	broadcastReadTimeout = 500 * time.Millisecond
+	// broadcastBurst is how many announcements one bump fires. Access points
+	// routinely rate-limit or drop broadcast frames, so a single packet at
+	// startup or after a Wi-Fi handover is a coin flip; five closely spaced
+	// ones are not, and still cost well under a kilobyte.
+	broadcastBurst    = 5
+	broadcastBurstGap = 150 * time.Millisecond
 )
 
 // Announcement is one decoded discovery packet.
@@ -36,6 +42,11 @@ type Announcement struct {
 	InstanceID string
 	Port       int
 	Reply      bool
+	// Bye marks a departure notice sent as the node shuts down or leaves the
+	// network. Protocol v3 peers that predate the field decode the packet as
+	// an ordinary announcement and fall back to probing, so emitting it costs
+	// nothing against older builds.
+	Bye bool
 }
 
 type announcementJSON struct {
@@ -44,10 +55,21 @@ type announcementJSON struct {
 	InstanceID string `json:"instance_id"`
 	Port       int    `json:"port"`
 	Reply      bool   `json:"reply"`
+	Bye        bool   `json:"bye,omitempty"`
 }
 
 // EncodeAnnouncement mirrors _encode_lan_announcement.
 func EncodeAnnouncement(instanceID string, port int, reply bool) ([]byte, error) {
+	return encodeAnnouncement(instanceID, port, reply, false)
+}
+
+// EncodeGoodbye builds the departure notice described on Announcement.Bye.
+func EncodeGoodbye(instanceID string, port int) ([]byte, error) {
+	return encodeAnnouncement(instanceID, port, false, true)
+}
+
+func encodeAnnouncement(instanceID string, port int, reply, bye bool) ([]byte,
+	error) {
 	if !ValidInstanceID(strings.ToLower(instanceID)) {
 		return nil, errInvalidInstanceID
 	}
@@ -60,6 +82,7 @@ func EncodeAnnouncement(instanceID string, port int, reply bool) ([]byte, error)
 		InstanceID: strings.ToLower(instanceID),
 		Port:       port,
 		Reply:      reply,
+		Bye:        bye,
 	})
 }
 
@@ -83,8 +106,10 @@ func DecodeAnnouncement(payload []byte) *Announcement {
 		InstanceID: decoded.InstanceID,
 		Port:       decoded.Port,
 		Reply:      decoded.Reply,
+		Bye:        decoded.Bye,
 	}
 }
+
 
 // broadcastTargets returns the directed broadcast address of every non-
 // virtual IPv4 network plus the limited broadcast address.
@@ -137,13 +162,20 @@ type broadcaster struct {
 	listenPort int
 	// onPeer receives every remote announcement (already self-filtered).
 	onPeer func(host string, announcement *Announcement)
+	// onBye receives departure notices so discovery can react without
+	// waiting out the liveness prober.
+	onBye func(host string, announcement *Announcement)
 	// extraTargets supplies verified unicast addresses for asymmetric
 	// hotspots that drop broadcasts in one direction.
 	extraTargets func() []string
+	// bumps requests an announcement burst; buffered so several triggers
+	// arriving together collapse into one burst.
+	bumps chan struct{}
 }
 
 func newBroadcaster(instanceID string, listenPort int,
-	onPeer func(string, *Announcement), extraTargets func() []string,
+	onPeer func(string, *Announcement), onBye func(string, *Announcement),
+	extraTargets func() []string,
 ) (*broadcaster, error) {
 	config := net.ListenConfig{Control: reusePortControl}
 	packet, err := config.ListenPacket(context.Background(), "udp4",
@@ -161,17 +193,56 @@ func newBroadcaster(instanceID string, listenPort int,
 		instanceID:   strings.ToLower(instanceID),
 		listenPort:   listenPort,
 		onPeer:       onPeer,
+		onBye:        onBye,
 		extraTargets: extraTargets,
+		bumps:        make(chan struct{}, 1),
 	}, nil
+}
+
+// bump asks the run loop to fire an announcement burst immediately.
+func (b *broadcaster) bump() {
+	select {
+	case b.bumps <- struct{}{}:
+	default:
+	}
+}
+
+// sayGoodbye tells the segment we are leaving. Best effort by definition —
+// a laptop whose Wi-Fi already dropped has nowhere to send it — which is why
+// the prober remains the authority on removal.
+func (b *broadcaster) sayGoodbye() {
+	payload, err := EncodeGoodbye(b.instanceID, b.listenPort)
+	if err != nil {
+		return
+	}
+	b.sendToAll(payload)
 }
 
 func (b *broadcaster) close() {
 	_ = b.sock.Close()
 }
 
+// sendToAll writes one payload to every directed broadcast address plus any
+// verified unicast address discovery has learned.
+func (b *broadcaster) sendToAll(payload []byte) {
+	targets := broadcastTargets()
+	if b.extraTargets != nil {
+		targets = append(targets, b.extraTargets()...)
+	}
+	for _, target := range targets {
+		addr, err := net.ResolveUDPAddr("udp4",
+			net.JoinHostPort(target, strconv.Itoa(BroadcastPort)))
+		if err != nil {
+			continue
+		}
+		_, _ = b.sock.WriteToUDP(payload, addr)
+	}
+}
+
 // run announces every broadcastInterval and answers announcements with a
-// unicast reply, exactly like the Python and Kotlin loops. Returns when the
-// context is cancelled or the socket is closed.
+// unicast reply, exactly like the Python and Kotlin loops. A bump collapses
+// the schedule into a short burst. Returns when the context is cancelled or
+// the socket is closed.
 func (b *broadcaster) run(ctx context.Context) {
 	announcement, err := EncodeAnnouncement(b.instanceID, b.listenPort, false)
 	if err != nil {
@@ -182,26 +253,31 @@ func (b *broadcaster) run(ctx context.Context) {
 	defer stop()
 	buf := make([]byte, broadcastMaxPacket+1)
 	var nextAnnounce time.Time
+	burst := 0
 	for ctx.Err() == nil {
+		select {
+		case <-b.bumps:
+			burst = broadcastBurst
+			nextAnnounce = time.Time{}
+		default:
+		}
 		now := time.Now()
 		if !now.Before(nextAnnounce) {
-			targets := broadcastTargets()
-			if b.extraTargets != nil {
-				for _, extra := range b.extraTargets() {
-					targets = append(targets, extra)
-				}
+			b.sendToAll(announcement)
+			if burst > 0 {
+				burst--
+				nextAnnounce = now.Add(broadcastBurstGap)
+			} else {
+				nextAnnounce = now.Add(broadcastInterval)
 			}
-			for _, target := range targets {
-				addr, err := net.ResolveUDPAddr("udp4",
-					net.JoinHostPort(target, strconv.Itoa(BroadcastPort)))
-				if err != nil {
-					continue
-				}
-				_, _ = b.sock.WriteToUDP(announcement, addr)
-			}
-			nextAnnounce = now.Add(broadcastInterval)
 		}
-		_ = b.sock.SetReadDeadline(now.Add(broadcastReadTimeout))
+		// Never sleep past the next scheduled announcement, or a burst would
+		// be stretched to the read timeout and stop being a burst.
+		wait := broadcastReadTimeout
+		if until := time.Until(nextAnnounce); until > 0 && until < wait {
+			wait = until
+		}
+		_ = b.sock.SetReadDeadline(time.Now().Add(wait))
 		n, sender, err := b.sock.ReadFromUDP(buf)
 		if err != nil {
 			var netErr net.Error
@@ -221,6 +297,12 @@ func (b *broadcaster) run(ctx context.Context) {
 		if zone := strings.IndexByte(host, '%'); zone >= 0 {
 			host = host[:zone]
 		}
+		if decoded.Bye {
+			if b.onBye != nil {
+				b.onBye(host, decoded)
+			}
+			continue
+		}
 		if !decoded.Reply {
 			_, _ = b.sock.WriteToUDP(reply, &net.UDPAddr{
 				IP: sender.IP, Port: BroadcastPort})
@@ -230,6 +312,7 @@ func (b *broadcaster) run(ctx context.Context) {
 		}
 	}
 }
+
 
 // reusePortControl lets several nodes on one machine share the discovery
 // port (tests, desktop + CLI side by side), matching SO_REUSEADDR/REUSEPORT
