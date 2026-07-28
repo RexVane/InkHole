@@ -154,6 +154,16 @@ export function RecentFiles(): $CancellablePromise<string[] | null> {
     return $Call.ByID(2597322811);
 }
 
+/**
+ * RefreshDiscovery drives discovery hard for a few seconds: an announcement
+ * burst, back-to-back mDNS sweeps and a faster liveness cadence. The frontend
+ * calls it when the window comes forward or the user opens the device list,
+ * which is exactly when a stale list is visible and worth the extra traffic.
+ */
+export function RefreshDiscovery(): $CancellablePromise<void> {
+    return $Call.ByID(287367892);
+}
+
 export function RejectOneTime(sessionID: string): $CancellablePromise<void> {
     return $Call.ByID(776819465, sessionID);
 }

@@ -694,6 +694,19 @@ func (s *InkHoleService) Peers() []PeerView {
 	return s.peerViewsLocked()
 }
 
+// RefreshDiscovery drives discovery hard for a few seconds: an announcement
+// burst, back-to-back mDNS sweeps and a faster liveness cadence. The frontend
+// calls it when the window comes forward or the user opens the device list,
+// which is exactly when a stale list is visible and worth the extra traffic.
+func (s *InkHoleService) RefreshDiscovery() {
+	s.mu.Lock()
+	discovery := s.discovery
+	s.mu.Unlock()
+	if discovery != nil {
+		discovery.Refresh()
+	}
+}
+
 func (s *InkHoleService) SelectPeer(instanceID string) error {
 	instanceID = strings.ToLower(strings.TrimSpace(instanceID))
 	if instanceID != "" && !lan.ValidInstanceID(instanceID) {

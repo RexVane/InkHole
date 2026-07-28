@@ -672,4 +672,17 @@ async function initialise(): Promise<void> {
     }
 }
 
+// Coming back to the window is the moment a stale device list is visible, so
+// that is when discovery is asked to run hot: an announcement burst, back to
+// back mDNS sweeps and a faster liveness cadence for a few seconds. The core
+// keeps its own quiet cadence otherwise, so this costs nothing while idle.
+function nudgeDiscovery(): void {
+    void Service.RefreshDiscovery().catch(() => {});
+}
+
+window.addEventListener("focus", nudgeDiscovery);
+document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) nudgeDiscovery();
+});
+
 void initialise();
