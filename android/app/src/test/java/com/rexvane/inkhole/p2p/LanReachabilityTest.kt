@@ -71,4 +71,45 @@ class LanReachabilityTest {
         assertFalse(LanReachability.isLanInterfaceName("rmnet_data0"))
         assertFalse(LanReachability.isLanInterfaceName("ppp0"))
     }
+
+    @Test
+    fun networkSignatureIsStableAcrossOrderingAndDuplicates() {
+        val first = listOf(
+            LanLink("192.168.8.5", 24),
+            LanLink("10.0.0.4", 24),
+            LanLink("192.168.8.5", 24),
+        )
+        val second = listOf(LanLink("10.0.0.4", 24), LanLink("192.168.8.5", 24))
+        assertEquals(
+            LanReachability.linkSignature(first),
+            LanReachability.linkSignature(second),
+        )
+    }
+
+    @Test
+    fun departedLinksCompareSubnetsInsteadOfDhcpAddresses() {
+        val before = listOf(
+            LanLink("192.168.8.5", 24),
+            LanLink("10.0.0.4", 24),
+        )
+        val sameWifiWithNewAddress = listOf(
+            LanLink("192.168.8.99", 24),
+            LanLink("172.16.1.3", 24),
+        )
+        assertEquals(
+            listOf(LanLink("10.0.0.4", 24)),
+            LanReachability.departedLinks(before, sameWifiWithNewAddress),
+        )
+    }
+
+    @Test
+    fun onlyPeersConfinedToDepartedSubnetAreStranded() {
+        val departed = listOf(LanLink("192.168.8.5", 24))
+        assertTrue(LanReachability.peerStrandedBy(
+            listOf("192.168.8.20"), departed))
+        assertFalse(LanReachability.peerStrandedBy(
+            listOf("192.168.8.20", "100.96.1.8"), departed))
+        assertFalse(LanReachability.peerStrandedBy(
+            listOf("100.96.1.8"), departed))
+    }
 }

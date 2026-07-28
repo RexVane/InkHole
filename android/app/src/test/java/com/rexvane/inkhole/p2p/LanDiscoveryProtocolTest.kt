@@ -1,5 +1,6 @@
 package com.rexvane.inkhole.p2p
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -12,6 +13,29 @@ class LanDiscoveryProtocolTest {
             LanAnnouncement(id, 41300),
             LanDiscoveryProtocol.decode(LanDiscoveryProtocol.encode(id, 41300)),
         )
+    }
+
+    @Test
+    fun ordinaryAnnouncementRemainsByteCompatible() {
+        val id = "0123456789abcdef0123456789abcdef"
+        val expected =
+            """{"magic":"inkhole-lan-v1","instance_id":"$id","port":41300,"reply":false,"version":3}"""
+                .toByteArray(Charsets.US_ASCII)
+        assertArrayEquals(expected, LanDiscoveryProtocol.encode(id, 41300))
+    }
+
+    @Test
+    fun goodbyeRoundTripsWithoutChangingOrdinaryPackets() {
+        val id = "0123456789abcdef0123456789abcdef"
+        val payload = LanDiscoveryProtocol.encode(id, 41300, bye = true)
+        assertEquals(
+            LanAnnouncement(id, 41300, isBye = true),
+            LanDiscoveryProtocol.decode(payload),
+        )
+        assertNull(LanDiscoveryProtocol.decode(
+            """{"magic":"inkhole-lan-v1","version":3,"instance_id":"$id","port":41300,"reply":false,"bye":"true"}"""
+                .toByteArray(Charsets.US_ASCII),
+        ))
     }
 
     @Test

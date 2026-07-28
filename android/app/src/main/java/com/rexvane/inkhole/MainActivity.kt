@@ -463,7 +463,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onRefreshClick = {
                         statusMsg.value = "正在重新搜索设备…"
-                        InkHoleBus.node?.restartDiscovery()
+                        InkHoleBus.node?.refreshDiscovery()
                     },
                     onCrossNetworkClick = {
                         deepLinkReceiveCode.value = ""
@@ -498,7 +498,7 @@ class MainActivity : ComponentActivity() {
             peers.clear()
             peers.addAll(node.getPeers())
             selectedPeer.value = node.getSelectedPeer()
-            node.probeNow()
+            node.refreshDiscovery()
         } else {
             peers.clear()
             selectedPeer.value = null

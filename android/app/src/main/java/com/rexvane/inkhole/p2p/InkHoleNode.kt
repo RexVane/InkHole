@@ -2,6 +2,7 @@ package com.rexvane.inkhole.p2p
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -24,6 +25,8 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -107,6 +110,13 @@ private data class PeerProbeResult(
 
 private class IdentityMismatchException(message: String) : IOException(message)
 private class TailnetUnavailableException(message: String) : IOException(message)
+
+/**
+ * 对端的每个地址都明确拒绝了连接（或路由不可达）。这是确定信息，探活循环
+ * 据此一轮即可下线，而不必消耗留给沉默设备的容忍轮数。
+ */
+private class PeerRefusedException(cause: Throwable) :
+    IOException(cause.message ?: "对端拒绝连接", cause)
 private class ReceiverRejectedException(message: String) : IOException(message)
 
 private data class ProbeOutcome(
@@ -115,12 +125,21 @@ private data class ProbeOutcome(
     val result: PeerProbeResult? = null,
     val identityError: String? = null,
     val tailnetUnavailable: Boolean = false,
+    /** 每个地址都明确拒绝：可以一轮下线，不必等满容忍轮数。 */
+    val refused: Boolean = false,
 )
 
 private data class ManualProbeOutcome(
     val peer: ManualPeer,
     val result: PeerProbeResult? = null,
     val identityError: String? = null,
+)
+
+private data class AddressProbeOutcome(
+    val result: PeerProbeResult? = null,
+    val identityError: IdentityMismatchException? = null,
+    val tailnetUnavailable: TailnetUnavailableException? = null,
+    val error: Exception? = null,
 )
 
 /**
@@ -162,7 +181,12 @@ class InkHoleNode(
         private const val PROBE_INTERVAL_MS = 5_000L          // 探活轮询间隔
         private const val PROBE_STRIKES = 4                   // 自动发现设备连续失败几轮剔除
         private const val PROBE_STRIKES_MANUAL = 4            // 手动设备同等容忍(息屏 WiFi 休眠易误判)
-        private const val LAN_CHANGE_CHECK_INTERVAL_MS = 5_000L
+        private const val LAN_CHANGE_POLL_INTERVAL_MS = 5_000L
+        private const val LAN_CHANGE_DEBOUNCE_MS = 200L
+        // 同网段对端的探活预算。局域网往返是个位数毫秒，3 秒是给 Tailscale
+        // 和息屏手机留的余量，用在本地地址上只会让陈旧地址白白拖慢一整轮。
+        private const val LAN_PROBE_TIMEOUT_MS = 700
+        private const val MAX_PARALLEL_PROBE_ADDRESSES = 8
         private const val EMPTY_DISCOVERY_RESTART_TICKS = 6
         // 手动设备探活超时:Tailscale 空闲后懒惰唤醒(打洞/DERP 建链)首次
         // 握手常超 1.2s,太紧会把在线的跨网设备判死或迟迟不上线
@@ -179,6 +203,8 @@ class InkHoleNode(
     private var serverSocket: ServerSocket? = null
     private var tcpStartError: String? = null
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
+    private val activeProbeSockets = ConcurrentHashMap.newKeySet<Socket>()
+    private val probeExecutor = Executors.newFixedThreadPool(MAX_PARALLEL_PROBE_ADDRESSES)
     private val activeSendSocket = AtomicReference<Socket?>(null)
     private val activeSendInput = AtomicReference<InputStream?>(null)
     private val sendInProgress = AtomicBoolean(false)
@@ -225,6 +251,11 @@ class InkHoleNode(
     @Volatile private var running = false
     /** 系统实际注册下来的服务名(冲突时可能被系统改名)，用于"不发现自己"。 */
     @Volatile private var registeredName: String? = null
+    private val lanNetworkStateLock = Any()
+    private var lastLanLinks: List<LanLink> = emptyList()
+    private var networkCallbackManager: ConnectivityManager? = null
+    private var lanNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private val networkChangeKick = Channel<Unit>(Channel.CONFLATED)
 
     // 手动添加的设备(跨网/固定 IP 直连):没有 NSD 通告,靠探活循环维持状态
     private val manualPeers =
@@ -335,38 +366,13 @@ class InkHoleNode(
             onError = { detail ->
                 if (running) listener.onStatus("热点设备发现启动失败: $detail")
             },
+            onGoodbye = ::handleLanGoodbye,
         ).also { it.start() }
+        startNetworkMonitoring()
         // 手动设备不再启动即乐观入列:前台服务被厂商省电反复杀死重启,每次
         // 重启都会把早已关机的对端"复活"成假在线。改由探活循环首轮(立即执行)
         // 验证,连得上才显示——列表语义收紧为"当前真实在线的设备"。
         startProbeLoop()  // 全量存活探活:定期 TCP 探测所有对端(含自动发现),清理断网/崩溃残留
-        // 网络变化与发现自愈。Android 的 NSD 不会稳定地跟随 WiFi/热点接口切换，
-        // 每 5 秒比较一次真实 LAN 链路；变化后立即重启发现。列表持续为空时仍
-        // 每 30 秒重启一次，覆盖 WiFi 省电丢组播/系统服务卡住的情况。
-        scope.launch {
-            var previousLinks = lanLinkSignature(currentLanLinks())
-            var emptyTicks = 0
-            while (running) {
-                delay(LAN_CHANGE_CHECK_INTERVAL_MS)
-                val currentLinks = lanLinkSignature(currentLanLinks())
-                if (currentLinks != previousLinks) {
-                    previousLinks = currentLinks
-                    emptyTicks = 0
-                    if (running) {
-                        restartDiscovery()
-                        probeNow()
-                    }
-                    continue
-                }
-                emptyTicks += 1
-                if (emptyTicks < EMPTY_DISCOVERY_RESTART_TICKS) continue
-                emptyTicks = 0
-                val hasDiscoveredPeer = synchronized(peersLock) {
-                    peers.values.any { !it.manual && it.transport == "lan" }
-                }
-                if (!hasDiscoveredPeer && running) restartDiscovery()
-            }
-        }
         // 把当前列表主动推给 UI:服务被杀重启后 Activity 可能还挂着旧节点的
         // 设备列表,周围没有设备时不会再有 onPeerChanged 事件来纠正它。
         listener.onPeerChanged(getPeers())
@@ -375,7 +381,10 @@ class InkHoleNode(
 
     /** 重启系统 NSD 与显式接口 mDNS 发现。stop 是异步的,稍等再启。 */
     fun restartDiscovery() {
-        if (!running || !discoveryRestartPending.compareAndSet(false, true)) return
+        if (!running) return
+        lanBroadcastDiscovery?.bump()
+        probeNow()
+        if (!discoveryRestartPending.compareAndSet(false, true)) return
         scope.launch {
             try {
                 restartJmDnsDiscovery(force = true)
@@ -392,6 +401,120 @@ class InkHoleNode(
             } finally {
                 discoveryRestartPending.set(false)
             }
+        }
+    }
+
+    /** 回前台或用户点刷新时的轻量刷新：不拆系统 NSD，只主动广播、刷新
+     *  显式接口 mDNS，并立即探活已有设备。 */
+    fun refreshDiscovery() {
+        if (!running) return
+        lanBroadcastDiscovery?.bump()
+        probeNow()
+        scope.launch { restartJmDnsDiscovery(force = true) }
+    }
+
+    private fun startNetworkMonitoring() {
+        val initialLinks = currentLanLinks()
+        synchronized(lanNetworkStateLock) { lastLanLinks = initialLinks }
+
+        // ConnectivityManager is the primary path. Several callbacks for one
+        // handover collapse into one check after link properties settle.
+        scope.launch {
+            while (running) {
+                networkChangeKick.receive()
+                delay(LAN_CHANGE_DEBOUNCE_MS)
+                while (networkChangeKick.tryReceive().isSuccess) Unit
+                checkForLanNetworkChange()
+            }
+        }
+
+        val manager = try {
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        } catch (_: Exception) {
+            null
+        }
+        if (manager != null) {
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = signalNetworkChange()
+                override fun onLost(network: Network) = signalNetworkChange()
+                override fun onLinkPropertiesChanged(
+                    network: Network,
+                    linkProperties: LinkProperties,
+                ) = signalNetworkChange()
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) = signalNetworkChange()
+            }
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                .build()
+            try {
+                manager.registerNetworkCallback(request, callback)
+                networkCallbackManager = manager
+                lanNetworkCallback = callback
+            } catch (error: Exception) {
+                listener.onStatus("网络变化监听启动失败: ${error.message}")
+            }
+        }
+
+        // SoftAP/厂商网络常不进入 ConnectivityManager，保留低频接口轮询兜底。
+        // 同时每 30 秒修复一次空列表下卡住的系统 NSD。
+        scope.launch {
+            var emptyTicks = 0
+            while (running) {
+                delay(LAN_CHANGE_POLL_INTERVAL_MS)
+                if (checkForLanNetworkChange()) emptyTicks = 0 else emptyTicks += 1
+                if (emptyTicks < EMPTY_DISCOVERY_RESTART_TICKS) continue
+                emptyTicks = 0
+                val hasDiscoveredPeer = synchronized(peersLock) {
+                    peers.values.any { !it.manual && it.transport == "lan" }
+                }
+                if (!hasDiscoveredPeer && running) restartDiscovery()
+            }
+        }
+    }
+
+    private fun signalNetworkChange() {
+        if (running) networkChangeKick.trySend(Unit)
+    }
+
+    private fun checkForLanNetworkChange(): Boolean {
+        if (!running) return false
+        val current = currentLanLinks()
+        val previous = synchronized(lanNetworkStateLock) {
+            if (LanReachability.linkSignature(lastLanLinks) ==
+                LanReachability.linkSignature(current)) return false
+            val snapshot = lastLanLinks
+            lastLanLinks = current
+            snapshot
+        }
+        val departed = LanReachability.departedLinks(previous, current)
+        if (departed.isNotEmpty()) {
+            val stranded = synchronized(peersLock) {
+                peers.filter { (_, peer) ->
+                    peer.transport == "lan" && LanReachability.peerStrandedBy(
+                        listOf(peer.host) + peer.hosts,
+                        departed,
+                    )
+                }.keys.toList()
+            }
+            stranded.forEach(::removePeer)
+        }
+        restartDiscovery()
+        if (running) listener.onStatus("网络已切换，正在重新发现设备")
+        return true
+    }
+
+    private fun stopNetworkMonitoring() {
+        val manager = networkCallbackManager
+        val callback = lanNetworkCallback
+        networkCallbackManager = null
+        lanNetworkCallback = null
+        if (manager != null && callback != null) {
+            try { manager.unregisterNetworkCallback(callback) } catch (_: Exception) {}
         }
     }
 
@@ -459,8 +582,11 @@ class InkHoleNode(
                             LanReachability.verifiedPeerCandidates(
                                 peer.hosts, lanLinks, peer.host)
                         }
-                        val timeout = if (isManual) PROBE_TIMEOUT_MANUAL_MS
-                            else LOST_PROBE_TIMEOUT_MS
+                        val timeout = when {
+                            isManual -> PROBE_TIMEOUT_MANUAL_MS
+                            peer.transport == "lan" -> LAN_PROBE_TIMEOUT_MS
+                            else -> LOST_PROBE_TIMEOUT_MS
+                        }
                         val expected = manualPeer?.instanceId ?: peer.instanceId
                         try {
                             ProbeOutcome(key, isManual,
@@ -469,6 +595,8 @@ class InkHoleNode(
                             ProbeOutcome(key, isManual, identityError = e.message)
                         } catch (_: TailnetUnavailableException) {
                             ProbeOutcome(key, isManual, tailnetUnavailable = true)
+                        } catch (_: PeerRefusedException) {
+                            ProbeOutcome(key, isManual, refused = true)
                         } catch (_: Exception) {
                             ProbeOutcome(key, isManual)
                         }
@@ -493,6 +621,8 @@ class InkHoleNode(
                     }
                     val threshold = when {
                         isManual && outcome.tailnetUnavailable -> 1
+                        // 明确拒绝是确定信息，不占用留给沉默设备的容忍。
+                        outcome.refused -> 1
                         isManual -> PROBE_STRIKES_MANUAL
                         else -> PROBE_STRIKES
                     }
@@ -598,6 +728,12 @@ class InkHoleNode(
     fun stop() {
         running = false
         cancelSend()
+        stopNetworkMonitoring()
+        // 先关闭监听端口，再发离开通知。对端收到通知后的签名探测会得到明确
+        // 拒绝，从而能立即下线；反过来排序会把即将退出的节点误判为仍在线。
+        try { serverSocket?.close() } catch (_: IOException) {}
+        serverSocket = null
+        lanBroadcastDiscovery?.sayGoodbye()
         // 注册/发现可能从未成功，注销时系统会抛 IllegalArgumentException——不能让退出流程崩掉
         nsdManager?.let { nsd ->
             try { discoveryListener?.let { nsd.stopServiceDiscovery(it) } } catch (_: Exception) {}
@@ -608,12 +744,19 @@ class InkHoleNode(
         lanBroadcastDiscovery?.stop()
         lanBroadcastDiscovery = null
         releaseMulticastLock()
-        try { serverSocket?.close() } catch (_: IOException) {}
-        serverSocket = null
         activeSockets.forEach { socket ->
             try { socket.close() } catch (_: IOException) {}
         }
         activeSockets.clear()
+        // Let queued probes observe running=false and report completion to
+        // callers. shutdownNow() would discard queued FutureTasks without
+        // completing their CompletionService entries and could strand a
+        // caller in take().
+        probeExecutor.shutdown()
+        activeProbeSockets.forEach { socket ->
+            try { socket.close() } catch (_: IOException) {}
+        }
+        activeProbeSockets.clear()
         actualPort = 0
         resolveQueue.clear()
         resolving.set(false)
@@ -1723,54 +1866,130 @@ class InkHoleNode(
         var lastError: Exception? = null
         var identityError: IdentityMismatchException? = null
         var tailnetUnavailable: TailnetUnavailableException? = null
+        var sawSilence = false
         val targets = TailnetAddress.order(hosts.flatMap(::resolveHostAddresses))
-        for (address in targets) {
-            val socket = socketForAddress(address)
-            if (socket == null) {
-                tailnetUnavailable = TailnetUnavailableException(
-                    "Tailscale 未连接，无法到达 $address")
-                continue
-            }
-            try {
-                socket.use {
-                    it.connect(java.net.InetSocketAddress(address, port), timeoutMs)
-                    it.soTimeout = timeoutMs
-                    val nonce = ByteArray(32).also(SecureRandom()::nextBytes)
-                    it.getOutputStream().apply {
-                        if (endpointToken.isNotEmpty()) {
-                            // 跨网桥接端点(短码/SSH)：先过 IKAT 鉴权；桥接为
-                            // 每个连接开独立通道，探测不影响随后的 WHPP 连接。
-                            write("IKAT".toByteArray(Charsets.US_ASCII))
-                            write(endpointToken.toByteArray(Charsets.US_ASCII))
-                        }
-                        write(WHPP.CAP_MAGIC)
-                        write(nonce)
-                        flush()
-                    }
-                    val capabilities = WHPP.readCapabilities(it.getInputStream(), nonce)
-                    if (expectedInstanceId.isNotEmpty() &&
-                        capabilities.instanceId != expectedInstanceId.lowercase()) {
-                        throw IdentityMismatchException(
-                            "设备身份已变化，请删除后重新添加")
-                    }
-                    return PeerProbeResult(
-                        capabilities.instanceId,
-                        capabilities.peerName,
-                        capabilities.capabilities,
+            .distinct()
+            .take(MAX_PARALLEL_PROBE_ADDRESSES)
+        if (targets.isEmpty()) throw IOException("目标设备没有可用地址")
+
+        val localSockets = ConcurrentHashMap.newKeySet<Socket>()
+        val completion = ExecutorCompletionService<AddressProbeOutcome>(probeExecutor)
+        val futures = try {
+            targets.map { address ->
+                completion.submit {
+                    probeAddress(
                         address,
-                        capabilities.publicKey,
-                        capabilities.fingerprint,
+                        port,
+                        timeoutMs,
+                        expectedInstanceId,
+                        endpointToken,
+                        localSockets,
                     )
                 }
-            } catch (e: IdentityMismatchException) {
-                identityError = e
-            } catch (e: Exception) {
-                lastError = e
             }
+        } catch (error: Exception) {
+            localSockets.forEach { socket -> try { socket.close() } catch (_: Exception) {} }
+            throw IOException("设备探测已停止", error)
+        }
+        try {
+            repeat(targets.size) {
+                val outcome = try {
+                    completion.take().get()
+                } catch (error: Exception) {
+                    AddressProbeOutcome(error = IOException("设备探测失败", error))
+                }
+                outcome.result?.let { return it }
+                outcome.identityError?.let { identityError = it }
+                outcome.tailnetUnavailable?.let { tailnetUnavailable = it }
+                outcome.error?.let { error ->
+                    lastError = error
+                    if (!isDefiniteRefusal(error)) sawSilence = true
+                }
+            }
+        } finally {
+            futures.forEach { it.cancel(true) }
+            localSockets.forEach { socket -> try { socket.close() } catch (_: Exception) {} }
         }
         identityError?.let { throw it }
         tailnetUnavailable?.let { throw it }
-        throw (lastError ?: IOException("目标设备没有可用地址"))
+        val failure = lastError ?: IOException("目标设备没有可用地址")
+        // 每个地址都明确拒绝了我们，这是确定信息而不是猜测：调用方据此
+        // 一轮就能下线，不必动用留给息屏设备的容忍轮数。
+        if (!sawSilence && lastError != null) throw PeerRefusedException(failure)
+        throw failure
+    }
+
+    private fun probeAddress(
+        address: String,
+        port: Int,
+        timeoutMs: Int,
+        expectedInstanceId: String,
+        endpointToken: String,
+        localSockets: MutableSet<Socket>,
+    ): AddressProbeOutcome {
+        if (!running) return AddressProbeOutcome(error = IOException("设备探测已停止"))
+        val socket = socketForAddress(address) ?: return AddressProbeOutcome(
+            tailnetUnavailable = TailnetUnavailableException(
+                "Tailscale 未连接，无法到达 $address"),
+        )
+        if (!running) {
+            try { socket.close() } catch (_: IOException) {}
+            return AddressProbeOutcome(error = IOException("设备探测已停止"))
+        }
+        localSockets.add(socket)
+        activeProbeSockets.add(socket)
+        return try {
+            socket.use {
+                it.connect(java.net.InetSocketAddress(address, port), timeoutMs)
+                it.soTimeout = timeoutMs
+                val nonce = ByteArray(32).also(SecureRandom()::nextBytes)
+                it.getOutputStream().apply {
+                    if (endpointToken.isNotEmpty()) {
+                        // 跨网桥接端点(短码/SSH)：先过 IKAT 鉴权；桥接为
+                        // 每个连接开独立通道，探测不影响随后的 WHPP 连接。
+                        write("IKAT".toByteArray(Charsets.US_ASCII))
+                        write(endpointToken.toByteArray(Charsets.US_ASCII))
+                    }
+                    write(WHPP.CAP_MAGIC)
+                    write(nonce)
+                    flush()
+                }
+                val capabilities = WHPP.readCapabilities(it.getInputStream(), nonce)
+                if (expectedInstanceId.isNotEmpty() &&
+                    capabilities.instanceId != expectedInstanceId.lowercase()) {
+                    throw IdentityMismatchException("设备身份已变化，请删除后重新添加")
+                }
+                AddressProbeOutcome(result = PeerProbeResult(
+                    capabilities.instanceId,
+                    capabilities.peerName,
+                    capabilities.capabilities,
+                    address,
+                    capabilities.publicKey,
+                    capabilities.fingerprint,
+                ))
+            }
+        } catch (error: IdentityMismatchException) {
+            AddressProbeOutcome(identityError = error)
+        } catch (error: Exception) {
+            AddressProbeOutcome(error = error)
+        } finally {
+            localSockets.remove(socket)
+            activeProbeSockets.remove(socket)
+            try { socket.close() } catch (_: IOException) {}
+        }
+    }
+
+    /**
+     * 区分"对端应答了并且说不"与"对端什么都没说"。拒绝连接或路由不可达是
+     * 确定的；超时不是——息屏的手机和已经离开网络的手机产生的沉默完全一样，
+     * 把两者等同正是设备列表以前忽隐忽现的原因。
+     */
+    private fun isDefiniteRefusal(error: Throwable): Boolean = when (error) {
+        is java.net.SocketTimeoutException -> false
+        is java.net.ConnectException -> true
+        is java.net.NoRouteToHostException -> true
+        is java.net.PortUnreachableException -> true
+        else -> false
     }
 
     // ---- NSD 注册 ----
@@ -1922,7 +2141,7 @@ class InkHoleNode(
                 val candidates = LanReachability.discoveryCandidates(
                     resolvedHosts.toList(), hostList, currentLanLinks())
                 val result = try {
-                    probePeer(candidates, port, LOST_PROBE_TIMEOUT_MS, txtInstanceId)
+                    probePeer(candidates, port, LAN_PROBE_TIMEOUT_MS, txtInstanceId)
                 } catch (_: Exception) {
                     return@launch
                 }
@@ -1933,6 +2152,45 @@ class InkHoleNode(
             } finally {
                 pendingDiscoveryProbes.remove(discoveryName)
             }
+        }
+    }
+
+    /**
+     * 处理离开通知。同网段任何人都能伪造这种包，所以它只是线索而非命令：
+     * 先探测确认对端确实不可达，再移除。即便如此也只需几百毫秒，远快于
+     * 等满探活容忍轮数。
+     */
+    private fun handleLanGoodbye(host: String, announcement: LanAnnouncement) {
+        if (!running || announcement.instanceId == instanceId) return
+        val target = synchronized(peersLock) {
+            peers.entries.firstOrNull { (_, peer) ->
+                val knownHosts = (listOf(peer.host) + peer.hosts)
+                    .map { it.substringBefore('%') }
+                peer.transport == "lan" &&
+                    peer.instanceId == announcement.instanceId &&
+                    peer.port == announcement.port &&
+                    host.substringBefore('%') in knownHosts
+            }?.let { it.key to it.value }
+        } ?: return
+        val (key, peer) = target
+        scope.launch {
+            val candidates = LanReachability.verifiedPeerCandidates(
+                peer.hosts, currentLanLinks(), peer.host)
+            val definitelyGone = try {
+                probePeer(candidates, peer.port, LAN_PROBE_TIMEOUT_MS,
+                    peer.instanceId)
+                false
+            } catch (_: PeerRefusedException) {
+                true
+            } catch (_: IdentityMismatchException) {
+                true
+            } catch (_: Exception) {
+                // A timeout remains ambiguous even after a goodbye: an
+                // unauthenticated packet must not bypass sleep tolerance.
+                probeNow()
+                false
+            }
+            if (definitelyGone && running) removePeer(key)
         }
     }
 
@@ -1956,7 +2214,7 @@ class InkHoleNode(
                     probePeer(
                         candidates,
                         announcement.port,
-                        LOST_PROBE_TIMEOUT_MS,
+                        LAN_PROBE_TIMEOUT_MS,
                         announcement.instanceId,
                     )
                 } catch (_: Exception) {
@@ -1995,7 +2253,7 @@ class InkHoleNode(
                     probePeer(
                         listOf(host),
                         port,
-                        LOST_PROBE_TIMEOUT_MS,
+                        LAN_PROBE_TIMEOUT_MS,
                         hintedInstanceId,
                     )
                 } catch (_: Exception) {
@@ -2112,11 +2370,6 @@ class InkHoleNode(
         }
         return (connectivityLinks + interfaceLinks).distinct()
     }
-
-    private fun lanLinkSignature(links: List<LanLink>): String = links
-        .map { "${it.address.substringBefore('%')}/${it.prefixLength}" }
-        .sorted()
-        .joinToString("|")
 
     private fun discoverNsd() {
         if (!running) return

@@ -17,6 +17,11 @@ internal data class LanAnnouncement(
     val instanceId: String,
     val port: Int,
     val isReply: Boolean = false,
+    /**
+     * 离开通知：节点正常退出或切换网络时发出。协议 v3 的旧端不认识这个字段，
+     * 会按普通通告解码并回到原有探测路径，因此发送它对老版本没有副作用。
+     */
+    val isBye: Boolean = false,
 )
 
 internal data class LanHint(val instanceId: String, val port: Int)
@@ -59,14 +64,18 @@ internal object LanDiscoveryProtocol {
     private const val VERSION = 3
     const val MAX_PACKET = 2048
 
-    fun encode(instanceId: String, port: Int, reply: Boolean = false): ByteArray {
+    fun encode(instanceId: String, port: Int, reply: Boolean = false,
+               bye: Boolean = false): ByteArray {
         require(instanceId.matches(Regex("[0-9a-fA-F]{32}")) && port in 1..65535)
-        return JSONObject()
+        val json = JSONObject()
             .put("magic", MAGIC)
             .put("version", VERSION)
             .put("instance_id", instanceId.lowercase())
             .put("port", port)
             .put("reply", reply)
+        // 普通通告不带这个键，保证与旧版本逐字节一致。
+        if (bye) json.put("bye", true)
+        return json
             .toString()
             .toByteArray(Charsets.US_ASCII)
     }
@@ -87,9 +96,15 @@ internal object LanDiscoveryProtocol {
             is Boolean -> rawReply
             else -> return null
         }
+        val rawBye = json.opt("bye")
+        val bye = when (rawBye) {
+            null -> false
+            is Boolean -> rawBye
+            else -> return null
+        }
         if (json.optString("magic") != MAGIC || json.optInt("version") != VERSION ||
             !instanceId.matches(Regex("[0-9a-f]{32}")) || port !in 1..65535) return null
-        return LanAnnouncement(instanceId, port, reply)
+        return LanAnnouncement(instanceId, port, reply, bye)
     }
 
     fun broadcastTargets(links: List<LanLink>): List<String> {
@@ -124,13 +139,21 @@ internal class LanBroadcastDiscovery(
     private val links: () -> List<LanLink>,
     private val onAnnouncement: (host: String, announcement: LanAnnouncement) -> Unit,
     private val onError: (String) -> Unit,
+    private val onGoodbye: (host: String, announcement: LanAnnouncement) -> Unit = { _, _ -> },
 ) {
     companion object {
         private const val ANNOUNCE_INTERVAL_MS = 2_000L
         private const val RECEIVE_TIMEOUT_MS = 500
+        /**
+         * 一次 bump 连发的包数与间隔。路由器普遍限速或直接丢弃广播帧，
+         * 启动或切网时只发一包等于赌运气；五包总量不到 1KB，代价可以忽略。
+         */
+        private const val BURST_COUNT = 5
+        private const val BURST_GAP_MS = 150L
     }
 
     @Volatile private var socket: DatagramSocket? = null
+    @Volatile private var burstRemaining = 0
 
     fun start() {
         if (socket != null) return
@@ -146,7 +169,27 @@ internal class LanBroadcastDiscovery(
             return
         }
         socket = opened
+        burstRemaining = BURST_COUNT
         scope.launch { run(opened) }
+    }
+
+    /** 请求立即连发一轮通告：启动、切换网络、回到前台时调用。 */
+    fun bump() {
+        burstRemaining = BURST_COUNT
+    }
+
+    /**
+     * 告诉同网段本机要走了，让对端不必耗完探活容忍就能移除。尽力而为——
+     * WiFi 已经断掉时根本发不出去，所以探活循环仍是移除的最终依据。
+     */
+    fun sayGoodbye() {
+        val opened = socket ?: return
+        val payload = try {
+            LanDiscoveryProtocol.encode(instanceId, listenPort, bye = true)
+        } catch (_: Exception) {
+            return
+        }
+        sendToAll(opened, payload)
     }
 
     fun stop() {
@@ -158,6 +201,20 @@ internal class LanBroadcastDiscovery(
         }
     }
 
+    private fun sendToAll(opened: DatagramSocket, payload: ByteArray) {
+        LanDiscoveryProtocol.broadcastTargets(links()).forEach { target ->
+            try {
+                opened.send(DatagramPacket(
+                    payload,
+                    payload.size,
+                    InetAddress.getByName(target),
+                    LanDiscoveryProtocol.PORT,
+                ))
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     private suspend fun run(opened: DatagramSocket) {
         val announcement = LanDiscoveryProtocol.encode(instanceId, listenPort)
         val reply = LanDiscoveryProtocol.encode(instanceId, listenPort, reply = true)
@@ -165,26 +222,28 @@ internal class LanBroadcastDiscovery(
         while (scope.isActive && socket === opened) {
             val now = System.currentTimeMillis()
             if (now >= nextAnnouncement) {
-                LanDiscoveryProtocol.broadcastTargets(links()).forEach { target ->
-                    try {
-                        val packet = DatagramPacket(
-                            announcement,
-                            announcement.size,
-                            InetAddress.getByName(target),
-                            LanDiscoveryProtocol.PORT,
-                        )
-                        opened.send(packet)
-                    } catch (_: Exception) {
-                    }
+                sendToAll(opened, announcement)
+                nextAnnouncement = if (burstRemaining > 0) {
+                    burstRemaining -= 1
+                    now + BURST_GAP_MS
+                } else {
+                    now + ANNOUNCE_INTERVAL_MS
                 }
-                nextAnnouncement = now + ANNOUNCE_INTERVAL_MS
             }
+            // 突发期间不能睡满接收超时，否则间隔被拉长就不再是突发。
+            val wait = (nextAnnouncement - System.currentTimeMillis())
+                .coerceIn(1L, RECEIVE_TIMEOUT_MS.toLong())
+            opened.soTimeout = wait.toInt()
             val buffer = ByteArray(LanDiscoveryProtocol.MAX_PACKET + 1)
             val packet = DatagramPacket(buffer, buffer.size)
             try {
                 opened.receive(packet)
                 val decoded = LanDiscoveryProtocol.decode(buffer, packet.length) ?: continue
                 val host = packet.address?.hostAddress?.substringBefore('%') ?: continue
+                if (decoded.isBye) {
+                    onGoodbye(host, decoded)
+                    continue
+                }
                 if (!decoded.isReply) {
                     try {
                         opened.send(DatagramPacket(
