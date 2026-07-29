@@ -1482,29 +1482,46 @@ class P2PNode:
         """Handle goodbye message: probe to confirm departure before removing."""
         with self._lock:
             peer_key = None
+            peer_port = None
             peer_hosts = []
             for key, peer in self._peers.items():
                 if (peer.transport == "lan" and
                     peer.instance_id == instance_id and
                     host in ([peer.host] + list(peer.hosts or []))):
                     peer_key = key
+                    peer_port = peer.port  # Use verified port, not UDP packet
                     peer_hosts = [peer.host] + list(peer.hosts or [])
                     break
             if peer_key is None:
                 return  # Unknown peer
 
-        # Probe to confirm the peer is really gone
+        # Probe to confirm the peer is really gone. Only definite refusal
+        # (ECONNREFUSED/EHOSTUNREACH) or identity mismatch confirms departure;
+        # timeouts are ambiguous (sleeping phone vs offline).
         try:
-            result = self._probe_hosts(peer_hosts, port, _LAN_PROBE_TIMEOUT, instance_id)
+            result = self._probe_hosts(peer_hosts, peer_port, _LAN_PROBE_TIMEOUT, instance_id)
             # If probe succeeds, peer is still alive - ignore goodbye
-        except Exception:
-            # Probe failed - confirmed gone, remove immediately
+        except _IdentityMismatch:
+            # Identity changed - remove immediately
             with self._lock:
                 if peer_key in self._peers:
                     del self._peers[peer_key]
+                if peer_key in self._strikes:
+                    del self._strikes[peer_key]
+            self._emit_peers()
+        except OSError as exc:
+            # Only remove on definite refusal, not timeout
+            if _is_definite_refusal(exc):
+                with self._lock:
+                    if peer_key in self._peers:
+                        del self._peers[peer_key]
                     if peer_key in self._strikes:
                         del self._strikes[peer_key]
-            self._emit_peers()
+                self._emit_peers()
+            # Timeout/other errors: let normal strike policy handle it
+        except Exception:
+            # Unexpected error: don't crash the UDP thread, log and continue
+            pass
 
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
@@ -2743,10 +2760,12 @@ class P2PNode:
         if tailnet_error is not None:
             raise tailnet_error
         # Preserve error classification: if any address timed out, the failure
-        # is ambiguous and should not trigger fast eviction
-        if saw_timeout and last_error and not _is_definite_refusal(last_error):
-            # Replace with a timeout-like error to prevent fast eviction
+        # is ambiguous and should not trigger fast eviction. Only raise the
+        # definite error if ALL addresses gave definite refusals.
+        if saw_timeout:
+            # At least one timeout - treat as ambiguous regardless of other errors
             raise TimeoutError("部分地址超时，设备可能仍在线")
+        # All addresses gave definite refusals - raise the last error
         raise last_error if last_error else OSError("目标设备没有可用地址")
 
     def _send_lan_hint(self, host: str, port: int) -> None:

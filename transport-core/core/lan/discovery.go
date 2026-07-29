@@ -617,6 +617,11 @@ func (d *Discovery) onNetworkChange(current, lost []*net.IPNet) {
 		d.broadcast.bump()
 	}
 	d.kick()
+	// Wake mDNS query immediately after network change
+	select {
+	case d.queryWake <- struct{}{}:
+	default:
+	}
 	d.status("网络已切换，正在重新发现设备")
 }
 
@@ -750,6 +755,14 @@ func (d *Discovery) probePeerHosts(hosts []string, port int,
 	if len(hosts) == 0 {
 		return nil, "", hostGone
 	}
+
+	// Limit concurrent probes per peer to prevent resource exhaustion from
+	// malicious large address lists. Keep at most 8 addresses per peer.
+	const maxHostsPerPeer = 8
+	if len(hosts) > maxHostsPerPeer {
+		hosts = hosts[:maxHostsPerPeer]
+	}
+
 	type attempt struct {
 		result  *ProbeResult
 		host    string

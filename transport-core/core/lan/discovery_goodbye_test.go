@@ -211,13 +211,12 @@ func TestGoodbyeThrottling(t *testing.T) {
 	var mu sync.Mutex
 
 	bobDisc, err := Start(Config{
-		PeerName:        "bob",
-		InstanceID:      bobID,
-		Port:            bobPort,
-		Identity:        bobIdentity,
-		Capabilities:    []string{"folder-v1"},
-		LocalIPs:        []string{"127.0.0.1"},
-		DisableBroadcast: true,
+		PeerName:     "bob",
+		InstanceID:   bobID,
+		Port:         bobPort,
+		Identity:     bobIdentity,
+		Capabilities: []string{"folder-v1"},
+		LocalIPs:     []string{"127.0.0.1"},
 	}, func(peers []Peer) {
 		mu.Lock()
 		bobPeers = filterTestPeers(peers, aliceID)
@@ -241,8 +240,17 @@ func TestGoodbyeThrottling(t *testing.T) {
 	}
 	defer aliceDisc.Stop()
 
-	// Wait for discovery
-	deadline := time.Now().Add(5 * time.Second)
+	// Manually inject alice as a discovered peer to bob
+	bobDisc.handleEntry(mdnsEntry{
+		ServiceName: "alice-service",
+		InstanceID:  aliceID,
+		PeerName:    "alice",
+		Port:        alicePort,
+		Hosts:       []string{"127.0.0.1"},
+	})
+
+	// Wait for verification to complete
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		found := len(bobPeers) > 0
@@ -312,13 +320,12 @@ func TestGoodbyeAcceptsOnlyKnownHost(t *testing.T) {
 	var mu sync.Mutex
 
 	bobDisc, err := Start(Config{
-		PeerName:        "bob",
-		InstanceID:      bobID,
-		Port:            bobPort,
-		Identity:        bobIdentity,
-		Capabilities:    []string{"folder-v1"},
-		LocalIPs:        []string{"127.0.0.1"},
-		DisableBroadcast: true,
+		PeerName:     "bob",
+		InstanceID:   bobID,
+		Port:         bobPort,
+		Identity:     bobIdentity,
+		Capabilities: []string{"folder-v1"},
+		LocalIPs:     []string{"127.0.0.1"},
 	}, func(peers []Peer) {
 		mu.Lock()
 		bobPeers = filterTestPeers(peers, aliceID)
@@ -342,7 +349,16 @@ func TestGoodbyeAcceptsOnlyKnownHost(t *testing.T) {
 	}
 	defer aliceDisc.Stop()
 
-	// Wait for bob to discover alice
+	// Manually inject alice as a discovered peer to bob
+	bobDisc.handleEntry(mdnsEntry{
+		ServiceName: "alice-service",
+		InstanceID:  aliceID,
+		PeerName:    "alice",
+		Port:        alicePort,
+		Hosts:       []string{"127.0.0.1"},
+	})
+
+	// Wait for verification to complete
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -357,7 +373,7 @@ func TestGoodbyeAcceptsOnlyKnownHost(t *testing.T) {
 	mu.Lock()
 	if len(bobPeers) != 1 {
 		mu.Unlock()
-		t.Skip("discovery didn't complete")
+		t.Fatalf("alice should be discovered, got %d peers", len(bobPeers))
 	}
 	aliceInstanceID := bobPeers[0].InstanceID
 	mu.Unlock()
