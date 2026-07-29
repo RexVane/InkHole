@@ -297,6 +297,95 @@ func TestNetworkChangeKeepsSilentRoutedPeerOnStrikePolicy(t *testing.T) {
 	}
 }
 
+func startSelectiveProbeServer(t *testing.T, identity *Identity, instanceID,
+	responsiveHost string) (net.Listener, int) {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				head := make([]byte, 4)
+				if _, err := io.ReadFull(conn, head); err != nil ||
+					string(head) != capMagic {
+					return
+				}
+				local, _ := conn.LocalAddr().(*net.TCPAddr)
+				if local == nil || local.IP.String() != responsiveHost {
+					// Consume the challenge but deliberately never answer. The
+					// client closes at its deadline, which releases this handler.
+					_, _ = io.Copy(io.Discard, conn)
+					return
+				}
+				_ = RespondProbe(conn, identity, instanceID, "worker-peer",
+					[]string{CapFolder})
+			}(conn)
+		}
+	}()
+	return listener, listener.Addr().(*net.TCPAddr).Port
+}
+
+func TestProbePeerHostsTriesCandidatesBeyondWorkerLimit(t *testing.T) {
+	identity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	instanceID := randomInstanceID(t)
+	_, port := startSelectiveProbeServer(t, identity, instanceID, "127.0.0.1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	discovery := &Discovery{ctx: ctx, timeout: 900 * time.Millisecond}
+	hosts := []string{
+		"127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5",
+		"127.0.0.6", "127.0.0.7", "127.0.0.8", "127.0.0.9",
+		"127.0.0.10", "127.0.0.1",
+	}
+
+	result, connected, verdict := discovery.probePeerHosts(
+		hosts, port, instanceID, nil)
+	if verdict != hostAlive || result == nil {
+		t.Fatalf("tenth candidate verdict = %v, result = %#v", verdict, result)
+	}
+	if connected != "127.0.0.1" {
+		t.Fatalf("connected address = %q, want 127.0.0.1", connected)
+	}
+}
+
+func TestProbePeerHostsReturnsBeforeUnrelatedSlowCandidates(t *testing.T) {
+	identity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	instanceID := randomInstanceID(t)
+	_, port := startSelectiveProbeServer(t, identity, instanceID, "127.0.0.1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	discovery := &Discovery{ctx: ctx, timeout: 900 * time.Millisecond}
+	hosts := []string{
+		"127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4",
+		"127.0.0.5", "127.0.0.6", "127.0.0.7", "127.0.0.8",
+		"127.0.0.9", "127.0.0.10",
+	}
+
+	started := time.Now()
+	result, _, verdict := discovery.probePeerHosts(hosts, port, instanceID, nil)
+	elapsed := time.Since(started)
+	if verdict != hostAlive || result == nil {
+		t.Fatalf("fast candidate verdict = %v, result = %#v", verdict, result)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("fast candidate was held behind slow work for %v", elapsed)
+	}
+}
+
 func TestLANInterfaceNameFilter(t *testing.T) {
 	for _, name := range []string{
 		"en0", "en7", "eth0", "wlan0", "Wi-Fi", "Ethernet", "bridge100",

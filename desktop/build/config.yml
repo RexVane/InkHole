@@ -11,7 +11,7 @@ info:
   description: "轻量、安全的跨平台文件传输工具"
   copyright: "Copyright 2026 RexVane"
   comments: "InkHole desktop client"
-  version: "1.7.2"
+  version: "1.7.3"
   # cfBundleIconName: "appicon" # The macOS icon name in Assets.car icon bundles (optional)
   #                               # Should match the name of your .icon file without the extension
   #                               # If not set and Assets.car exists, defaults to "appicon"

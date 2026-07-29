@@ -1,3 +1,4 @@
+import errno
 import ipaddress
 import socket
 import sys
@@ -6,6 +7,7 @@ import time
 import types
 
 import inkhole.p2p as p2p_module
+import pytest
 
 from inkhole.p2p import (
     _CAP_VERSION,
@@ -60,6 +62,97 @@ def test_local_ips_ignore_loopback_default_when_lan_address_exists(
     )
 
     assert node._get_local_ips() == ["192.168.50.7"]
+
+
+def test_goodbye_definite_refusal_removes_current_peer_and_notifies(
+        tmp_path, monkeypatch):
+    changed = []
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False),
+        on_peers_changed=lambda: changed.append(True))
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name="Android-test", hosts=["192.0.2.9"],
+        instance_id="a" * 32, transport="lan")
+    node.select_peer("Android")
+    changed.clear()
+    probed_ports = []
+
+    def refused(_hosts, port, _timeout, _instance_id):
+        probed_ports.append(port)
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+
+    monkeypatch.setattr(node, "_probe_hosts", refused)
+    node._handle_lan_goodbye("192.0.2.9", 1, "a" * 32)
+
+    assert probed_ports == [41300]
+    assert node.peer_names() == []
+    assert node.selected_peer() is None
+    assert changed == [True]
+
+
+def test_goodbye_timeout_keeps_peer(tmp_path, monkeypatch):
+    changed = []
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False),
+        on_peers_changed=lambda: changed.append(True))
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name="Android-test", hosts=["192.0.2.9"],
+        instance_id="a" * 32, transport="lan")
+    changed.clear()
+
+    def timeout(*_args, **_kwargs):
+        raise TimeoutError("sleeping phone")
+
+    monkeypatch.setattr(node, "_probe_hosts", timeout)
+    node._handle_lan_goodbye("192.0.2.9", 41300, "a" * 32)
+
+    assert node.peer_names() == ["Android"]
+    assert changed == []
+
+
+def test_goodbye_does_not_remove_replacement_peer(tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name="Android-test", hosts=["192.0.2.9"],
+        instance_id="a" * 32, transport="lan")
+
+    def replaced_then_refused(*_args, **_kwargs):
+        node._on_peer_added(
+            "Android", "192.0.2.10", 41300,
+            service_name="replacement", hosts=["192.0.2.10"],
+            instance_id="b" * 32, transport="lan")
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "old peer left")
+
+    monkeypatch.setattr(node, "_probe_hosts", replaced_then_refused)
+    node._handle_lan_goodbye("192.0.2.9", 41300, "a" * 32)
+
+    assert len(node.peers()) == 1
+    assert node.peers()[0].instance_id == "b" * 32
+
+
+def test_probe_hosts_keeps_timeout_classification_regardless_of_order(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+
+    for errors in (
+        [TimeoutError("timeout"),
+         ConnectionRefusedError(errno.ECONNREFUSED, "refused")],
+        [ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+         TimeoutError("timeout")],
+    ):
+        remaining = iter(errors)
+
+        def fail(*_args, **_kwargs):
+            raise next(remaining)
+
+        monkeypatch.setattr(p2p_module, "_probe_peer", fail)
+        with pytest.raises(TimeoutError):
+            node._probe_hosts(["192.0.2.1", "192.0.2.2"], 41300, 0.01)
 
 
 def test_probe_requires_four_failures_without_rebuilding_mdns(

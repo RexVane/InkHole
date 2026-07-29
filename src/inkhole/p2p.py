@@ -1498,26 +1498,21 @@ class P2PNode:
         # Probe to confirm the peer is really gone. Only definite refusal
         # (ECONNREFUSED/EHOSTUNREACH) or identity mismatch confirms departure;
         # timeouts are ambiguous (sleeping phone vs offline).
+        should_remove = False
         try:
-            result = self._probe_hosts(peer_hosts, peer_port, _LAN_PROBE_TIMEOUT, instance_id)
+            self._probe_hosts(peer_hosts, peer_port, _LAN_PROBE_TIMEOUT, instance_id)
             # If probe succeeds, peer is still alive - ignore goodbye
         except _IdentityMismatch:
-            # Identity changed - remove immediately
-            with self._lock:
-                if peer_key in self._peers:
-                    del self._peers[peer_key]
-            self._on_peers_changed()
+            should_remove = True
         except OSError as exc:
-            # Only remove on definite refusal, not timeout
-            if _is_definite_refusal(exc):
-                with self._lock:
-                    if peer_key in self._peers:
-                        del self._peers[peer_key]
-                self._on_peers_changed()
-            # Timeout/other errors: let normal strike policy handle it
+            should_remove = _is_definite_refusal(exc)
         except Exception:
-            # Unexpected error: don't crash the UDP thread, log and continue
-            pass
+            return
+
+        if should_remove:
+            # Re-check the signed identity under the lock. The display-name key
+            # may have been reused while the network probe was in flight.
+            self._on_peer_removed(peer_key, expected_instance_id=instance_id)
 
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
@@ -2593,13 +2588,20 @@ class P2PNode:
         if self.on_peers_changed:
             self.on_peers_changed()
 
-    def _on_peer_removed(self, name: str) -> None:
+    def _on_peer_removed(self, name: str,
+                         expected_instance_id: str = "") -> None:
         """按显示名移除节点(离线)。
 
         智能保留：离线时清空 _selected_peer（避免向已离线设备发送），
         但保留 _last_selected_service，等对端重新上线时自动恢复选中。
         """
+        expected_instance_id = expected_instance_id.lower()
         with self._lock:
+            current = self._peers.get(name)
+            if (expected_instance_id and
+                    (current is None or
+                     current.instance_id != expected_instance_id)):
+                return
             if name in self._peers:
                 del self._peers[name]
             if self._selected_peer == name:

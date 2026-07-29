@@ -761,39 +761,70 @@ func (d *Discovery) probePeerHosts(hosts []string, port int,
 		host    string
 		verdict hostVerdict
 	}
-	results := make(chan attempt, len(hosts))
 
-	// Limit concurrent probes per peer to prevent resource exhaustion from
-	// malicious large address lists. Use a semaphore instead of truncating
-	// to ensure we eventually try all addresses.
+	// A fixed worker pool bounds sockets and goroutines without truncating the
+	// candidate set. Results are consumed while work is still being dispatched,
+	// so one fast valid address is not held behind unrelated slow addresses.
 	const maxConcurrentProbesPerPeer = 8
-	sem := make(chan struct{}, maxConcurrentProbesPerPeer)
-
+	workerCount := len(hosts)
+	if workerCount > maxConcurrentProbesPerPeer {
+		workerCount = maxConcurrentProbesPerPeer
+	}
+	jobs := make(chan string, len(hosts))
 	for _, host := range hosts {
-		sem <- struct{}{} // Acquire
-		go func(host string) {
-			defer func() { <-sem }() // Release
-			timeout := d.timeout
-			if onLocalNet(host, nets) && lanProbeTimeout < timeout {
-				timeout = lanProbeTimeout
-			}
-			result, err := ProbePeer(host, port, timeout, expectedInstanceID)
-			switch {
-			case err == nil:
-				connected := result.ConnectedIP
-				if connected == "" {
-					connected = host
+		jobs <- host
+	}
+	close(jobs)
+	results := make(chan attempt, workerCount)
+	done := make(chan struct{})
+	defer close(done)
+	for range workerCount {
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				case host, ok := <-jobs:
+					if !ok {
+						return
+					}
+					// If cancellation raced with receiving a buffered job, do not
+					// start another socket after a peer has already verified.
+					select {
+					case <-done:
+						return
+					default:
+					}
+					timeout := d.timeout
+					if onLocalNet(host, nets) && lanProbeTimeout < timeout {
+						timeout = lanProbeTimeout
+					}
+					result, err := ProbePeer(host, port, timeout,
+						expectedInstanceID)
+					item := attempt{}
+					switch {
+					case err == nil:
+						connected := result.ConnectedIP
+						if connected == "" {
+							connected = host
+						}
+						item = attempt{result: result, host: connected,
+							verdict: hostAlive}
+					case errors.Is(err, ErrIdentityMismatch):
+						item.verdict = hostMismatch
+					case isDefiniteRefusal(err):
+						item.verdict = hostGone
+					default:
+						item.verdict = hostSilent
+					}
+					select {
+					case results <- item:
+					case <-done:
+						return
+					}
 				}
-				results <- attempt{result: result, host: connected,
-					verdict: hostAlive}
-			case errors.Is(err, ErrIdentityMismatch):
-				results <- attempt{verdict: hostMismatch}
-			case isDefiniteRefusal(err):
-				results <- attempt{verdict: hostGone}
-			default:
-				results <- attempt{verdict: hostSilent}
 			}
-		}(host)
+		}()
 	}
 	// hostGone only survives if every address agrees; one silent address is
 	// enough to fall back to the tolerant path.

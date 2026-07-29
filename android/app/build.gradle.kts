@@ -15,8 +15,8 @@ android {
         applicationId = "com.rexvane.inkhole"
         minSdk = 24
         targetSdk = 34
-        versionCode = 73
-        versionName = "1.7.2"
+        versionCode = 74
+        versionName = "1.7.3"
     }
 
     // GitHub Releases distributes installable APKs directly. Release builds opt

@@ -1,6 +1,6 @@
 # InkHole Android
 
-墨洞 Android 客户端（当前版本 `1.7.2`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
+墨洞 Android 客户端（当前版本 `1.7.3`），与 Windows/macOS 桌面端通过局域网、Tailscale、一次性短码或 SSH VPS 中继互传文件。
 
 ## 功能
 

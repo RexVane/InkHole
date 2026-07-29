@@ -1,7 +1,6 @@
 package lan
 
 import (
-	"context"
 	"io"
 	"net"
 	"strconv"
@@ -75,9 +74,6 @@ func TestGoodbyeVerifiesBeforeRemoval(t *testing.T) {
 		Capabilities: []string{"folder-v1"},
 		LocalIPs:     []string{"127.0.0.1"},
 	}, func([]Peer) {}, func(string) {})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,12 +211,15 @@ func TestGoodbyeThrottling(t *testing.T) {
 	var mu sync.Mutex
 
 	bobDisc, err := Start(Config{
-		PeerName:     "bob",
-		InstanceID:   bobID,
-		Port:         bobPort,
-		Identity:     bobIdentity,
-		Capabilities: []string{"folder-v1"},
-		LocalIPs:     []string{"127.0.0.1"},
+		PeerName:         "bob",
+		InstanceID:       bobID,
+		Port:             bobPort,
+		Identity:         bobIdentity,
+		Capabilities:     []string{"folder-v1"},
+		LocalIPs:         []string{"127.0.0.1"},
+		DisableMDNS:      true,
+		DisableBroadcast: true,
+		ProbeInterval:    time.Hour,
 	}, func(peers []Peer) {
 		mu.Lock()
 		bobPeers = filterTestPeers(peers, aliceID)
@@ -230,19 +229,6 @@ func TestGoodbyeThrottling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer bobDisc.Stop()
-
-	aliceDisc, err := Start(Config{
-		PeerName:     "alice",
-		InstanceID:   aliceID,
-		Port:         alicePort,
-		Identity:     aliceIdentity,
-		Capabilities: []string{"folder-v1"},
-		LocalIPs:     []string{"127.0.0.1"},
-	}, func([]Peer) {}, func(string) {})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer aliceDisc.Stop()
 
 	// Manually inject alice as a discovered peer to bob
 	bobDisc.handleEntry(mdnsEntry{
@@ -302,38 +288,21 @@ func TestGoodbyeThrottling(t *testing.T) {
 		}
 	}()
 
-	// Send rapid goodbye burst (simulating attack)
-	// Only the first should trigger a probe goroutine, rest should be throttled
+	// Invoke the handler directly so this test cannot pass merely because the
+	// host dropped every UDP broadcast. Only the first call may start a probe.
+	goodbye := &Announcement{InstanceID: aliceID, Port: alicePort, Bye: true}
 	for i := 0; i < 20; i++ {
-		aliceDisc.broadcast.sayGoodbye()
+		bobDisc.handleGoodbye("127.0.0.1", goodbye)
+	}
+
+	deadline = time.Now().Add(time.Second)
+	for atomic.LoadInt32(&probeCount) == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-
-	// Wait for any spawned probes to complete
-	time.Sleep(1 * time.Second)
-
-	// Verify throttling: should see at most 2-3 probes (initial + maybe 1-2 more)
-	// not 20 probes
+	time.Sleep(100 * time.Millisecond)
 	finalCount := atomic.LoadInt32(&probeCount)
-	if finalCount > 5 {
-		t.Errorf("throttling failed: expected ≤5 probes, got %d", finalCount)
-	}
-
-	// The system should still be responsive
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	done := make(chan bool)
-	go func() {
-		bobDisc.Refresh()
-		done <- true
-	}()
-
-	select {
-	case <-done:
-		// Good - system is responsive
-	case <-ctx.Done():
-		t.Fatal("system became unresponsive after goodbye flood (throttling may have failed)")
+	if finalCount != 1 {
+		t.Fatalf("goodbye burst started %d probes, want exactly 1", finalCount)
 	}
 }
 
