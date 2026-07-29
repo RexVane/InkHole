@@ -213,6 +213,138 @@ def test_probe_failure_does_not_remove_reconnected_same_instance(
     assert (peers[0].host, peers[0].port) == ("192.0.2.10", 41400)
 
 
+def _wait_goodbye_probes_settled(node):
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with node._lock:
+            if not node._pending_goodbye_probes:
+                return
+        time.sleep(0.01)
+
+
+def test_mdns_remove_event_confirms_before_removing(tmp_path, monkeypatch):
+    """陈旧的 mDNS 下线事件不得删除广播已刷新且探测在线的设备。"""
+    changed = []
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False),
+        on_peers_changed=lambda: changed.append(True))
+    service = "Android-test._inkhole._tcp.local."
+    node._on_peer_added(
+        "Android", "192.0.2.20", 41500,
+        service_name=service, hosts=["192.0.2.20"],
+        instance_id="a" * 32, transport="lan")
+    changed.clear()
+
+    def alive(*_args, **_kwargs):
+        return p2p_module._ProbeResult(
+            "a" * 32, "Android", frozenset({"folder-v1"}),
+            "192.0.2.20", "", "")
+
+    monkeypatch.setattr(node, "_probe_hosts", alive)
+    node._on_peer_removed_by_service(service)
+    _wait_goodbye_probes_settled(node)
+
+    assert node.peer_names() == ["Android"]
+    assert changed == []
+
+
+def test_mdns_remove_event_removes_after_confirmed_refusal(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    service = "Android-test._inkhole._tcp.local."
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name=service, hosts=["192.0.2.9"],
+        instance_id="a" * 32, transport="lan")
+
+    def refused(*_args, **_kwargs):
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "really gone")
+
+    monkeypatch.setattr(node, "_probe_hosts", refused)
+    node._on_peer_removed_by_service(service)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and node.peer_names():
+        time.sleep(0.01)
+
+    assert node.peer_names() == []
+
+
+def test_stale_verify_result_does_not_roll_back_refreshed_endpoint(
+        tmp_path, monkeypatch):
+    """验证发起后端点被刷新，迟到的旧结果必须整体作废。"""
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    node._running = True
+    instance_id = "a" * 32
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name="svc", hosts=["192.0.2.9"],
+        instance_id=instance_id, transport="lan")
+    monkeypatch.setattr(node, "_hosts_on_current_lan", lambda hosts: hosts)
+    monkeypatch.setattr(node, "_send_lan_hint", lambda *_a, **_k: None)
+
+    def stale_probe(*_args, **_kwargs):
+        node._on_peer_added(
+            "Android", "192.0.2.20", 41500,
+            service_name="svc", hosts=["192.0.2.20"],
+            instance_id=instance_id, transport="lan")
+        return p2p_module._ProbeResult(
+            instance_id, "Android", frozenset({"folder-v1"}),
+            "192.0.2.9", "", "")
+
+    monkeypatch.setattr(node, "_probe_hosts", stale_probe)
+    node._verify_discovered_peer(
+        "Android", ["192.0.2.9"], 41300, "svc", instance_id)
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with node._lock:
+            if "svc" not in node._pending_discovery_probes:
+                break
+        time.sleep(0.01)
+
+    peers = node.peers()
+    assert len(peers) == 1
+    assert (peers[0].host, peers[0].port) == ("192.0.2.20", 41500)
+
+
+def test_second_nic_announcement_is_not_news(tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    instance_id = "a" * 32
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name=f"broadcast|{instance_id}",
+        hosts=["192.0.2.9", "192.0.2.10"],
+        instance_id=instance_id, transport="lan")
+    calls = []
+    monkeypatch.setattr(node, "_verify_discovered_peer",
+                        lambda *args, **kwargs: calls.append(args))
+
+    node._handle_lan_announcement("192.0.2.10", 41300, instance_id)
+    assert calls == []
+    node._handle_lan_announcement("192.0.2.11", 41300, instance_id)
+    assert len(calls) == 1
+
+
+def test_broadcast_update_from_second_nic_keeps_first_address(tmp_path):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    instance_id = "a" * 32
+    service = f"broadcast|{instance_id}"
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300, service_name=service,
+        hosts=["192.0.2.9"], instance_id=instance_id, transport="lan")
+    node._on_peer_added(
+        "Android", "192.0.2.10", 41300, service_name=service,
+        hosts=["192.0.2.10"], instance_id=instance_id, transport="lan")
+
+    peers = node.peers()
+    assert len(peers) == 1
+    assert peers[0].host == "192.0.2.10"
+    assert {"192.0.2.9", "192.0.2.10"} <= set(peers[0].hosts)
+
+
 def test_probe_hosts_keeps_timeout_classification_regardless_of_order(
         tmp_path, monkeypatch):
     node = P2PNode(P2PConfig(

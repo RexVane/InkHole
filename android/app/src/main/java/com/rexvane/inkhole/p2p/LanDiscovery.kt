@@ -152,6 +152,8 @@ internal class LanBroadcastDiscovery(
          */
         private const val BURST_COUNT = 5
         private const val BURST_GAP_MS = 150L
+        /** 等 goodbye 真正发出去的上限；超时就放弃，探活循环兜底。 */
+        private const val GOODBYE_FLUSH_MS = 300L
     }
 
     @Volatile private var socket: DatagramSocket? = null
@@ -218,7 +220,19 @@ internal class LanBroadcastDiscovery(
         } catch (_: Exception) {
             return
         }
-        sendToAll(opened, payload)
+        // stop() 从 Service 主线程进来；UDP send 在主线程会抛
+        // NetworkOnMainThreadException 且被 sendToAll 静默吞掉，快速下线
+        // 随之失效。放到独立线程发送，并短暂等待让包在 socket 关闭前离开。
+        val sender = Thread {
+            sendToAll(opened, payload)
+        }
+        sender.isDaemon = true
+        sender.start()
+        try {
+            sender.join(GOODBYE_FLUSH_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     fun stop() {

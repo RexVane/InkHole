@@ -252,6 +252,9 @@ class InkHoleNode(
     private val pendingDiscoveryProbes = ConcurrentHashMap.newKeySet<String>()
     private val pendingGoodbyeProbes = ConcurrentHashMap.newKeySet<String>()
     private val goodbyeProbeTimes = ConcurrentHashMap<String, Long>()
+
+    /** addPeer 的 expectedGeneration 默认值：区分"未传入期望"与"期望当时不存在(null)"。 */
+    private object GenerationUnset
     @Volatile private var selectedPeer: String? = null   // 显示名
     @Volatile private var lastSelectedService: String? = null  // 智能保留：记住选中设备的 serviceName
     @Volatile private var running = false
@@ -1694,13 +1697,20 @@ class InkHoleNode(
                         capabilities: Set<String> = emptySet(), manual: Boolean = false,
                         transport: String = if (manual) "tailscale" else "lan",
                         endpointToken: String = "", publicKey: String = "",
-                        identityFingerprint: String = "") {
+                        identityFingerprint: String = "",
+                        expectedGeneration: Any? = GenerationUnset) {
         var added = false
         var finalName: String
         synchronized(peersLock) {
             // Async discovery/probe callbacks can race stop(). Never let an old
             // node repopulate the UI after the stop path cleared its peer map.
             if (!running) return
+            if (expectedGeneration !== GenerationUnset &&
+                deviceEntryLocked(serviceName, instanceId, manual) !== expectedGeneration) {
+                // The endpoint was refreshed while this probe was in flight; a
+                // newer write already holds fresher state than this result.
+                return
+            }
             val baseName = ReceiveFiles.utf8Prefix(
                 displayName.filterNot { it.isISOControl() }.trim(),
                 200,
@@ -1762,6 +1772,17 @@ class InkHoleNode(
         if (added) listener.onStatus("发现: $finalName")
         listener.onPeerChanged(getPeers())
     }
+
+    /** 当前代表该设备的 Peer 对象（须持 peersLock）。与 addPeer 的更新分支
+     *  用同一匹配规则；返回的对象即"端点代次"。 */
+    private fun deviceEntryLocked(serviceName: String, instanceId: String,
+                                  manual: Boolean): Peer? =
+        peers[serviceName]
+            ?: if (instanceId.isNotEmpty() && !manual) {
+                peers.values.firstOrNull {
+                    it.transport == "lan" && it.instanceId == instanceId
+                }
+            } else null
 
     /** 将共享传输核心暴露的已认证 loopback 端点加入普通发送目标列表。 */
     fun upsertExternalPeer(
@@ -2174,6 +2195,11 @@ class InkHoleNode(
         // 表现为对端明明关了却一直显示在线。可达性标准与探活循环一致:仅认
         // 当前 WiFi/以太网可达的地址,不给 Tailscale 等 VPN 路径兜底的机会。
         if (!pendingDiscoveryProbes.add(discoveryName)) return
+        // 记录探测出发时的端点代次。探测往返期间换网/广播验证可能已把该设备
+        // 刷新到新地址；迟到的旧结果不得把 Host/Port 回滚到刚离开的地址。
+        val dispatchedGeneration = synchronized(peersLock) {
+            deviceEntryLocked(discoveryName, txtInstanceId, manual = false)
+        }
         scope.launch {
             try {
                 val candidates = LanReachability.discoveryCandidates(
@@ -2186,7 +2212,8 @@ class InkHoleNode(
                 if (running) addPeer(
                     discoveryName, result.peerName, result.connectedAddress, port,
                     hostList, result.instanceId, result.capabilities, manual = false,
-                    publicKey = result.publicKey, identityFingerprint = result.fingerprint)
+                    publicKey = result.publicKey, identityFingerprint = result.fingerprint,
+                    expectedGeneration = dispatchedGeneration)
             } finally {
                 pendingDiscoveryProbes.remove(discoveryName)
             }

@@ -297,8 +297,12 @@ func (d *Discovery) handleAnnouncement(host string, announcement *Announcement) 
 	key := "broadcast|" + announcement.InstanceID
 	d.mu.Lock()
 	for _, peer := range d.peers {
+		// Compare against every verified address, not just the primary one:
+		// a multi-homed device announces from each NIC in turn, and treating
+		// the second NIC as news would re-verify and flip the endpoint forever.
 		if peer.InstanceID == announcement.InstanceID &&
-			peer.Host == host && peer.Port == announcement.Port {
+			peer.Port == announcement.Port &&
+			stringInSlice(host, append([]string{peer.Host}, peer.Hosts...)) {
 			d.mu.Unlock()
 			return
 		}
@@ -371,6 +375,11 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 			delete(d.goodbyeInFlight, snapshot.InstanceID)
 			if _, current := d.peerByInstanceLocked(snapshot.InstanceID); current == nil {
 				delete(d.goodbyeLast, snapshot.InstanceID)
+			} else {
+				// The cooldown counts from completion. A verification that ran
+				// longer than the cooldown itself must not let the very next
+				// goodbye start another expensive probe immediately.
+				d.goodbyeLast[snapshot.InstanceID] = time.Now()
 			}
 			d.mu.Unlock()
 		}()
@@ -412,6 +421,12 @@ func (d *Discovery) verifyCandidate(key, name string, hosts []string,
 		return
 	}
 	d.verinstr[key] = true
+	// Snapshot the endpoint generations this probe departs from. The network
+	// round-trip takes long enough for a Wi-Fi handover to land a fresh
+	// endpoint in the map; a result computed against the old world must then
+	// be discarded, or it rolls Host/Port back to the address just left.
+	dispatchKeyPeer := d.peers[key]
+	_, dispatchInstancePeer := d.peerByInstanceLocked(instanceID)
 	d.wg.Add(1)
 	d.mu.Unlock()
 	go func() {
@@ -435,6 +450,12 @@ func (d *Discovery) verifyCandidate(key, name string, hosts []string,
 		changed := false
 		if existingKey, existing := d.peerByInstanceLocked(result.InstanceID); existing != nil &&
 			existingKey != key {
+			if existing != dispatchInstancePeer {
+				// The entry was refreshed or replaced while this probe was in
+				// flight; the newer write already holds fresher endpoint state.
+				d.mu.Unlock()
+				return
+			}
 			// The same device already entered through the other discovery
 			// source (mDNS vs broadcast). Merge addresses instead of showing
 			// a duplicate entry.
@@ -458,18 +479,30 @@ func (d *Discovery) verifyCandidate(key, name string, hosts []string,
 			}
 			delete(d.strike, existingKey)
 		} else {
+			current := d.peers[key]
+			if current != dispatchKeyPeer {
+				// Same generation rule as above, for the direct-key path.
+				d.mu.Unlock()
+				return
+			}
+			hostsUnion := addresses
+			if current != nil && current.InstanceID == result.InstanceID {
+				// A multi-homed device is verified once per NIC. Each pass adds
+				// the address it came through; none may erase the others.
+				hostsUnion = dedupeStrings(append(addresses, current.Hosts...))
+			}
 			fresh := &Peer{
 				InstanceID:   result.InstanceID,
 				Name:         firstNonEmpty(result.PeerName, name),
 				Host:         connected,
-				Hosts:        addresses,
+				Hosts:        hostsUnion,
 				Port:         port,
 				Capabilities: result.Capabilities,
 				PublicKey:    result.PublicKey,
 				Fingerprint:  result.Fingerprint,
 				ServiceName:  key,
 			}
-			if current, ok := d.peers[key]; !ok || !samePeer(current, fresh) {
+			if current == nil || !samePeer(current, fresh) {
 				d.peers[key] = fresh
 				changed = true
 			}

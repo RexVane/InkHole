@@ -632,6 +632,10 @@ def _same_peer_info(left: PeerInfo, right: PeerInfo) -> bool:
                for field in PeerInfo.__slots__)
 
 
+# 区分"未传入代次期望"与"期望设备当时不存在(None)"的哨兵值。
+_GENERATION_UNSET = object()
+
+
 def _service_label(name: str, instance_id: str) -> str:
     """mDNS 服务实例标签：显示名 + 实例 ID 后缀，保证局域网内唯一。
 
@@ -1484,8 +1488,12 @@ class P2PNode:
     def _handle_lan_announcement(
             self, host: str, port: int, instance_id: str) -> None:
         with self._lock:
+            # 多网卡设备会从每块网卡各广播一次。只要来源地址已经在该设备的
+            # 任一已验证地址里，就不是新信息；只比较主地址会让两块网卡的
+            # 通告互相触发重验证，主地址来回翻转。
             if any(p.transport == "lan" and p.instance_id == instance_id
-                   and p.host == host and p.port == port
+                   and p.port == port
+                   and host in ([p.host] + list(p.hosts or []))
                    for p in self._peers.values()):
                 return
         self._verify_discovered_peer(
@@ -1496,20 +1504,30 @@ class P2PNode:
         """Handle goodbye message: probe to confirm departure before removing."""
         with self._lock:
             peer_key = None
-            peer_port = None
-            peer_hosts = []
             peer_snapshot = None
             for key, peer in self._peers.items():
                 if (peer.transport == "lan" and
                     peer.instance_id == instance_id and
                     host in ([peer.host] + list(peer.hosts or []))):
                     peer_key = key
-                    peer_port = peer.port  # Use verified port, not UDP packet
-                    peer_hosts = [peer.host] + list(peer.hosts or [])
                     peer_snapshot = peer
                     break
             if peer_key is None:
                 return  # Unknown peer
+        self._confirm_departure_then_remove(peer_key, peer_snapshot)
+
+    def _confirm_departure_then_remove(
+            self, peer_key: str, peer_snapshot: "PeerInfo") -> None:
+        """未认证的离开提示（goodbye / mDNS 下线事件）只有探测确认才生效。
+
+        只有明确拒绝或身份不匹配才移除；超时仍然歧义（息屏手机与已离线
+        的手机产生同样的沉默），交给常规 strike 策略。同一设备 500ms 内
+        最多一次昂贵探测，且探测期间的重复提示直接合并。
+        """
+        instance_id = peer_snapshot.instance_id
+        peer_port = peer_snapshot.port  # 已验证端口，而非提示包里的端口
+        peer_hosts = [peer_snapshot.host] + list(peer_snapshot.hosts or [])
+        with self._lock:
             now = time.monotonic()
             if (instance_id in self._pending_goodbye_probes or
                     now - self._goodbye_probe_times.get(instance_id, 0.0) < 0.5):
@@ -1519,9 +1537,6 @@ class P2PNode:
 
         def worker() -> None:
             try:
-                # Only definite refusal (ECONNREFUSED/EHOSTUNREACH) or an
-                # identity mismatch confirms departure. Timeouts remain
-                # ambiguous because a sleeping phone produces the same result.
                 should_remove = False
                 try:
                     self._probe_hosts(
@@ -2559,20 +2574,46 @@ class P2PNode:
                 self._last_selected_service = peer.service_name
         self._status(f"目标: {name}" if name else "未选择目标")
 
+    def _device_entry_locked(self, service_name: str,
+                             instance_id: str) -> "PeerInfo | None":
+        """当前代表该设备的 PeerInfo 对象（调用方须持有 self._lock）。
+
+        匹配规则与 _on_peer_added 的更新分支一致：service_name 精确匹配，
+        或 LAN 传输下 instance_id 相同。返回的对象即"端点代次"。
+        """
+        if not service_name:
+            return None
+        for p in self._peers.values():
+            same_lan_identity = (bool(instance_id)
+                                 and p.instance_id == instance_id
+                                 and p.transport == "lan")
+            if p.service_name == service_name or same_lan_identity:
+                return p
+        return None
+
     def _on_peer_added(self, name: str, host: str, port: int, service_name: str = "",
                        hosts: list[str] | None = None, instance_id: str = "",
                        capabilities: set[str] | frozenset[str] | None = None,
                        manual: bool = False, transport: str = "",
                        endpoint_token: str = "", public_key: str = "",
-                       identity_fingerprint: str = "") -> None:
+                       identity_fingerprint: str = "",
+                       expected_generation: "PeerInfo | None | object" = _GENERATION_UNSET,
+                       ) -> None:
         """mDNS 发现新节点时调用（由 _InkHoleListener 触发）。
 
         - 同一服务(service_name 相同)重复通告/地址变化：原地更新，不新增条目。
         - 不同设备撞了显示名：给后来者加 " (2)" 后缀，两台都能选。
         - 智能保留：若新上线设备的 service_name 匹配之前选中的，自动恢复选择。
+        - expected_generation：探测发起时该设备的 PeerInfo 对象（无则 None）。
+          写回时若对象已被替换，说明有更新的写入发生在探测期间，本结果作废。
         """
         display_name = name  # 最终显示名（可能带后缀）
         with self._lock:
+            if expected_generation is not _GENERATION_UNSET:
+                current_generation = self._device_entry_locked(
+                    service_name, instance_id)
+                if current_generation is not expected_generation:
+                    return
             updated = False
             if service_name:
                 for peer_key, p in list(self._peers.items()):
@@ -2587,8 +2628,16 @@ class P2PNode:
                                and display_name != peer_key):
                             display_name = f"{name} ({suffix})"
                             suffix += 1
+                        merged_hosts = hosts
+                        if (service_name.startswith("broadcast|")
+                                and instance_id
+                                and p.instance_id == instance_id):
+                            # 多网卡设备逐网卡广播，每次验证只带来它经过的
+                            # 那个地址；不能抹掉其他网卡已验证的地址。
+                            merged_hosts = list(dict.fromkeys(
+                                list(hosts or []) + list(p.hosts or [])))
                         fresh = PeerInfo(display_name, host, port,
-                                         stable_service_name, hosts,
+                                         stable_service_name, merged_hosts,
                                          instance_id, capabilities, manual,
                                          transport, endpoint_token, public_key,
                                          identity_fingerprint)
@@ -2717,9 +2766,15 @@ class P2PNode:
                 if fallback in self._peers and not self._peers[fallback].service_name:
                     display = fallback
                     expected_peer = self._peers[fallback]
-        if display is None:
+        if display is None or expected_peer is None:
             return
-        self._on_peer_removed(display, expected_peer=expected_peer)
+        # mDNS 下线事件滞后于现实：广播/探活可能早已把该设备刷新到新地址，
+        # 此刻按事件直接删除会清掉确认在线的设备。与 goodbye 同样处理——
+        # 事件只是提示，探测确认到明确拒绝或身份变化才移除。
+        if expected_peer.instance_id:
+            self._confirm_departure_then_remove(display, expected_peer)
+        else:
+            self._on_peer_removed(display, expected_peer=expected_peer)
 
     # ---------- 手动设备(Tailscale/固定 IP 直连) ----------
     @staticmethod
@@ -2848,6 +2903,12 @@ class P2PNode:
             if service_name in self._pending_discovery_probes:
                 return
             self._pending_discovery_probes[service_name] = token
+            # Snapshot the endpoint generation this probe departs from. The
+            # round-trip is long enough for a Wi-Fi handover to land a fresh
+            # endpoint; a result computed against the old world must then be
+            # discarded, or it rolls host/port back to the address just left.
+            dispatched_generation = self._device_entry_locked(
+                service_name, instance_id)
 
         def worker() -> None:
             try:
@@ -2863,7 +2924,8 @@ class P2PNode:
                         result.peer_name or name, result.connected_address, port, service_name,
                         addresses, result.instance_id, result.capabilities, False,
                         public_key=result.public_key,
-                        identity_fingerprint=result.fingerprint)
+                        identity_fingerprint=result.fingerprint,
+                        expected_generation=dispatched_generation)
                     if not service_name.startswith("hint|"):
                         self._send_lan_hint(result.connected_address, port)
             except OSError:
