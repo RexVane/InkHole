@@ -215,14 +215,20 @@ def _encode_lan_announcement(
     """Encode the small unauthenticated hint used when hotspots block mDNS."""
     if not _valid_instance_id(instance_id) or not 1 <= int(port) <= 65535:
         raise ValueError("invalid LAN discovery announcement")
-    return json.dumps({
+    message = {
         "magic": _LAN_DISCOVERY_MAGIC,
         "version": _CAP_VERSION,
         "instance_id": str(instance_id).lower(),
         "port": int(port),
         "reply": bool(reply),
-        "bye": bool(bye),
-    }, separators=(",", ":"), sort_keys=True).encode("ascii")
+    }
+    # Preserve the exact v3 wire format for ordinary announcements. Older
+    # peers ignore unknown fields, but byte stability keeps cross-language
+    # vectors and packet captures useful during mixed-version diagnostics.
+    if bye:
+        message["bye"] = True
+    return json.dumps(
+        message, separators=(",", ":"), sort_keys=True).encode("ascii")
 
 
 def _decode_lan_announcement(payload: bytes) -> tuple[str, int, bool, bool] | None:
@@ -619,6 +625,12 @@ class PeerInfo:
 
     def __str__(self):
         return f"{self.name} ({self.host})"
+
+
+def _same_peer_info(left: PeerInfo, right: PeerInfo) -> bool:
+    return all(getattr(left, field) == getattr(right, field)
+               for field in PeerInfo.__slots__)
+
 
 def _service_label(name: str, instance_id: str) -> str:
     """mDNS 服务实例标签：显示名 + 实例 ID 后缀，保证局域网内唯一。
@@ -1189,6 +1201,8 @@ class P2PNode:
         self._probe_thread: threading.Thread | None = None
         self._probe_wake = threading.Event()
         self._pending_discovery_probes: dict[str, object] = {}
+        self._pending_goodbye_probes: set[str] = set()
+        self._goodbye_probe_times: dict[str, float] = {}
         self._identity_errors: set[str] = set()
 
         if cfg.active_secret:
@@ -1484,6 +1498,7 @@ class P2PNode:
             peer_key = None
             peer_port = None
             peer_hosts = []
+            peer_snapshot = None
             for key, peer in self._peers.items():
                 if (peer.transport == "lan" and
                     peer.instance_id == instance_id and
@@ -1491,28 +1506,48 @@ class P2PNode:
                     peer_key = key
                     peer_port = peer.port  # Use verified port, not UDP packet
                     peer_hosts = [peer.host] + list(peer.hosts or [])
+                    peer_snapshot = peer
                     break
             if peer_key is None:
                 return  # Unknown peer
+            now = time.monotonic()
+            if (instance_id in self._pending_goodbye_probes or
+                    now - self._goodbye_probe_times.get(instance_id, 0.0) < 0.5):
+                return
+            self._pending_goodbye_probes.add(instance_id)
+            self._goodbye_probe_times[instance_id] = now
 
-        # Probe to confirm the peer is really gone. Only definite refusal
-        # (ECONNREFUSED/EHOSTUNREACH) or identity mismatch confirms departure;
-        # timeouts are ambiguous (sleeping phone vs offline).
-        should_remove = False
-        try:
-            self._probe_hosts(peer_hosts, peer_port, _LAN_PROBE_TIMEOUT, instance_id)
-            # If probe succeeds, peer is still alive - ignore goodbye
-        except _IdentityMismatch:
-            should_remove = True
-        except OSError as exc:
-            should_remove = _is_definite_refusal(exc)
-        except Exception:
-            return
+        def worker() -> None:
+            try:
+                # Only definite refusal (ECONNREFUSED/EHOSTUNREACH) or an
+                # identity mismatch confirms departure. Timeouts remain
+                # ambiguous because a sleeping phone produces the same result.
+                should_remove = False
+                try:
+                    self._probe_hosts(
+                        peer_hosts, peer_port, _LAN_PROBE_TIMEOUT, instance_id)
+                except _IdentityMismatch:
+                    should_remove = True
+                except OSError as exc:
+                    should_remove = _is_definite_refusal(exc)
+                except Exception:
+                    return
 
-        if should_remove:
-            # Re-check the signed identity under the lock. The display-name key
-            # may have been reused while the network probe was in flight.
-            self._on_peer_removed(peer_key, expected_instance_id=instance_id)
+                if should_remove:
+                    # Object identity is the endpoint generation: the same
+                    # persistent instance id may have reconnected elsewhere.
+                    self._on_peer_removed(
+                        peer_key, expected_peer=peer_snapshot)
+            finally:
+                with self._lock:
+                    self._pending_goodbye_probes.discard(instance_id)
+                    if any(peer.instance_id == instance_id
+                           for peer in self._peers.values()):
+                        self._goodbye_probe_times[instance_id] = time.monotonic()
+                    else:
+                        self._goodbye_probe_times.pop(instance_id, None)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def stop(self) -> None:
         """停止：注销 mDNS + 关闭 TCP 监听。"""
@@ -2559,7 +2594,9 @@ class P2PNode:
                                          identity_fingerprint)
                         if display_name != peer_key:
                             del self._peers[peer_key]
-                        self._peers[display_name] = fresh
+                            self._peers[display_name] = fresh
+                        elif not _same_peer_info(p, fresh):
+                            self._peers[display_name] = fresh
                         if self._selected_peer == peer_key:
                             self._selected_peer = display_name
                         updated = True
@@ -2589,7 +2626,8 @@ class P2PNode:
             self.on_peers_changed()
 
     def _on_peer_removed(self, name: str,
-                         expected_instance_id: str = "") -> None:
+                         expected_instance_id: str = "",
+                         expected_peer: PeerInfo | None = None) -> bool:
         """按显示名移除节点(离线)。
 
         智能保留：离线时清空 _selected_peer（避免向已离线设备发送），
@@ -2598,19 +2636,28 @@ class P2PNode:
         expected_instance_id = expected_instance_id.lower()
         with self._lock:
             current = self._peers.get(name)
+            if expected_peer is not None and current is not expected_peer:
+                return False
             if (expected_instance_id and
                     (current is None or
                      current.instance_id != expected_instance_id)):
-                return
-            if name in self._peers:
-                del self._peers[name]
+                return False
+            if current is None:
+                return False
+            del self._peers[name]
             if self._selected_peer == name:
                 self._selected_peer = None    # 清空当前选择，但保留 _last_selected_service
+
+            if (current.instance_id and
+                    not any(peer.instance_id == current.instance_id
+                            for peer in self._peers.values())):
+                self._goodbye_probe_times.pop(current.instance_id, None)
 
         self._status(f"{name} 离线")
 
         if self.on_peers_changed:
             self.on_peers_changed()
+        return True
 
     # ---------- 外部传输核心端点（短码 / SSH） ----------
     def upsert_external_peer(self, peer_id: str, name: str, host: str, port: int,
@@ -2653,10 +2700,12 @@ class P2PNode:
         with self._lock:
             self._pending_discovery_probes.pop(service_name, None)
         display = None
+        expected_peer = None
         with self._lock:
             for n, p in self._peers.items():
                 if p.service_name == service_name:
                     display = n
+                    expected_peer = p
                     break
         if display is None:
             # Directly injected/test peers may not carry a service key.
@@ -2667,9 +2716,10 @@ class P2PNode:
             with self._lock:
                 if fallback in self._peers and not self._peers[fallback].service_name:
                     display = fallback
+                    expected_peer = self._peers[fallback]
         if display is None:
             return
-        self._on_peer_removed(display)
+        self._on_peer_removed(display, expected_peer=expected_peer)
 
     # ---------- 手动设备(Tailscale/固定 IP 直连) ----------
     @staticmethod
@@ -2739,14 +2789,15 @@ class P2PNode:
     def _probe_hosts(self, hosts: list[str], port: int, timeout: float,
                      expected_instance_id: str = "") -> _ProbeResult:
         last_error: OSError | None = None
+        identity_error: _IdentityMismatch | None = None
         tailnet_error: _TailnetUnavailable | None = None
         saw_definite_refusal = False
         saw_timeout = False
         for host in hosts:
             try:
                 return _probe_peer(host, port, timeout, expected_instance_id)
-            except _IdentityMismatch:
-                raise
+            except _IdentityMismatch as exc:
+                identity_error = exc
             except _TailnetUnavailable as exc:
                 tailnet_error = exc
             except OSError as exc:
@@ -2755,14 +2806,16 @@ class P2PNode:
                     saw_definite_refusal = True
                 else:
                     saw_timeout = True
-        if tailnet_error is not None:
-            raise tailnet_error
         # Preserve error classification: if any address timed out, the failure
         # is ambiguous and should not trigger fast eviction. Only raise the
         # definite error if ALL addresses gave definite refusals.
         if saw_timeout:
             # At least one timeout - treat as ambiguous regardless of other errors
             raise TimeoutError("部分地址超时，设备可能仍在线")
+        if tailnet_error is not None:
+            raise tailnet_error
+        if identity_error is not None:
+            raise identity_error
         # All addresses gave definite refusals - raise the last error
         raise last_error if last_error else OSError("目标设备没有可用地址")
 
@@ -2825,7 +2878,9 @@ class P2PNode:
     # ---------- 对端存活探测 ----------
     def _probe_loop(self) -> None:
         """WHPC v3 liveness loop for verified discovered and manual peers."""
-        strikes: dict[str, int] = {}   # service_name(或显示名) -> 连续失败轮数
+        # Pair failures with the exact peer object. Reusing a display
+        # or service key for a refreshed endpoint must reset the old count.
+        strikes: dict[str, tuple[PeerInfo, int]] = {}
         while self._running:
             with self._lock:
                 # SSH/短码回环端点由跨网核心维护；LAN 子网过滤会固定排除
@@ -2855,26 +2910,40 @@ class P2PNode:
                 try:
                     result = self._probe_hosts(
                         hosts, peer.port, probe_timeout, expected)
+                    with self._lock:
+                        if self._peers.get(display) is not peer:
+                            strikes.pop(key, None)
+                            continue
                     if entry is not None:
                         self._bind_manual_identity(entry, result)
                         addresses = _resolved_addresses([str(entry["host"])])
                         if result.connected_address not in addresses:
                             addresses.insert(0, result.connected_address)
-                        peer.host = result.connected_address
-                        peer.hosts = addresses
-                    peer.instance_id = result.instance_id
-                    peer.capabilities = result.capabilities
-                    peer.public_key = result.public_key
-                    peer.identity_fingerprint = result.fingerprint
+                    else:
+                        addresses = list(peer.hosts)
+                    with self._lock:
+                        if self._peers.get(display) is not peer:
+                            strikes.pop(key, None)
+                            continue
+                        fresh = PeerInfo(
+                            peer.name, result.connected_address, peer.port,
+                            peer.service_name, addresses, result.instance_id,
+                            result.capabilities, peer.manual, peer.transport,
+                            peer.endpoint_token, result.public_key,
+                            result.fingerprint)
+                        if not _same_peer_info(peer, fresh):
+                            self._peers[display] = fresh
                     strikes.pop(key, None)
                     self._identity_errors.discard(key)
                     continue
                 except _IdentityMismatch as exc:
                     strikes.pop(key, None)
+                    removed = self._on_peer_removed(display, expected_peer=peer)
+                    if not removed:
+                        continue
                     report_error = key not in self._identity_errors
                     if report_error:
                         self._identity_errors.add(key)
-                    self._on_peer_removed(display)
                     if report_error:
                         self._status(f"{display} 身份验证失败", str(exc))
                     continue
@@ -2887,11 +2956,14 @@ class P2PNode:
                              else 1 if definite_refusal  # 连接被拒/不可达立即下线
                              else self._probe_strikes * 2
                              if is_manual else self._probe_strikes)
-                if strikes.get(key, 0) + 1 >= threshold:
+                previous = strikes.get(key)
+                failures = (previous[1] if previous is not None and
+                            previous[0] is peer else 0) + 1
+                if failures >= threshold:
                     strikes.pop(key, None)
-                    self._on_peer_removed(display)
+                    self._on_peer_removed(display, expected_peer=peer)
                 else:
-                    strikes[key] = strikes.get(key, 0) + 1
+                    strikes[key] = (peer, failures)
             # 已经不在对端表里的条目不再计数(正常离线/被 mDNS 先移除)
             for k in list(strikes):
                 if k not in seen:

@@ -121,6 +121,8 @@ private class ReceiverRejectedException(message: String) : IOException(message)
 
 private data class ProbeOutcome(
     val key: String,
+    /** Exact map value that was probed; replacement entries must ignore this result. */
+    val peer: Peer,
     val manual: Boolean,
     val result: PeerProbeResult? = null,
     val identityError: String? = null,
@@ -248,6 +250,8 @@ class InkHoleNode(
     // onServiceLost 误报兜底：正在 TCP 探活确认的 serviceName，避免并发重复探活
     private val probingLost = java.util.Collections.synchronizedSet(HashSet<String>())
     private val pendingDiscoveryProbes = ConcurrentHashMap.newKeySet<String>()
+    private val pendingGoodbyeProbes = ConcurrentHashMap.newKeySet<String>()
+    private val goodbyeProbeTimes = ConcurrentHashMap<String, Long>()
     @Volatile private var selectedPeer: String? = null   // 显示名
     @Volatile private var lastSelectedService: String? = null  // 智能保留：记住选中设备的 serviceName
     @Volatile private var running = false
@@ -501,9 +505,9 @@ class InkHoleNode(
                         listOf(peer.host) + peer.hosts,
                         departed,
                     )
-                }.keys.toList()
+                }.map { (key, peer) -> key to peer }
             }
-            stranded.forEach(::removePeer)
+            stranded.forEach { (key, peer) -> removePeer(key, peer) }
         }
         restartDiscovery()
         if (running) listener.onStatus("网络已切换，正在重新发现设备")
@@ -560,7 +564,9 @@ class InkHoleNode(
      *  自动发现误移除后重启 NSD 浏览器,手动设备探活成功后自动加回。 */
     private fun startProbeLoop() {
         scope.launch {
-            val strikes = HashMap<String, Int>()
+            // Keep the exact immutable Peer beside its count. Reusing a map key
+            // for a refreshed endpoint must reset failures from the old object.
+            val strikes = HashMap<String, Pair<Peer, Int>>()
             while (running) {
                 // 获取当前所有已知对端的探活目标(key、hosts、port)
                 val targets = synchronized(peersLock) {
@@ -591,16 +597,16 @@ class InkHoleNode(
                         }
                         val expected = manualPeer?.instanceId ?: peer.instanceId
                         try {
-                            ProbeOutcome(key, isManual,
+                            ProbeOutcome(key, peer, isManual,
                                 result = probePeer(probeHosts, peer.port, timeout, expected))
                         } catch (e: IdentityMismatchException) {
-                            ProbeOutcome(key, isManual, identityError = e.message)
+                            ProbeOutcome(key, peer, isManual, identityError = e.message)
                         } catch (_: TailnetUnavailableException) {
-                            ProbeOutcome(key, isManual, tailnetUnavailable = true)
+                            ProbeOutcome(key, peer, isManual, tailnetUnavailable = true)
                         } catch (_: PeerRefusedException) {
-                            ProbeOutcome(key, isManual, refused = true)
+                            ProbeOutcome(key, peer, isManual, refused = true)
                         } catch (_: Exception) {
-                            ProbeOutcome(key, isManual)
+                            ProbeOutcome(key, peer, isManual)
                         }
                     }
                 }.awaitAll()
@@ -611,12 +617,18 @@ class InkHoleNode(
                     val key = outcome.key
                     val isManual = outcome.manual
                     val result = outcome.result
-                    val present = synchronized(peersLock) { peers.containsKey(key) }
-                    if (!present) continue  // 已被其他逻辑移除,跳过
+                    val currentIsSnapshot = synchronized(peersLock) {
+                        peers[key] === outcome.peer
+                    }
+                    if (!currentIsSnapshot) {
+                        // The key was removed or re-used while the socket probe
+                        // was running. Do not carry old failures into the new peer.
+                        strikes.remove(key)
+                        continue
+                    }
                     if (outcome.identityError != null) {
                         strikes.remove(key)
-                        removePeer(key)
-                        if (identityErrors.add(key)) {
+                        if (removePeer(key, outcome.peer) && identityErrors.add(key)) {
                             listener.onStatus("设备身份验证失败: ${outcome.identityError}")
                         }
                         continue
@@ -630,31 +642,30 @@ class InkHoleNode(
                     }
 
                     if (result == null) {
-                        val s = (strikes[key] ?: 0) + 1
+                        val previous = strikes[key]
+                            ?.takeIf { (peer, _) -> peer === outcome.peer }
+                            ?.second ?: 0
+                        val s = previous + 1
                         if (s >= threshold) {
                             strikes.remove(key)
-                            removePeer(key)
-                            if (!isManual) autoRemovedThisRound = true
+                            val removed = removePeer(key, outcome.peer)
+                            if (removed && !isManual) autoRemovedThisRound = true
                         } else {
-                            strikes[key] = s
+                            strikes[key] = outcome.peer to s
                         }
                     } else {
-                        strikes.remove(key)
-                        identityErrors.remove(key)
-                        synchronized(peersLock) {
-                            peers[key]?.let { current ->
-                                val addresses = if (isManual) {
-                                    val configured = manualByKey[key]
-                                    configured?.let {
-                                        resolveHostAddresses(it.host).toMutableList().apply {
-                                            if (result.connectedAddress !in this) {
-                                                add(0, result.connectedAddress)
-                                            }
-                                        }
-                                    }
-                                        ?: current.hosts
-                                } else current.hosts
-                                peers[key] = current.copy(
+                        val configured = if (isManual) manualByKey[key] else null
+                        val manualAddresses = configured?.let {
+                            resolveHostAddresses(it.host).toMutableList().apply {
+                                if (result.connectedAddress !in this) {
+                                    add(0, result.connectedAddress)
+                                }
+                            }
+                        }
+                        val updated = synchronized(peersLock) {
+                            peers[key]?.takeIf { it === outcome.peer }?.let { current ->
+                                val addresses = manualAddresses ?: current.hosts
+                                val fresh = current.copy(
                                     host = result.connectedAddress,
                                     hosts = addresses.distinct(),
                                     instanceId = result.instanceId,
@@ -662,7 +673,13 @@ class InkHoleNode(
                                     publicKey = result.publicKey,
                                     identityFingerprint = result.fingerprint,
                                 )
+                                if (fresh != current) peers[key] = fresh
+                                true
                             }
+                        } == true
+                        if (updated) {
+                            strikes.remove(key)
+                            identityErrors.remove(key)
                         }
                     }
                 }
@@ -759,6 +776,8 @@ class InkHoleNode(
             try { socket.close() } catch (_: IOException) {}
         }
         activeProbeSockets.clear()
+        pendingGoodbyeProbes.clear()
+        goodbyeProbeTimes.clear()
         actualPort = 0
         resolveQueue.clear()
         resolving.set(false)
@@ -1679,6 +1698,9 @@ class InkHoleNode(
         var added = false
         var finalName: String
         synchronized(peersLock) {
+            // Async discovery/probe callbacks can race stop(). Never let an old
+            // node repopulate the UI after the stop path cleared its peer map.
+            if (!running) return
             val baseName = ReceiveFiles.utf8Prefix(
                 displayName.filterNot { it.isISOControl() }.trim(),
                 200,
@@ -1704,7 +1726,7 @@ class InkHoleNode(
             if (existing != null && existingKey != null) {
                 // 同一服务重新解析：同步地址和对端改名，并保持选中状态。
                 finalName = uniqueName(existingKey)
-                peers[existingKey] = existing.copy(
+                val fresh = existing.copy(
                     name = finalName,
                     host = host,
                     port = port,
@@ -1717,6 +1739,7 @@ class InkHoleNode(
                     publicKey = publicKey,
                     identityFingerprint = identityFingerprint,
                 )
+                if (fresh != existing) peers[existingKey] = fresh
                 if (selectedPeer == existing.name &&
                     lastSelectedService == existing.serviceName) {
                     selectedPeer = finalName
@@ -1781,22 +1804,32 @@ class InkHoleNode(
         removePeer("external|${transport.trim().lowercase()}|${peerId.trim()}")
     }
 
-    private fun removePeer(serviceName: String) {
-        val removed = synchronized(peersLock) { peers.remove(serviceName) } ?: return
+    private fun removePeer(serviceName: String, expected: Peer? = null): Boolean {
+        val removed = synchronized(peersLock) {
+            val current = peers[serviceName] ?: return@synchronized null
+            if (expected != null && current !== expected) return@synchronized null
+            peers.remove(serviceName)
+        } ?: return false
         if (selectedPeer == removed.name) selectedPeer = null
+        goodbyeProbeTimes.remove(removed.instanceId)
         listener.onPeerChanged(getPeers())
         listener.onStatus("${removed.name} 离线")
+        return true
     }
 
     /** onServiceLost 误报兜底：连续 TCP 探活都失败才真移除；任意一次连上视为误报忽略。
-     *  探活期间对端可能被重新发现(addPeer 更新 host/port)，故每次都重读最新地址。 */
+     *  Peer 对象是不可变的端点代次标记；探活期间若 addPeer 换入新对象，说明旧的
+     *  lost 事件已经过期，不能继续追踪并删除新端点。 */
     private fun verifyLostThenRemove(serviceName: String) {
         if (!probingLost.add(serviceName)) return   // 已在探活，避免并发重复
         scope.launch {
             try {
+                val original = synchronized(peersLock) { peers[serviceName] }
+                    ?: return@launch
                 repeat(LOST_PROBE_ATTEMPTS) { attempt ->
                     val peer = synchronized(peersLock) { peers[serviceName] }
                         ?: return@launch          // 已被别处移除，无需再探
+                    if (peer !== original) return@launch
                     val hosts = LanReachability.verifiedPeerCandidates(
                         (listOf(peer.host) + peer.hosts).distinct(),
                         currentLanLinks(),
@@ -1809,7 +1842,7 @@ class InkHoleNode(
                     if (attempt < LOST_PROBE_ATTEMPTS - 1) delay(LOST_PROBE_INTERVAL_MS)
                 }
                 // 连续都失败：确认真离线
-                removePeer(serviceName)
+                removePeer(serviceName, original)
             } finally {
                 probingLost.remove(serviceName)
             }
@@ -1911,12 +1944,16 @@ class InkHoleNode(
             futures.forEach { it.cancel(true) }
             localSockets.forEach { socket -> try { socket.close() } catch (_: Exception) {} }
         }
-        identityError?.let { throw it }
-        tailnetUnavailable?.let { throw it }
         val failure = lastError ?: IOException("目标设备没有可用地址")
+        // A timeout can still be the sleeping/temporarily unreachable copy of
+        // the expected device. Do not let a different stale address turn that
+        // ambiguous state into an immediate identity eviction.
+        if (sawSilence) throw failure
+        tailnetUnavailable?.let { throw it }
+        identityError?.let { throw it }
         // 每个地址都明确拒绝了我们，这是确定信息而不是猜测：调用方据此
         // 一轮就能下线，不必动用留给息屏设备的容忍轮数。
-        if (!sawSilence && lastError != null) throw PeerRefusedException(failure)
+        if (lastError != null) throw PeerRefusedException(failure)
         throw failure
     }
 
@@ -2174,24 +2211,41 @@ class InkHoleNode(
             }?.let { it.key to it.value }
         } ?: return
         val (key, peer) = target
+        val pendingKey = announcement.instanceId
+        val now = System.nanoTime()
+        val last = goodbyeProbeTimes[pendingKey]
+        if (last != null && now - last < TimeUnit.MILLISECONDS.toNanos(500)) return
+        if (!pendingGoodbyeProbes.add(pendingKey)) return
+        goodbyeProbeTimes[pendingKey] = now
         scope.launch {
-            val candidates = LanReachability.verifiedPeerCandidates(
-                peer.hosts, currentLanLinks(), peer.host)
-            val definitelyGone = try {
-                probePeer(candidates, peer.port, LAN_PROBE_TIMEOUT_MS,
-                    peer.instanceId)
-                false
-            } catch (_: PeerRefusedException) {
-                true
-            } catch (_: IdentityMismatchException) {
-                true
-            } catch (_: Exception) {
-                // A timeout remains ambiguous even after a goodbye: an
-                // unauthenticated packet must not bypass sleep tolerance.
-                probeNow()
-                false
+            try {
+                val candidates = LanReachability.verifiedPeerCandidates(
+                    peer.hosts, currentLanLinks(), peer.host)
+                val definitelyGone = try {
+                    probePeer(candidates, peer.port, LAN_PROBE_TIMEOUT_MS,
+                        peer.instanceId)
+                    false
+                } catch (_: PeerRefusedException) {
+                    true
+                } catch (_: IdentityMismatchException) {
+                    true
+                } catch (_: Exception) {
+                    // A timeout remains ambiguous even after a goodbye: an
+                    // unauthenticated packet must not bypass sleep tolerance.
+                    probeNow()
+                    false
+                }
+                if (definitelyGone && running) removePeer(key, peer)
+            } finally {
+                pendingGoodbyeProbes.remove(pendingKey)
+                if (synchronized(peersLock) {
+                        peers.values.any { it.instanceId == pendingKey }
+                    }) {
+                    goodbyeProbeTimes[pendingKey] = System.nanoTime()
+                } else {
+                    goodbyeProbeTimes.remove(pendingKey)
+                }
             }
-            if (definitelyGone && running) removePeer(key)
         }
     }
 

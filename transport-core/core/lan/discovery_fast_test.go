@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -383,6 +384,72 @@ func TestProbePeerHostsReturnsBeforeUnrelatedSlowCandidates(t *testing.T) {
 	}
 	if elapsed >= 500*time.Millisecond {
 		t.Fatalf("fast candidate was held behind slow work for %v", elapsed)
+	}
+}
+
+func TestProbePeerHostsValidIdentityWinsOverStaleMismatch(t *testing.T) {
+	wantedIdentity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleIdentity, err := GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantedID := randomInstanceID(t)
+	staleID := randomInstanceID(t)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	// macOS does not route the 127.0.0.2+ loopback aliases without manual
+	// ifconfig setup, so the stale and the valid endpoint cannot be told apart
+	// by address. Present the same address twice instead and let accept order
+	// decide: the first connection gets the stale identity, and only after
+	// that answer is on the wire may the second connection get the valid one.
+	mismatchAnswered := make(chan struct{})
+	var firstConn sync.Once
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+				head := make([]byte, len(capMagic))
+				if _, readErr := io.ReadFull(conn, head); readErr != nil ||
+					string(head) != capMagic {
+					return
+				}
+				stale := false
+				firstConn.Do(func() { stale = true })
+				if stale {
+					_ = RespondProbe(conn, staleIdentity, staleID,
+						"stale endpoint", []string{CapFolder})
+					close(mismatchAnswered)
+					return
+				}
+				<-mismatchAnswered
+				_ = RespondProbe(conn, wantedIdentity, wantedID,
+					"valid endpoint", []string{CapFolder})
+			}(conn)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	discovery := &Discovery{ctx: ctx, timeout: time.Second}
+	port := listener.Addr().(*net.TCPAddr).Port
+	result, connected, verdict := discovery.probePeerHosts(
+		[]string{"127.0.0.1", "127.0.0.1"}, port, wantedID, nil)
+	if verdict != hostAlive || result == nil || result.InstanceID != wantedID {
+		t.Fatalf("mixed candidates verdict=%v result=%#v", verdict, result)
+	}
+	if connected != "127.0.0.1" {
+		t.Fatalf("connected address = %q, want valid 127.0.0.1", connected)
 	}
 }
 

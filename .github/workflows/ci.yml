@@ -64,7 +64,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: desktop/frontend
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Build frontend
         working-directory: desktop/frontend

@@ -208,6 +208,9 @@ func (b *broadcaster) bump() {
 	case b.bumps <- struct{}{}:
 	default:
 	}
+	// The receive loop normally blocks for up to broadcastReadTimeout. Pull its
+	// deadline forward so a foreground/network-change refresh starts promptly.
+	_ = b.sock.SetReadDeadline(time.Now())
 }
 
 // sayGoodbye tells the segment we are leaving. Best effort by definition —
@@ -255,7 +258,10 @@ func (b *broadcaster) run(ctx context.Context) {
 	stop := context.AfterFunc(ctx, func() { _ = b.sock.Close() })
 	defer stop()
 	buf := make([]byte, broadcastMaxPacket+1)
-	var nextAnnounce time.Time
+	// Start on the quiet cadence. Discovery.Start immediately calls Refresh,
+	// which queues the first five-packet burst; an unconditional send here could
+	// race ahead of that bump and turn the configured five packets into six.
+	nextAnnounce := time.Now().Add(broadcastInterval)
 	burst := 0
 	for ctx.Err() == nil {
 		select {
@@ -267,12 +273,9 @@ func (b *broadcaster) run(ctx context.Context) {
 		now := time.Now()
 		if !now.Before(nextAnnounce) {
 			b.sendToAll(announcement)
-			if burst > 0 {
-				burst--
-				nextAnnounce = now.Add(broadcastBurstGap)
-			} else {
-				nextAnnounce = now.Add(broadcastInterval)
-			}
+			var delay time.Duration
+			burst, delay = advanceBroadcastBurst(burst)
+			nextAnnounce = now.Add(delay)
 		}
 		// Never sleep past the next scheduled announcement, or a burst would
 		// be stretched to the read timeout and stop being a burst.
@@ -281,6 +284,16 @@ func (b *broadcaster) run(ctx context.Context) {
 			wait = until
 		}
 		_ = b.sock.SetReadDeadline(time.Now().Add(wait))
+		// A bump can race with the deadline assignment above. Consume it once
+		// more before entering ReadFromUDP; if it arrives after this select, bump
+		// pulls the socket deadline forward and wakes the read instead.
+		select {
+		case <-b.bumps:
+			burst = broadcastBurst
+			nextAnnounce = time.Time{}
+			continue
+		default:
+		}
 		n, sender, err := b.sock.ReadFromUDP(buf)
 		if err != nil {
 			var netErr net.Error
@@ -314,6 +327,16 @@ func (b *broadcaster) run(ctx context.Context) {
 			b.onPeer(host, decoded)
 		}
 	}
+}
+
+// advanceBroadcastBurst accounts for the packet that was just sent. A burst
+// value includes that packet, so a configured value of five produces exactly
+// five sends and four short gaps before returning to the quiet cadence.
+func advanceBroadcastBurst(remaining int) (int, time.Duration) {
+	if remaining > 1 {
+		return remaining - 1, broadcastBurstGap
+	}
+	return 0, broadcastInterval
 }
 
 // reusePortControl lets several nodes on one machine share the discovery

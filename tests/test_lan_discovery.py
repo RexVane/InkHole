@@ -24,9 +24,10 @@ from inkhole.p2p import (
 
 def test_lan_announcement_round_trip():
     instance_id = "0123456789abcdef0123456789abcdef"
-    assert _decode_lan_announcement(
-        _encode_lan_announcement(instance_id, 41300)
-    ) == (instance_id, 41300, False, False)
+    encoded = _encode_lan_announcement(instance_id, 41300)
+    assert b'"bye"' not in encoded
+    assert _decode_lan_announcement(encoded) == (
+        instance_id, 41300, False, False)
 
 
 def test_lan_announcement_rejects_bad_metadata():
@@ -85,6 +86,10 @@ def test_goodbye_definite_refusal_removes_current_peer_and_notifies(
     monkeypatch.setattr(node, "_probe_hosts", refused)
     node._handle_lan_goodbye("192.0.2.9", 1, "a" * 32)
 
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and node.peer_names():
+        time.sleep(0.01)
+
     assert probed_ports == [41300]
     assert node.peer_names() == []
     assert node.selected_peer() is None
@@ -108,6 +113,13 @@ def test_goodbye_timeout_keeps_peer(tmp_path, monkeypatch):
     monkeypatch.setattr(node, "_probe_hosts", timeout)
     node._handle_lan_goodbye("192.0.2.9", 41300, "a" * 32)
 
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with node._lock:
+            if not node._pending_goodbye_probes:
+                break
+        time.sleep(0.01)
+
     assert node.peer_names() == ["Android"]
     assert changed == []
 
@@ -130,8 +142,75 @@ def test_goodbye_does_not_remove_replacement_peer(tmp_path, monkeypatch):
     monkeypatch.setattr(node, "_probe_hosts", replaced_then_refused)
     node._handle_lan_goodbye("192.0.2.9", 41300, "a" * 32)
 
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with node._lock:
+            if not node._pending_goodbye_probes:
+                break
+        time.sleep(0.01)
+
     assert len(node.peers()) == 1
     assert node.peers()[0].instance_id == "b" * 32
+
+
+def test_goodbye_does_not_remove_reconnected_same_instance(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    instance_id = "a" * 32
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name="Android-test", hosts=["192.0.2.9"],
+        instance_id=instance_id, transport="lan")
+
+    def reconnected_then_refused(*_args, **_kwargs):
+        node._on_peer_added(
+            "Android", "192.0.2.10", 41400,
+            service_name="Android-test", hosts=["192.0.2.10"],
+            instance_id=instance_id, transport="lan")
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "old endpoint left")
+
+    monkeypatch.setattr(node, "_probe_hosts", reconnected_then_refused)
+    node._handle_lan_goodbye("192.0.2.9", 41300, instance_id)
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with node._lock:
+            if not node._pending_goodbye_probes:
+                break
+        time.sleep(0.01)
+    peers = node.peers()
+    assert len(peers) == 1
+    assert peers[0].instance_id == instance_id
+    assert (peers[0].host, peers[0].port) == ("192.0.2.10", 41400)
+
+
+def test_probe_failure_does_not_remove_reconnected_same_instance(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    instance_id = "a" * 32
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name="Android-test", hosts=["192.0.2.9"],
+        instance_id=instance_id, transport="lan")
+    node._running = True
+
+    def reconnected_then_refused(*_args, **_kwargs):
+        node._on_peer_added(
+            "Android", "192.0.2.10", 41400,
+            service_name="Android-test", hosts=["192.0.2.10"],
+            instance_id=instance_id, transport="lan")
+        node._running = False
+        node._probe_wake.set()
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "old endpoint left")
+
+    monkeypatch.setattr(node, "_probe_hosts", reconnected_then_refused)
+    node._probe_loop()
+
+    peers = node.peers()
+    assert len(peers) == 1
+    assert (peers[0].host, peers[0].port) == ("192.0.2.10", 41400)
 
 
 def test_probe_hosts_keeps_timeout_classification_regardless_of_order(
@@ -153,6 +232,63 @@ def test_probe_hosts_keeps_timeout_classification_regardless_of_order(
         monkeypatch.setattr(p2p_module, "_probe_peer", fail)
         with pytest.raises(TimeoutError):
             node._probe_hosts(["192.0.2.1", "192.0.2.2"], 41300, 0.01)
+
+
+def test_probe_hosts_accepts_valid_address_after_identity_mismatch(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    expected = p2p_module._ProbeResult(
+        "a" * 32, "Android", frozenset({"folder-v1"}),
+        "192.0.2.2", "public-key", "fingerprint")
+
+    def probe(host, *_args, **_kwargs):
+        if host == "192.0.2.1":
+            raise p2p_module._IdentityMismatch("stale address")
+        return expected
+
+    monkeypatch.setattr(p2p_module, "_probe_peer", probe)
+    assert node._probe_hosts(
+        ["192.0.2.1", "192.0.2.2"], 41300, 0.01, "a" * 32) is expected
+
+
+def test_probe_hosts_treats_mismatch_plus_timeout_as_ambiguous(
+        tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+
+    def probe(host, *_args, **_kwargs):
+        if host == "192.0.2.1":
+            raise p2p_module._IdentityMismatch("stale address")
+        raise TimeoutError("expected device may be sleeping")
+
+    monkeypatch.setattr(p2p_module, "_probe_peer", probe)
+    with pytest.raises(TimeoutError):
+        node._probe_hosts(
+            ["192.0.2.1", "192.0.2.2"], 41300, 0.01, "a" * 32)
+
+
+def test_unchanged_probe_keeps_peer_generation(tmp_path, monkeypatch):
+    node = P2PNode(P2PConfig(
+        inbox=str(tmp_path), peer_name="Mac", enable_mdns=False))
+    instance_id = "a" * 32
+    node._on_peer_added(
+        "Android", "192.0.2.9", 41300,
+        service_name="Android-test", hosts=["192.0.2.9"],
+        instance_id=instance_id, capabilities={"folder-v1"}, transport="lan")
+    original = node.peers()[0]
+    node._running = True
+
+    def alive(*_args, **_kwargs):
+        node._running = False
+        node._probe_wake.set()
+        return p2p_module._ProbeResult(
+            instance_id, "Android", frozenset({"folder-v1"}),
+            "192.0.2.9", "", "")
+
+    monkeypatch.setattr(node, "_probe_hosts", alive)
+    node._probe_loop()
+    assert node.peers()[0] is original
 
 
 def test_probe_requires_four_failures_without_rebuilding_mdns(

@@ -133,7 +133,9 @@ jobs:
         run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.117
 
       - name: Import macOS signing certificate
-        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != ''
+        if: >-
+          runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != '' &&
+          env.MACOS_CERTIFICATE_PASSWORD != '' && env.MACOS_SIGNING_IDENTITY != ''
         shell: bash
         run: |
           certificate_path="$RUNNER_TEMP/inkhole-signing.p12"
@@ -156,11 +158,13 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             wails3 task build
           else
-            wails3 task package
+            wails3 task darwin:package:universal
           fi
 
       - name: Sign Windows executables
-        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: >-
+          runner.os == 'Windows' && env.WINDOWS_CERTIFICATE_BASE64 != '' &&
+          env.WINDOWS_CERTIFICATE_PASSWORD != ''
         shell: pwsh
         run: |
           $pfx = Join-Path $env:RUNNER_TEMP "inkhole-signing.pfx"
@@ -178,7 +182,9 @@ jobs:
           Remove-Item -Force $pfx
 
       - name: Sign macOS app
-        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != ''
+        if: >-
+          runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != '' &&
+          env.MACOS_CERTIFICATE_PASSWORD != '' && env.MACOS_SIGNING_IDENTITY != ''
         shell: bash
         run: |
           codesign --force --deep --options runtime --timestamp \
@@ -189,6 +195,7 @@ jobs:
       - name: Notarize and staple macOS app
         if: >-
           runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != '' &&
+          env.MACOS_CERTIFICATE_PASSWORD != '' && env.MACOS_SIGNING_IDENTITY != '' &&
           env.APPLE_ID != '' && env.APPLE_APP_SPECIFIC_PASSWORD != '' && env.APPLE_TEAM_ID != ''
         shell: bash
         run: |
@@ -222,7 +229,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 InkHolePet-windows.zip).Hash.ToLowerInvariant()
           $manifest = "InkHolePet-windows.zip.sha256.ps1"
           Set-Content -Encoding ascii $manifest "# INKHOLE-SHA256 $hash  InkHolePet-windows.zip"
-          if ($env:WINDOWS_CERTIFICATE_BASE64) {
+          if ($env:WINDOWS_CERTIFICATE_BASE64 -and $env:WINDOWS_CERTIFICATE_PASSWORD) {
             $pfx = Join-Path $env:RUNNER_TEMP "inkhole-manifest-signing.pfx"
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
             $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force

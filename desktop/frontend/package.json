@@ -6,14 +6,14 @@
   "scripts": {
     "dev": "vite",
     "build:dev": "vite build --minify false --mode development",
-    "build": "vite build --mode production",
+    "build": "tsc --noEmit && vite build --mode production",
     "preview": "vite preview"
   },
   "dependencies": {
-    "@wailsio/runtime": "latest"
+    "@wailsio/runtime": "3.0.0-alpha2.117"
   },
   "devDependencies": {
-    "typescript": "^4.9.3",
+    "typescript": "5.9.3",
     "vite": "^8.0.5"
   }
 }

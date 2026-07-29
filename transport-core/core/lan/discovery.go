@@ -114,8 +114,10 @@ type Discovery struct {
 	stopping  bool
 	stopOnce  sync.Once
 
-	// goodbyeThrottle prevents DoS via rapid goodbye messages
-	goodbyeHandling map[string]time.Time
+	// Goodbye packets are unauthenticated hints. Keep at most one verification
+	// in flight per peer and retain a short cooldown after it completes.
+	goodbyeLast     map[string]time.Time
+	goodbyeInFlight map[string]bool
 
 	broadcast *broadcaster
 	mdns      *mdnsLayer
@@ -156,7 +158,8 @@ func Start(cfg Config, onPeers func([]Peer), onStatus func(string)) (*Discovery,
 		localNets:       localNetworks(),
 		wake:            make(chan struct{}, 1),
 		queryWake:       make(chan struct{}, 1),
-		goodbyeHandling: make(map[string]time.Time),
+		goodbyeLast:     make(map[string]time.Time),
+		goodbyeInFlight: make(map[string]bool),
 
 		verifySem: make(chan struct{}, maxConcurrentVerifications),
 	}
@@ -333,6 +336,7 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 		d.mu.Unlock()
 		return
 	}
+	original := peer
 	snapshot := *peer
 	knownHosts := dedupeStrings(append([]string{snapshot.Host},
 		snapshot.Hosts...))
@@ -345,19 +349,31 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 
 	// Throttle goodbye handling to prevent DoS via rapid goodbye flooding.
 	// Allow at most one goodbye per instance per 500ms.
-	if last, ok := d.goodbyeHandling[announcement.InstanceID]; ok {
-		if time.Since(last) < 500*time.Millisecond {
-			d.mu.Unlock()
-			return
-		}
+	if d.goodbyeInFlight[announcement.InstanceID] {
+		d.mu.Unlock()
+		return
 	}
-	d.goodbyeHandling[announcement.InstanceID] = time.Now()
+	if last, ok := d.goodbyeLast[announcement.InstanceID]; ok &&
+		time.Since(last) < 500*time.Millisecond {
+		d.mu.Unlock()
+		return
+	}
+	d.goodbyeLast[announcement.InstanceID] = time.Now()
+	d.goodbyeInFlight[announcement.InstanceID] = true
 
 	nets := append([]*net.IPNet(nil), d.localNets...)
 	d.wg.Add(1)
 	d.mu.Unlock()
 	go func() {
 		defer d.wg.Done()
+		defer func() {
+			d.mu.Lock()
+			delete(d.goodbyeInFlight, snapshot.InstanceID)
+			if _, current := d.peerByInstanceLocked(snapshot.InstanceID); current == nil {
+				delete(d.goodbyeLast, snapshot.InstanceID)
+			}
+			d.mu.Unlock()
+		}()
 		_, _, verdict := d.probePeerHosts(knownHosts, snapshot.Port,
 			snapshot.InstanceID, nets)
 		if (verdict != hostGone && verdict != hostMismatch) ||
@@ -368,13 +384,11 @@ func (d *Discovery) handleGoodbye(host string, announcement *Announcement) {
 		}
 		d.mu.Lock()
 		current, ok := d.peers[key]
-		if !ok || current.InstanceID != snapshot.InstanceID {
+		if !ok || current != original {
 			d.mu.Unlock()
 			return
 		}
-		delete(d.peers, key)
-		delete(d.strike, key)
-		delete(d.goodbyeHandling, snapshot.InstanceID)
+		d.deletePeerLocked(key)
 		d.mu.Unlock()
 		d.emitPeers()
 	}()
@@ -414,19 +428,37 @@ func (d *Discovery) verifyCandidate(key, name string, hosts []string,
 		}
 		addresses := dedupeStrings(append([]string{connected}, hosts...))
 		d.mu.Lock()
+		if d.stopping || d.ctx.Err() != nil {
+			d.mu.Unlock()
+			return
+		}
+		changed := false
 		if existingKey, existing := d.peerByInstanceLocked(result.InstanceID); existing != nil &&
 			existingKey != key {
 			// The same device already entered through the other discovery
 			// source (mDNS vs broadcast). Merge addresses instead of showing
 			// a duplicate entry.
-			existing.Name = firstNonEmpty(result.PeerName, existing.Name)
-			existing.Hosts = dedupeStrings(append(existing.Hosts, addresses...))
-			existing.Capabilities = result.Capabilities
-			existing.PublicKey = result.PublicKey
-			existing.Fingerprint = result.Fingerprint
+			fresh := *existing
+			fresh.Name = firstNonEmpty(result.PeerName, existing.Name)
+			fresh.Host = connected
+			fresh.Hosts = dedupeStrings(append(addresses, existing.Hosts...))
+			fresh.Port = port
+			fresh.Capabilities = result.Capabilities
+			fresh.PublicKey = result.PublicKey
+			fresh.Fingerprint = result.Fingerprint
+			if !samePeer(existing, &fresh) {
+				d.peers[existingKey] = &fresh
+				changed = true
+			}
+			// The candidate key is now represented by existingKey. Remove either
+			// a duplicate or a stale process that reused the service key.
+			if _, ok := d.peers[key]; ok {
+				d.deletePeerLocked(key)
+				changed = true
+			}
 			delete(d.strike, existingKey)
 		} else {
-			d.peers[key] = &Peer{
+			fresh := &Peer{
 				InstanceID:   result.InstanceID,
 				Name:         firstNonEmpty(result.PeerName, name),
 				Host:         connected,
@@ -437,11 +469,17 @@ func (d *Discovery) verifyCandidate(key, name string, hosts []string,
 				Fingerprint:  result.Fingerprint,
 				ServiceName:  key,
 			}
+			if current, ok := d.peers[key]; !ok || !samePeer(current, fresh) {
+				d.peers[key] = fresh
+				changed = true
+			}
 			delete(d.strike, key)
 			delete(d.reported, key)
 		}
 		d.mu.Unlock()
-		d.emitPeers()
+		if changed {
+			d.emitPeers()
+		}
 	}()
 }
 
@@ -453,6 +491,22 @@ func (d *Discovery) peerByInstanceLocked(instanceID string) (string, *Peer) {
 		}
 	}
 	return "", nil
+}
+
+// deletePeerLocked removes one peer and all state that cannot outlive it.
+// Identity-report suppression intentionally stays until a verified candidate
+// returns; verifyCandidate clears it when that happens.
+func (d *Discovery) deletePeerLocked(key string) bool {
+	peer, ok := d.peers[key]
+	if !ok {
+		return false
+	}
+	delete(d.peers, key)
+	delete(d.strike, key)
+	if _, remaining := d.peerByInstanceLocked(peer.InstanceID); remaining == nil {
+		delete(d.goodbyeLast, peer.InstanceID)
+	}
+	return true
 }
 
 // probeHosts races every candidate address; the first that verifies wins.
@@ -598,8 +652,7 @@ func (d *Discovery) onNetworkChange(current, lost []*net.IPNet) {
 	removed := 0
 	for key, peer := range d.peers {
 		if peerStrandedBy(peer, lost) {
-			delete(d.peers, key)
-			delete(d.strike, key)
+			d.deletePeerLocked(key)
 			removed++
 		}
 	}
@@ -646,22 +699,24 @@ func (d *Discovery) probeRound() {
 	d.mu.Lock()
 	nets := append([]*net.IPNet(nil), d.localNets...)
 	type target struct {
-		key  string
-		peer Peer
+		key      string
+		original *Peer
+		peer     Peer
 	}
 	targets := make([]target, 0, len(d.peers))
 	for key, peer := range d.peers {
-		targets = append(targets, target{key: key, peer: *peer})
+		targets = append(targets, target{key: key, original: peer, peer: *peer})
 	}
 	d.mu.Unlock()
 	if len(targets) == 0 {
 		return
 	}
 	type outcome struct {
-		key     string
-		result  *ProbeResult
-		conn    string
-		verdict hostVerdict
+		key      string
+		original *Peer
+		result   *ProbeResult
+		conn     string
+		verdict  hostVerdict
 	}
 	results := make(chan outcome, len(targets))
 	for _, item := range targets {
@@ -670,8 +725,8 @@ func (d *Discovery) probeRound() {
 				item.peer.Hosts...))
 			result, conn, verdict := d.probePeerHosts(hosts, item.peer.Port,
 				item.peer.InstanceID, nets)
-			results <- outcome{key: item.key, result: result, conn: conn,
-				verdict: verdict}
+			results <- outcome{key: item.key, original: item.original,
+				result: result, conn: conn, verdict: verdict}
 		}(item)
 	}
 	changed := false
@@ -685,11 +740,11 @@ func (d *Discovery) probeRound() {
 		d.mu.Lock()
 		peer, alive := d.peers[out.key]
 		switch {
-		case !alive:
-			// Removed elsewhere while probing; nothing to do.
+		case !alive || peer != out.original:
+			// Removed or replaced while probing. An old result must never
+			// mutate the endpoint that has since taken over this key.
 		case out.verdict == hostMismatch:
-			delete(d.peers, out.key)
-			delete(d.strike, out.key)
+			d.deletePeerLocked(out.key)
 			changed = true
 			if !d.reported[out.key] {
 				d.reported[out.key] = true
@@ -698,15 +753,22 @@ func (d *Discovery) probeRound() {
 				d.mu.Lock()
 			}
 		case out.verdict == hostAlive && out.result != nil:
-			peer.Name = firstNonEmpty(out.result.PeerName, peer.Name)
-			peer.Capabilities = out.result.Capabilities
-			peer.PublicKey = out.result.PublicKey
-			peer.Fingerprint = out.result.Fingerprint
+			fresh := *peer
+			fresh.Name = firstNonEmpty(out.result.PeerName, peer.Name)
+			fresh.Capabilities = out.result.Capabilities
+			fresh.PublicKey = out.result.PublicKey
+			fresh.Fingerprint = out.result.Fingerprint
 			if out.conn != "" && out.conn != peer.Host {
-				peer.Host = out.conn
-				peer.Hosts = dedupeStrings(
+				fresh.Host = out.conn
+				fresh.Hosts = dedupeStrings(
 					append([]string{out.conn}, peer.Hosts...))
+			}
+			if !samePeer(peer, &fresh) {
 				changed = true
+				// Replacing the pointer gives concurrent goodbye and discovery
+				// operations a stable endpoint-generation token. Leave it intact
+				// when a routine liveness probe learned nothing new.
+				d.peers[out.key] = &fresh
 			}
 			delete(d.strike, out.key)
 		case out.verdict == hostGone:
@@ -714,14 +776,12 @@ func (d *Discovery) probeRound() {
 			// than a timeout guess, so the dozing-phone tolerance does not
 			// apply. A network change already removed peers stranded on its
 			// departed subnet in onNetworkChange.
-			delete(d.peers, out.key)
-			delete(d.strike, out.key)
+			d.deletePeerLocked(out.key)
 			changed = true
 		default:
 			d.strike[out.key]++
 			if d.strike[out.key] >= d.strikes {
-				delete(d.peers, out.key)
-				delete(d.strike, out.key)
+				d.deletePeerLocked(out.key)
 				changed = true
 			}
 		}
@@ -826,9 +886,11 @@ func (d *Discovery) probePeerHosts(hosts []string, port int,
 			}
 		}()
 	}
-	// hostGone only survives if every address agrees; one silent address is
-	// enough to fall back to the tolerant path.
+	// A valid signed answer wins even if a stale address now belongs to another
+	// device. Silence is next: it is ambiguous and must retain strike tolerance.
+	// Only an all-definite result may upgrade a mismatch to an immediate verdict.
 	worst := hostGone
+	sawMismatch := false
 	for range hosts {
 		select {
 		case <-d.ctx.Done():
@@ -838,11 +900,17 @@ func (d *Discovery) probePeerHosts(hosts []string, port int,
 			case hostAlive:
 				return item.result, item.host, hostAlive
 			case hostMismatch:
-				return nil, "", hostMismatch
+				sawMismatch = true
 			case hostSilent:
 				worst = hostSilent
 			}
 		}
+	}
+	if worst == hostSilent {
+		return nil, "", hostSilent
+	}
+	if sawMismatch {
+		return nil, "", hostMismatch
 	}
 	return nil, "", worst
 }
@@ -964,6 +1032,21 @@ func dedupeStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func samePeer(left, right *Peer) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.InstanceID == right.InstanceID &&
+		left.Name == right.Name &&
+		left.Host == right.Host &&
+		left.Port == right.Port &&
+		left.PublicKey == right.PublicKey &&
+		left.Fingerprint == right.Fingerprint &&
+		left.ServiceName == right.ServiceName &&
+		sameStrings(left.Hosts, right.Hosts) &&
+		sameStrings(left.Capabilities, right.Capabilities)
 }
 
 func stringInSlice(want string, values []string) bool {

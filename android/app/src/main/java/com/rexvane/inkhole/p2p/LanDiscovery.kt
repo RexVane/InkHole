@@ -12,6 +12,8 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketException
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 internal data class LanAnnouncement(
     val instanceId: String,
@@ -153,7 +155,11 @@ internal class LanBroadcastDiscovery(
     }
 
     @Volatile private var socket: DatagramSocket? = null
-    @Volatile private var burstRemaining = 0
+    // Number of packets left in the current burst, including the next send.
+    // Atomic updates prevent a UI/network-change bump racing with the run loop
+    // from being overwritten by its decrement.
+    private val burstRemaining = AtomicInteger(0)
+    private val burstRequested = AtomicBoolean(false)
 
     fun start() {
         if (socket != null) return
@@ -169,13 +175,36 @@ internal class LanBroadcastDiscovery(
             return
         }
         socket = opened
-        burstRemaining = BURST_COUNT
+        burstRemaining.set(BURST_COUNT)
         scope.launch { run(opened) }
     }
 
     /** 请求立即连发一轮通告：启动、切换网络、回到前台时调用。 */
     fun bump() {
-        burstRemaining = BURST_COUNT
+        val opened = socket ?: return
+        burstRemaining.set(BURST_COUNT)
+        burstRequested.set(true)
+        // receive() may otherwise keep the old quiet-period schedule for up to
+        // two seconds. An invalid loopback datagram wakes it without exposing a
+        // discovery packet to the LAN; the next iteration starts the burst.
+        // bump() is called by Activity callbacks, so network I/O must stay on
+        // the discovery scope instead of Android's main thread.
+        scope.launch {
+            if (socket !== opened) return@launch
+            try {
+                DatagramSocket().use { wakeSocket ->
+                    val wake = byteArrayOf(0)
+                    wakeSocket.send(DatagramPacket(
+                        wake,
+                        wake.size,
+                        InetAddress.getByName("127.0.0.1"),
+                        LanDiscoveryProtocol.PORT,
+                    ))
+                }
+            } catch (_: Exception) {
+                // The existing receive timeout remains a bounded fallback.
+            }
+        }
     }
 
     /**
@@ -220,11 +249,14 @@ internal class LanBroadcastDiscovery(
         val reply = LanDiscoveryProtocol.encode(instanceId, listenPort, reply = true)
         var nextAnnouncement = 0L
         while (scope.isActive && socket === opened) {
+            if (burstRequested.getAndSet(false)) nextAnnouncement = 0L
             val now = System.currentTimeMillis()
             if (now >= nextAnnouncement) {
                 sendToAll(opened, announcement)
-                nextAnnouncement = if (burstRemaining > 0) {
-                    burstRemaining -= 1
+                val remaining = burstRemaining.updateAndGet { current ->
+                    if (current > 0) current - 1 else 0
+                }
+                nextAnnouncement = if (remaining > 0) {
                     now + BURST_GAP_MS
                 } else {
                     now + ANNOUNCE_INTERVAL_MS
