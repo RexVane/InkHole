@@ -2,7 +2,11 @@ package lan
 
 import (
 	"context"
+	"io"
+	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -265,8 +269,38 @@ func TestGoodbyeThrottling(t *testing.T) {
 	count := len(bobPeers)
 	mu.Unlock()
 	if count != 1 {
-		t.Skipf("discovery didn't complete in time (found %d peers, expected 1)", count)
+		t.Fatalf("discovery didn't complete in time (found %d peers, expected 1)", count)
 	}
+
+	// Track probe invocations by monitoring alice's connection attempts
+	var probeCount int32
+	aliceListener.Close()
+
+	// Create a new listener that counts connection attempts
+	newListener, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(alicePort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newListener.Close()
+
+	go func() {
+		for {
+			conn, err := newListener.Accept()
+			if err != nil {
+				return
+			}
+			atomic.AddInt32(&probeCount, 1)
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				head := make([]byte, 4)
+				if _, err := io.ReadFull(c, head); err != nil || string(head) != capMagic {
+					return
+				}
+				_ = RespondProbe(c, aliceIdentity, aliceID, "alice", []string{"folder-v1"})
+			}(conn)
+		}
+	}()
 
 	// Send rapid goodbye burst (simulating attack)
 	// Only the first should trigger a probe goroutine, rest should be throttled
@@ -277,6 +311,13 @@ func TestGoodbyeThrottling(t *testing.T) {
 
 	// Wait for any spawned probes to complete
 	time.Sleep(1 * time.Second)
+
+	// Verify throttling: should see at most 2-3 probes (initial + maybe 1-2 more)
+	// not 20 probes
+	finalCount := atomic.LoadInt32(&probeCount)
+	if finalCount > 5 {
+		t.Errorf("throttling failed: expected ≤5 probes, got %d", finalCount)
+	}
 
 	// The system should still be responsive
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

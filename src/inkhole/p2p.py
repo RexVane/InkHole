@@ -1506,18 +1506,14 @@ class P2PNode:
             with self._lock:
                 if peer_key in self._peers:
                     del self._peers[peer_key]
-                if peer_key in self._strikes:
-                    del self._strikes[peer_key]
-            self._emit_peers()
+            self._on_peers_changed()
         except OSError as exc:
             # Only remove on definite refusal, not timeout
             if _is_definite_refusal(exc):
                 with self._lock:
                     if peer_key in self._peers:
                         del self._peers[peer_key]
-                    if peer_key in self._strikes:
-                        del self._strikes[peer_key]
-                self._emit_peers()
+                self._on_peers_changed()
             # Timeout/other errors: let normal strike policy handle it
         except Exception:
             # Unexpected error: don't crash the UDP thread, log and continue

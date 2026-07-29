@@ -756,21 +756,23 @@ func (d *Discovery) probePeerHosts(hosts []string, port int,
 		return nil, "", hostGone
 	}
 
-	// Limit concurrent probes per peer to prevent resource exhaustion from
-	// malicious large address lists. Keep at most 8 addresses per peer.
-	const maxHostsPerPeer = 8
-	if len(hosts) > maxHostsPerPeer {
-		hosts = hosts[:maxHostsPerPeer]
-	}
-
 	type attempt struct {
 		result  *ProbeResult
 		host    string
 		verdict hostVerdict
 	}
 	results := make(chan attempt, len(hosts))
+
+	// Limit concurrent probes per peer to prevent resource exhaustion from
+	// malicious large address lists. Use a semaphore instead of truncating
+	// to ensure we eventually try all addresses.
+	const maxConcurrentProbesPerPeer = 8
+	sem := make(chan struct{}, maxConcurrentProbesPerPeer)
+
 	for _, host := range hosts {
+		sem <- struct{}{} // Acquire
 		go func(host string) {
+			defer func() { <-sem }() // Release
 			timeout := d.timeout
 			if onLocalNet(host, nets) && lanProbeTimeout < timeout {
 				timeout = lanProbeTimeout
