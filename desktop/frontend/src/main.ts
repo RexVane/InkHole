@@ -8,7 +8,9 @@ import type {
 import {InkHoleAnimation} from "./inkhole.js";
 
 const byID = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
-const settingsDialog = byID<HTMLDialogElement>("settings");
+const homePage = byID<HTMLElement>("homePage");
+const settingsPage = byID<HTMLElement>("settings");
+const settingsButton = byID<HTMLButtonElement>("openSettings");
 const peerList = byID<HTMLUListElement>("peerList");
 const receivedList = byID<HTMLUListElement>("receivedList");
 const animation = new InkHoleAnimation(byID<HTMLCanvasElement>("hole"));
@@ -422,7 +424,23 @@ async function refreshCrossConfig(): Promise<void> {
     fillSSHConfig();
 }
 
+function showHomePage(): void {
+    settingsPage.hidden = true;
+    homePage.hidden = false;
+    settingsButton.classList.remove("active");
+    settingsButton.setAttribute("aria-expanded", "false");
+}
+
+function showSettingsPage(): void {
+    homePage.hidden = true;
+    settingsPage.hidden = false;
+    settingsButton.classList.add("active");
+    settingsButton.setAttribute("aria-expanded", "true");
+    settingsPage.querySelector<HTMLElement>(".settings-scroll")?.scrollTo({top: 0});
+}
+
 async function openSettings(): Promise<void> {
+    if (!settingsPage.hidden) return;
     try {
         const [config, cross, manual] = await Promise.all([
             Service.GetConfig(),
@@ -451,7 +469,7 @@ async function openSettings(): Promise<void> {
         byID<HTMLInputElement>("wormholeRelay").value = String(wormhole.transit_relay || "");
         renderManualPeers(manual || []);
         fillSSHConfig();
-        if (!settingsDialog.open) settingsDialog.showModal();
+        showSettingsPage();
     } catch (error) {
         toast(errorMessage(error), true);
     }
@@ -477,7 +495,7 @@ async function saveSettings(): Promise<void> {
             byID<HTMLInputElement>("wormholeRelay").value,
         );
         await Service.SaveSSHConfig(collectSSHInput());
-        settingsDialog.close();
+        showHomePage();
         toast("设置已保存");
         await Promise.all([reloadPeers(), reloadRecent()]);
     } catch (error) {
@@ -532,7 +550,7 @@ function handleTransport(payload: Record<string, any>): void {
         byID("sshState").textContent = "正在重连";
     } else if (eventName === "ssh.paired") {
         toast("SSH 设备配对成功");
-        if (settingsDialog.open) void refreshCrossConfig();
+        if (!settingsPage.hidden) void refreshCrossConfig();
     } else if (eventName.endsWith(".error") && data.error) {
         toast(String(data.error), true);
     }
@@ -546,18 +564,22 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-cross-t
     });
 }
 
-byID("openSettings").addEventListener("click", () => void openSettings());
+settingsButton.setAttribute("aria-expanded", "false");
+settingsButton.addEventListener("click", () => void openSettings());
 byID("minimiseWindow").addEventListener("click", () => void AppWindow.Minimise());
 byID("hideWindow").addEventListener("click", () => void AppWindow.Hide());
 document.querySelector(".titlebar")!.addEventListener("dblclick", (event) => {
     if ((event.target as HTMLElement).closest("button")) return;
     void AppWindow.ToggleMaximise();
 });
-byID("closeSettings").addEventListener("click", () => settingsDialog.close());
-byID("cancelSettings").addEventListener("click", () => settingsDialog.close());
+byID("closeSettings").addEventListener("click", showHomePage);
+byID("cancelSettings").addEventListener("click", showHomePage);
 byID("saveSettings").addEventListener("click", () => void saveSettings());
 byID("addManualPeer").addEventListener("click", () => addManualPeerRow());
 byID("sshKeyMode").addEventListener("change", updateSSHKeyFields);
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !settingsPage.hidden) showHomePage();
+});
 
 byID("chooseFiles").addEventListener("click", () => void run(async () => {
     const paths = (await Service.ChooseFiles()) || [];
