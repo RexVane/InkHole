@@ -454,7 +454,6 @@ async function openSettings(): Promise<void> {
         byID<HTMLInputElement>("cfgInbox").value = String(appConfig.inbox || "");
         byID<HTMLInputElement>("cfgPort").value = String(appConfig.port || 0);
         byID<HTMLInputElement>("cfgSecret").value = "";
-        byID<HTMLInputElement>("cfgClearSecret").checked = false;
         byID<HTMLInputElement>("cfgEncrypt").checked = appConfig.encryptionEnabled === true;
         byID<HTMLInputElement>("cfgShowPet").checked = appConfig.showPet !== false;
         byID("actualPort").textContent = appConfig.actualPort ? `当前端口 ${appConfig.actualPort}` : "启动后自动分配";
@@ -484,7 +483,7 @@ async function saveSettings(): Promise<void> {
             byID<HTMLInputElement>("cfgName").value,
             byID<HTMLInputElement>("cfgInbox").value,
             byID<HTMLInputElement>("cfgSecret").value,
-            byID<HTMLInputElement>("cfgClearSecret").checked,
+            false,
             Number(byID<HTMLInputElement>("cfgPort").value || 0),
             byID<HTMLInputElement>("cfgShowPet").checked,
             byID<HTMLInputElement>("cfgEncrypt").checked,
