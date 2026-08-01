@@ -20,6 +20,15 @@ export interface PeerView {
     "capabilities"?: string[] | null;
 }
 
+export interface SSHPeerConfig {
+    "id": string;
+    "name": string;
+    "instance_id": string;
+    "remote_port": number;
+    "noise_public": string;
+    "end_to_end": boolean;
+}
+
 export interface SSHSettingsInput {
     "enabled": boolean;
     "host": string;
@@ -31,4 +40,5 @@ export interface SSHSettingsInput {
     "passphrase": string;
     "clearPassphrase": boolean;
     "hostKeySHA256": string;
+    "peers": SSHPeerConfig[] | null;
 }

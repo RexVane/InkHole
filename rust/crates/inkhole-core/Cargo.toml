@@ -1,0 +1,43 @@
+[package]
+name = "inkhole-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+bip39.workspace = true
+blake3.workspace = true
+crypto_secretbox.workspace = true
+ed25519-dalek.workspace = true
+filetime.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+if-addrs.workspace = true
+mdns-sd.workspace = true
+quinn.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+russh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+spake2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

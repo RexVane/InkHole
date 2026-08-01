@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "apps/inkhole-desktop",
+    "crates/inkhole-core",
+    "crates/inkhole-ffi",
+]
+resolver = "3"
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+repository = "https://github.com/RexVane/InkHole"
+
+[workspace.dependencies]
+base64 = "0.22.1"
+bip39 = "2.2.2"
+blake3 = "1.8.5"
+crypto_secretbox = "0.1.1"
+ed25519-dalek = "2.2.0"
+filetime = "0.2.26"
+futures-util = "0.3.31"
+hex = "0.4.3"
+hkdf = "0.12.4"
+if-addrs = "0.15.0"
+mdns-sd = "0.20.3"
+quinn = "0.11.11"
+rand = "0.9.2"
+rcgen = "0.14.8"
+rustls = { version = "0.23.32", default-features = false, features = ["ring", "std"] }
+russh = { version = "0.62.4", default-features = false, features = ["ring", "rsa"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+socket2 = "0.6.5"
+spake2 = "0.4.0"
+subtle = "2.6.1"
+thiserror = "2.0.17"
+time = { version = "0.3.47", features = ["formatting"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tracing = "0.1.41"
+unicode-normalization = "0.1.25"
+url = "2.5.7"
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

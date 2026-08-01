@@ -18,18 +18,43 @@ interface SavedPosition extends Point {
 
 const positionKey = "inkhole.pet.position.v1";
 const canvas = document.getElementById("hole") as HTMLCanvasElement;
+const petTarget = document.getElementById("petTarget") as HTMLDivElement;
 const status = document.getElementById("petStatus") as HTMLDivElement;
-const animation = new InkHoleAnimation(canvas);
-let activeSendID = "";
+const animation = new InkHoleAnimation(canvas, "pet");
+const activeSendIDs = new Set<string>();
+const finishedSendEvents = new Map<string, Record<string, any>>();
+let pendingSendRequests = 0;
+let activeReceive = false;
+let dropHover = false;
 let clearTimer = 0;
 let collapseTimer = 0;
+let receiveTimer = 0;
 let dragState: DragState | null = null;
 let dragFinishing = false;
 let edge: Edge = -1;
 let collapsed = false;
 let screenArea: Area | null = null;
+// The pet window is fixed-size (resizable: false); cache the physical size so
+// hover expand/collapse does not pay an IPC round trip before starting to move.
+let windowSize: {width: number; height: number} | null = null;
+async function petSize(): Promise<{width: number; height: number}> {
+    if (!windowSize) windowSize = await AppWindow.Size();
+    return windowSize;
+}
 
 animation.run();
+
+function hasActiveSend(): boolean {
+    return pendingSendRequests > 0 || activeSendIDs.size > 0;
+}
+
+function rememberFinishedSend(sendID: string, data: Record<string, any>): void {
+    if (!sendID) return;
+    finishedSendEvents.set(sendID, data);
+    window.setTimeout(() => {
+        if (finishedSendEvents.get(sendID) === data) finishedSendEvents.delete(sendID);
+    }, 30000);
+}
 
 function showStatus(message: string, hold = 2200): void {
     window.clearTimeout(clearTimer);
@@ -93,7 +118,7 @@ function expandedPosition(area: Area, size: {width: number; height: number}, pos
 async function expand(): Promise<void> {
     window.clearTimeout(collapseTimer);
     if (edge < 0 || !collapsed || !screenArea) return;
-    const size = await AppWindow.Size();
+    const size = await petSize();
     const current = await AppWindow.Position();
     const target = {...current};
     if (edge === 0) target.x = screenArea.X;
@@ -105,10 +130,11 @@ async function expand(): Promise<void> {
 }
 
 async function collapse(fromSnap = false): Promise<void> {
-    if (edge < 0 || collapsed || activeSendID || !screenArea || dragState || (dragFinishing && !fromSnap)) return;
-    const size = await AppWindow.Size();
+    if (edge < 0 || collapsed || hasActiveSend() || activeReceive || dropHover ||
+        !screenArea || dragState || (dragFinishing && !fromSnap)) return;
+    const size = await petSize();
     const current = await AppWindow.Position();
-    const peek = Math.max(12, Math.round(Math.min(size.width, size.height) * 0.18));
+    const peek = Math.max(28, Math.round(Math.min(size.width, size.height) * 0.4));
     const target = {...current};
     if (edge === 0) target.x = screenArea.X - (size.width - peek);
     if (edge === 1) target.x = screenArea.X + screenArea.Width - peek;
@@ -124,7 +150,7 @@ function scheduleCollapse(delay = 800): void {
 }
 
 async function snap(position: Point): Promise<void> {
-    const size = await AppWindow.Size();
+    const size = await petSize();
     // The legacy QML attaches to Screen.width/height, not availableGeometry:
     // the physical screen edge remains the boundary even beside the Dock.
     const area = await currentScreenArea();
@@ -159,7 +185,7 @@ async function snap(position: Point): Promise<void> {
 }
 
 async function restorePosition(): Promise<void> {
-    const size = await AppWindow.Size();
+    const size = await petSize();
     const saved = readPosition();
     screenArea = await currentScreenArea();
     if (!saved) {
@@ -204,13 +230,27 @@ async function send(paths: string[]): Promise<void> {
     if (!paths.length) return;
     try {
         await expand();
-        activeSendID = await Service.SendToSelected(paths);
         animation.active = true;
         animation.progress = 0;
         showStatus("正在发送", 0);
+        pendingSendRequests += 1;
+        let finishedEvent: Record<string, any> | undefined;
+        try {
+            const sendID = await Service.SendToSelected(paths);
+            // A tiny transfer can finish before this RPC response reaches the
+            // WebView. In that case the completion event is authoritative and
+            // must not be overwritten with a stale active send.
+            finishedEvent = finishedSendEvents.get(sendID);
+            if (!finishedEvent) activeSendIDs.add(sendID);
+        } finally {
+            pendingSendRequests -= 1;
+        }
+        if (finishedEvent) finishSendVisual(finishedEvent);
     } catch (error) {
-        animation.active = false;
-        animation.progress = -1;
+        if (!hasActiveSend()) {
+            animation.active = false;
+            animation.progress = -1;
+        }
         showStatus(errorMessage(error), 4200);
         scheduleCollapse();
     }
@@ -262,47 +302,117 @@ window.addEventListener("mouseup", (event) => {
     if (!current || current.dragging) return;
     dragState = null;
     canvas.style.cursor = "grab";
-    void Service.ShowMain();
 });
 canvas.addEventListener("pointerenter", () => void expand());
 canvas.addEventListener("pointerleave", () => scheduleCollapse());
-// 右键交给 Wails 原生菜单(--custom-contextmenu: petMenu),不在此拦截。
+canvas.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    void Service.OpenPetMenu(event.clientX, event.clientY);
+});
+
+function updateDropHover(): void {
+    const hovering = petTarget.classList.contains("file-drop-target-active");
+    if (hovering === dropHover) return;
+    dropHover = hovering;
+    if (hovering) {
+        window.clearTimeout(collapseTimer);
+        showStatus("松手发送", 0);
+        void expand();
+        return;
+    }
+    if (status.textContent === "松手发送") showStatus("", 0);
+    scheduleCollapse();
+}
+
+new MutationObserver(updateDropHover).observe(petTarget, {
+    attributes: true,
+    attributeFilter: ["class"],
+});
+
+function holdReceive(delay: number): void {
+    activeReceive = true;
+    window.clearTimeout(receiveTimer);
+    receiveTimer = window.setTimeout(() => {
+        activeReceive = false;
+        if (!hasActiveSend()) {
+            animation.active = false;
+            animation.progress = -1;
+        }
+        scheduleCollapse();
+    }, delay);
+}
 
 Events.On("files-dropped", (event) => {
     const data = (event.data || {}) as Record<string, any>;
     if (data.window === "pet" && Array.isArray(data.files)) void send(data.files as string[]);
 });
+Events.On("transfer-start", (event) => {
+    const data = (event.data || {}) as Record<string, any>;
+    const sendID = String(data.sendId || "");
+    if (sendID && finishedSendEvents.has(sendID)) return;
+    if (sendID) activeSendIDs.add(sendID);
+    animation.active = true;
+    animation.progress = 0;
+    animation.playAbsorb();
+    showStatus("正在发送", 0);
+    void expand();
+});
 Events.On("progress", (event) => {
     const data = (event.data || {}) as Record<string, any>;
-    if (data.kind !== "send") return;
+    const kind = data.kind === "recv" ? "recv" : "send";
+    // 发送进行中时接收进度不抢显示，与主界面 setProgress 的守卫保持一致。
+    if (kind === "recv" && hasActiveSend()) return;
+    const sendID = kind === "send" ? String(data.sendId || "") : "";
+    if (sendID && finishedSendEvents.has(sendID)) return;
+    if (sendID) activeSendIDs.add(sendID);
     const done = Number(data.done || 0);
     const total = Number(data.total || 0);
     animation.active = true;
-    animation.progress = total > 0 ? Math.min(1, done / total) : 0;
-    showStatus(`${String(data.filename || "发送中")} ${Math.round(animation.progress * 100)}%`, 0);
+    animation.progress = total > 0 ? Math.max(0, Math.min(1, done / total)) : 0;
+    const action = kind === "recv" ? "接收" : "发送";
+    showStatus(`${action} ${String(data.filename || "传输中")} ${Math.round(animation.progress * 100)}%`, 0);
+    if (kind === "recv") holdReceive(total > 0 && done >= total ? 3000 : 8000);
     void expand();
 });
 Events.On("sent", (event) => {
     const data = (event.data || {}) as Record<string, any>;
     if (!data.ok) showStatus(String(data.error || "发送失败"), 4200);
 });
-Events.On("transfer-finished", (event) => {
-    const data = (event.data || {}) as Record<string, any>;
-    if (activeSendID && data.sendId !== activeSendID) return;
+
+function finishSendVisual(data: Record<string, any>): void {
+    if (hasActiveSend()) return;
     const succeeded = Number(data.succeeded || 0);
     const total = Number(data.total || 0);
     animation.active = false;
     animation.progress = succeeded === total ? 1 : -1;
-    activeSendID = "";
     showStatus(succeeded === total ? "发送完成" : `${succeeded}/${total} 项成功`);
     window.setTimeout(() => {
-        if (!activeSendID) animation.progress = -1;
+        if (!hasActiveSend() && !activeReceive) animation.progress = -1;
     }, 2200);
     scheduleCollapse(2600);
+}
+
+Events.On("transfer-finished", (event) => {
+    const data = (event.data || {}) as Record<string, any>;
+    const sendID = String(data.sendId || "");
+    if (sendID) activeSendIDs.delete(sendID);
+    rememberFinishedSend(sendID, data);
+    finishSendVisual(data);
+});
+Events.On("received", (event) => {
+    const data = (event.data || {}) as Record<string, any>;
+    holdReceive(2200);
+    showStatus(`接收 ${String(data.name || "文件")}`, 2200);
+    void (async () => {
+        await expand();
+        animation.playEmit();
+    })().catch((error) => showStatus(errorMessage(error), 4200));
 });
 Events.On("status", (event) => {
     const message = String(event.data || "");
-    if (message.includes("异常") || message.includes("失败")) showStatus(message, 4200);
+    const persistent = ["异常", "失败", "无法", "未开启", "错误", "不可用"]
+        .some((part) => message.includes(part));
+    showStatus(message, persistent ? 0 : 2200);
 });
 
 void restorePosition().catch((error) => showStatus(errorMessage(error), 4200));

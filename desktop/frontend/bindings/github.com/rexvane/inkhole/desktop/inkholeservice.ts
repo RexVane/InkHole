@@ -14,6 +14,13 @@ export function AcceptOneTime(sessionID: string): $CancellablePromise<void> {
 }
 
 /**
+ * AutostartEnabled reports the operating system's current login-item state.
+ */
+export function AutostartEnabled(): $CancellablePromise<boolean> {
+    return $Call.ByID(3564958705);
+}
+
+/**
  * CancelPetMotion stops an in-progress expand or collapse animation. Dragging
  * calls this before handing control to the native window manager.
  */
@@ -47,6 +54,10 @@ export function ChooseFolder(): $CancellablePromise<string> {
 
 export function ChooseInbox(): $CancellablePromise<string> {
     return $Call.ByID(3353811010);
+}
+
+export function ChooseInboxCategory(category: string, current: string, inbox: string): $CancellablePromise<string> {
+    return $Call.ByID(4281227866, category, current, inbox);
 }
 
 export function ClearRecent(): $CancellablePromise<void> {
@@ -138,6 +149,14 @@ export function OpenPath(path: string): $CancellablePromise<void> {
     return $Call.ByID(4119985044, path);
 }
 
+/**
+ * OpenPetMenu refreshes the target list immediately before showing the native
+ * menu, so peer discovery and selection changes are always reflected.
+ */
+export function OpenPetMenu(x: number, y: number): $CancellablePromise<void> {
+    return $Call.ByID(656087303, x, y);
+}
+
 export function OpenReleases(): $CancellablePromise<void> {
     return $Call.ByID(1155708841);
 }
@@ -176,6 +195,14 @@ export function SaveConfig(peerName: string, inbox: string, secret: string, clea
     return $Call.ByID(236602228, peerName, inbox, secret, clearSecret, port, showPet, encryptionEnabled);
 }
 
+/**
+ * SaveInboxClassification persists receive routing independently from the
+ * main settings form. Empty category paths select the inbox subdirectories.
+ */
+export function SaveInboxClassification(enabled: boolean, categoryDirs: { [_ in string]?: string } | null): $CancellablePromise<void> {
+    return $Call.ByID(4185740830, enabled, categoryDirs);
+}
+
 export function SaveManualPeers(peers: $models.ManualPeerConfig[] | null): $CancellablePromise<void> {
     return $Call.ByID(74294601, peers);
 }
@@ -198,6 +225,15 @@ export function SendPaths(instanceID: string, paths: string[] | null): $Cancella
 
 export function SendToSelected(paths: string[] | null): $CancellablePromise<string> {
     return $Call.ByID(519415057, paths);
+}
+
+/**
+ * SetAutostart updates the operating system login item and returns its actual
+ * state after the change. No user settings or credentials enter the startup
+ * registration.
+ */
+export function SetAutostart(enabled: boolean): $CancellablePromise<boolean> {
+    return $Call.ByID(468953190, enabled);
 }
 
 export function SetPetVisible(visible: boolean): $CancellablePromise<void> {

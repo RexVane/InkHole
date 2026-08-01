@@ -9,5 +9,6 @@ export {
 export type {
     ManualPeerConfig,
     PeerView,
+    SSHPeerConfig,
     SSHSettingsInput
 } from "./models.js";

@@ -1,0 +1,29 @@
+[package]
+name = "inkhole-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "6.0.0"
+inkhole-core = { path = "../../crates/inkhole-core" }
+keyring = "4.1.5"
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.11.5", features = ["image-png", "tray-icon"] }
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-opener = "2.5.4"
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

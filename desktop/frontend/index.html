@@ -20,7 +20,7 @@
     <div class="titlebar-spacer"></div>
     <div class="window-controls">
         <button class="title-control settings-button" id="openSettings" type="button"
-                title="打开设置" aria-label="设置">⚙</button>
+                title="打开设置" aria-label="设置" aria-pressed="false">⚙</button>
         <button class="title-control" id="minimiseWindow" type="button"
                 title="最小化" aria-label="最小化">−</button>
         <button class="title-control close-control" id="hideWindow" type="button"
@@ -28,7 +28,7 @@
     </div>
 </header>
 
-<main class="app-shell">
+<main class="app-shell app-page" id="homePage">
     <section class="transfer-pane" data-file-drop-target id="dropzone">
         <div class="target-heading">
             <span class="section-label">发送目标</span>
@@ -54,6 +54,11 @@
             </div>
             <button class="danger-button compact" id="cancelSend" type="button" hidden>取消发送</button>
             <span class="selection-note" id="selectionNote">未选择目标设备</span>
+        </div>
+
+        <div class="remote-actions" aria-label="一次性短码传输">
+            <button class="quiet-button" id="createOneTime" type="button"><span aria-hidden="true">→</span>一次性发送</button>
+            <button class="quiet-button" id="openReceiveCode" type="button"><span aria-hidden="true">↓</span>输入短码接收</button>
         </div>
 
         <div class="transfer-strip" id="transferStrip" hidden>
@@ -100,95 +105,106 @@
     </aside>
 </main>
 
-<dialog id="settings" class="settings-dialog">
-    <div class="dialog-shell">
-        <header class="dialog-header">
-            <div><h2>设置</h2><p id="settingsVersion"></p></div>
-            <button class="icon-button" id="closeSettings" type="button" title="关闭" aria-label="关闭">×</button>
+<section id="settings" class="settings-page app-page" aria-labelledby="settingsTitle" hidden>
+    <div class="settings-shell">
+        <header class="settings-header">
+            <button class="icon-button settings-back" id="closeSettings" type="button"
+                    title="返回主页" aria-label="返回主页">‹</button>
+            <h1 id="settingsTitle" tabindex="-1">设置</h1>
         </header>
         <div class="settings-scroll">
+            <div class="settings-columns">
+                <div class="settings-column settings-primary">
             <section class="settings-section">
-                <div class="section-title"><h3>设备</h3><p>本机在其他设备上的名称与监听方式</p></div>
+                <div class="section-title"><h3>设备设置</h3><p>本机在其他设备上的名称与监听方式</p></div>
                 <div class="form-grid two-columns">
                     <label class="field"><span>设备名称</span><input id="cfgName" type="text" maxlength="40" autocomplete="off"/></label>
                     <label class="field"><span>唯一标识</span><input id="cfgInstance" type="text" readonly/></label>
                     <label class="field"><span>本机监听端口</span><input id="cfgPort" type="number" min="0" max="65535"/></label>
                     <div class="field field-note"><span>局域网传输一般无需修改</span><small id="actualPort"></small></div>
                 </div>
-                <label class="toggle-row"><input id="cfgShowPet" type="checkbox"/><span class="toggle"></span><span>显示桌宠</span></label>
             </section>
 
-            <section class="settings-section">
-                <div class="section-title"><h3>存储</h3><p>接收到的文件统一保存到默认目录</p></div>
-                <label class="field"><span>默认目录</span><div class="input-action"><input id="cfgInbox" type="text" autocomplete="off"/><button id="chooseInbox" type="button">选择</button></div></label>
+            <section class="settings-section storage-section">
+                <div class="section-title"><h3>存储与分类</h3><p>设置接收位置，并按内容类型自动整理</p></div>
+                <label class="field"><span>默认目录</span><div class="input-action"><input id="cfgInbox" type="text" readonly/><button id="chooseInbox" type="button">更换目录</button></div></label>
+                <label class="toggle-row toggle-detail">
+                    <input id="cfgAutoClassify" type="checkbox"/>
+                    <span class="toggle"></span>
+                    <span><strong>启用文件自动分类</strong><small>图片和视频、压缩包、文件、文件夹分别保存</small></span>
+                </label>
+                <fieldset class="category-fields" id="categoryFields">
+                    <div class="category-row">
+                        <label for="categoryMedia">图片和视频</label>
+                        <input id="categoryMedia" data-category="media" type="text" readonly placeholder="默认目录"/>
+                        <button data-choose-category="media" type="button">选择</button>
+                        <button class="icon-button category-reset" data-reset-category="media" type="button" title="恢复图片和视频默认目录" aria-label="恢复图片和视频默认目录">↺</button>
+                    </div>
+                    <div class="category-row">
+                        <label for="categoryArchive">压缩包</label>
+                        <input id="categoryArchive" data-category="archive" type="text" readonly placeholder="默认目录"/>
+                        <button data-choose-category="archive" type="button">选择</button>
+                        <button class="icon-button category-reset" data-reset-category="archive" type="button" title="恢复压缩包默认目录" aria-label="恢复压缩包默认目录">↺</button>
+                    </div>
+                    <div class="category-row">
+                        <label for="categoryFile">文件</label>
+                        <input id="categoryFile" data-category="file" type="text" readonly placeholder="默认目录"/>
+                        <button data-choose-category="file" type="button">选择</button>
+                        <button class="icon-button category-reset" data-reset-category="file" type="button" title="恢复文件默认目录" aria-label="恢复文件默认目录">↺</button>
+                    </div>
+                    <div class="category-row">
+                        <label for="categoryFolder">文件夹</label>
+                        <input id="categoryFolder" data-category="folder" type="text" readonly placeholder="默认目录"/>
+                        <button data-choose-category="folder" type="button">选择</button>
+                        <button class="icon-button category-reset" data-reset-category="folder" type="button" title="恢复文件夹默认目录" aria-label="恢复文件夹默认目录">↺</button>
+                    </div>
+                </fieldset>
             </section>
 
             <section class="settings-section">
                 <div class="section-title"><h3>传输安全</h3><p id="secretState">未设置端到端口令</p></div>
-                <label class="toggle-row"><input id="cfgEncrypt" type="checkbox"/><span class="toggle"></span><span>启用端到端加密</span></label>
-                <label class="field"><span>端到端加密口令</span><input id="cfgSecret" type="password" placeholder="留空保持不变" autocomplete="new-password"/></label>
-                <label class="check-row"><input id="cfgClearSecret" type="checkbox"/>清除已保存的口令</label>
+                <label class="field"><span>加密口令（两端一致）</span><input id="cfgSecret" type="password" placeholder="留空保持不变" autocomplete="new-password"/></label>
+                <label class="toggle-row toggle-detail">
+                    <input id="cfgEncrypt" type="checkbox"/><span class="toggle"></span>
+                    <span><strong>端到端加密</strong><small>使用 AES-256-GCM 保护传输内容，两端需使用相同口令</small></span>
+                </label>
             </section>
 
             <section class="settings-section cross-section">
-                <div class="section-title"><h3>跨网络</h3><p>选择与你当前网络环境匹配的通道</p></div>
-                <div class="segmented" role="tablist" aria-label="跨网络通道">
-                    <button class="active" type="button" role="tab" data-cross-tab="manual">Tailscale</button>
-                    <button type="button" role="tab" data-cross-tab="wormhole">一次性短码</button>
-                    <button type="button" role="tab" data-cross-tab="ssh">SSH 中继</button>
+                <div class="section-title"><h3>跨网络配置</h3><p>固定地址、临时短码与 SSH 中继</p></div>
+                <div class="cross-tabs" role="tablist" aria-label="跨网络方式">
+                    <button class="cross-tab" id="crossTabManual" type="button" role="tab" aria-selected="true" aria-controls="crossPanelManual">Tailscale</button>
+                    <button class="cross-tab" id="crossTabWormhole" type="button" role="tab" aria-selected="false" aria-controls="crossPanelWormhole">一次性短码</button>
+                    <button class="cross-tab" id="crossTabSSH" type="button" role="tab" aria-selected="false" aria-controls="crossPanelSSH">SSH 中继</button>
                 </div>
-
-                <div class="tab-panel active" data-cross-panel="manual">
-                    <div class="panel-toolbar"><div><strong>固定地址设备</strong><span>适用于 Tailscale、NetBird 或自建 VPN</span></div><button id="addManualPeer" type="button">添加</button></div>
+                <div class="settings-subsection cross-panel" id="crossPanelManual" role="tabpanel" aria-labelledby="crossTabManual">
+                    <div class="panel-toolbar"><div><strong>固定地址设备</strong><span>适用于 Tailscale、NetBird 或自建 VPN</span></div><button id="addManualPeer" type="button">添加设备</button></div>
                     <div class="manual-peer-list" id="manualPeerList"></div>
                 </div>
 
-                <div class="tab-panel" data-cross-panel="wormhole">
-                    <div class="one-time-grid">
-                        <div class="operation-block">
-                            <strong>发送</strong>
-                            <p>生成仅本次有效的接收短码</p>
-                            <div class="inline-actions"><button id="createOneTime" type="button">选择文件</button><button id="createOneTimeFolder" type="button">选择文件夹</button></div>
-                            <div class="code-result" id="sendCodeResult" hidden>
-                                <code id="sendCode"></code>
-                                <button id="copySendCode" class="quiet-button" type="button">复制</button>
-                                <button id="cancelOneTime" class="quiet-button" type="button">取消</button>
-                            </div>
-                        </div>
-                        <div class="operation-block">
-                            <strong>接收</strong>
-                            <p>输入发送端显示的短码</p>
-                            <div class="input-action"><input id="receiveCode" type="text" autocomplete="off" placeholder="短码"/><button id="joinOneTime" type="button">连接</button></div>
-                            <div class="offer-result" id="offerResult" hidden>
-                                <strong id="offerTitle"></strong><span id="offerSummary"></span>
-                                <div><button id="acceptOffer" type="button">接收</button><button id="rejectOffer" class="quiet-button" type="button">拒绝</button></div>
-                            </div>
-                        </div>
+                <div class="settings-subsection cross-panel" id="crossPanelWormhole" role="tabpanel" aria-labelledby="crossTabWormhole" hidden>
+                    <div class="subsection-title"><strong>短码服务设置</strong><span>一次性发送和短码接收位于主页</span></div>
+                    <div class="form-grid">
+                        <label class="field"><span>配对服务地址</span><input id="wormholeRendezvous" type="text" autocomplete="off" placeholder="留空使用默认服务"/></label>
+                        <label class="field"><span>传输中继地址</span><input id="wormholeRelay" type="text" autocomplete="off" placeholder="留空使用默认服务"/></label>
                     </div>
-                    <details class="advanced-settings">
-                        <summary>服务地址</summary>
-                        <div class="form-grid">
-                            <label class="field"><span>Rendezvous URL</span><input id="wormholeRendezvous" type="text" autocomplete="off"/></label>
-                            <label class="field"><span>Transit Relay</span><input id="wormholeRelay" type="text" autocomplete="off"/></label>
-                        </div>
-                    </details>
                 </div>
 
-                <div class="tab-panel" data-cross-panel="ssh">
+                <div class="settings-subsection cross-panel" id="crossPanelSSH" role="tabpanel" aria-labelledby="crossTabSSH" hidden>
                     <label class="toggle-row"><input id="sshEnabled" type="checkbox"/><span class="toggle"></span><span>启用 SSH 中继</span><small id="sshState"></small></label>
+                    <fieldset class="ssh-fields" id="sshFields">
                     <div class="form-grid ssh-grid">
                         <label class="field"><span>主机</span><input id="sshHost" type="text" autocomplete="off"/></label>
                         <label class="field small-field"><span>端口</span><input id="sshPort" type="number" min="1" max="65535"/></label>
                         <label class="field"><span>用户</span><input id="sshUser" type="text" autocomplete="off"/></label>
                     </div>
                     <label class="field"><span>私钥来源</span><select id="sshKeyMode"><option value="file">私钥文件</option><option value="paste">粘贴私钥</option></select></label>
-                    <div id="sshFileFields"><label class="field"><span>私钥文件</span><div class="input-action"><input id="sshKeyPath" type="text" autocomplete="off"/><button id="chooseSSHKey" type="button">选择</button></div></label></div>
+                    <div id="sshFileFields"><label class="field"><span>私钥文件</span><div class="input-action"><input id="sshKeyPath" type="text" readonly/><button id="chooseSSHKey" type="button">选择</button></div></label></div>
                     <div id="sshPasteFields" hidden><label class="field"><span>私钥内容</span><textarea id="sshPastedKey" rows="4" autocomplete="off"></textarea></label></div>
                     <div class="form-grid two-columns">
                         <label class="field"><span>私钥口令</span><input id="sshPassphrase" type="password" placeholder="留空保持不变" autocomplete="new-password"/></label>
                         <label class="field"><span>主机指纹</span><input id="sshFingerprint" type="text" readonly/></label>
                     </div>
-                    <label class="check-row"><input id="sshClearPassphrase" type="checkbox"/>清除已保存的私钥口令</label>
                     <div class="panel-toolbar"><button id="checkSSH" type="button">检测并确认指纹</button><span id="sshCheckResult"></span></div>
                     <div class="pairing-area">
                         <div class="panel-toolbar"><div><strong>配对设备</strong><span>配对后自动通过中继或 QUIC 直连</span></div><button id="createSSHPairing" type="button">生成配对码</button></div>
@@ -196,19 +212,126 @@
                         <div class="code-result" id="sshPairResult" hidden><code id="sshPairCreatedCode"></code><button id="copySSHPairCode" class="quiet-button" type="button">复制</button></div>
                         <ul class="paired-list" id="sshPeerList"></ul>
                     </div>
+                    </fieldset>
                 </div>
             </section>
 
-            <section class="settings-section help-section">
-                <div class="section-title"><h3>帮助与更新</h3><p id="updateState">当前版本</p></div>
-                <div class="help-actions"><button id="checkUpdate" type="button">检查更新</button><button id="openRepository" type="button">项目主页</button></div>
+                </div>
+                <div class="settings-column settings-secondary">
+            <section class="settings-section behavior-section">
+                <div class="section-title"><h3>应用行为</h3><p>控制桌面端的常驻组件</p></div>
+                <label class="toggle-row toggle-detail">
+                    <input id="cfgShowPet" type="checkbox"/><span class="toggle"></span>
+                    <span><strong>桌面挂件</strong><small>可拖动的墨洞图标，拖文件到上面发送</small></span>
+                </label>
+                <label class="toggle-row toggle-detail">
+                    <input id="cfgAutostart" type="checkbox"/><span class="toggle"></span>
+                    <span><strong>开机自启</strong><small>登录系统后自动启动墨洞并接收文件</small></span>
+                </label>
             </section>
+
+            <section class="settings-section help-section">
+                <div class="section-title"><h3>帮助与更新</h3></div>
+                <div class="action-row">
+                    <div><strong>使用说明</strong><span>局域网、跨网络传输与文件位置</span></div>
+                    <button id="openUsageGuide" type="button">查看说明</button>
+                </div>
+                <div class="action-row">
+                    <div><strong>检查更新</strong><span id="updateState">当前版本</span></div>
+                    <div class="inline-actions"><button id="checkUpdate" type="button">检查更新</button><button id="openReleases" class="quiet-button" type="button" hidden>发布页面</button></div>
+                </div>
+                <div class="action-row">
+                    <div><strong>GitHub 仓库</strong><span>查看源码、问题反馈与历史版本</span></div>
+                    <button id="openRepository" type="button">打开仓库</button>
+                </div>
+            </section>
+                </div>
+            </div>
         </div>
-        <footer class="dialog-footer">
-            <span id="settingsMessage"></span>
+        <footer class="settings-footer">
+            <span id="settingsMessage" role="status" aria-live="polite"></span>
             <button class="quiet-button" id="cancelSettings" type="button">取消</button>
-            <button class="primary-button" id="saveSettings" type="button">保存设置</button>
+            <button class="primary-button" id="saveSettings" type="button">保存</button>
         </footer>
+    </div>
+</section>
+
+<dialog id="oneTimeSourceDialog" class="flow-dialog" aria-labelledby="oneTimeSourceTitle">
+    <div class="flow-dialog-shell">
+        <header class="flow-dialog-header">
+            <div><h2 id="oneTimeSourceTitle">一次性发送</h2><p>选择要通过短码发送的内容</p></div>
+            <button class="icon-button" id="closeOneTimeSource" type="button" title="取消" aria-label="取消">×</button>
+        </header>
+        <div class="flow-dialog-body source-choice-grid">
+            <button id="chooseOneTimeFiles" type="button"><span aria-hidden="true">▤</span><strong>选择文件</strong></button>
+            <button id="chooseOneTimeFolder" type="button"><span aria-hidden="true">▣</span><strong>选择文件夹</strong></button>
+        </div>
+    </div>
+</dialog>
+
+<dialog id="sendCodeDialog" class="flow-dialog" aria-labelledby="sendCodeTitle">
+    <div class="flow-dialog-shell">
+        <header class="flow-dialog-header">
+            <div><h2 id="sendCodeTitle">一次性短码</h2><p id="sendCodeState">等待接收方连接</p></div>
+            <button class="icon-button" id="closeSendCode" type="button" title="取消一次性发送" aria-label="取消一次性发送">×</button>
+        </header>
+        <div class="flow-dialog-body code-dialog-body">
+            <canvas id="sendCodeQR" width="176" height="176" aria-label="短码二维码"></canvas>
+            <div class="code-result" id="sendCodeResult" hidden>
+                <code id="sendCode"></code>
+            </div>
+            <span class="code-expiry" id="sendCodeExpiry"></span>
+        </div>
+        <footer class="flow-dialog-footer">
+            <button class="quiet-button" id="copySendCode" type="button">复制短码</button>
+            <button class="danger-button" id="cancelOneTime" type="button">取消发送</button>
+        </footer>
+    </div>
+</dialog>
+
+<dialog id="receiveCodeDialog" class="flow-dialog" aria-labelledby="receiveCodeTitle">
+    <div class="flow-dialog-shell">
+        <header class="flow-dialog-header">
+            <div><h2 id="receiveCodeTitle">输入短码接收</h2><p id="receiveCodeState">输入发送端显示的一次性短码</p></div>
+            <button class="icon-button" id="closeReceiveCode" type="button" title="取消接收" aria-label="取消接收">×</button>
+        </header>
+        <div class="flow-dialog-body">
+            <label class="field"><span>一次性短码</span><div class="input-action"><input id="receiveCode" type="text" autocomplete="off"/><button id="joinOneTime" type="button">连接</button></div></label>
+            <div class="offer-result" id="offerResult" hidden>
+                <strong id="offerTitle"></strong><span id="offerSummary"></span>
+                <div><button id="acceptOffer" type="button">接收</button><button id="rejectOffer" class="quiet-button" type="button">拒绝</button></div>
+            </div>
+        </div>
+    </div>
+</dialog>
+
+<dialog id="sshFingerprintDialog" class="flow-dialog fingerprint-dialog" aria-labelledby="sshFingerprintTitle">
+    <div class="flow-dialog-shell">
+        <header class="flow-dialog-header">
+            <div><h2 id="sshFingerprintTitle">确认 VPS 主机指纹</h2><p>请与 VPS 控制台显示的指纹核对</p></div>
+        </header>
+        <div class="flow-dialog-body fingerprint-dialog-body">
+            <code id="sshFingerprintCandidate"></code>
+        </div>
+        <footer class="flow-dialog-footer">
+            <button class="quiet-button" id="cancelSSHFingerprint" type="button">取消</button>
+            <button class="primary-button" id="trustSSHFingerprint" type="button">确认并固定</button>
+        </footer>
+    </div>
+</dialog>
+
+<dialog id="usageGuide" class="flow-dialog guide-dialog" aria-labelledby="usageGuideTitle">
+    <div class="flow-dialog-shell">
+        <header class="flow-dialog-header">
+            <div><h2 id="usageGuideTitle">使用说明</h2></div>
+            <button class="icon-button" id="closeUsageGuide" type="button" title="关闭说明" aria-label="关闭说明">×</button>
+        </header>
+        <div class="flow-dialog-body guide-content">
+            <section><h3>局域网</h3><p>两台设备连接同一个 WiFi，并同时打开墨洞。发现设备后选择对方，再选择发送内容；也可以把内容拖到窗口或桌面挂件。</p></section>
+            <section><h3>跨网络</h3><p>长期直连可使用 Tailscale；临时发送可在主页生成一次性短码；有 VPS 时可在设置中启用 SSH 中继，并用配对码添加长期设备。</p></section>
+            <section><h3>文件位置</h3><p>收到的内容保存在设置中的默认目录。启用自动分类后，会分别进入图片和视频、压缩包、文件与文件夹目录。</p></section>
+        </div>
+        <footer class="flow-dialog-footer"><button class="primary-button" id="confirmUsageGuide" type="button">知道了</button></footer>
     </div>
 </dialog>
 

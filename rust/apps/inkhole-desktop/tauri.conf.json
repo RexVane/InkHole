@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "墨洞 InkHole",
+  "version": "2.0.0",
+  "identifier": "com.rexvane.inkhole",
+  "build": {
+    "beforeDevCommand": "node inkhole-desktop/scripts/frontend.mjs dev",
+    "devUrl": "http://127.0.0.1:9245",
+    "beforeBuildCommand": "node inkhole-desktop/scripts/frontend.mjs build",
+    "frontendDist": "dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "../../../desktop/build/appicon.png",
+      "../../../desktop/build/windows/icon.ico"
+    ],
+    "shortDescription": "跨平台文件传输 · 局域网自动发现"
+  }
+}
