@@ -6,78 +6,67 @@ on:
   pull_request:
 
 jobs:
-  test:
+  rust:
+    name: Rust core and Tauri
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - name: Set up Rust 1.93
+        uses: dtolnay/rust-toolchain@master
         with:
-          python-version: "3.12"
+          toolchain: 1.93.0
+          components: rustfmt, clippy
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: transport-core/go.mod
-          cache-dependency-path: transport-core/go.sum
-
-      - name: Install Qt runtime libraries
+      - name: Install Linux Tauri dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
-
-      - name: Install dependencies
-        run: pip install -e ".[gui,test]"
-
-      - name: Run Python tests
-        run: pytest -q
-
-      - name: Run shared transport-core tests
-        working-directory: transport-core
-        run: go test -race ./...
-
-  desktop:
-    name: Desktop (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: desktop/go.mod
-          cache-dependency-path: |
-            desktop/go.sum
-            transport-core/go.sum
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libssl-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            pkg-config
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
 
       - name: Install frontend dependencies
         working-directory: desktop/frontend
-        run: npm ci --no-audit --no-fund
+        run: npm ci
 
-      - name: Build frontend
-        working-directory: desktop/frontend
-        run: npm run build
+      - name: Build desktop frontend
+        run: node rust/apps/inkhole-desktop/scripts/frontend.mjs build
 
-      - name: Test desktop
-        working-directory: desktop
-        run: go test -race ./...
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
 
-      - name: Vet desktop
-        working-directory: desktop
-        run: go vet ./...
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --all -- --check
 
-      - name: Build desktop executable
-        working-directory: desktop
-        run: go build .
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test Rust workspace
+        working-directory: rust
+        run: cargo test --workspace

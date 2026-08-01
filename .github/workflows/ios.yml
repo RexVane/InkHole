@@ -1,0 +1,88 @@
+name: Flutter iOS
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Existing tag to which the unsigned iOS build is uploaded
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+  push:
+    paths:
+      - 'mobile/**'
+      - 'rust/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - 'rust/**'
+      - '.github/workflows/ios.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: mobile
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.29.0'
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.0
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Generate Flutter iOS host metadata
+        run: flutter create --platforms=ios --org com.rexvane --project-name inkhole_mobile --no-pub .
+
+      - name: Configure iOS local-network privacy
+        run: python tool/configure_ios_host.py
+
+      - name: Resolve Dart packages
+        run: flutter pub get
+
+      - name: Build Rust iOS XCFramework
+        run: bash tool/build_native_ios.sh
+
+      - name: Build unsigned iOS app
+        run: flutter build ios --release --no-codesign
+
+      - name: Archive unsigned app
+        run: ditto -c -k --sequesterRsrc --keepParent build/ios/iphoneos/Runner.app InkHole-${GITHUB_SHA}-ios.zip
+
+      - name: Upload workflow artifact
+        if: env.RELEASE_TAG == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: inkhole-ios
+          path: mobile/InkHole-${{ github.sha }}-ios.zip
+
+      - name: Upload app to release
+        if: env.RELEASE_TAG != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: mobile/InkHole-${{ github.sha }}-ios.zip

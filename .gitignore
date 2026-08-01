@@ -1,17 +1,27 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
-venv/
-dist/
-build/
-transport-core/bin/
-*.egg-info/
+# Rust
+rust/target/
+rust/apps/inkhole-desktop/dist/
+
+# Flutter
+mobile/.dart_tool/
+mobile/build/
+mobile/.flutter-plugins
+mobile/.flutter-plugins-dependencies
+mobile/.packages
+mobile/native/android/*/libinkhole_ffi.so
+mobile/native/ios/*.xcframework/
+**/.gradle/
+**/local.properties
+
+# Desktop frontend
+desktop/frontend/node_modules/
+desktop/frontend/dist/
+desktop/frontend/.bindings-tmp-*
+
+# OS / IDE
 .DS_Store
-
-# 墨洞收件箱：运行期收到的文件，不进仓库
-received/
-
-# 旧版 FTPS 证书(已不使用，私钥绝不进仓库)
-certs/
 .idea/
+.tmp/
+
+# Runtime inbox files are kept outside version control.
+received/

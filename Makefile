@@ -1,20 +1,30 @@
-.PHONY: test test-python test-core clean
+.PHONY: test test-rust test-flutter fmt lint build-desktop build-android clean
 
-# Windows(Git Bash) 没有 python3 命令，自动回退到 python；本地优先使用项目虚拟环境
-PYTHON ?= $(shell if [ -x .venv/bin/python ]; then echo .venv/bin/python; elif command -v python3 >/dev/null 2>&1; then command -v python3; else echo python; fi)
-PYTHONPATH := src
+RUST_DIR := rust
+MOBILE_DIR := mobile
 
-# Python 桌面测试(P2P 引擎 + 手动设备 + 主窗口离屏冒烟)
-test:
-	$(MAKE) test-python
-	$(MAKE) test-core
+test: test-rust test-flutter
 
-test-python:
-	PYTHONPATH=$(PYTHONPATH) QT_QPA_PLATFORM=offscreen $(PYTHON) -m pytest tests/ -q
+test-rust:
+	cargo test --workspace --manifest-path $(RUST_DIR)/Cargo.toml
 
-test-core:
-	$(MAKE) -C transport-core test
+test-flutter:
+	cd $(MOBILE_DIR) && flutter test
+
+fmt:
+	cargo fmt --all --manifest-path $(RUST_DIR)/Cargo.toml
+
+lint:
+	cargo clippy --workspace --all-targets --manifest-path $(RUST_DIR)/Cargo.toml -- -D warnings
+	cd $(MOBILE_DIR) && flutter analyze
+
+build-desktop:
+	cd $(RUST_DIR)/apps/inkhole-desktop && cargo tauri build
+
+build-android:
+	cd $(MOBILE_DIR) && bash tool/build_native.sh
+	cd $(MOBILE_DIR) && flutter build apk --release
 
 clean:
-	find . -type d -name __pycache__ -prune -exec rm -rf {} +
-	find . -type f -name '*.py[co]' -delete
+	cargo clean --manifest-path $(RUST_DIR)/Cargo.toml
+	if [ -d $(MOBILE_DIR) ]; then cd $(MOBILE_DIR) && flutter clean; fi

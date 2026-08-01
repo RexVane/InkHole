@@ -1,22 +1,15 @@
 # Third-party notices
 
-InkHole includes and vendors open-source dependencies. Their copyright and license terms remain with their respective authors.
+InkHole 2.0 uses the Rust crates resolved by `rust/Cargo.lock`. Their license
+and source metadata remain available through Cargo. The most relevant runtime
+dependencies are:
 
-## wormhole-william
+- Tokio for asynchronous tasks and cancellation.
+- Quinn and rustls for authenticated QUIC.
+- mdns-sd and if-addrs for LAN discovery.
+- BLAKE3, Ed25519, SPAKE2, and russh for integrity and authenticated relay
+  sessions.
+- Tauri 2 for the desktop host and Flutter plugins for the mobile host.
 
-`wormhole-william` is the upstream project name, not an InkHole product name.
-
-- Upstream: `github.com/psanford/wormhole-william`
-- Copyright: Peter Sanford and contributors
-- License: MIT
-- Local source and license: `transport-core/third_party/wormhole-william/`
-
-InkHole carries a local fork for raw encrypted tunnel sessions, proxy support, and connection reliability changes. InkHole does not use the dependency's ZIP/file-transfer workflow; it runs WHPP/WHF1 over the tunnel.
-
-## Vendored Go modules
-
-License files for the Go modules shipped with the shared transport core are retained beside their source under `transport-core/vendor/`. This includes Noise, yamux, gospake2, `golang.org/x/*`, websocket, and compression dependencies.
-
-## Android QR encoding
-
-The Android client uses ZXing Core (`com.google.zxing:core`) under the Apache License 2.0 to render pairing QR codes.
+No vendored Go, Python, Kotlin, gomobile, or Wails transport implementation is
+part of the 2.0 source tree.
