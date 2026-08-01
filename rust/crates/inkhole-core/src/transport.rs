@@ -94,6 +94,9 @@ impl fmt::Debug for SendFileOptions {
     }
 }
 
+/// 收到入站 QUIC 连接时回调对端 IP,用于发现模块反向信标(单向可见修复)。
+pub type InboundPeerCallback = Arc<dyn Fn(IpAddr) + Send + Sync + 'static>;
+
 #[derive(Clone)]
 pub struct QuicServerConfig {
     pub bind_address: SocketAddr,
@@ -102,6 +105,7 @@ pub struct QuicServerConfig {
     pub identity: DeviceIdentity,
     pub capabilities: Vec<String>,
     pub shared_secret: String,
+    pub on_inbound_peer: Option<InboundPeerCallback>,
 }
 
 impl fmt::Debug for QuicServerConfig {
@@ -114,6 +118,7 @@ impl fmt::Debug for QuicServerConfig {
             .field("identity", &self.identity)
             .field("capabilities", &self.capabilities)
             .field("has_shared_secret", &!self.shared_secret.is_empty())
+            .field("has_inbound_peer_hook", &self.on_inbound_peer.is_some())
             .finish()
     }
 }
@@ -160,6 +165,7 @@ struct IncomingTransferContext {
     capabilities: Arc<Vec<String>>,
     shared_secret: Arc<str>,
     events: TransferEventSink,
+    on_inbound_peer: Option<InboundPeerCallback>,
 }
 
 pub struct QuicServer {
@@ -210,6 +216,7 @@ impl QuicServer {
                     broadcast: events.clone(),
                     callback,
                 },
+                on_inbound_peer: config.on_inbound_peer,
             },
             cancellation.clone(),
         ));
@@ -756,6 +763,9 @@ async fn handle_connection(
     context: IncomingTransferContext,
     cancellation: CancellationToken,
 ) {
+    if let Some(hook) = context.on_inbound_peer.as_ref() {
+        hook(connection.remote_address().ip());
+    }
     let mut streams = JoinSet::new();
     loop {
         tokio::select! {
@@ -1304,6 +1314,7 @@ mod tests {
             identity: receiver.clone(),
             capabilities: vec!["quic-v2".into(), "blake3".into()],
             shared_secret: "room secret".into(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1370,6 +1381,7 @@ mod tests {
             identity: receiver.clone(),
             capabilities: Vec::new(),
             shared_secret: "room secret".into(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1421,6 +1433,7 @@ mod tests {
             identity: receiver.clone(),
             capabilities: vec!["folder-v1".into()],
             shared_secret: "room secret".into(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1486,6 +1499,7 @@ mod tests {
             identity: receiver,
             capabilities: vec!["folder-v1".into()],
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1572,6 +1586,7 @@ mod tests {
             identity: receiver.clone(),
             capabilities: Vec::new(),
             shared_secret: "correct secret".into(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1616,6 +1631,7 @@ mod tests {
             identity: receiver,
             capabilities: Vec::new(),
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1653,6 +1669,7 @@ mod tests {
             identity: receiver.clone(),
             capabilities: Vec::new(),
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();

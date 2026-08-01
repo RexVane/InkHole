@@ -36,6 +36,8 @@ const MAX_MDNS_EVENTS: usize = 128;
 const MDNS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_UDP_ERROR_STREAK: u32 = 50;
 const UDP_ERROR_BACKOFF: Duration = Duration::from_millis(250);
+/// 同一入站 IP 的反向信标最小间隔。
+const BEACON_MIN_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveredPeer {
@@ -118,6 +120,7 @@ pub struct UdpDiscovery {
     refresh: Arc<Notify>,
     snapshots: watch::Receiver<Arc<Vec<DiscoveredPeer>>>,
     local_address: SocketAddr,
+    hints: mpsc::UnboundedSender<IpAddr>,
     task: StdMutex<Option<JoinHandle<Result<()>>>>,
 }
 
@@ -173,6 +176,7 @@ impl UdpDiscovery {
         let goodbye = encode_announcement(&config, false, true)?;
         let refresh = Arc::new(Notify::new());
         let (snapshots, receiver) = watch::channel(Arc::new(Vec::new()));
+        let (hints, hint_receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(run_discovery(DiscoveryTask {
             socket,
             mdns,
@@ -183,12 +187,14 @@ impl UdpDiscovery {
             cancellation: cancellation.clone(),
             refresh: refresh.clone(),
             snapshots,
+            hints: hint_receiver,
         }));
         Ok(Self {
             cancellation,
             refresh,
             snapshots: receiver,
             local_address,
+            hints,
             task: StdMutex::new(Some(task)),
         })
     }
@@ -205,6 +211,18 @@ impl UdpDiscovery {
         if !self.cancellation.is_cancelled() {
             self.refresh.notify_one();
         }
+    }
+
+    /// 报告一个有入站连接的对端 IP(例如 QUIC 服务端看到的探测来源)。
+    /// 发现任务会向其发现端口单播一份 announce,触发对端按协议回复,
+    /// 从而在"对端的广播/mDNS 到不了本机"的网络里恢复双向可见。
+    pub fn hint_peer(&self, ip: IpAddr) {
+        let _ = self.hints.send(ip);
+    }
+
+    /// 供服务层在发现启动后接线 QUIC 入站回调使用。
+    pub fn hint_sender(&self) -> mpsc::UnboundedSender<IpAddr> {
+        self.hints.clone()
     }
 
     pub fn close_immediately(&self) {
@@ -310,6 +328,7 @@ struct DiscoveryTask {
     cancellation: CancellationToken,
     refresh: Arc<Notify>,
     snapshots: watch::Sender<Arc<Vec<DiscoveredPeer>>>,
+    hints: mpsc::UnboundedReceiver<IpAddr>,
 }
 
 async fn run_discovery(task: DiscoveryTask) -> Result<()> {
@@ -323,6 +342,7 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
         cancellation,
         refresh,
         snapshots,
+        hints: mut hint_receiver,
     } = task;
     let timings = config.timings;
     let mut records = HashMap::<String, PeerRecord>::new();
@@ -331,6 +351,8 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
     let mut mdns_services = HashMap::<String, HashSet<CandidateKey>>::new();
     let mut mdns_event_stream_open = mdns.is_some();
     let mut receive_buffer = vec![0_u8; MAX_UDP_PACKET + 1];
+    // 入站连接信标的限频记录:同一 IP 最少间隔 BEACON_MIN_INTERVAL 才再次单播。
+    let mut beaconed: HashMap<IpAddr, Instant> = HashMap::new();
     let mut periodic = tokio::time::interval(timings.announce_interval);
     let mut burst_tick = tokio::time::interval(timings.refresh_burst_gap);
     let mut liveness_tick = tokio::time::interval(timings.liveness_interval);
@@ -361,6 +383,29 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
                     send_to_targets(socket, &announcement, &config.targets).await;
                 }
                 burst_remaining -= 1;
+            }
+            hint = hint_receiver.recv() => {
+                let Some(ip) = hint else { continue };
+                let Some(socket) = socket.as_ref() else { continue };
+                let known = records
+                    .values()
+                    .any(|record| record.peer.hosts.iter().any(|host| host == &ip.to_string()));
+                if known {
+                    continue;
+                }
+                let now = Instant::now();
+                if beaconed.len() > 512 {
+                    beaconed.retain(|_, at| now.duration_since(*at) < BEACON_MIN_INTERVAL);
+                }
+                match beaconed.get(&ip) {
+                    Some(at) if now.duration_since(*at) < BEACON_MIN_INTERVAL => continue,
+                    _ => {}
+                }
+                beaconed.insert(ip, now);
+                // 对端能连到本机却不在设备表里:说明它的 announce 到不了这里。
+                // 向它的发现端口单播一份 announce,由对端按协议单播回复完成互认。
+                let target = SocketAddr::new(ip, config.bind_address.port());
+                send_to_targets(socket, &announcement, &[target]).await;
             }
             _ = refresh.notified() => {
                 if socket.is_some() {
@@ -1327,6 +1372,7 @@ mod tests {
             identity: genuine.clone(),
             capabilities: vec!["quic-v2".into()],
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1389,6 +1435,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_inbound_hint_beacons_a_peer_whose_announces_never_arrive() {
+        // 双向广播都被过滤的极端拓扑:A 与 C 互相收不到对方的 announce。
+        // 模拟 QUIC 服务端把入站连接来源 IP 交给 hint_peer 后,A 向 C 单播
+        // announce,C 按协议回复,两端恢复互认。
+        let root = tempfile::tempdir().unwrap();
+        let identity_a = DeviceIdentity::generate(None, "Alpha").unwrap();
+        let identity_c = DeviceIdentity::generate(None, "Gamma").unwrap();
+        let ip_a = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip_c = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let server_a = QuicServer::bind(QuicServerConfig {
+            bind_address: SocketAddr::new(ip_a, 0),
+            inbox: root.path().join("a"),
+            inbox_category_roots: crate::InboxCategoryRoots::default(),
+            identity: identity_a.clone(),
+            capabilities: vec!["quic-v2".into()],
+            shared_secret: String::new(),
+            on_inbound_peer: None,
+        })
+        .await
+        .unwrap();
+        let server_c = QuicServer::bind(QuicServerConfig {
+            bind_address: SocketAddr::new(ip_c, 0),
+            inbox: root.path().join("c"),
+            inbox_category_roots: crate::InboxCategoryRoots::default(),
+            identity: identity_c.clone(),
+            capabilities: vec!["quic-v2".into()],
+            shared_secret: String::new(),
+            on_inbound_peer: None,
+        })
+        .await
+        .unwrap();
+        let shared_port = reserve_udp_port();
+        // 显式黑洞目标,避免空 targets 触发广播注入(会打到本机真实 41301 端口)。
+        let blackhole = SocketAddr::new(ip_a, reserve_udp_port());
+        let mut config_a = discovery_config(
+            &identity_a,
+            server_a.local_address().port(),
+            shared_port,
+            vec![blackhole],
+        );
+        config_a.bind_address = SocketAddr::new(ip_a, shared_port);
+        let discovery_a = UdpDiscovery::start(config_a).await.unwrap();
+        let mut config_c = discovery_config(
+            &identity_c,
+            server_c.local_address().port(),
+            shared_port,
+            vec![blackhole],
+        );
+        config_c.bind_address = SocketAddr::new(ip_c, shared_port);
+        let discovery_c = UdpDiscovery::start(config_c).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(discovery_a.peers().is_empty());
+        assert!(discovery_c.peers().is_empty());
+
+        discovery_a.hint_peer(ip_c);
+
+        wait_for_peer_count(&discovery_c, 1).await;
+        wait_for_peer_count(&discovery_a, 1).await;
+        assert_eq!(discovery_a.peers()[0].instance_id, identity_c.instance_id());
+        assert_eq!(discovery_c.peers()[0].instance_id, identity_a.instance_id());
+
+        discovery_a.close().await.unwrap();
+        discovery_c.close().await.unwrap();
+        server_a.close().await.unwrap();
+        server_c.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_one_way_announce_topology_still_discovers_both_directions() {
         // 模拟家用路由器过滤无线客户端的上行广播:A 的 announce 能到 B,
         // B 的 announce 到不了 A。B 验证 A 后应向 A 单播回发 announce,
@@ -1403,6 +1518,7 @@ mod tests {
             identity: identity_a.clone(),
             capabilities: vec!["quic-v2".into()],
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1413,6 +1529,7 @@ mod tests {
             identity: identity_b.clone(),
             capabilities: vec!["quic-v2".into()],
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1429,12 +1546,14 @@ mod tests {
         ))
         .await
         .unwrap();
-        // B 没有任何 announce 目标:它的存在只能靠"验证后回发"让 A 得知。
+        // B 的 announce 全部进黑洞:它的存在只能靠"验证后回发"让 A 得知。
+        // (不能用空 targets——那会注入 255.255.255.255:41301 广播,污染真实环境。)
+        let blackhole = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), reserve_udp_port());
         let discovery_b = UdpDiscovery::start(discovery_config(
             &identity_b,
             server_b.local_address().port(),
             discovery_port_b,
-            Vec::new(),
+            vec![blackhole],
         ))
         .await
         .unwrap();
@@ -1462,6 +1581,7 @@ mod tests {
             identity: identity_a.clone(),
             capabilities: vec!["quic-v2".into(), "blake3".into()],
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1472,6 +1592,7 @@ mod tests {
             identity: identity_b.clone(),
             capabilities: vec!["quic-v2".into()],
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();
@@ -1528,6 +1649,7 @@ mod tests {
             identity: genuine.clone(),
             capabilities: vec!["quic-v2".into()],
             shared_secret: String::new(),
+            on_inbound_peer: None,
         })
         .await
         .unwrap();

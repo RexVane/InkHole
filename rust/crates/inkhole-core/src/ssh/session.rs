@@ -559,6 +559,7 @@ impl SshRelaySession {
                 identity: self.identity.clone(),
                 capabilities: self.capabilities.clone(),
                 shared_secret: secret.clone(),
+                on_inbound_peer: None,
             },
             self.on_transfer.clone(),
         )

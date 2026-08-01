@@ -650,6 +650,11 @@ impl JsonService {
                 event,
             );
         });
+        // 发现模块启动在 QUIC 服务之后,先占一个槽位,发现就绪后填入 hint 通道:
+        // 入站连接的来源 IP 会触发反向单播 announce(单向可见修复)。
+        let inbound_hint_slot: Arc<std::sync::OnceLock<mpsc::UnboundedSender<IpAddr>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let inbound_hook_slot = Arc::clone(&inbound_hint_slot);
         let server = Arc::new(
             QuicServer::bind_with_event_handler(
                 QuicServerConfig {
@@ -662,6 +667,11 @@ impl JsonService {
                     identity: identity.clone(),
                     capabilities: capabilities.clone(),
                     shared_secret: params.secret.clone(),
+                    on_inbound_peer: Some(Arc::new(move |ip| {
+                        if let Some(hints) = inbound_hook_slot.get() {
+                            let _ = hints.send(ip);
+                        }
+                    })),
                 },
                 Some(callback),
             )
@@ -703,7 +713,10 @@ impl JsonService {
             })
             .await
             {
-                Ok(discovery) => Some(Arc::new(discovery)),
+                Ok(discovery) => {
+                    let _ = inbound_hint_slot.set(discovery.hint_sender());
+                    Some(Arc::new(discovery))
+                }
                 Err(error) => {
                     emit_session_event(
                         &self.inner.events,
@@ -1581,6 +1594,7 @@ async fn run_wormhole_receiver(
             identity: lan.identity.clone(),
             capabilities: lan.capabilities.clone(),
             shared_secret: secret.clone(),
+            on_inbound_peer: None,
         },
         Some(callback),
     )
