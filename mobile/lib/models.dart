@@ -146,7 +146,7 @@ class InkSettings {
 /// 显示在设置里的版本号；与 pubspec.yaml 的 version 保持一致，
 /// 需要时可用 `--dart-define=APP_VERSION=x.y.z` 在打包阶段覆盖。
 const String appVersion =
-    String.fromEnvironment('APP_VERSION', defaultValue: '2.0.2');
+    String.fromEnvironment('APP_VERSION', defaultValue: '2.0.3');
 
 /// 旧版设置里「GitHub 仓库」指向的地址。
 const String repositoryUrl = 'https://github.com/RexVane/InkHole';
