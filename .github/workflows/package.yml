@@ -64,7 +64,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: desktop/frontend
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2.0' --locked
