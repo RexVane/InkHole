@@ -211,5 +211,5 @@ fn crisp_icon(target: u32) -> tauri::Result<Image<'static>> {
         40..=55 => include_bytes!("../../../../desktop/build/windows/icon-48.png"),
         _ => include_bytes!("../../../../desktop/build/windows/icon-64.png"),
     };
-    Ok(Image::from_bytes(bytes)?)
+    Image::from_bytes(bytes)
 }

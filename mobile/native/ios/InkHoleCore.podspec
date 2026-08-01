@@ -4,6 +4,9 @@ Pod::Spec.new do |s|
   s.summary = 'Rust transport core for InkHole'
   s.description = 'Static Rust XCFramework exposing the InkHole FFI ABI.'
   s.homepage = 'https://github.com/RexVane/InkHole'
+  s.license = { :type => 'MIT', :file => '../../../LICENSE' }
+  s.authors = { 'RexVane' => 'https://github.com/RexVane' }
+  s.source = { :path => '.' }
   s.ios.deployment_target = '12.0'
   s.static_framework = true
   s.vendored_frameworks = 'InkHoleCore.xcframework'
