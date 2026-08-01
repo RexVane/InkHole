@@ -80,9 +80,13 @@ jobs:
           name: inkhole-ios
           path: mobile/InkHole-${{ github.sha }}-ios.zip
 
+      - name: Rename release asset
+        if: env.RELEASE_TAG != ''
+        run: cp "mobile/InkHole-${{ github.sha }}-ios.zip" "mobile/InkHole-${{ env.RELEASE_TAG }}-ios.zip"
+
       - name: Upload app to release
         if: env.RELEASE_TAG != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          files: mobile/InkHole-${{ github.sha }}-ios.zip
+          files: mobile/InkHole-${{ env.RELEASE_TAG }}-ios.zip
