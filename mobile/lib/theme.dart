@@ -21,6 +21,11 @@ const Color inkBorder = Color(0xFF172623);
 /// 旧版 MainActivity 里错误提示用的暖红
 const Color inkDanger = Color(0xFFF08A7C);
 
+// 连接方式标签，色值取自桌面端 style.css 的 .route-badge：
+// 文字 #83e8d3，描边 rgba(90,216,192,.3)（0.3 alpha ≈ 0x4D）。
+const Color inkRouteBadgeText = Color(0xFF83E8D3);
+const Color inkRouteBadgeBorder = Color(0x4D5AD8C0);
+
 /// 与旧版 InkHoleTheme 对齐的深色主题。
 ThemeData buildInkHoleTheme() {
   const ColorScheme scheme = ColorScheme.dark(

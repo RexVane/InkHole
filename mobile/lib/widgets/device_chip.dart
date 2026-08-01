@@ -62,11 +62,24 @@ class DeviceChip extends StatelessWidget {
                         ),
                       ),
                     ),
-                    Text(
-                      deviceSubline(peer),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: inkTextDim, fontSize: 10),
+                    const SizedBox(height: 3),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        for (final String route in peer.routes) ...<Widget>[
+                          RouteBadge(route),
+                          const SizedBox(width: 4),
+                        ],
+                        Text(
+                          peer.shortId,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: inkTextDim,
+                            fontSize: 10,
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -90,17 +103,31 @@ class DeviceChip extends StatelessWidget {
   }
 }
 
-/// 第二行说明文字，对应旧版的 deviceSubline()。
-String deviceSubline(PeerView peer) {
-  switch (peer.serviceName) {
-    case 'ssh':
-      return 'SSH 中继';
-    case 'lan+ssh':
-      return '局域网 · SSH 中继';
-    case 'wormhole':
-      return '一次性短码';
-    default:
-      return peer.shortId;
+/// 连接方式小标签，对应桌面端的 `.route-badge`（青字 + 半透明青描边），
+/// 尺寸按移动端缩小一档。
+class RouteBadge extends StatelessWidget {
+  const RouteBadge(this.label, {super.key});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        border: Border.all(color: inkRouteBadgeBorder),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Text(
+        label,
+        maxLines: 1,
+        style: const TextStyle(
+          color: inkRouteBadgeText,
+          fontSize: 9,
+          height: 1.25,
+        ),
+      ),
+    );
   }
 }
 

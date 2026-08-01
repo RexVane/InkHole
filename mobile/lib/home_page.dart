@@ -974,7 +974,13 @@ class _HomePageState extends State<HomePage> {
     if (_sharedFiles.isNotEmpty && _selectedInstance == null) {
       return '有 ${_sharedFiles.length} 个待发送文件 · 点选下方设备立即发送';
     }
-    if (_selectedInstance != null) return '轻点墨洞选择文件';
+    if (_selectedInstance != null) {
+      // 与桌面端 selectionNote 一致：选中设备后顺带说明走的是哪条通道。
+      final PeerView? peer = _selectedPeer;
+      final String routes = peer == null ? '' : peer.routes.join(' · ');
+      if (routes.isEmpty) return '轻点墨洞选择文件';
+      return '轻点墨洞选择文件 · $routes';
+    }
     if (_peers.isNotEmpty) return '点选下方设备作为目标';
     return '等待附近的墨洞上线…';
   }
@@ -1120,7 +1126,7 @@ class _HomePageState extends State<HomePage> {
     return Padding(
       padding: const EdgeInsets.only(top: 4, bottom: 12),
       child: SizedBox(
-        height: 56,
+        height: 64,
         child: ListView.separated(
           scrollDirection: Axis.horizontal,
           itemCount: _peers.length,

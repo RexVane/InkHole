@@ -39,6 +39,19 @@ class PeerView {
 
   bool get viaSsh => serviceName == 'ssh' || serviceName == 'lan+ssh';
 
+  /// 连接方式标签，映射规则与桌面端 `inkhole-desktop/src/desktop.rs`
+  /// 的 `LanPeer -> PeerView` 完全一致，保证两端文案不打架。
+  List<String> get routes {
+    switch (serviceName) {
+      case 'ssh':
+        return const <String>['SSH/QUIC'];
+      case 'lan+ssh':
+        return const <String>['局域网', 'SSH/QUIC'];
+      default:
+        return const <String>['局域网'];
+    }
+  }
+
   String get shortId =>
       instanceId.length > 8 ? instanceId.substring(0, 8) : instanceId;
 }
