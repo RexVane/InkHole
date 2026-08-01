@@ -29,6 +29,10 @@ taskkill //IM inkhole-desktop.exe //F
 - debug 构建是 CONSOLE 子系统,必弹终端窗口 —— 给用户测试一律用 release。
 - 测试:`cargo test --workspace` 与 `cargo clippy --workspace --all-targets`(要求零警告);Flutter 端 `cd mobile && flutter analyze && flutter test`。
 
+## ⚠️ 冻结区:Windows 桌面端已验收,禁止改动
+
+`rust/apps/inkhole-desktop/` 与 `desktop/frontend/`(代码、UI 布局、样式、交互)已经过用户逐项实测验收(2026-08-01),**除非用户明确提出桌面端的新需求或 bug,否则不要修改这两个目录下的任何文件**。做其它平台(移动端/Linux)或核心库改动时,不得顺手重构、美化或"统一"桌面端代码;若核心库接口变更迫使桌面端跟改,先向用户说明再动手。
+
 ## 关键约束(都是修过的 bug,别回退)
 
 - **Tauri capability**(`apps/inkhole-desktop/capabilities/default.json`):窗口写操作(start-dragging/set-position/minimize/hide/toggle-maximize)必须显式授权,`core:window:default` 只读——少一条,拖窗/桌宠就废。
