@@ -13,5 +13,8 @@ command -v rustup >/dev/null || {
 }
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 mkdir -p "$out"
+# cargo-ndk 在解析 --manifest-path 之前就会在当前目录执行 cargo metadata,
+# 因此必须先进入 Rust workspace 再调用。
+cd "$repo/rust"
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o "$out" \
-  --manifest-path "$repo/rust/Cargo.toml" build --release -p inkhole-ffi
+  build --release -p inkhole-ffi
