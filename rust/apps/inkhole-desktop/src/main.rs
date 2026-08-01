@@ -34,9 +34,28 @@ async fn frontend_call(
 }
 
 fn main() {
+    init_diagnostic_logging();
     if let Err(error) = run() {
         eprintln!("墨洞启动失败: {error:#}");
     }
+}
+
+/// 仅当设置了 INKHOLE_LOG_FILE 环境变量时才落盘调试日志;
+/// 正常运行零行为变化。级别可用 INKHOLE_LOG 覆盖(默认 debug)。
+fn init_diagnostic_logging() {
+    let Ok(path) = std::env::var("INKHOLE_LOG_FILE") else {
+        return;
+    };
+    let Ok(file) = std::fs::File::create(&path) else {
+        return;
+    };
+    let filter = std::env::var("INKHOLE_LOG")
+        .unwrap_or_else(|_| "inkhole_core=debug,inkhole_desktop=debug".into());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .try_init();
 }
 
 fn run() -> Result<()> {

@@ -21,6 +21,7 @@
     "active": true,
     "targets": "all",
     "icon": [
+      "../../../desktop/build/darwin/icon.icns",
       "../../../desktop/build/darwin/icon-32.png",
       "../../../desktop/build/darwin/icon-128.png",
       "../../../desktop/build/darwin/icon-256.png",

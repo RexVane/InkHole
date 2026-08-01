@@ -42,3 +42,10 @@ cargo test --workspace --manifest-path rust/Cargo.toml
 移动端先运行 `mobile/tool/build_native.ps1` 或
 `mobile/tool/build_native.sh` 生成各 ABI 的 Rust 动态库，再执行
 `flutter build apk --release`。仓库不提交生成的 `.so` 或 XCFramework。
+
+
+## 常见问题:手机开着代理时,电脑发现不了手机
+
+手机上的代理/加速器(TUN 模式,如 Clash、Tailscale 等)会改写 UDP 出站包的来源端口。普通发现报文不受影响,但传输通道使用 QUIC 协议,QUIC 会校验对端地址一致性——回包端口被代理改写后握手包会被丢弃,表现为:手机能看到电脑,电脑始终看不到手机。
+
+解决办法:在代理 App 的分流设置里,把「墨洞 InkHole」加入绕过/直连名单(按应用分流),之后代理正常开启也不影响局域网传输。临时验证也可以直接关闭代理的 TUN/VPN 开关。

@@ -141,8 +141,16 @@ impl UdpDiscovery {
         let mut startup_errors = Vec::new();
         let socket = if config.enable_udp {
             match bind_udp_socket(config.bind_address) {
-                Ok(socket) => Some(Arc::new(socket)),
+                Ok(socket) => {
+                    tracing::info!(bind_address = %config.bind_address, "UDP discovery bound");
+                    Some(Arc::new(socket))
+                }
                 Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        bind_address = %config.bind_address,
+                        "UDP discovery bind failed (port 41301 likely in use); falling back to remaining transports"
+                    );
                     startup_errors.push(format!("UDP: {error}"));
                     None
                 }
@@ -156,8 +164,15 @@ impl UdpDiscovery {
         };
         let mdns = if config.enable_mdns {
             match start_mdns(&config, cancellation.child_token()) {
-                Ok(runtime) => Some(runtime),
+                Ok(runtime) => {
+                    tracing::info!("mDNS discovery started (service: _inkhole._udp.local.)");
+                    Some(runtime)
+                }
                 Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "mDNS discovery failed to start (port 5353 may be occupied on Windows); falling back to remaining transports"
+                    );
                     startup_errors.push(format!("mDNS: {error}"));
                     None
                 }
@@ -165,6 +180,11 @@ impl UdpDiscovery {
         } else {
             None
         };
+        tracing::info!(
+            udp = socket.is_some(),
+            mdns = mdns.is_some(),
+            "LAN discovery transports ready"
+        );
         if socket.is_none() && mdns.is_none() {
             return Err(CoreError::Protocol(format!(
                 "no LAN discovery transport could start: {}",
@@ -405,6 +425,7 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
                 // 对端能连到本机却不在设备表里:说明它的 announce 到不了这里。
                 // 向它的发现端口单播一份 announce,由对端按协议单播回复完成互认。
                 let target = SocketAddr::new(ip, config.bind_address.port());
+                tracing::info!(%target, "beaconing unicast announce to inbound peer");
                 send_to_targets(socket, &announcement, &[target]).await;
             }
             _ = refresh.notified() => {
@@ -453,11 +474,20 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
                     }
                 };
                 let Some(decoded) = decode_announcement(&receive_buffer[..length]) else {
+                    tracing::debug!(%sender, bytes = length, "undecodable discovery datagram");
                     continue;
                 };
                 if decoded.instance_id == config.instance_id {
                     continue;
                 }
+                tracing::debug!(
+                    %sender,
+                    instance = %decoded.instance_id,
+                    port = decoded.port,
+                    reply = decoded.reply,
+                    bye = decoded.bye,
+                    "received discovery announcement"
+                );
                 if decoded.bye {
                     // A goodbye packet is unauthenticated, so treat it as a hint: shorten
                     // the peer's liveness window and re-probe immediately. A real
@@ -572,11 +602,13 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
                             .announce_reply_port
                             .unwrap_or_else(|| config.bind_address.port());
                         if apply_probe_outcome(&mut records, outcome, timings.max_failures) {
+                            tracing::debug!(peers = records.len(), "peer table changed");
                             publish_snapshot(&records, &snapshots, config.on_peers.as_ref());
                             // 首次验证一个新设备后,向其发现端口单播一份 announce,
                             // 让 announce 到达不了本机的对端也能立即反向发现我们。
                             if let (Some(socket), Some(ip)) = (socket.as_ref(), newly_verified_ip) {
                                 let target = SocketAddr::new(ip, reply_port);
+                                tracing::info!(%target, "newly-verified reverse announce: unicast back");
                                 send_to_targets(socket, &announcement, &[target]).await;
                             }
                         }
@@ -935,7 +967,7 @@ fn apply_probe_outcome(
         }
         Err(CoreError::Cancelled) => false,
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 instance_id = %candidate.key.instance_id,
                 address = %candidate.key.address,
                 %error,

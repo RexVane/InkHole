@@ -764,6 +764,7 @@ async fn handle_connection(
     cancellation: CancellationToken,
 ) {
     if let Some(hook) = context.on_inbound_peer.as_ref() {
+        tracing::debug!(remote = %connection.remote_address(), "inbound QUIC connection");
         hook(connection.remote_address().ip());
     }
     let mut streams = JoinSet::new();
