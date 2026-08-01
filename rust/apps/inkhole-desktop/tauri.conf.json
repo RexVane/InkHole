@@ -21,7 +21,10 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "../../../desktop/build/appicon.png",
+      "../../../desktop/build/darwin/icon-32.png",
+      "../../../desktop/build/darwin/icon-128.png",
+      "../../../desktop/build/darwin/icon-256.png",
+      "../../../desktop/build/darwin/icon-512.png",
       "../../../desktop/build/windows/icon.ico"
     ],
     "shortDescription": "跨平台文件传输 · 局域网自动发现"
