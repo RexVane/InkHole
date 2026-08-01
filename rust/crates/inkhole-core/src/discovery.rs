@@ -266,6 +266,9 @@ struct CandidateKey {
 struct Candidate {
     key: CandidateKey,
     service_name: String,
+    /// UDP announce 的来源端口:反向单播 announce 时精确回发;mDNS 等无来源端口的
+    /// 路径为 None,回退到本端发现端口约定(生产环境两端均为 41301)。
+    announce_reply_port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -440,6 +443,7 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
                             fingerprint: decoded.fingerprint,
                         },
                         service_name: "udp-v4".into(),
+                        announce_reply_port: Some(sender.port()),
                     },
                     &config.shared_secret,
                     &cancellation,
@@ -495,6 +499,7 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
                                 Candidate {
                                     key,
                                     service_name: service_name.clone(),
+                                    announce_reply_port: None,
                                 },
                                 &config.shared_secret,
                                 &cancellation,
@@ -509,8 +514,26 @@ async fn run_discovery(task: DiscoveryTask) -> Result<()> {
                     Some(Ok((id, outcome))) => {
                         tracker.owners.remove(&id);
                         tracker.pending.remove(&outcome.candidate.key);
+                        // 记录探测成功且此前未登记的对端:广播/mDNS 常被路由器单向过滤,
+                        // 对端可能永远无法通过announce发现本机。
+                        let newly_verified_ip = outcome
+                            .result
+                            .as_ref()
+                            .ok()
+                            .filter(|verified| !records.contains_key(&verified.instance_id))
+                            .map(|verified| verified.address.ip());
+                        let reply_port = outcome
+                            .candidate
+                            .announce_reply_port
+                            .unwrap_or_else(|| config.bind_address.port());
                         if apply_probe_outcome(&mut records, outcome, timings.max_failures) {
                             publish_snapshot(&records, &snapshots, config.on_peers.as_ref());
+                            // 首次验证一个新设备后,向其发现端口单播一份 announce,
+                            // 让 announce 到达不了本机的对端也能立即反向发现我们。
+                            if let (Some(socket), Some(ip)) = (socket.as_ref(), newly_verified_ip) {
+                                let target = SocketAddr::new(ip, reply_port);
+                                send_to_targets(socket, &announcement, &[target]).await;
+                            }
                         }
                     }
                     Some(Err(error)) => {
@@ -702,6 +725,7 @@ fn mdns_candidates(service: &ResolvedService) -> Option<Vec<Candidate>> {
                     && *address != Ipv4Addr::BROADCAST
             })
             .map(|address| Candidate {
+                announce_reply_port: None,
                 key: CandidateKey {
                     instance_id: instance_id.to_owned(),
                     address: SocketAddr::new(IpAddr::V4(address), service.get_port()),
@@ -924,6 +948,7 @@ fn record_candidates(record: &PeerRecord) -> Vec<Candidate> {
                     fingerprint: record.peer.fingerprint.clone(),
                 },
                 service_name: record.peer.service_name.clone(),
+                announce_reply_port: None,
             })
         })
         .collect()
@@ -1364,6 +1389,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_one_way_announce_topology_still_discovers_both_directions() {
+        // 模拟家用路由器过滤无线客户端的上行广播:A 的 announce 能到 B,
+        // B 的 announce 到不了 A。B 验证 A 后应向 A 单播回发 announce,
+        // 让 A 也能反向发现 B。
+        let root = tempfile::tempdir().unwrap();
+        let identity_a = DeviceIdentity::generate(None, "Alpha").unwrap();
+        let identity_b = DeviceIdentity::generate(None, "Beta").unwrap();
+        let server_a = QuicServer::bind(QuicServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            inbox: root.path().join("a"),
+            inbox_category_roots: crate::InboxCategoryRoots::default(),
+            identity: identity_a.clone(),
+            capabilities: vec!["quic-v2".into()],
+            shared_secret: String::new(),
+        })
+        .await
+        .unwrap();
+        let server_b = QuicServer::bind(QuicServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            inbox: root.path().join("b"),
+            inbox_category_roots: crate::InboxCategoryRoots::default(),
+            identity: identity_b.clone(),
+            capabilities: vec!["quic-v2".into()],
+            shared_secret: String::new(),
+        })
+        .await
+        .unwrap();
+        let discovery_port_a = reserve_udp_port();
+        let discovery_port_b = reserve_udp_port();
+        let discovery_a = UdpDiscovery::start(discovery_config(
+            &identity_a,
+            server_a.local_address().port(),
+            discovery_port_a,
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                discovery_port_b,
+            )],
+        ))
+        .await
+        .unwrap();
+        // B 没有任何 announce 目标:它的存在只能靠"验证后回发"让 A 得知。
+        let discovery_b = UdpDiscovery::start(discovery_config(
+            &identity_b,
+            server_b.local_address().port(),
+            discovery_port_b,
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+
+        wait_for_peer_count(&discovery_b, 1).await;
+        wait_for_peer_count(&discovery_a, 1).await;
+        assert_eq!(discovery_a.peers()[0].instance_id, identity_b.instance_id());
+        assert_eq!(discovery_b.peers()[0].instance_id, identity_a.instance_id());
+
+        discovery_a.close().await;
+        discovery_b.close().await;
+        server_a.close().await;
+        server_b.close().await;
+    }
+
+    #[tokio::test]
     async fn two_udp_nodes_discover_verified_quic_peers_and_process_goodbye() {
         let root = tempfile::tempdir().unwrap();
         let identity_a = DeviceIdentity::generate(None, "Alpha").unwrap();
@@ -1534,6 +1621,7 @@ mod tests {
             bye: true,
         };
         let candidate = Candidate {
+            announce_reply_port: None,
             key: CandidateKey {
                 instance_id: instance_id.into(),
                 address,
@@ -1643,6 +1731,7 @@ mod tests {
                 &mut records,
                 ProbeOutcome {
                     candidate: Candidate {
+                        announce_reply_port: None,
                         key: CandidateKey {
                             instance_id: instance_id.into(),
                             address: first,
@@ -1661,6 +1750,7 @@ mod tests {
             &mut records,
             ProbeOutcome {
                 candidate: Candidate {
+                    announce_reply_port: None,
                     key: CandidateKey {
                         instance_id: instance_id.into(),
                         address: second,
