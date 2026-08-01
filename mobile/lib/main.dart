@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'home_page.dart';
+import 'theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -15,16 +16,7 @@ class InkHoleApp extends StatelessWidget {
     return MaterialApp(
       title: '墨洞',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xff080e13),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xff58e6c8),
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-        fontFamily: 'sans',
-      ),
+      theme: buildInkHoleTheme(),
       home: const HomePage(),
     );
   }
