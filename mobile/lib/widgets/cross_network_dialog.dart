@@ -8,6 +8,16 @@ import '../theme.dart';
 const Color _qrModule = Color(0xFF07100E);
 const Color _qrBackground = Color(0xFFE8FFF8);
 
+/// 旧版用 `take(160)` 静默截断，不显示字数；Flutter 用 maxLength 限长时
+/// 必须把默认的计数器关掉才不会多出一行 "0/160"。
+Widget? _noCounter(
+  BuildContext context, {
+  required int currentLength,
+  required bool isFocused,
+  required int? maxLength,
+}) =>
+    null;
+
 /// 跨网络传输面板，对应旧版 CrossNetworkUI.kt#CrossNetworkActionsDialog。
 ///
 /// 上半区是一次性短码（生成 / 扫码 / 输入短码接收），下半区是 SSH 中继配对。
@@ -87,7 +97,7 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
               icon: const Icon(Icons.send_outlined, size: 18),
               label: const Text('选择内容并生成短码'),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             ValueListenableBuilder<bool>(
               valueListenable: widget.joining,
               builder: (BuildContext context, bool joining, Widget? child) {
@@ -101,6 +111,8 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
                           child: TextField(
                             controller: _receiveCode,
                             enabled: !joining,
+                            maxLength: 160,
+                            buildCounter: _noCounter,
                             decoration: const InputDecoration(
                               labelText: '一次性接收短码',
                             ),
@@ -150,7 +162,10 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
                 );
               },
             ),
-            const Divider(height: 26),
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 5),
+              child: Divider(height: 1),
+            ),
             const Text(
               'SSH 中继配对',
               style: TextStyle(
@@ -169,6 +184,8 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
             TextField(
               controller: _pairCode,
               enabled: widget.sshReady,
+              maxLength: 180,
+              buildCounter: _noCounter,
               decoration: const InputDecoration(labelText: 'SSH 配对码'),
             ),
             const SizedBox(height: 8),
@@ -188,14 +205,6 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
                 );
               },
             ),
-            if (!widget.sshReady)
-              const Padding(
-                padding: EdgeInsets.only(top: 6),
-                child: Text(
-                  'SSH 中继未连接，先在设置里填好 VPS 并验证指纹',
-                  style: TextStyle(color: inkTextDim, fontSize: 11),
-                ),
-              ),
           ],
         ),
       ),

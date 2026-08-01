@@ -96,6 +96,7 @@ class ManualPeer {
 class InkSettings {
   const InkSettings({
     required this.peerName,
+    required this.listenPort,
     required this.encryptionEnabled,
     required this.secret,
     required this.manualPeers,
@@ -111,6 +112,10 @@ class InkSettings {
   });
 
   final String peerName;
+
+  /// 本机监听端口，0 = 自动分配。
+  final int listenPort;
+
   final bool encryptionEnabled;
   final String secret;
   final List<ManualPeer> manualPeers;
@@ -124,6 +129,14 @@ class InkSettings {
   final String sshPrivateKey;
   final String sshPassphrase;
 }
+
+/// 显示在设置里的版本号；与 pubspec.yaml 的 version 保持一致，
+/// 需要时可用 `--dart-define=APP_VERSION=x.y.z` 在打包阶段覆盖。
+const String appVersion =
+    String.fromEnvironment('APP_VERSION', defaultValue: '2.0.1');
+
+/// 旧版设置里「GitHub 仓库」指向的地址。
+const String repositoryUrl = 'https://github.com/RexVane/InkHole';
 
 int asInt(dynamic value) {
   if (value is int) return value;

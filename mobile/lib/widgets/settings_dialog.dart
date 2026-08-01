@@ -21,6 +21,7 @@ class SettingsDialog extends StatefulWidget {
     required this.onCheckSsh,
     required this.onCreateSshPair,
     required this.onOpenCrossNetwork,
+    required this.onOpenRepository,
   });
 
   final InkSettings initial;
@@ -34,6 +35,7 @@ class SettingsDialog extends StatefulWidget {
 
   final VoidCallback onCreateSshPair;
   final VoidCallback onOpenCrossNetwork;
+  final VoidCallback onOpenRepository;
 
   @override
   State<SettingsDialog> createState() => _SettingsDialogState();
@@ -41,6 +43,7 @@ class SettingsDialog extends StatefulWidget {
 
 class _SettingsDialogState extends State<SettingsDialog> {
   late final TextEditingController _name;
+  late final TextEditingController _listenPort;
   late final TextEditingController _secret;
   late final TextEditingController _rendezvous;
   late final TextEditingController _transit;
@@ -56,6 +59,8 @@ class _SettingsDialogState extends State<SettingsDialog> {
   late bool _sshEnabled;
   late String _fingerprint;
   late List<ManualPeer> _manualPeers;
+  late bool _keyStored;
+  late bool _passphraseStored;
   int _tab = 0;
   int _editing = -1;
   bool _checking = false;
@@ -67,6 +72,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
     super.initState();
     final InkSettings initial = widget.initial;
     _name = TextEditingController(text: initial.peerName);
+    _listenPort = TextEditingController(
+      text: initial.listenPort == 0 ? '' : initial.listenPort.toString(),
+    );
     _secret = TextEditingController(text: initial.secret);
     _rendezvous = TextEditingController(text: initial.rendezvousUrl);
     _transit = TextEditingController(text: initial.transitRelay);
@@ -78,12 +86,15 @@ class _SettingsDialogState extends State<SettingsDialog> {
     _encryption = initial.encryptionEnabled;
     _sshEnabled = initial.sshEnabled;
     _fingerprint = initial.sshFingerprint;
+    _keyStored = initial.sshPrivateKey.isNotEmpty;
+    _passphraseStored = initial.sshPassphrase.isNotEmpty;
     _manualPeers = List<ManualPeer>.of(initial.manualPeers);
   }
 
   @override
   void dispose() {
     _name.dispose();
+    _listenPort.dispose();
     _secret.dispose();
     _rendezvous.dispose();
     _transit.dispose();
@@ -101,6 +112,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
     final String name = _name.text.trim();
     return InkSettings(
       peerName: name.length > 40 ? name.substring(0, 40) : name,
+      listenPort: int.tryParse(_listenPort.text.trim()) ?? 0,
       encryptionEnabled: _encryption,
       secret: _secret.text.trim(),
       manualPeers: _manualPeers,
@@ -171,6 +183,13 @@ class _SettingsDialogState extends State<SettingsDialog> {
       setState(() => _error = '启用端到端加密后必须填写加密口令');
       return;
     }
+    final String listenPortText = _listenPort.text.trim();
+    final int? listenPort = int.tryParse(listenPortText);
+    if (listenPortText.isNotEmpty &&
+        (listenPort == null || listenPort < 1 || listenPort > 65535)) {
+      setState(() => _error = '本机监听端口必须在 1-65535 范围内');
+      return;
+    }
     final int? sshPort = int.tryParse(_sshPort.text.trim());
     if (_sshEnabled && (sshPort == null || sshPort < 1 || sshPort > 65535)) {
       setState(() => _error = 'SSH 端口必须在 1-65535 范围内');
@@ -199,6 +218,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   Text(widget.deviceLine, style: _hintStyle),
+                  Text('版本：v$appVersion', style: _hintStyle),
                   Text(widget.portLine, style: _hintStyle),
                 ],
               ),
@@ -209,6 +229,21 @@ class _SettingsDialogState extends State<SettingsDialog> {
             TextField(
               controller: _name,
               decoration: const InputDecoration(labelText: '设备名称'),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _listenPort,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: '本机监听端口（留空=自动）',
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text(
+                '局域网传输无需设置，保持自动即可；仅 Tailscale 直连时需要固定端口',
+                style: TextStyle(color: inkTextDim, fontSize: 11),
+              ),
             ),
             const SizedBox(height: 14),
             const _SectionTitle('存储'),
@@ -274,14 +309,22 @@ class _SettingsDialogState extends State<SettingsDialog> {
                   style: const TextStyle(color: inkDanger, fontSize: 11),
                 ),
               ),
-            const Divider(height: 26),
-            const _SectionTitle('帮助'),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton(
-                onPressed: () => showUsageGuide(context),
-                child: const Text('使用说明'),
-              ),
+            const Padding(
+              padding: EdgeInsets.only(top: 10, bottom: 8),
+              child: Divider(height: 1),
+            ),
+            const _SectionTitle('帮助与更新'),
+            Row(
+              children: <Widget>[
+                TextButton(
+                  onPressed: () => showUsageGuide(context),
+                  child: const Text('使用说明'),
+                ),
+                TextButton(
+                  onPressed: widget.onOpenRepository,
+                  child: const Text('GitHub 仓库'),
+                ),
+              ],
             ),
           ],
         ),
@@ -454,6 +497,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
       Row(
         children: <Widget>[
           Expanded(
+            flex: 4,
             child: TextField(
               controller: _sshPort,
               keyboardType: TextInputType.number,
@@ -462,7 +506,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
           ),
           const SizedBox(width: 7),
           Expanded(
-            flex: 2,
+            flex: 5,
             child: TextField(
               controller: _sshUser,
               decoration: const InputDecoration(labelText: 'SSH 用户'),
@@ -475,13 +519,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
         controller: _sshKey,
         autocorrect: false,
         obscureText: true,
-        decoration: const InputDecoration(labelText: '粘贴 OpenSSH / PEM 私钥'),
+        decoration: InputDecoration(
+          labelText: _keyStored ? 'SSH 私钥（已安全保存）' : '粘贴 OpenSSH / PEM 私钥',
+        ),
       ),
       const SizedBox(height: 7),
       TextField(
         controller: _sshPassphrase,
         obscureText: true,
-        decoration: const InputDecoration(labelText: '私钥口令（可选）'),
+        decoration: InputDecoration(
+          labelText: _passphraseStored ? '私钥口令（已安全保存）' : '私钥口令（可选）',
+        ),
       ),
       const SizedBox(height: 6),
       SelectionArea(

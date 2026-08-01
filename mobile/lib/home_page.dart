@@ -44,6 +44,7 @@ class _HomePageState extends State<HomePage> {
   String _peerName = 'Android';
   String _instanceId = '';
   int _listenPort = 0;
+  int _actualPort = 0;
   String _inbox = '';
   String _rendezvousUrl = '';
   String _transitRelay = '';
@@ -176,6 +177,7 @@ class _HomePageState extends State<HomePage> {
 
   void _loadStoredSettings() {
     final SharedPreferences prefs = _preferences!;
+    _listenPort = prefs.getInt('listen_port') ?? 0;
     _sshHost = prefs.getString('ssh_host') ?? '';
     _sshUser = prefs.getString('ssh_user') ?? '';
     _sshFingerprint = prefs.getString('ssh_fingerprint') ?? '';
@@ -201,14 +203,14 @@ class _HomePageState extends State<HomePage> {
           : '',
       'inbox': _inbox,
       'inbox_category_roots': <String, dynamic>{},
-      'listen_port': 0,
+      'listen_port': _listenPort,
       'capabilities': const <String>['quic-v2', 'blake3', 'folder-v1'],
       'discovery_targets': _manualPeers
           .map((ManualPeer peer) => peer.host)
           .toList(growable: false),
     });
     _sessionId = result['session_id']?.toString();
-    _listenPort = asInt(result['port']);
+    _actualPort = asInt(result['port']);
     _identityPrivate = result['identity_private']?.toString();
     if (_identityPrivate != null) {
       await _secureStorage.write(
@@ -744,13 +746,15 @@ class _HomePageState extends State<HomePage> {
     final String sshPassphrase =
         await _secureStorage.read(key: 'ssh_passphrase') ?? '';
     if (!mounted) return;
-    final String portLine =
-        _listenPort > 0 ? '端口：$_listenPort' : '端口：未启动';
+    final String portLine = _actualPort > 0
+        ? '端口：$_actualPort（建议自定义 1024-49151 固定端口）'
+        : '端口：未启动（建议自定义 1024-49151 固定端口）';
     final InkSettings? saved = await showDialog<InkSettings>(
       context: context,
       builder: (BuildContext dialogContext) => SettingsDialog(
         initial: InkSettings(
           peerName: _peerName,
+          listenPort: _listenPort,
           encryptionEnabled: _encryptionEnabled,
           secret: secret,
           manualPeers: _manualPeers,
@@ -771,6 +775,7 @@ class _HomePageState extends State<HomePage> {
         onCheckSsh: _checkSsh,
         onCreateSshPair: () => unawaited(_createSshPair()),
         onOpenCrossNetwork: () => unawaited(_showCrossNetwork()),
+        onOpenRepository: () => _copyText(repositoryUrl, '仓库地址已复制'),
       ),
     );
     if (saved == null) return;
@@ -812,11 +817,13 @@ class _HomePageState extends State<HomePage> {
     final String previousSecret =
         await _secureStorage.read(key: 'transfer_secret') ?? '';
     final bool restartNeeded = settings.peerName != _peerName ||
+        settings.listenPort != _listenPort ||
         settings.encryptionEnabled != _encryptionEnabled ||
         settings.secret != previousSecret ||
         !_sameHosts(settings.manualPeers, _manualPeers);
 
     await prefs.setString('peer_name', settings.peerName);
+    await prefs.setInt('listen_port', settings.listenPort);
     await prefs.setBool('encryption_enabled', settings.encryptionEnabled);
     await prefs.setStringList(
       'manual_peers',
@@ -855,6 +862,7 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     setState(() {
       _peerName = settings.peerName;
+      _listenPort = settings.listenPort;
       _encryptionEnabled = settings.encryptionEnabled;
       _manualPeers = settings.manualPeers;
       _rendezvousUrl = settings.rendezvousUrl;
