@@ -1896,31 +1896,31 @@ fn show_main(app: &AppHandle) -> Result<()> {
 
 const DRAG_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const DRAG_MAXIMUM_DURATION: Duration = Duration::from_secs(10);
-/// 非 Windows 平台以“位置连续静止”近似鼠标释放，约 240ms。
-#[cfg(not(windows))]
+/// Windows/macOS 之外的平台以“位置连续静止”近似鼠标释放，约 240ms。
+#[cfg(not(any(windows, target_os = "macos")))]
 const DRAG_IDLE_POLLS: u32 = 8;
 
 /// 前端依赖旧 Wails 语义：DragPet 在鼠标释放后才返回，返回后立刻读取窗口位置吸附边缘。
 /// `start_dragging` 会立即返回，所以这里轮询等待拖拽真正结束。
 async fn wait_for_drag_release(window: &tauri::WebviewWindow) {
     let deadline = tokio::time::Instant::now() + DRAG_MAXIMUM_DURATION;
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let mut last: Option<PhysicalPosition<i32>> = None;
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let mut idle = 0_u32;
     loop {
         tokio::time::sleep(DRAG_POLL_INTERVAL).await;
         if tokio::time::Instant::now() >= deadline {
             return;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let _ = window;
             if !primary_mouse_button_down() {
                 return;
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let Ok(position) = window.outer_position() else {
                 return;
@@ -1947,6 +1947,17 @@ fn primary_mouse_button_down() -> bool {
     const VK_LBUTTON: i32 = 0x01;
     // 返回值最高位为 1 表示该键当前处于按下状态。
     unsafe { GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000 != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn primary_mouse_button_down() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
+    }
+    // kCGEventSourceStateCombinedSessionState = 0,kCGMouseButtonLeft = 0:
+    // 与 Windows 的 GetAsyncKeyState 等价的全局左键按压状态。
+    unsafe { CGEventSourceButtonState(0, 0) }
 }
 
 fn set_pet_window_visible(app: &AppHandle, visible: bool) -> Result<()> {

@@ -96,7 +96,8 @@ fn create_main_window(app: &mut tauri::App, visible: bool) -> tauri::Result<()> 
         .title("墨洞 InkHole")
         .inner_size(960.0, 640.0)
         .min_inner_size(720.0, 480.0)
-        .decorations(!cfg!(target_os = "windows"))
+        // 全平台统一无边框 + 前端自绘标题栏,macOS 不再出现系统红绿灯与自绘控制条并存。
+        .decorations(false)
         .background_color(Color(10, 15, 16, 255))
         .visible(visible)
         .build()?;
@@ -114,7 +115,7 @@ fn create_main_window(app: &mut tauri::App, visible: bool) -> tauri::Result<()> 
 }
 
 fn create_pet_window(app: &mut tauri::App, visible: bool) -> tauri::Result<()> {
-    WebviewWindowBuilder::new(app, "pet", WebviewUrl::App("pet.html".into()))
+    let builder = WebviewWindowBuilder::new(app, "pet", WebviewUrl::App("pet.html".into()))
         .title("墨洞")
         .inner_size(96.0, 96.0)
         .resizable(false)
@@ -126,8 +127,12 @@ fn create_pet_window(app: &mut tauri::App, visible: bool) -> tauri::Result<()> {
         .always_on_top(true)
         .skip_taskbar(true)
         .shadow(false)
-        .visible(visible)
-        .build()?;
+        .visible(visible);
+    // 仅 macOS:跟随所有工作区(Spaces),对齐 Windows 桌宠常驻桌面的体验。
+    // 不在 Windows 上调用,保证 Windows 行为与已验收版本完全一致。
+    #[cfg(target_os = "macos")]
+    let builder = builder.visible_on_all_workspaces(true);
+    builder.build()?;
     Ok(())
 }
 

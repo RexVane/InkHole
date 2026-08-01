@@ -31,7 +31,7 @@ taskkill //IM inkhole-desktop.exe //F
 
 ## ⚠️ 冻结区:Windows 桌面端已验收,禁止改动
 
-`rust/apps/inkhole-desktop/` 与 `desktop/frontend/`(代码、UI 布局、样式、交互)已经过用户逐项实测验收(2026-08-01),**除非用户明确提出桌面端的新需求或 bug,否则不要修改这两个目录下的任何文件**。做其它平台(移动端/Linux)或核心库改动时,不得顺手重构、美化或"统一"桌面端代码;若核心库接口变更迫使桌面端跟改,先向用户说明再动手。
+`rust/apps/inkhole-desktop/` 与 `desktop/frontend/` 的 **Windows 行为**(代码、UI 布局、样式、交互)已经过用户逐项实测验收(2026-08-01),**除非用户明确提出桌面端的新需求或 bug,否则不得改变 Windows 上的任何行为**。macOS/Linux 侧允许调整,但必须:1) 布局与交互逻辑对齐 Windows 版(全平台统一无边框 + 自绘标题栏,macOS 拖宠用 CGEventSourceButtonState 检测松手);2) 平台差异一律用 `#[cfg(target_os = ...)]` 门控,不得触碰 Windows 代码路径。做移动端/核心库改动时不得顺手重构桌面端;若核心库接口变更迫使桌面端跟改,先向用户说明再动手。
 
 ## 关键约束(都是修过的 bug,别回退)
 
