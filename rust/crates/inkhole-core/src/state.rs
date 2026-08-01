@@ -1377,6 +1377,10 @@ mod tests {
         tokio::fs::write(outside.join("payload.bin"), b"tampered")
             .await
             .unwrap();
+        // prepare_folder 已按 manifest 预建了 nested 真实目录,先移除才能放置符号链接。
+        tokio::fs::remove_dir(prepared.staging_path.join("nested"))
+            .await
+            .unwrap();
         symlink(&outside, prepared.staging_path.join("nested")).unwrap();
 
         assert!(store.prepare_folder(&offer, &manifest).await.is_err());
