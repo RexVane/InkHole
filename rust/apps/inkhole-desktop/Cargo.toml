@@ -16,7 +16,7 @@ inkhole-core = { path = "../../crates/inkhole-core" }
 keyring = "4.1.5"
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2.11.5", features = ["image-png", "tray-icon"] }
+tauri = { version = "2.11.5", features = ["image-png", "tray-icon", "macos-private-api"] }
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-opener = "2.5.4"
