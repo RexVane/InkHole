@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Shared InkHole mark: black core, teal outer arc, amber inner arc. -->
+    <path
+        android:pathData="M54,54 m-20.4,0 a20.4,20.4 0,1 1,40.8,0 a20.4,20.4 0,1 1,-40.8,0"
+        android:fillColor="#FF020506" />
+    <path
+        android:pathData="M77.38,40.5 A27,27 0,1 0 38.51,76.12"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FF5AD8C0"
+        android:strokeWidth="5.5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M37.95,65.24 A19.6,19.6 0,0 0 65.24,70.06"
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFE9BD72"
+        android:strokeWidth="4.2"
+        android:strokeLineCap="round" />
+</vector>

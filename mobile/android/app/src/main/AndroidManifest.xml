@@ -11,6 +11,7 @@
     <application
         android:label="墨洞"
         android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="false">
         <activity
             android:name=".MainActivity"
