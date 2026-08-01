@@ -1444,10 +1444,10 @@ mod tests {
         assert_eq!(discovery_a.peers()[0].instance_id, identity_b.instance_id());
         assert_eq!(discovery_b.peers()[0].instance_id, identity_a.instance_id());
 
-        discovery_a.close().await;
-        discovery_b.close().await;
-        server_a.close().await;
-        server_b.close().await;
+        discovery_a.close().await.unwrap();
+        discovery_b.close().await.unwrap();
+        server_a.close().await.unwrap();
+        server_b.close().await.unwrap();
     }
 
     #[tokio::test]
