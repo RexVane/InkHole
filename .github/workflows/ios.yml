@@ -82,7 +82,7 @@ jobs:
 
       - name: Rename release asset
         if: env.RELEASE_TAG != ''
-        run: cp "mobile/InkHole-${{ github.sha }}-ios.zip" "mobile/InkHole-${{ env.RELEASE_TAG }}-ios.zip"
+        run: cp "InkHole-${{ github.sha }}-ios.zip" "InkHole-${{ env.RELEASE_TAG }}-ios.zip"
 
       - name: Upload app to release
         if: env.RELEASE_TAG != ''
