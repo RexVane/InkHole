@@ -5,11 +5,18 @@ import '../theme.dart';
 
 /// 接收记录卡片，对应旧版 InkHoleUI.kt#FileCard：
 /// 表情图标 + 文件名 + 「大小 · 时间」，右侧一个青色的轻操作。
+/// 轻点打开文件，长按复制路径。
 class FileCard extends StatelessWidget {
-  const FileCard({super.key, required this.file, required this.onTap});
+  const FileCard({
+    super.key,
+    required this.file,
+    required this.onTap,
+    required this.onLongPress,
+  });
 
   final ReceivedFile file;
   final VoidCallback onTap;
+  final VoidCallback onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -23,6 +30,7 @@ class FileCard extends StatelessWidget {
       borderRadius: BorderRadius.circular(12),
       child: InkWell(
         onTap: onTap,
+        onLongPress: onLongPress,
         borderRadius: BorderRadius.circular(12),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
@@ -60,7 +68,7 @@ class FileCard extends StatelessWidget {
               ),
               const SizedBox(width: 8),
               Text(
-                '复制路径',
+                '打开',
                 style: TextStyle(
                   color: inkTeal.withValues(alpha: 0.8),
                   fontSize: 11,

@@ -30,7 +30,7 @@ class SettingsDialog extends StatefulWidget {
     required this.deviceLine,
     required this.portLine,
     required this.inboxPath,
-    required this.exportLabel,
+    required this.exportPath,
     required this.onPickExportDirectory,
     required this.onResetExportDirectory,
     required this.sshReady,
@@ -43,16 +43,18 @@ class SettingsDialog extends StatefulWidget {
   final InkSettings initial;
   final String deviceLine;
   final String portLine;
+
+  /// 应用私有收件箱，导出失败时文件会留在这里。
   final String inboxPath;
 
-  /// 当前收件落点的展示文案(默认「系统下载目录/InkHole」或自定义目录名)。
-  final String exportLabel;
+  /// 收件落点的完整路径(默认目录的绝对路径，或解开的自定义目录)。
+  final String exportPath;
 
-  /// 弹系统目录选择器,选择成功返回新目录展示名,取消返回 null。
+  /// 弹系统目录选择器,选择成功返回新的完整路径,取消返回 null。
   final Future<String?> Function() onPickExportDirectory;
 
-  /// 恢复默认收件目录(系统下载目录/InkHole)。
-  final Future<void> Function() onResetExportDirectory;
+  /// 恢复默认收件目录,返回默认目录的完整路径。
+  final Future<String> Function() onResetExportDirectory;
 
   final bool sshReady;
 
@@ -90,7 +92,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
   late bool _passphraseStored;
   int _tab = 0;
   int _editing = -1;
-  late String _exportLabel;
+  late String _exportPath;
   bool _checking = false;
   bool _checkingUpdate = false;
   String _manualError = '';
@@ -118,7 +120,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
     _keyStored = initial.sshPrivateKey.isNotEmpty;
     _passphraseStored = initial.sshPassphrase.isNotEmpty;
     _manualPeers = List<ManualPeer>.of(initial.manualPeers);
-    _exportLabel = widget.exportLabel;
+    _exportPath = widget.exportPath;
   }
 
   @override
@@ -159,17 +161,18 @@ class _SettingsDialogState extends State<SettingsDialog> {
     );
   }
 
-  void _submitManualPeer() {
+  /// 提交 Tailscale 标签页正在编辑的设备；输入非法返回 false 并留下提示。
+  bool _submitManualPeer() {
     final String host = _manualHost.text.trim();
     if (host.isEmpty || host.contains(' ')) {
       setState(() => _manualError = 'Tailscale IP 或 MagicDNS 名称无效');
-      return;
+      return false;
     }
     final String portText = _manualPort.text.trim();
     final int manualPort = portText.isEmpty ? 0 : (int.tryParse(portText) ?? -1);
     if (manualPort < 0 || manualPort > 65535) {
       setState(() => _manualError = '对方监听端口需为 1-65535 或留空');
-      return;
+      return false;
     }
     final ManualPeer peer = ManualPeer(
       name: _manualName.text.trim(),
@@ -189,6 +192,14 @@ class _SettingsDialogState extends State<SettingsDialog> {
       _manualPort.clear();
       _manualHost.clear();
     });
+    return true;
+  }
+
+  /// 填完地址直接点「保存」是最自然的操作，但设备要先经「添加设备」才进列表。
+  /// 保存时兜底收下还留在输入框里的地址，否则用户以为存上了、回来却看不到。
+  bool _commitPendingManualPeer() {
+    if (_manualHost.text.trim().isEmpty) return true;
+    return _submitManualPeer();
   }
 
   Future<void> _verifySsh() async {
@@ -239,6 +250,13 @@ class _SettingsDialogState extends State<SettingsDialog> {
     }
     if (_name.text.trim().isEmpty) {
       setState(() => _error = '设备名称不能为空');
+      return;
+    }
+    if (!_commitPendingManualPeer()) {
+      setState(() {
+        _tab = 0;
+        _error = '请先修正 Tailscale 设备信息';
+      });
       return;
     }
     Navigator.of(context).pop(_draft());
@@ -412,28 +430,32 @@ class _SettingsDialogState extends State<SettingsDialog> {
               '收件目录',
               style: TextStyle(color: inkTextPrimary, fontSize: 13),
             ),
-            Text(_exportLabel, style: _hintStyle),
+            SelectionArea(child: Text(_exportPath, style: _hintStyle)),
             const Text(
               '所有接收文件和文件夹统一保存在这里；未自定义时保存到系统下载目录的 InkHole 文件夹',
               style: TextStyle(color: inkTextDim, fontSize: 11),
+            ),
+            SelectionArea(
+              child: Text(
+                '导出失败时暂存于应用内：${widget.inboxPath}',
+                style: const TextStyle(color: inkTextDim, fontSize: 11),
+              ),
             ),
             Row(
               children: <Widget>[
                 TextButton(
                   onPressed: () async {
-                    final String? label = await widget.onPickExportDirectory();
-                    if (label != null && mounted) {
-                      setState(() => _exportLabel = label);
+                    final String? path = await widget.onPickExportDirectory();
+                    if (path != null && mounted) {
+                      setState(() => _exportPath = path);
                     }
                   },
                   child: const Text('选择目录'),
                 ),
                 TextButton(
                   onPressed: () async {
-                    await widget.onResetExportDirectory();
-                    if (mounted) {
-                      setState(() => _exportLabel = '系统下载目录/InkHole');
-                    }
+                    final String path = await widget.onResetExportDirectory();
+                    if (mounted) setState(() => _exportPath = path);
                   },
                   child: const Text('恢复默认'),
                 ),
@@ -593,7 +615,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
       Align(
         alignment: Alignment.centerLeft,
         child: TextButton(
-          onPressed: _submitManualPeer,
+          onPressed: () => _submitManualPeer(),
           child: Text(_editing < 0 ? '添加设备' : '保存设备'),
         ),
       ),

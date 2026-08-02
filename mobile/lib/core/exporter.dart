@@ -46,4 +46,43 @@ class ExporterChannel {
     if (uri.isEmpty) return null;
     return PickedDirectory(uri: uri, label: '${raw['label'] ?? '自定义目录'}');
   }
+
+  /// 打开一条收件记录。返回 [openedExact] 表示直接打开了该文件，
+  /// [openedDownloads] 表示只能回退到系统下载管理(文件夹或记录已被移走)。
+  static Future<String> open({
+    required String path,
+    required String name,
+    String? treeUri,
+  }) async {
+    final String? outcome =
+        await _channel.invokeMethod<String>('open', <String, String?>{
+      'path': path,
+      'name': name,
+      'treeUri': (treeUri == null || treeUri.isEmpty) ? null : treeUri,
+    });
+    return outcome ?? openedDownloads;
+  }
+
+  /// 默认收件落点的绝对路径;非 Android 平台返回 null。
+  static Future<String?> downloadsPath() async {
+    try {
+      return await _channel.invokeMethod<String>('downloadsPath');
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// 把 SAF 树 URI 解成可读路径;解不出来返回 null。
+  static Future<String?> describeTree(String uri) async {
+    if (uri.isEmpty) return null;
+    try {
+      return await _channel
+          .invokeMethod<String>('describeTree', <String, String>{'uri': uri});
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  static const String openedExact = 'exact';
+  static const String openedDownloads = 'downloads';
 }

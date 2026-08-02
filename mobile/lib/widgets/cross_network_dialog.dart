@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
@@ -29,7 +31,7 @@ class CrossNetworkActionsDialog extends StatefulWidget {
     required this.sshReady,
     required this.initialReceiveCode,
     required this.onOneTimeSend,
-    required this.onScanRequested,
+    required this.onScan,
     required this.onJoinOneTime,
     required this.onCreateSshPair,
     required this.onJoinSshPair,
@@ -40,7 +42,9 @@ class CrossNetworkActionsDialog extends StatefulWidget {
   final bool sshReady;
   final String initialReceiveCode;
   final VoidCallback onOneTimeSend;
-  final VoidCallback onScanRequested;
+
+  /// 拉起扫码，返回识别出的短码；取消或识别失败返回 null。
+  final Future<String?> Function() onScan;
 
   /// 返回 true 表示已连上，面板自行关闭；返回 false 时保留面板让用户重试。
   final Future<bool> Function(String code) onJoinOneTime;
@@ -77,6 +81,16 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
     if (!joined) return;
     if (!mounted) return;
     Navigator.of(context).pop();
+  }
+
+  /// 扫到的短码直接填进输入框，由用户确认后再点「连接并接收」。
+  Future<void> _scan() async {
+    final String? code = await widget.onScan();
+    if (code == null || code.isEmpty || !mounted) return;
+    _receiveCode.value = TextEditingValue(
+      text: code,
+      selection: TextSelection.collapsed(offset: code.length),
+    );
   }
 
   @override
@@ -125,7 +139,7 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
                         const SizedBox(width: 4),
                         IconButton(
                           tooltip: '扫描一次性短码二维码',
-                          onPressed: joining ? null : widget.onScanRequested,
+                          onPressed: joining ? null : () => unawaited(_scan()),
                           icon: const Icon(Icons.qr_code_scanner),
                         ),
                       ],

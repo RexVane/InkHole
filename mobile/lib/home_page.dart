@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/exporter.dart';
 import 'core/inkhole_core.dart';
+import 'core/scanner.dart';
 import 'models.dart';
 import 'theme.dart';
 import 'widgets/cross_network_dialog.dart';
@@ -72,8 +73,19 @@ class _HomePageState extends State<HomePage> {
   final List<ReceivedFile> _received = <ReceivedFile>[];
   String _exportTreeUri = '';
   String _exportTreeLabel = '';
+
+  /// 收件落点的完整可读路径，只用于设置里展示。
+  String _exportPath = '';
   final List<String> _sharedFiles = <String>[];
   final Map<String, TransferProgress> _progress = <String, TransferProgress>{};
+
+  /// 仍在进行的发送，key 与 _progress 一致。接收方向没有 send_id，
+  /// 分开记才不会在纯接收时冒出「取消发送」。
+  final Set<String> _sendIds = <String>{};
+
+  /// 用户主动取消的发送。核心随后仍会回一条失败的 lan.sent，
+  /// 不记下来就会把「已取消发送」盖成「发送失败」。
+  final Set<String> _cancelledSends = <String>{};
 
   // 传输速率的指数平滑采样，对应旧版 MainActivity#onProgress。
   String _speedKey = '';
@@ -156,6 +168,7 @@ class _HomePageState extends State<HomePage> {
         await _preferences!.remove('identity_private');
       }
       _loadStoredSettings();
+      unawaited(_refreshExportPath());
       _events = _core.events.listen(_onCoreEvent);
       await _core.start();
       await _startLanSession();
@@ -241,6 +254,8 @@ class _HomePageState extends State<HomePage> {
         _peers = const <PeerView>[];
         _selectedInstance = null;
         _progress.clear();
+        _sendIds.clear();
+        _cancelledSends.clear();
         _sending = false;
       });
     }
@@ -355,6 +370,8 @@ class _HomePageState extends State<HomePage> {
           _status = '共享传输核心已停止';
           _sending = false;
           _progress.clear();
+          _sendIds.clear();
+          _cancelledSends.clear();
         });
       case 'lan.peers':
         final List<dynamic> values =
@@ -397,22 +414,32 @@ class _HomePageState extends State<HomePage> {
         });
       case 'lan.sent':
         final String? id = data['send_id']?.toString();
+        final bool cancelled = id != null && _cancelledSends.remove(id);
         if (!mounted) return;
         setState(() {
-          if (id != null) _progress.remove(id);
-          _sending = _progress.isNotEmpty;
+          if (id != null) {
+            _progress.remove(id);
+            _sendIds.remove(id);
+          }
+          _sending = _sendIds.isNotEmpty;
         });
-        _setStatus(
-          data['ok'] == true ? '发送完成' : '发送失败：${data['error'] ?? '连接中断'}',
-        );
+        if (cancelled) {
+          _setStatus('已取消发送');
+        } else {
+          _setStatus(
+            data['ok'] == true ? '发送完成' : '发送失败：${data['error'] ?? '连接中断'}',
+          );
+        }
       case 'lan.received':
         final String path = data['path']?.toString() ?? '';
         final String? receiveId =
             data['send_id']?.toString() ?? data['transfer_id']?.toString();
         if (!mounted) return;
         setState(() {
+          // 收完就把进度条撤掉：后面还要把成品搬到下载目录，
+          // 那段时间进度环停在 100% 会被当成卡住。
           if (receiveId != null) _progress.remove(receiveId);
-          _sending = _progress.isNotEmpty;
+          _sending = _sendIds.isNotEmpty;
           _received.insert(
             0,
             ReceivedFile(
@@ -424,8 +451,11 @@ class _HomePageState extends State<HomePage> {
             ),
           );
         });
-        _setStatus('已接收文件');
-        if (path.isNotEmpty) unawaited(_exportReceived(path));
+        if (path.isEmpty) {
+          _setStatus('已接收文件');
+        } else {
+          unawaited(_exportReceived(path));
+        }
       case 'wormhole.offer':
         _activeWormholeSession = data['session_id']?.toString();
         if (mounted) unawaited(_showWormholeOffer(data));
@@ -460,6 +490,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 百分比与速度放最前：状态栏空间不够时截断的是文件名，实时速度永远可见。
+  ///
+  /// 满 100% 之后核心还要 fsync + 落盘校验，这段时间不会再有事件，
+  /// 所以文字换成「正在写入存储…」，免得看起来像卡死。
   String _progressLine(String kind, String filename, int done, int total) {
     final String key = '$kind|$filename';
     final int now = DateTime.now().millisecondsSinceEpoch;
@@ -482,13 +515,17 @@ class _HomePageState extends State<HomePage> {
       }
     }
     final int percent = total > 0 ? (done * 100 / total).round() : 100;
+    final String direction = kind == 'send' ? '↑ 发送' : '↓ 接收';
+    if (total > 0 && done >= total) {
+      final String tail = kind == 'send' ? '正在校验…' : '正在写入存储…';
+      return '$direction 100% · $tail · $filename';
+    }
     String speed = '';
     if (_speedBytes >= 1024 * 1024) {
       speed = ' · ${(_speedBytes / 1024 / 1024).toStringAsFixed(1)} MB/s';
     } else if (_speedBytes >= 1024) {
       speed = ' · ${(_speedBytes / 1024).toStringAsFixed(0)} KB/s';
     }
-    final String direction = kind == 'send' ? '↑ 发送' : '↓ 接收';
     return '$direction $percent%$speed · $filename';
   }
 
@@ -552,16 +589,25 @@ class _HomePageState extends State<HomePage> {
           'endpoint_token': '',
         });
         final String? id = response['send_id']?.toString();
-        if (id != null && mounted) setState(() => _sending = true);
+        if (id != null && mounted) {
+          setState(() {
+            _sendIds.add(id);
+            _sending = true;
+          });
+        }
       } catch (error) {
         _setStatus('发送失败：$error');
       }
     }
   }
 
+  /// 中断所有在途发送。核心只提供 lan.send.cancel，接收方向没有
+  /// 单条取消的接口（取消只能整体停会话），所以这里只管发送。
   Future<void> _cancelSending() async {
     if (_sessionId == null) return;
-    final List<String> sends = _progress.keys.toList(growable: false);
+    final List<String> sends = _sendIds.toList(growable: false);
+    if (sends.isEmpty) return;
+    _cancelledSends.addAll(sends);
     for (final String sendId in sends) {
       try {
         await _core.call('lan.send.cancel', <String, dynamic>{
@@ -570,7 +616,15 @@ class _HomePageState extends State<HomePage> {
         });
       } catch (_) {}
     }
-    if (mounted) setState(() => _sending = false);
+    if (mounted) {
+      setState(() {
+        for (final String sendId in sends) {
+          _progress.remove(sendId);
+          _sendIds.remove(sendId);
+        }
+        _sending = _sendIds.isNotEmpty;
+      });
+    }
     _setStatus('已取消发送');
   }
 
@@ -651,7 +705,7 @@ class _HomePageState extends State<HomePage> {
         sshReady: _sshSessionId != null,
         initialReceiveCode: '',
         onOneTimeSend: () => unawaited(_createOneTime()),
-        onScanRequested: _scanUnavailable,
+        onScan: _scanShortCode,
         onJoinOneTime: _joinOneTime,
         onCreateSshPair: () => unawaited(_createSshPair()),
         onJoinSshPair: (String code) => unawaited(_joinSshPair(code)),
@@ -659,8 +713,22 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  void _scanUnavailable() {
-    _toast('本版本暂未接入扫码，请粘贴或手动输入短码');
+  /// 扫一次性短码二维码；取消返回 null，扫到无关内容时提示并返回 null。
+  Future<String?> _scanShortCode() async {
+    final String? raw;
+    try {
+      raw = await ScannerChannel.scan();
+    } on Exception catch (error) {
+      _toast(friendlyError(error));
+      return null;
+    }
+    if (raw == null) return null;
+    final String? code = parseScannedCode(raw);
+    if (code == null) {
+      _toast('二维码不是有效的一次性短码');
+      return null;
+    }
+    return code;
   }
 
   Future<void> _createSshPair() async {
@@ -777,15 +845,16 @@ class _HomePageState extends State<HomePage> {
         deviceLine: '本机：$_peerName-${_shortInstanceId()}',
         portLine: portLine,
         inboxPath: _inbox,
-        exportLabel: _exportTreeLabel.isEmpty ? '系统下载目录/InkHole' : _exportTreeLabel,
+        exportPath: _exportPath.isEmpty ? '系统下载目录/InkHole' : _exportPath,
         onPickExportDirectory: () async {
           final PickedDirectory? picked = await ExporterChannel.pickDirectory();
           if (picked == null) return null;
           await _saveExportDirectory(picked.uri, picked.label);
-          return picked.label;
+          return _exportPath;
         },
         onResetExportDirectory: () async {
           await _saveExportDirectory('', '');
+          return _exportPath;
         },
         sshReady: _sshSessionId != null,
         onCheckSsh: _checkSsh,
@@ -934,31 +1003,55 @@ class _HomePageState extends State<HomePage> {
   // ---- 杂项 ----
 
   /// 收件成品导出到公共位置(默认 Download/InkHole,或用户自定义目录)。
+  ///
+  /// GB 级文件搬运要几十秒，期间进度条已经撤掉了，得用状态文字说明还在忙。
   Future<void> _exportReceived(String path) async {
+    final String target =
+        _exportTreeLabel.isEmpty ? '下载目录' : _exportTreeLabel;
+    _setStatus('正在保存到$target…');
     try {
       final ExportOutcome outcome = await ExporterChannel.export(
         path,
         treeUri: _exportTreeUri.isEmpty ? null : _exportTreeUri,
       );
       if (!mounted) return;
-      if (outcome.location.isNotEmpty) {
-        final int index =
-            _received.indexWhere((ReceivedFile file) => file.path == path);
-        if (index >= 0) {
-          setState(() {
-            _received[index] = ReceivedFile(
-              name: outcome.name.isEmpty ? _received[index].name : outcome.name,
-              path: '${outcome.location}/${outcome.name}',
-              size: _received[index].size,
-              receivedAt: _received[index].receivedAt,
-              sender: _received[index].sender,
-            );
-          });
-        }
-        _setStatus('已保存到 ${outcome.location}');
+      if (outcome.location.isEmpty) {
+        _setStatus('已接收，文件留在应用内收件箱');
+        return;
       }
+      final int index =
+          _received.indexWhere((ReceivedFile file) => file.path == path);
+      if (index >= 0) {
+        setState(() {
+          _received[index] = ReceivedFile(
+            name: outcome.name.isEmpty ? _received[index].name : outcome.name,
+            path: '${outcome.location}/${outcome.name}',
+            size: _received[index].size,
+            receivedAt: _received[index].receivedAt,
+            sender: _received[index].sender,
+          );
+        });
+      }
+      _setStatus('已保存到 ${outcome.location}');
     } on Exception {
       // 导出失败留在应用内目录,记录保持原路径即可。
+      _setStatus('已接收，文件留在应用内收件箱');
+    }
+  }
+
+  /// 轻点收件记录直接交给系统打开；文件夹或已被移走的条目回退到下载管理。
+  Future<void> _openReceived(ReceivedFile file) async {
+    try {
+      final String outcome = await ExporterChannel.open(
+        path: file.path,
+        name: file.name,
+        treeUri: _exportTreeUri,
+      );
+      if (outcome == ExporterChannel.openedDownloads) {
+        _toast('已打开系统下载目录，请在 InkHole 文件夹里查看');
+      }
+    } on Exception catch (error) {
+      _toast(friendlyError(error));
     }
   }
 
@@ -974,6 +1067,23 @@ class _HomePageState extends State<HomePage> {
       await prefs.setString('export_tree_uri', uri);
       await prefs.setString('export_tree_label', label);
     }
+    await _refreshExportPath();
+  }
+
+  /// 收件落点的完整路径：默认目录问原生要绝对路径，自定义目录把树 URI 解开。
+  Future<String> _refreshExportPath() async {
+    String resolved;
+    if (_exportTreeUri.isEmpty) {
+      resolved = await ExporterChannel.downloadsPath() ?? '';
+      if (resolved.isEmpty) resolved = '系统下载目录/InkHole';
+    } else {
+      resolved = await ExporterChannel.describeTree(_exportTreeUri) ?? '';
+      if (resolved.isEmpty) {
+        resolved = _exportTreeLabel.isEmpty ? '自定义目录' : _exportTreeLabel;
+      }
+    }
+    if (mounted) setState(() => _exportPath = resolved);
+    return resolved;
   }
 
   void _setStatus(String value) {
@@ -1161,6 +1271,13 @@ class _HomePageState extends State<HomePage> {
         child: Center(
           child: TextButton.icon(
             onPressed: () => unawaited(_cancelSending()),
+            style: TextButton.styleFrom(
+              foregroundColor: inkDanger,
+              // 中断是破坏性操作，给一层淡红底把它从青色的常规操作里挑出来。
+              backgroundColor: inkDanger.withValues(alpha: 0.12),
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              shape: const StadiumBorder(),
+            ),
             icon: const Icon(Icons.close, size: 15),
             label: const Text('取消发送', style: TextStyle(fontSize: 12)),
           ),
@@ -1264,7 +1381,8 @@ class _HomePageState extends State<HomePage> {
         final ReceivedFile file = _received[index];
         return FileCard(
           file: file,
-          onTap: () => _copyText(file.path, '已复制文件路径'),
+          onTap: () => unawaited(_openReceived(file)),
+          onLongPress: () => _copyText(file.path, '已复制文件路径'),
         );
       },
     );
