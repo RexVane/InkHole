@@ -25,3 +25,6 @@ desktop/frontend/.bindings-tmp-*
 
 # Runtime inbox files are kept outside version control.
 received/
+
+# 本地会话工具目录
+.zcode/
