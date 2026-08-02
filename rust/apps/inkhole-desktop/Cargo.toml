@@ -25,6 +25,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset", "system-proxy", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 uuid.workspace = true
 
 [dev-dependencies]

@@ -1112,6 +1112,13 @@ byID("checkUpdate").addEventListener("click", () => {
         const latest = String(result?.latest || "");
         byID("updateState").textContent = result?.available ? `发现新版本 v${latest}，当前 v${current}` : `已是最新版本 v${current}`;
         byID("openReleases").hidden = !result?.available;
+        if (result?.available) {
+            const dialog = (window as any).__TAURI__?.dialog;
+            const confirmed = dialog?.ask
+                ? await dialog.ask(`发现新版本 v${latest}（当前 v${current}），是否前往下载？`, {title: "墨洞更新", kind: "info", okLabel: "立即更新", cancelLabel: "稍后"})
+                : false;
+            if (confirmed) await Service.OpenReleases();
+        }
     }, "更新检查完成");
 });
 byID("openReleases").addEventListener("click", () => void run(() => Service.OpenReleases()));

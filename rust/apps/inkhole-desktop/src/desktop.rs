@@ -281,11 +281,7 @@ impl DesktopState {
                 open_url(app, RELEASES_URL)?;
                 Ok(Value::Null)
             }
-            "CheckForUpdate" => Ok(json!({
-                "current": env!("CARGO_PKG_VERSION"),
-                "latest": env!("CARGO_PKG_VERSION"),
-                "available": false,
-            })),
+            "CheckForUpdate" => check_for_update().await,
             "AutostartEnabled" => Ok(Value::Bool(app.autolaunch().is_enabled()?)),
             "SetAutostart" => self.set_autostart(app, &args),
             "ShowMain" => {
@@ -1880,6 +1876,55 @@ fn open_path(app: &AppHandle, value: &str) -> Result<()> {
         .context("无法调用系统程序打开路径")
 }
 
+/// 查询 GitHub 最新 Release 与当前版本比较。走系统代理(reqwest 默认读环境),
+/// 8 秒超时;失败返回可读中文错误由前端 toast 呈现。
+async fn check_for_update() -> Result<Value> {
+    #[derive(serde::Deserialize)]
+    struct LatestRelease {
+        tag_name: String,
+    }
+    let current = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("InkHole/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("初始化更新检查客户端失败")?;
+    let release: LatestRelease = client
+        .get("https://api.github.com/repos/RexVane/InkHole/releases/latest")
+        .send()
+        .await
+        .context("无法连接 GitHub 检查更新")?
+        .error_for_status()
+        .context("GitHub 更新接口返回错误")?
+        .json()
+        .await
+        .context("解析 GitHub 更新信息失败")?;
+    let latest = release.tag_name.trim().trim_start_matches('v').to_owned();
+    Ok(json!({
+        "current": current,
+        "latest": latest,
+        "available": version_is_newer(&latest, current),
+    }))
+}
+
+/// 按点分数字逐段比较,latest 严格大于 current 才算有新版。
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let parse = |value: &str| {
+        value
+            .split('.')
+            .map(|part| {
+                part.trim()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>()
+    };
+    parse(latest) > parse(current)
+}
+
 fn open_url(app: &AppHandle, url: &str) -> Result<()> {
     app.opener()
         .open_url(url, None::<&str>)
@@ -2145,6 +2190,18 @@ mod tests {
             assert!(runtime.batches.is_empty());
             assert!(runtime.core_to_batch.is_empty());
         }
+    }
+
+    #[test]
+    fn version_comparison_detects_newer_releases_only() {
+        assert!(version_is_newer("2.0.4", "2.0.3"));
+        assert!(version_is_newer("2.1.0", "2.0.9"));
+        assert!(version_is_newer("3.0.0", "2.9.9"));
+        assert!(!version_is_newer("2.0.3", "2.0.3"));
+        assert!(!version_is_newer("2.0.2", "2.0.3"));
+        assert!(!version_is_newer("", "2.0.3"));
+        // 老客户端遇到形如 2.0.4-beta 的标签,数字段截断比较仍安全。
+        assert!(version_is_newer("2.0.4-beta", "2.0.3"));
     }
 
     #[test]

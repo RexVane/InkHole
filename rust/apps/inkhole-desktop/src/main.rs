@@ -59,6 +59,9 @@ fn init_diagnostic_logging() {
 }
 
 fn run() -> Result<()> {
+    // reqwest(rustls-no-provider)依赖进程级 CryptoProvider;核心的 quinn 是显式传
+    // provider 不装默认,这里统一安装 ring。重复安装返回 Err,可安全忽略。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let store = config::ConfigStore::discover()?;
     let config = store.load_or_create()?;
     let show_pet = config.show_pet;
