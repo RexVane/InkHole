@@ -82,6 +82,10 @@ jobs:
           Compress-Archive -Path $bundle.FullName -DestinationPath packaging/dist/InkHole-$env:RELEASE_TAG-windows.zip
           (Get-FileHash -Algorithm SHA256 packaging/dist/InkHole-$env:RELEASE_TAG-windows.zip).Hash.ToLowerInvariant() |
             Set-Content -Encoding ascii packaging/dist/InkHole-$env:RELEASE_TAG-windows.zip.sha256
+          # 应用内更新直接下载运行的裸安装器
+          Copy-Item $bundle.FullName packaging/dist/InkHole-$env:RELEASE_TAG-setup.exe
+          (Get-FileHash -Algorithm SHA256 packaging/dist/InkHole-$env:RELEASE_TAG-setup.exe).Hash.ToLowerInvariant() |
+            Set-Content -Encoding ascii packaging/dist/InkHole-$env:RELEASE_TAG-setup.exe.sha256
 
       - name: Package macOS bundle
         if: runner.os == 'macOS'

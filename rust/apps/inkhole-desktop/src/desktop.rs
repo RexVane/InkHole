@@ -282,6 +282,10 @@ impl DesktopState {
                 Ok(Value::Null)
             }
             "CheckForUpdate" => check_for_update().await,
+            "DownloadUpdate" => {
+                let url: String = argument(&args, 0, "url")?;
+                download_and_launch_update(app, &url).await
+            }
             "AutostartEnabled" => Ok(Value::Bool(app.autolaunch().is_enabled()?)),
             "SetAutostart" => self.set_autostart(app, &args),
             "ShowMain" => {
@@ -1900,11 +1904,113 @@ async fn check_for_update() -> Result<Value> {
         .await
         .context("解析 GitHub 更新信息失败")?;
     let latest = release.tag_name.trim().trim_start_matches('v').to_owned();
+    let tag = release.tag_name.trim();
+    let download_url = platform_update_asset_url(tag);
     Ok(json!({
         "current": current,
         "latest": latest,
         "available": version_is_newer(&latest, current),
+        "downloadUrl": download_url,
     }))
+}
+
+/// 当前平台应用内更新要下载的资产地址(Windows 裸安装器 / macOS dmg);
+/// 其余平台返回空串,前端回退到打开发布页。
+fn platform_update_asset_url(tag: &str) -> String {
+    let base = format!("https://github.com/RexVane/InkHole/releases/download/{tag}");
+    if cfg!(target_os = "windows") {
+        format!("{base}/InkHole-{tag}-setup.exe")
+    } else if cfg!(target_os = "macos") {
+        format!("{base}/InkHole-{tag}-macos.dmg")
+    } else {
+        String::new()
+    }
+}
+
+/// 应用内更新:流式下载到临时目录并按平台拉起安装。
+/// Windows 运行 NSIS 安装器后退出应用;macOS 打开 dmg 由用户完成替换。
+async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value> {
+    if !url.starts_with("https://github.com/RexVane/InkHole/releases/download/") {
+        bail!("更新地址不在允许范围");
+    }
+    let file_name = url.rsplit('/').next().unwrap_or("InkHole-update.bin");
+    let target_dir = std::env::temp_dir().join("inkhole-update");
+    tokio::fs::create_dir_all(&target_dir)
+        .await
+        .context("无法创建更新缓存目录")?;
+    let target_path = target_dir.join(file_name);
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("InkHole/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("初始化下载客户端失败")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("无法连接更新下载服务器")?
+        .error_for_status()
+        .context("更新下载服务器返回错误")?;
+    let total = response.content_length().unwrap_or(0);
+    const MAX_UPDATE_SIZE: u64 = 250 * 1024 * 1024;
+    if total > MAX_UPDATE_SIZE {
+        bail!("更新包大小异常");
+    }
+    let mut file = tokio::fs::File::create(&target_path)
+        .await
+        .context("无法写入更新缓存文件")?;
+    let mut stream = response;
+    let mut done: u64 = 0;
+    let mut last_percent: i64 = -1;
+    while let Some(chunk) = stream.chunk().await.context("下载更新数据中断")? {
+        done += chunk.len() as u64;
+        if done > MAX_UPDATE_SIZE {
+            bail!("更新包大小异常");
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .context("写入更新缓存失败")?;
+        if total > 0 {
+            let percent = (done * 100 / total) as i64;
+            if percent != last_percent {
+                last_percent = percent;
+                let _ = app.emit("update-progress", json!({ "percent": percent }));
+            }
+        }
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .context("写入更新缓存失败")?;
+    drop(file);
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new(&target_path)
+            .spawn()
+            .context("无法启动更新安装程序")?;
+        // 给安装器让路:主动走既有退出流程(Stop 清理由 ExitRequested 处理)。
+        let app = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            app.exit(0);
+        });
+        Ok(json!({ "launched": true, "restart": true }))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        app.opener()
+            .open_path(
+                target_path.to_string_lossy().to_string(),
+                None::<&str>,
+            )
+            .context("无法打开更新镜像")?;
+        return Ok(json!({ "launched": true, "restart": false }));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = target_path;
+        bail!("当前平台暂不支持应用内更新");
+    }
 }
 
 /// 按点分数字逐段比较,latest 严格大于 current 才算有新版。

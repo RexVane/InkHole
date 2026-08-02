@@ -1101,6 +1101,31 @@ byID("joinSSHPairing").addEventListener("click", () => {
     }, "设备配对成功");
 });
 
+Events.On("update-progress", (event) => {
+    const percent = Number((event.data as any)?.percent ?? 0);
+    byID("updateState").textContent = `正在下载更新 ${percent}%`;
+});
+
+async function downloadUpdate(url: string): Promise<void> {
+    if (!url) {
+        await Service.OpenReleases();
+        return;
+    }
+    byID("updateState").textContent = "正在下载更新 0%";
+    try {
+        const outcome = await (window as any).__TAURI__.core.invoke("frontend_call", {method: "DownloadUpdate", args: [url]});
+        if (outcome?.restart) {
+            byID("updateState").textContent = "安装程序已启动，墨洞即将退出";
+        } else {
+            byID("updateState").textContent = "已打开更新镜像，请将墨洞拖入「应用程序」完成更新";
+        }
+    } catch (error) {
+        byID("updateState").textContent = errorMessage(error);
+        toast(errorMessage(error), true);
+        await Service.OpenReleases();
+    }
+}
+
 byID("checkUpdate").addEventListener("click", () => {
     const session = readySettingsSession();
     if (session === null) return;
@@ -1115,9 +1140,9 @@ byID("checkUpdate").addEventListener("click", () => {
         if (result?.available) {
             const dialog = (window as any).__TAURI__?.dialog;
             const confirmed = dialog?.ask
-                ? await dialog.ask(`发现新版本 v${latest}（当前 v${current}），是否前往下载？`, {title: "墨洞更新", kind: "info", okLabel: "立即更新", cancelLabel: "稍后"})
+                ? await dialog.ask(`发现新版本 v${latest}（当前 v${current}），是否立即更新？`, {title: "墨洞更新", kind: "info", okLabel: "立即更新", cancelLabel: "稍后"})
                 : false;
-            if (confirmed) await Service.OpenReleases();
+            if (confirmed) await downloadUpdate(String(result?.downloadUrl || ""));
         }
     }, "更新检查完成");
 });
