@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'core/exporter.dart';
 import 'core/inkhole_core.dart';
 import 'models.dart';
 import 'theme.dart';
@@ -69,6 +70,8 @@ class _HomePageState extends State<HomePage> {
   final ValueNotifier<bool> _oneTimeConnected = ValueNotifier<bool>(false);
   final ValueNotifier<bool> _sshPaired = ValueNotifier<bool>(false);
   final List<ReceivedFile> _received = <ReceivedFile>[];
+  String _exportTreeUri = '';
+  String _exportTreeLabel = '';
   final List<String> _sharedFiles = <String>[];
   final Map<String, TransferProgress> _progress = <String, TransferProgress>{};
 
@@ -185,6 +188,8 @@ class _HomePageState extends State<HomePage> {
     _sshEnabled = prefs.getBool('ssh_enabled') ?? false;
     _rendezvousUrl = prefs.getString('rendezvous_url') ?? '';
     _transitRelay = prefs.getString('transit_relay') ?? '';
+    _exportTreeUri = prefs.getString('export_tree_uri') ?? '';
+    _exportTreeLabel = prefs.getString('export_tree_label') ?? '';
     _manualPeers = (prefs.getStringList('manual_peers') ?? const <String>[])
         .map(ManualPeer.decode)
         .where((ManualPeer peer) => peer.host.isNotEmpty)
@@ -420,6 +425,7 @@ class _HomePageState extends State<HomePage> {
           );
         });
         _setStatus('已接收文件');
+        if (path.isNotEmpty) unawaited(_exportReceived(path));
       case 'wormhole.offer':
         _activeWormholeSession = data['session_id']?.toString();
         if (mounted) unawaited(_showWormholeOffer(data));
@@ -771,6 +777,16 @@ class _HomePageState extends State<HomePage> {
         deviceLine: '本机：$_peerName-${_shortInstanceId()}',
         portLine: portLine,
         inboxPath: _inbox,
+        exportLabel: _exportTreeLabel.isEmpty ? '系统下载目录/InkHole' : _exportTreeLabel,
+        onPickExportDirectory: () async {
+          final PickedDirectory? picked = await ExporterChannel.pickDirectory();
+          if (picked == null) return null;
+          await _saveExportDirectory(picked.uri, picked.label);
+          return picked.label;
+        },
+        onResetExportDirectory: () async {
+          await _saveExportDirectory('', '');
+        },
         sshReady: _sshSessionId != null,
         onCheckSsh: _checkSsh,
         onCreateSshPair: () => unawaited(_createSshPair()),
@@ -916,6 +932,49 @@ class _HomePageState extends State<HomePage> {
   }
 
   // ---- 杂项 ----
+
+  /// 收件成品导出到公共位置(默认 Download/InkHole,或用户自定义目录)。
+  Future<void> _exportReceived(String path) async {
+    try {
+      final ExportOutcome outcome = await ExporterChannel.export(
+        path,
+        treeUri: _exportTreeUri.isEmpty ? null : _exportTreeUri,
+      );
+      if (!mounted) return;
+      if (outcome.location.isNotEmpty) {
+        final int index =
+            _received.indexWhere((ReceivedFile file) => file.path == path);
+        if (index >= 0) {
+          setState(() {
+            _received[index] = ReceivedFile(
+              name: outcome.name.isEmpty ? _received[index].name : outcome.name,
+              path: '${outcome.location}/${outcome.name}',
+              size: _received[index].size,
+              receivedAt: _received[index].receivedAt,
+              sender: _received[index].sender,
+            );
+          });
+        }
+        _setStatus('已保存到 ${outcome.location}');
+      }
+    } on Exception {
+      // 导出失败留在应用内目录,记录保持原路径即可。
+    }
+  }
+
+  /// 设置弹窗里选择/恢复收件目录后的持久化。
+  Future<void> _saveExportDirectory(String uri, String label) async {
+    _exportTreeUri = uri;
+    _exportTreeLabel = label;
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    if (uri.isEmpty) {
+      await prefs.remove('export_tree_uri');
+      await prefs.remove('export_tree_label');
+    } else {
+      await prefs.setString('export_tree_uri', uri);
+      await prefs.setString('export_tree_label', label);
+    }
+  }
 
   void _setStatus(String value) {
     if (mounted) setState(() => _status = value);

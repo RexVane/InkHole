@@ -1999,10 +1999,7 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
     #[cfg(target_os = "macos")]
     {
         app.opener()
-            .open_path(
-                target_path.to_string_lossy().to_string(),
-                None::<&str>,
-            )
+            .open_path(target_path.to_string_lossy().to_string(), None::<&str>)
             .context("无法打开更新镜像")?;
         return Ok(json!({ "launched": true, "restart": false }));
     }

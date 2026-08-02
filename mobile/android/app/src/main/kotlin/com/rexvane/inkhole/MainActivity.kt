@@ -20,6 +20,9 @@ class MainActivity : FlutterActivity() {
     private var shareChannel: MethodChannel? = null
     private var updaterChannel: MethodChannel? = null
     private val updateExecutor = Executors.newSingleThreadExecutor()
+    private var exporterChannel: MethodChannel? = null
+    private val exportExecutor = Executors.newSingleThreadExecutor()
+    private var pendingDirectoryPick: MethodChannel.Result? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,6 +37,43 @@ class MainActivity : FlutterActivity() {
             channel.setMethodCallHandler { call: MethodCall, result: MethodChannel.Result ->
                 when (call.method) {
                     "consumeSharedFiles" -> result.success(drainPendingSharedFiles())
+                    else -> result.notImplemented()
+                }
+            }
+        }
+        exporterChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, EXPORTER_CHANNEL).also { channel ->
+            channel.setMethodCallHandler { call: MethodCall, result: MethodChannel.Result ->
+                when (call.method) {
+                    "export" -> {
+                        val path = call.argument<String>("path").orEmpty()
+                        val treeUri = call.argument<String>("treeUri")
+                        exportExecutor.execute {
+                            try {
+                                val outcome = Exporter.export(this, path, treeUri)
+                                runOnUiThread {
+                                    result.success(
+                                        mapOf("name" to outcome.name, "location" to outcome.location),
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("export_failed", e.message ?: "导出失败", null) }
+                            }
+                        }
+                    }
+                    "pickDirectory" -> {
+                        if (pendingDirectoryPick != null) {
+                            result.error("busy", "目录选择进行中", null)
+                        } else {
+                            pendingDirectoryPick = result
+                            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+                            )
+                            @Suppress("DEPRECATION")
+                            startActivityForResult(intent, REQUEST_PICK_DIRECTORY)
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -87,9 +127,34 @@ class MainActivity : FlutterActivity() {
         handleIncomingIntent(intent)
     }
 
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_PICK_DIRECTORY) return
+        val pending = pendingDirectoryPick ?: return
+        pendingDirectoryPick = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            pending.success(null)
+            return
+        }
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        } catch (_: SecurityException) {
+        }
+        val label = androidx.documentfile.provider.DocumentFile.fromTreeUri(this, uri)?.name
+        pending.success(mapOf("uri" to uri.toString(), "label" to (label ?: "自定义目录")))
+    }
+
     override fun onDestroy() {
         shareExecutor.shutdownNow()
         updateExecutor.shutdownNow()
+        exportExecutor.shutdownNow()
+        exporterChannel = null
+        pendingDirectoryPick = null
         shareChannel = null
         updaterChannel = null
         super.onDestroy()
@@ -219,6 +284,8 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val SHARE_CHANNEL = "com.rexvane.inkhole/share"
         private const val UPDATER_CHANNEL = "com.rexvane.inkhole/updater"
+        private const val EXPORTER_CHANNEL = "com.rexvane.inkhole/exporter"
+        private const val REQUEST_PICK_DIRECTORY = 9107
         private const val SHARE_CACHE_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
     }
 }

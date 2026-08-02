@@ -30,6 +30,9 @@ class SettingsDialog extends StatefulWidget {
     required this.deviceLine,
     required this.portLine,
     required this.inboxPath,
+    required this.exportLabel,
+    required this.onPickExportDirectory,
+    required this.onResetExportDirectory,
     required this.sshReady,
     required this.onCheckSsh,
     required this.onCreateSshPair,
@@ -41,6 +44,16 @@ class SettingsDialog extends StatefulWidget {
   final String deviceLine;
   final String portLine;
   final String inboxPath;
+
+  /// 当前收件落点的展示文案(默认「系统下载目录/InkHole」或自定义目录名)。
+  final String exportLabel;
+
+  /// 弹系统目录选择器,选择成功返回新目录展示名,取消返回 null。
+  final Future<String?> Function() onPickExportDirectory;
+
+  /// 恢复默认收件目录(系统下载目录/InkHole)。
+  final Future<void> Function() onResetExportDirectory;
+
   final bool sshReady;
 
   /// 返回 ssh.check 的原始结果；失败时返回 null，错误由页面用状态栏提示。
@@ -77,6 +90,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
   late bool _passphraseStored;
   int _tab = 0;
   int _editing = -1;
+  late String _exportLabel;
   bool _checking = false;
   bool _checkingUpdate = false;
   String _manualError = '';
@@ -104,6 +118,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
     _keyStored = initial.sshPrivateKey.isNotEmpty;
     _passphraseStored = initial.sshPassphrase.isNotEmpty;
     _manualPeers = List<ManualPeer>.of(initial.manualPeers);
+    _exportLabel = widget.exportLabel;
   }
 
   @override
@@ -229,6 +244,28 @@ class _SettingsDialogState extends State<SettingsDialog> {
     Navigator.of(context).pop(_draft());
   }
 
+  /// 在设置弹窗上层弹提示(SnackBar 会被弹窗遮挡且位置在屏幕底部)。
+  Future<void> _showUpdateNotice(String title, String message) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        backgroundColor: inkBgCard,
+        title: Text(title, style: const TextStyle(color: inkTextPrimary)),
+        content: Text(
+          message,
+          style: const TextStyle(color: inkTextSecondary, fontSize: 13),
+        ),
+        actions: <Widget>[
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('好'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _checkUpdate() async {
     setState(() => _checkingUpdate = true);
     UpdateInfo info;
@@ -237,17 +274,13 @@ class _SettingsDialogState extends State<SettingsDialog> {
     } on Exception catch (error) {
       if (!mounted) return;
       setState(() => _checkingUpdate = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('检查更新失败：${friendlyError(error)}')),
-      );
+      await _showUpdateNotice('检查更新失败', friendlyError(error));
       return;
     }
     if (!mounted) return;
     setState(() => _checkingUpdate = false);
     if (!info.newer) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已是最新版本 v$appVersion')),
-      );
+      await _showUpdateNotice('检查更新', '当前已是最新版本 v$appVersion');
       return;
     }
     final bool? confirmed = await showDialog<bool>(
@@ -317,9 +350,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
     } on Exception catch (error) {
       if (mounted && dialogOpen) Navigator.of(context, rootNavigator: true).pop();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('下载更新失败：${friendlyError(error)}')),
-      );
+      await _showUpdateNotice('下载更新失败', friendlyError(error));
       return;
     } finally {
       UpdaterChannel.onProgress = null;
@@ -378,13 +409,35 @@ class _SettingsDialogState extends State<SettingsDialog> {
             const _SectionTitle('存储'),
             const SizedBox(height: 4),
             const Text(
-              '默认目录',
+              '收件目录',
               style: TextStyle(color: inkTextPrimary, fontSize: 13),
             ),
-            Text(widget.inboxPath, style: _hintStyle),
+            Text(_exportLabel, style: _hintStyle),
             const Text(
-              '所有接收文件和文件夹统一保存在这里',
+              '所有接收文件和文件夹统一保存在这里；未自定义时保存到系统下载目录的 InkHole 文件夹',
               style: TextStyle(color: inkTextDim, fontSize: 11),
+            ),
+            Row(
+              children: <Widget>[
+                TextButton(
+                  onPressed: () async {
+                    final String? label = await widget.onPickExportDirectory();
+                    if (label != null && mounted) {
+                      setState(() => _exportLabel = label);
+                    }
+                  },
+                  child: const Text('选择目录'),
+                ),
+                TextButton(
+                  onPressed: () async {
+                    await widget.onResetExportDirectory();
+                    if (mounted) {
+                      setState(() => _exportLabel = '系统下载目录/InkHole');
+                    }
+                  },
+                  child: const Text('恢复默认'),
+                ),
+              ],
             ),
             const SizedBox(height: 14),
             const _SectionTitle('传输安全'),
