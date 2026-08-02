@@ -211,8 +211,24 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _startLanSession() async {
     _instanceId = _loadInstanceId();
-    final Map<String, dynamic> result =
-        await _core.call('lan.start', <String, dynamic>{
+    Map<String, dynamic> result;
+    try {
+      result = await _lanStartCall();
+    } on Exception catch (error) {
+      // 端口尚在释放中的极端竞态:核心已支持启动时自动清理旧会话,
+      // 等一秒重试一次即可恢复。
+      if ('$error'.contains('Address already in use')) {
+        await Future<void>.delayed(const Duration(seconds: 1));
+        result = await _lanStartCall();
+      } else {
+        rethrow;
+      }
+    }
+    _applyLanStartResult(result);
+  }
+
+  Future<Map<String, dynamic>> _lanStartCall() async {
+    return _core.call('lan.start', <String, dynamic>{
       'peer_name': _peerName,
       'instance_id': _instanceId,
       'identity_private': _identityPrivate ?? '',
@@ -227,13 +243,16 @@ class _HomePageState extends State<HomePage> {
           .map((ManualPeer peer) => peer.host)
           .toList(growable: false),
     });
+  }
+
+  void _applyLanStartResult(Map<String, dynamic> result) {
     _sessionId = result['session_id']?.toString();
     _actualPort = asInt(result['port']);
     _identityPrivate = result['identity_private']?.toString();
-    if (_identityPrivate != null) {
-      await _secureStorage.write(
-        key: 'identity_private',
-        value: _identityPrivate!,
+    final String? identityPrivate = _identityPrivate;
+    if (identityPrivate != null) {
+      unawaited(
+        _secureStorage.write(key: 'identity_private', value: identityPrivate),
       );
     }
     if (_sshEnabled) unawaited(_startSsh());

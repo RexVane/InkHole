@@ -603,6 +603,33 @@ impl JsonService {
     }
 
     async fn start_lan(&self, mut params: LanStartParams) -> Result<Value> {
+        // 幂等保险丝:调用方(尤其是被前台服务保活的安卓 App)重建界面时会再次
+        // lan.start;旧会话还占着监听端口会导致 EADDRINUSE。先关掉本实例内
+        // 既有的全部 LAN 会话与其中继,再建新会话。
+        let (stale_sessions, stale_relays) = {
+            let mut state = self.inner.state.lock().await;
+            let sessions = state
+                .sessions
+                .drain()
+                .map(|(_, session)| session)
+                .collect::<Vec<_>>();
+            let relays = state
+                .ssh_relays
+                .drain()
+                .map(|(_, relay)| relay)
+                .collect::<Vec<_>>();
+            (sessions, relays)
+        };
+        if !stale_sessions.is_empty() {
+            tracing::info!(
+                count = stale_sessions.len(),
+                "closing stale LAN sessions before starting a new one"
+            );
+        }
+        close_ssh_relays(stale_relays).await?;
+        for session in stale_sessions {
+            session.close().await?;
+        }
         params.instance_id = params.instance_id.trim().to_ascii_lowercase();
         if params.peer_name.trim().is_empty()
             || params.inbox.trim().is_empty()

@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
@@ -299,7 +300,15 @@ void _nativeWorker(List<dynamic> arguments) {
 }
 
 class InkHoleCore {
-  InkHoleCore({this.libraryPath});
+  /// 进程级单例:前台服务让进程常驻,Activity 重建时必须复用同一核心
+  /// 实例,否则旧实例的会话继续占用端口导致 Address already in use。
+  factory InkHoleCore({String? libraryPath}) =>
+      _instance ??= InkHoleCore.internal(libraryPath: libraryPath);
+
+  @visibleForTesting
+  InkHoleCore.internal({this.libraryPath});
+
+  static InkHoleCore? _instance;
 
   final String? libraryPath;
   final StreamController<Map<String, dynamic>> _events =
