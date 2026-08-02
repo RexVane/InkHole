@@ -1,9 +1,22 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
 
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../core/updater.dart';
 import '../models.dart';
 import '../theme.dart';
 import 'cross_network_dialog.dart';
 import 'usage_guide_dialog.dart';
+
+/// 把 PlatformException 压成用户可读的一句话。
+String friendlyError(Object error) {
+  if (error is PlatformException) {
+    final String message = (error.message ?? '').trim();
+    return message.isEmpty ? error.code : message;
+  }
+  return '$error';
+}
 
 /// 设置面板，对应旧版 MainActivity.kt#SettingsDialog。
 ///
@@ -54,6 +67,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
   late final TextEditingController _sshPassphrase;
   final TextEditingController _manualName = TextEditingController();
   final TextEditingController _manualHost = TextEditingController();
+  final TextEditingController _manualPort = TextEditingController();
 
   late bool _encryption;
   late bool _sshEnabled;
@@ -64,6 +78,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
   int _tab = 0;
   int _editing = -1;
   bool _checking = false;
+  bool _checkingUpdate = false;
   String _manualError = '';
   String _error = '';
 
@@ -105,6 +120,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
     _sshPassphrase.dispose();
     _manualName.dispose();
     _manualHost.dispose();
+    _manualPort.dispose();
     super.dispose();
   }
 
@@ -134,7 +150,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
       setState(() => _manualError = 'Tailscale IP 或 MagicDNS 名称无效');
       return;
     }
-    final ManualPeer peer = ManualPeer(name: _manualName.text.trim(), host: host);
+    final String portText = _manualPort.text.trim();
+    final int manualPort = portText.isEmpty ? 0 : (int.tryParse(portText) ?? -1);
+    if (manualPort < 0 || manualPort > 65535) {
+      setState(() => _manualError = '对方监听端口需为 1-65535 或留空');
+      return;
+    }
+    final ManualPeer peer = ManualPeer(
+      name: _manualName.text.trim(),
+      host: host,
+      port: manualPort,
+    );
     setState(() {
       _manualError = '';
       if (_editing >= 0 && _editing < _manualPeers.length) {
@@ -145,6 +171,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
       }
       _editing = -1;
       _manualName.clear();
+      _manualPort.clear();
       _manualHost.clear();
     });
   }
@@ -202,12 +229,114 @@ class _SettingsDialogState extends State<SettingsDialog> {
     Navigator.of(context).pop(_draft());
   }
 
+  Future<void> _checkUpdate() async {
+    setState(() => _checkingUpdate = true);
+    UpdateInfo info;
+    try {
+      info = await UpdaterChannel.check(appVersion);
+    } on Exception catch (error) {
+      if (!mounted) return;
+      setState(() => _checkingUpdate = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('检查更新失败：${friendlyError(error)}')),
+      );
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _checkingUpdate = false);
+    if (!info.newer) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已是最新版本 v$appVersion')),
+      );
+      return;
+    }
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        backgroundColor: inkBgCard,
+        title: Text(
+          '发现新版本 ${info.version}',
+          style: const TextStyle(color: inkTextPrimary),
+        ),
+        content: Text(
+          info.notes.isEmpty ? '新版本已发布，是否立即更新？' : info.notes,
+          style: const TextStyle(color: inkTextSecondary, fontSize: 12),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('稍后'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('立即更新'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    if (info.apkUrl.isEmpty) {
+      widget.onOpenRepository();
+      return;
+    }
+    await _downloadAndInstall(info.apkUrl);
+  }
+
+  Future<void> _downloadAndInstall(String url) async {
+    final ValueNotifier<int> progress = ValueNotifier<int>(0);
+    UpdaterChannel.onProgress = (int percent) => progress.value = percent;
+    bool dialogOpen = true;
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext dialogContext) => AlertDialog(
+          backgroundColor: inkBgCard,
+          title: const Text('正在下载更新', style: TextStyle(color: inkTextPrimary)),
+          content: ValueListenableBuilder<int>(
+            valueListenable: progress,
+            builder: (BuildContext _, int percent, Widget? __) => Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                LinearProgressIndicator(
+                  value: percent <= 0 ? null : percent / 100,
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  percent <= 0 ? '连接中…' : '$percent%',
+                  style: const TextStyle(color: inkTextSecondary, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ).whenComplete(() => dialogOpen = false),
+    );
+    try {
+      await UpdaterChannel.downloadInstall(url);
+    } on Exception catch (error) {
+      if (mounted && dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('下载更新失败：${friendlyError(error)}')),
+      );
+      return;
+    } finally {
+      UpdaterChannel.onProgress = null;
+    }
+    if (mounted && dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: inkBgCard,
+      // 对齐旧版:弹窗接近全屏,左右仅留窄边。
+      insetPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 36),
       title: const Text('设置', style: TextStyle(color: inkTextPrimary)),
-      content: SingleChildScrollView(
+      content: SizedBox(
+        width: double.maxFinite,
+        child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -321,12 +450,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
                   child: const Text('使用说明'),
                 ),
                 TextButton(
+                  onPressed: _checkingUpdate ? null : _checkUpdate,
+                  child: Text(_checkingUpdate ? '正在检查…' : '检查更新'),
+                ),
+                TextButton(
                   onPressed: widget.onOpenRepository,
                   child: const Text('GitHub 仓库'),
                 ),
               ],
             ),
           ],
+        ),
         ),
       ),
       actions: <Widget>[
@@ -389,6 +523,12 @@ class _SettingsDialogState extends State<SettingsDialog> {
         controller: _manualHost,
         decoration: const InputDecoration(labelText: 'Tailscale IP 或 MagicDNS'),
       ),
+      const SizedBox(height: 6),
+      TextField(
+        controller: _manualPort,
+        keyboardType: TextInputType.number,
+        decoration: const InputDecoration(labelText: '对方监听端口（留空=自动）'),
+      ),
       if (_manualError.isNotEmpty)
         Padding(
           padding: const EdgeInsets.only(top: 4),
@@ -423,7 +563,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       ),
                     ),
                   Text(
-                    _manualPeers[index].host,
+                    _manualPeers[index].port == 0
+                        ? _manualPeers[index].host
+                        : '${_manualPeers[index].host}:${_manualPeers[index].port}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: _hintStyle,
@@ -437,6 +579,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 setState(() {
                   _manualName.text = peer.name;
                   _manualHost.text = peer.host;
+                  _manualPort.text = peer.port == 0 ? '' : peer.port.toString();
                   _editing = index;
                 });
               },

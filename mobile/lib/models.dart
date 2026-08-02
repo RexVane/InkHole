@@ -87,22 +87,27 @@ class TransferProgress {
 
 /// 手动添加的跨网设备（Tailscale IP / MagicDNS 主机名）。
 class ManualPeer {
-  const ManualPeer({required this.name, required this.host});
+  const ManualPeer({required this.name, required this.host, this.port = 0});
 
-  /// 存储格式为 `备注|主机`，备注里的竖线在写入前已被替换掉。
+  /// 存储格式为 `备注|主机|端口`（端口段可缺省，兼容旧格式 `备注|主机`）。
   factory ManualPeer.decode(String raw) {
-    final int separator = raw.indexOf('|');
-    if (separator < 0) return ManualPeer(name: '', host: raw.trim());
+    final List<String> parts = raw.split('|');
+    if (parts.length == 1) return ManualPeer(name: '', host: raw.trim());
+    final int port = parts.length >= 3 ? (int.tryParse(parts[2].trim()) ?? 0) : 0;
     return ManualPeer(
-      name: raw.substring(0, separator).trim(),
-      host: raw.substring(separator + 1).trim(),
+      name: parts[0].trim(),
+      host: parts[1].trim(),
+      port: (port >= 1 && port <= 65535) ? port : 0,
     );
   }
 
   final String name;
   final String host;
 
-  String encode() => '${name.replaceAll('|', ' ')}|$host';
+  /// 对方监听端口；0 表示未指定（与桌面端 manual_peers 一样仅随配置存储）。
+  final int port;
+
+  String encode() => '${name.replaceAll('|', ' ')}|$host|$port';
 }
 
 /// 设置对话框的完整草稿，保存时整体回传给页面。
@@ -146,7 +151,7 @@ class InkSettings {
 /// 显示在设置里的版本号；与 pubspec.yaml 的 version 保持一致，
 /// 需要时可用 `--dart-define=APP_VERSION=x.y.z` 在打包阶段覆盖。
 const String appVersion =
-    String.fromEnvironment('APP_VERSION', defaultValue: '2.0.3');
+    String.fromEnvironment('APP_VERSION', defaultValue: '2.0.4');
 
 /// 旧版设置里「GitHub 仓库」指向的地址。
 const String repositoryUrl = 'https://github.com/RexVane/InkHole';

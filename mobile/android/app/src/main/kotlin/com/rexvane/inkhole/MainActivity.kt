@@ -18,6 +18,8 @@ class MainActivity : FlutterActivity() {
     private val pendingLock = Any()
     private val pendingSharedFiles = ArrayList<String>()
     private var shareChannel: MethodChannel? = null
+    private var updaterChannel: MethodChannel? = null
+    private val updateExecutor = Executors.newSingleThreadExecutor()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,6 +38,47 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+        updaterChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, UPDATER_CHANNEL).also { channel ->
+            channel.setMethodCallHandler { call: MethodCall, result: MethodChannel.Result ->
+                when (call.method) {
+                    "check" -> {
+                        val current = call.argument<String>("current").orEmpty()
+                        updateExecutor.execute {
+                            try {
+                                val info = Updater.fetchLatest()
+                                runOnUiThread {
+                                    result.success(
+                                        mapOf(
+                                            "version" to info.version,
+                                            "apkUrl" to info.apkUrl,
+                                            "notes" to info.notes,
+                                            "newer" to Updater.versionNewer(info.version, current),
+                                        ),
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("check_failed", e.message ?: "检查更新失败", null) }
+                            }
+                        }
+                    }
+                    "downloadInstall" -> {
+                        val url = call.argument<String>("url").orEmpty()
+                        updateExecutor.execute {
+                            try {
+                                val apk = Updater.downloadApk(this, url) { percent ->
+                                    runOnUiThread { updaterChannel?.invokeMethod("progress", percent) }
+                                }
+                                Updater.installApk(this, apk)
+                                runOnUiThread { result.success(true) }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("download_failed", e.message ?: "下载安装失败", null) }
+                            }
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -46,7 +89,9 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         shareExecutor.shutdownNow()
+        updateExecutor.shutdownNow()
         shareChannel = null
+        updaterChannel = null
         super.onDestroy()
     }
 
@@ -173,6 +218,7 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val SHARE_CHANNEL = "com.rexvane.inkhole/share"
+        private const val UPDATER_CHANNEL = "com.rexvane.inkhole/updater"
         private const val SHARE_CACHE_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
     }
 }

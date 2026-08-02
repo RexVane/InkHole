@@ -83,8 +83,12 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: inkBgCard,
+      // 对齐旧版:弹窗接近全屏,左右仅留窄边。
+      insetPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 36),
       title: const Text('跨网络传输', style: TextStyle(color: inkTextPrimary)),
-      content: SingleChildScrollView(
+      content: SizedBox(
+        width: double.maxFinite,
+        child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -206,6 +210,7 @@ class _CrossNetworkActionsDialogState extends State<CrossNetworkActionsDialog> {
               },
             ),
           ],
+        ),
         ),
       ),
       actions: <Widget>[
