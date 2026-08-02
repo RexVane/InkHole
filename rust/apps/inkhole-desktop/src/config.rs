@@ -79,8 +79,8 @@ impl DesktopConfig {
         for peer in &mut self.manual_peers {
             peer.normalize();
         }
-        self.manual_peers
-            .retain(|peer| !peer.host.is_empty() && peer.port != 0);
+        // 端口允许为 0(未指定):发现路径只用 host,端口仅作为直连提示保存。
+        self.manual_peers.retain(|peer| !peer.host.is_empty());
         self.recent_files.truncate(MAXIMUM_RECENT_FILES);
         self.recent_files.retain(|path| !path.trim().is_empty());
         self.cross_network.normalize();

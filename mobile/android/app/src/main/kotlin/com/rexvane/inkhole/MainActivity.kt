@@ -1,10 +1,14 @@
 package com.rexvane.inkhole
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import com.google.zxing.integration.android.IntentIntegrator
+import com.journeyapps.barcodescanner.ScanIntentResult
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.MethodCall
@@ -23,6 +27,8 @@ class MainActivity : FlutterActivity() {
     private var exporterChannel: MethodChannel? = null
     private val exportExecutor = Executors.newSingleThreadExecutor()
     private var pendingDirectoryPick: MethodChannel.Result? = null
+    private var scannerChannel: MethodChannel? = null
+    private var pendingScan: MethodChannel.Result? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -74,6 +80,32 @@ class MainActivity : FlutterActivity() {
                             startActivityForResult(intent, REQUEST_PICK_DIRECTORY)
                         }
                     }
+                    "open" -> {
+                        val path = call.argument<String>("path").orEmpty()
+                        val name = call.argument<String>("name").orEmpty()
+                        val treeUri = call.argument<String>("treeUri")
+                        exportExecutor.execute { openReceived(path, name, treeUri, result) }
+                    }
+                    "downloadsPath" -> result.success(Opener.downloadsPath())
+                    "describeTree" -> {
+                        val uri = call.argument<String>("uri").orEmpty()
+                        if (uri.isEmpty()) {
+                            result.success(null)
+                        } else {
+                            exportExecutor.execute {
+                                val described = Opener.describeTree(this, uri)
+                                runOnUiThread { result.success(described) }
+                            }
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
+        scannerChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SCANNER_CHANNEL).also { channel ->
+            channel.setMethodCallHandler { call: MethodCall, result: MethodChannel.Result ->
+                when (call.method) {
+                    "scan" -> startScan(result)
                     else -> result.notImplemented()
                 }
             }
@@ -130,7 +162,34 @@ class MainActivity : FlutterActivity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQUEST_PICK_DIRECTORY) return
+        when (requestCode) {
+            REQUEST_PICK_DIRECTORY -> completeDirectoryPick(resultCode, data)
+            REQUEST_SCAN -> {
+                val pending = pendingScan ?: return
+                pendingScan = null
+                // contents 为 null 表示用户按返回键放弃了扫码。
+                pending.success(ScanIntentResult.parseActivityResult(resultCode, data).contents)
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_CAMERA) return
+        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            launchScanner()
+        } else {
+            val pending = pendingScan ?: return
+            pendingScan = null
+            pending.error("camera_denied", "需要相机权限才能扫描二维码", null)
+        }
+    }
+
+    private fun completeDirectoryPick(resultCode: Int, data: Intent?) {
         val pending = pendingDirectoryPick ?: return
         pendingDirectoryPick = null
         val uri = data?.data
@@ -149,12 +208,82 @@ class MainActivity : FlutterActivity() {
         pending.success(mapOf("uri" to uri.toString(), "label" to (label ?: "自定义目录")))
     }
 
+    /** 扫码前先要相机权限;权限回调里再真正拉起取景界面。 */
+    private fun startScan(result: MethodChannel.Result) {
+        if (pendingScan != null) {
+            result.error("busy", "扫码进行中", null)
+            return
+        }
+        pendingScan = result
+        if (checkSelfPermission(android.Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            launchScanner()
+        } else {
+            requestPermissions(arrayOf(android.Manifest.permission.CAMERA), REQUEST_CAMERA)
+        }
+    }
+
+    private fun launchScanner() {
+        val intent = IntentIntegrator(this)
+            .setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
+            .setPrompt("将一次性短码二维码放入框内")
+            .setBeepEnabled(false)
+            .setOrientationLocked(true)
+            .setCaptureActivity(PortraitCaptureActivity::class.java)
+            .createScanIntent()
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, REQUEST_SCAN)
+        } catch (e: ActivityNotFoundException) {
+            val pending = pendingScan ?: return
+            pendingScan = null
+            pending.error("scan_unavailable", e.message ?: "无法启动扫码", null)
+        }
+    }
+
+    /** 打开收件条目;文件夹和查不到的条目回退到系统下载管理。 */
+    private fun openReceived(
+        path: String,
+        name: String,
+        treeUri: String?,
+        result: MethodChannel.Result,
+    ) {
+        val intent = try {
+            Opener.viewIntent(this, path, name, treeUri)
+        } catch (_: Exception) {
+            null
+        }
+        runOnUiThread {
+            if (intent != null && tryStart(intent)) {
+                result.success(Opener.RESULT_EXACT)
+                return@runOnUiThread
+            }
+            if (tryStart(Opener.downloadsIntent())) {
+                result.success(Opener.RESULT_DOWNLOADS)
+            } else {
+                result.error("open_failed", "没有可以打开该文件的应用", null)
+            }
+        }
+    }
+
+    private fun tryStart(intent: Intent): Boolean = try {
+        startActivity(intent)
+        true
+    } catch (_: ActivityNotFoundException) {
+        false
+    } catch (_: SecurityException) {
+        false
+    }
+
     override fun onDestroy() {
         shareExecutor.shutdownNow()
         updateExecutor.shutdownNow()
         exportExecutor.shutdownNow()
         exporterChannel = null
         pendingDirectoryPick = null
+        pendingScan = null
+        scannerChannel = null
         shareChannel = null
         updaterChannel = null
         super.onDestroy()
@@ -285,7 +414,10 @@ class MainActivity : FlutterActivity() {
         private const val SHARE_CHANNEL = "com.rexvane.inkhole/share"
         private const val UPDATER_CHANNEL = "com.rexvane.inkhole/updater"
         private const val EXPORTER_CHANNEL = "com.rexvane.inkhole/exporter"
+        private const val SCANNER_CHANNEL = "com.rexvane.inkhole/scanner"
         private const val REQUEST_PICK_DIRECTORY = 9107
+        private const val REQUEST_SCAN = 9108
+        private const val REQUEST_CAMERA = 9109
         private const val SHARE_CACHE_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
     }
 }

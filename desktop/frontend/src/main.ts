@@ -307,6 +307,19 @@ function finishProgress(data: Record<string, any>): void {
     }, 2200);
 }
 
+let manualPeerSaveTimer = 0;
+function scheduleManualPeerSave(): void {
+    window.clearTimeout(manualPeerSaveTimer);
+    manualPeerSaveTimer = window.setTimeout(() => {
+        const peers = collectManualPeers();
+        // 空 host 的未完成行不触发保存;有 host 即自动持久化,无需点保存。
+        if (peers.some((peer) => !peer.host)) return;
+        void run(async () => {
+            await Service.SaveManualPeers(peers);
+        }, "已自动保存固定地址设备");
+    }, 700);
+}
+
 function addManualPeerRow(peer?: ManualPeerConfig): void {
     const list = byID("manualPeerList");
     list.querySelector(".empty-state")?.remove();
@@ -334,9 +347,13 @@ function addManualPeerRow(peer?: ManualPeerConfig): void {
     remove.title = "删除";
     remove.setAttribute("aria-label", "删除固定地址设备");
     remove.textContent = "×";
+    for (const input of [name, host, port]) {
+        input.addEventListener("change", scheduleManualPeerSave);
+    }
     remove.addEventListener("click", () => {
         row.remove();
         showManualEmpty();
+        scheduleManualPeerSave();
     });
     row.append(name, host, port, remove);
     list.append(row);
@@ -947,6 +964,11 @@ byID("chooseFiles").addEventListener("click", () => void run(async () => {
     const paths = (await Service.ChooseFiles()) || [];
     await sendPaths(paths);
 }));
+byID("hole").addEventListener("click", () => void run(async () => {
+    const paths = (await Service.ChooseFiles()) || [];
+    await sendPaths(paths);
+}));
+
 byID("chooseFolder").addEventListener("click", () => void run(async () => {
     const path = await Service.ChooseFolder();
     if (path) await sendPaths([path]);

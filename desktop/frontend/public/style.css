@@ -187,10 +187,11 @@ button:disabled { opacity: .45; cursor: default; transform: none; }
 .transfer-pane.file-drop-target-active .drop-overlay { display: grid; }
 
 .send-actions { min-height: 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; }
-.send-picker { display: flex; }
+.send-picker { display: flex; gap: 8px; }
 .send-picker .primary-button { min-height: 42px; }
-.send-picker .primary-button:first-child { width: 156px; border-radius: 8px 0 0 8px; }
-.send-picker .folder-button { width: 42px; padding: 0; border-left-color: rgba(7,25,23,.24); border-radius: 0 8px 8px 0; }
+.send-picker .primary-button:first-child { width: 148px; border-radius: 8px; }
+.send-picker .folder-button { width: 42px; padding: 0; border-radius: 8px; }
+#hole { cursor: pointer; }
 .send-actions button span { margin-right: 5px; }
 .selection-note { max-width: 100%; color: var(--faint); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remote-actions { min-height: 36px; display: flex; align-items: center; justify-content: center; gap: 7px; }

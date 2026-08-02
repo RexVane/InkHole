@@ -1196,6 +1196,15 @@ where
     Ok(serde_json::from_value(frame)?)
 }
 
+/// 局域网大文件吞吐调优:quinn 默认流窗口 1.25MB 在 Wi-Fi RTT 下会钉住带宽,
+/// 放大到 16MB;初始 MTU 提到以太网安全值并保留 MTU 发现。
+fn tune_transport(transport: &mut quinn::TransportConfig) {
+    transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
+    transport.send_window(32 * 1024 * 1024);
+    transport.initial_mtu(1452);
+}
+
 fn server_config(identity: &DeviceIdentity) -> Result<ServerConfig> {
     let certificate = CertificateDer::from(identity.tls_certificate_der().to_vec());
     let private_key = PrivatePkcs8KeyDer::from(identity.tls_private_key_der().to_vec());
@@ -1212,6 +1221,7 @@ fn server_config(identity: &DeviceIdentity) -> Result<ServerConfig> {
     transport.max_concurrent_uni_streams(0_u8.into());
     transport.max_concurrent_bidi_streams(64_u32.into());
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    tune_transport(transport);
     Ok(server)
 }
 
@@ -1224,7 +1234,12 @@ fn client_config(expected_fingerprint: &str) -> Result<ClientConfig> {
     tls.alpn_protocols = vec![QUIC_ALPN.to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|error| CoreError::QuinnConfig(error.to_string()))?;
-    Ok(ClientConfig::new(Arc::new(crypto)))
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    tune_transport(&mut transport);
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }
 
 #[derive(Debug)]

@@ -871,8 +871,21 @@ impl DesktopState {
             if input.private_key_mode == "paste" && !input.pasted_key.trim().is_empty() {
                 input.pasted_key.clone()
             } else if input.private_key_mode != "paste" && !input.private_key_path.is_empty() {
-                fs::read_to_string(&input.private_key_path)
-                    .with_context(|| format!("无法读取 SSH 私钥文件: {}", input.private_key_path))?
+                match fs::read_to_string(&input.private_key_path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        // 文件被移动/删除时回退系统安全存储里已保存的私钥,
+                        // 避免一次失效路径卡死整个保存/启动链。
+                        match private_key_entry.get_password() {
+                            Ok(stored) if !stored.trim().is_empty() => stored,
+                            _ => {
+                                return Err(error).with_context(|| {
+                                    format!("无法读取 SSH 私钥文件: {}", input.private_key_path)
+                                });
+                            }
+                        }
+                    }
+                }
             } else {
                 private_key_entry
                     .get_password()

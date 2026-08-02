@@ -3,6 +3,10 @@
     <!-- 应用私有收件箱(导出失败时兜底打开用) -->
     <external-files-path name="inbox" path="." />
     <files-path name="internal_inbox" path="." />
+    <!-- path_provider 的 documents 目录是 getDir("app_flutter")，与 files/ 平级，
+         没有对应的 FileProvider 标签，只能用 root-path 覆盖 /data 下的自身数据目录。
+         provider 未导出，URI 只在本应用主动分享时才生成，不会暴露其它路径。 -->
+    <root-path name="app_documents" path="/data/" />
     <!-- Android 9 及以下：公共 Downloads/InkHole 里的文件经 FileProvider 打开 -->
     <external-path name="downloads" path="Download/InkHole/" />
     <!-- 应用内更新:缓存目录里的新版 APK 交给系统安装器 -->
