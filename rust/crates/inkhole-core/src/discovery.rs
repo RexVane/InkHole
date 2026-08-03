@@ -982,11 +982,28 @@ fn apply_probe_outcome(
                         && record.peer.hosts.contains(&key.address.ip().to_string())
                 })
                 .is_some_and(|record| {
-                    if record.farewelled {
-                        return true;
-                    }
                     let failures = record.failures.entry(key.address).or_default();
                     *failures = failures.saturating_add(1);
+                    if record.farewelled {
+                        // 收到 goodbye 后,只要每个已知 host 都已探测失败过一次
+                        // 即淘汰;但必须等所有 host 都失败,否则多宿主对端首个地址
+                        // 失败即移除会导致列表闪烁,健康地址稍后成功只能重新插入,
+                        // 极端下被 MAX_DISCOVERED_PEERS 拒绝而永久丢失。成功探针
+                        // 会把 farewelled 清零恢复正常。
+                        return record.peer.hosts.iter().all(|host| {
+                            host.parse::<IpAddr>()
+                                .ok()
+                                .map(|ip| {
+                                    record
+                                        .failures
+                                        .get(&SocketAddr::new(ip, record.peer.port))
+                                        .copied()
+                                        .unwrap_or(0)
+                                        > 0
+                                })
+                                .unwrap_or(true)
+                        });
+                    }
                     record.peer.hosts.iter().all(|host| {
                         host.parse::<IpAddr>()
                             .ok()

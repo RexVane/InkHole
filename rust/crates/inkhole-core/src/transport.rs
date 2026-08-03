@@ -503,6 +503,15 @@ pub async fn send_file(
         sent += read as u64;
         emit_progress(&options, &offer, sent);
     }
+    // 源文件在传输期间被追加写入会导致接收端拿到旧快照且 blake3 校验仍通过
+    // (校验基于原始大小),发送方误报成功。读完声明大小后再读 1 字节确认 EOF,
+    // 与文件夹路径一致(见 send_folder_stream 尾部检查)。
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra).await? != 0 {
+        return Err(CoreError::InvalidTransfer(
+            "source file grew while sending".into(),
+        ));
+    }
     send.finish()
         .map_err(|error| CoreError::Protocol(format!("finish QUIC stream: {error}")))?;
     let response: TransferResponse =
