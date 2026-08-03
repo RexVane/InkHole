@@ -626,9 +626,15 @@ impl JsonService {
                 "closing stale LAN sessions before starting a new one"
             );
         }
-        close_ssh_relays(stale_relays).await?;
+        // 关闭旧会话/中继的错误不应阻断创建新会话:旧会话已从 state 移除,
+        // Drop 兜底会 cancel + close_immediately 释放端口;这里仅记录警告。
+        if let Err(error) = close_ssh_relays(stale_relays).await {
+            tracing::warn!(%error, "failed to close a stale SSH relay during lan.start");
+        }
         for session in stale_sessions {
-            session.close().await?;
+            if let Err(error) = session.close().await {
+                tracing::warn!(%error, "failed to close a stale LAN session during lan.start");
+            }
         }
         params.instance_id = params.instance_id.trim().to_ascii_lowercase();
         if params.peer_name.trim().is_empty()
@@ -1903,9 +1909,16 @@ fn derive_transfer_id(
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default();
     let mut hasher = blake3::Hasher::new();
+    // Windows 文件系统不区分大小写,同一文件可能以不同大小写路径发起发送;
+    // 归一化为小写再哈希,保证断点续传复用同一 transfer_id(与
+    // normalize_wormhole_paths 的 eq_ignore_ascii_case 去重逻辑一致)。
+    #[cfg(windows)]
+    let source_bytes = source.to_string_lossy().to_ascii_lowercase();
+    #[cfg(not(windows))]
+    let source_bytes = source.to_string_lossy();
     for field in [
         instance_id.as_bytes(),
-        source.to_string_lossy().as_bytes(),
+        source_bytes.as_bytes(),
         target.as_bytes(),
     ] {
         hasher.update(&(field.len() as u64).to_le_bytes());

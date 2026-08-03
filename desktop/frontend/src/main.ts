@@ -289,6 +289,10 @@ function setProgress(data: Record<string, any>): void {
 }
 
 function finishProgress(data: Record<string, any>): void {
+    // 旧批次的完成事件不应清空新批次状态:校验 sendId 匹配当前批次,
+    // 否则发送中再发起的新批次会被旧批次的 transfer-finished 错误终结
+    // (清空 activeSendID、隐藏取消按钮)。迟到的旧事件直接丢弃。
+    if (data.sendId && data.sendId !== activeSendID) return;
     const succeeded = Number(data.succeeded || 0);
     const total = Number(data.total || 0);
     window.clearTimeout(recvIdleTimer);

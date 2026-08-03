@@ -367,12 +367,21 @@ class InkHoleCore {
     final id = _nextRequest++;
     final completer = Completer<dynamic>();
     _pending[id] = completer;
-    _commands!.send(<String, dynamic>{
-      'operation': 'call',
-      'id': id,
-      'method': method,
-      'params': params,
-    });
+    try {
+      _commands!.send(<String, dynamic>{
+        'operation': 'call',
+        'id': id,
+        'method': method,
+        'params': params,
+      });
+    } catch (error) {
+      // SendPort 已关(worker isolate 被外部杀掉):Completer 必须显式清理,
+      // 否则永远留在 _pending 里导致 map 缓慢膨胀。
+      _pending.remove(id);
+      completer.completeError(
+        StateError('InkHole core channel is closed: $error'),
+      );
+    }
     final result = await completer.future;
     if (result == null) return <String, dynamic>{};
     if (result is Map) return Map<String, dynamic>.from(result);
@@ -385,8 +394,19 @@ class InkHoleCore {
     final id = _nextRequest++;
     final completer = Completer<dynamic>();
     _pending[id] = completer;
-    commands.send(<String, dynamic>{'operation': 'shutdown', 'id': id});
-    await completer.future;
+    try {
+      commands.send(<String, dynamic>{'operation': 'shutdown', 'id': id});
+    } catch (_) {
+      // SendPort 已关,直接走强制清理。
+    }
+    // worker 的命令处理是串行的:若正阻塞在 in-flight native 调用(如大文件
+    // lan.send),shutdown 命令排队等待,completer 永不完成。给一个超时,
+    // 超时后强杀 isolate 兜底,避免 close() 永久挂起。
+    try {
+      await completer.future.timeout(const Duration(seconds: 3));
+    } on TimeoutException {
+      // 优雅关闭超时,强制释放。
+    }
     _receive?.close();
     _isolate?.kill(priority: Isolate.immediate);
     _isolate = null;

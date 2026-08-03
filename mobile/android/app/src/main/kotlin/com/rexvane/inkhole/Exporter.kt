@@ -25,6 +25,27 @@ object Exporter {
     private const val EXPORT_BUFFER = 1024 * 1024
     private val exportLock = Any()
 
+    /**
+     * 清理上次导出在 insert 后、update 前被中断留下的 IS_PENDING=1 孤儿记录。
+     * 进程被杀时 catch 块跑不到,这些记录会永久残留并占用下载列表,故在
+     * 启动时扫描 Download/InkHole/ 下所有 IS_PENDING=1 的记录删除。只清本应用
+     * 目录(RELATIVE_PATH 前缀匹配),避免误删其他应用的 pending 文件。
+     */
+    fun cleanupPendingOrphans(ctx: Context) {
+        if (Build.VERSION.SDK_INT < 29) return
+        try {
+            val prefix = "${publicInboxRelativePath()}/%"
+            ctx.contentResolver.delete(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                "${MediaStore.MediaColumns.IS_PENDING}=1" +
+                    " AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+                arrayOf(prefix),
+            )
+        } catch (_: Exception) {
+            // 清理失败不阻塞启动;孤儿会在下次启动重试清理。
+        }
+    }
+
     /** 导出结果:display 为对用户展示的落点(如 Download/InkHole/xx)。 */
     data class Outcome(val name: String, val location: String)
 
@@ -51,7 +72,14 @@ object Exporter {
         synchronized(exportLock) {
             if (src.isDirectory) {
                 val target = createUniqueDirectory(root, src.name)
-                copyTreeInto(ctx, src, target)
+                try {
+                    copyTreeInto(ctx, src, target)
+                } catch (error: Exception) {
+                    // 部分拷贝失败时回滚已创建的子树,避免在用户目录残留半截
+                    // 文件夹;私有源不删(数据不丢),回传异常走默认回退路径。
+                    target.delete()
+                    throw error
+                }
                 src.deleteRecursively()
                 return Outcome(target.name ?: src.name, label)
             }
@@ -173,6 +201,7 @@ object Exporter {
             }
             val publicRoot = uniqueMediaStoreFolderName(ctx, src.name)
             val inserted = ArrayList<Uri>(files.size)
+            var publishedCount = 0
             try {
                 for (file in files) {
                     val relative = file.relativeTo(src).invariantSeparatorsPath
@@ -207,11 +236,14 @@ object Exporter {
                         put(MediaStore.MediaColumns.IS_PENDING, 0)
                     }, null, null)
                     if (published <= 0) throw IOException("无法发布下载文件夹")
+                    publishedCount++
                 }
                 src.deleteRecursively()
                 return@synchronized Outcome(publicRoot, "Download/InkHole")
             } catch (_: Exception) {
-                inserted.forEach { uri ->
+                // 只回滚未发布的(从 publishedCount 开始的),保留已发布到
+                // Download/InkHole 的文件,避免用户看到文件先出现再消失。
+                for (uri in inserted.drop(publishedCount)) {
                     try { ctx.contentResolver.delete(uri, null, null) } catch (_: Exception) {}
                 }
                 return@synchronized Outcome(src.name, "")

@@ -224,7 +224,7 @@ class _HomePageState extends State<HomePage> {
         rethrow;
       }
     }
-    _applyLanStartResult(result);
+    await _applyLanStartResult(result);
   }
 
   Future<Map<String, dynamic>> _lanStartCall() async {
@@ -245,15 +245,20 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  void _applyLanStartResult(Map<String, dynamic> result) {
+  Future<void> _applyLanStartResult(Map<String, dynamic> result) async {
     _sessionId = result['session_id']?.toString();
     _actualPort = asInt(result['port']);
     _identityPrivate = result['identity_private']?.toString();
     final String? identityPrivate = _identityPrivate;
     if (identityPrivate != null) {
-      unawaited(
-        _secureStorage.write(key: 'identity_private', value: identityPrivate),
-      );
+      // 设备身份(TLS 证书 + ed25519 私钥)必须落盘后才能算启动成功;否则
+      // 首启崩溃或安全存储写入失败会导致下次冷启生成全新身份,对端固定指纹
+      // 失配(SSH 配对断裂、被当新设备)。await 而非 unawaited,失败时提示。
+      try {
+        await _secureStorage.write(key: 'identity_private', value: identityPrivate);
+      } catch (_) {
+        _setStatus('身份保存失败,重启后可能需要重新配对');
+      }
     }
     if (_sshEnabled) unawaited(_startSsh());
   }
@@ -393,6 +398,10 @@ class _HomePageState extends State<HomePage> {
           _cancelledSends.clear();
         });
       case 'lan.peers':
+        // 旧会话残余的 peers 快照会污染设备列表(尤其 _restartLan 期间),
+        // 只处理当前会话事件;_sessionId 为 null(重启中)时也忽略。
+        final String? peersSession = data['session_id']?.toString();
+        if (peersSession != null && peersSession != _sessionId) return;
         final List<dynamic> values =
             data['peers'] as List<dynamic>? ?? const <dynamic>[];
         if (!mounted) return;
@@ -412,6 +421,10 @@ class _HomePageState extends State<HomePage> {
           }
         });
       case 'lan.status':
+        // 与 lan.peers 同理:重启期间(_sessionId 为 null)忽略旧会话状态,
+        // 避免旧状态文字短暂覆盖"设置已生效"等新提示。
+        final String? statusSession = data['session_id']?.toString();
+        if (statusSession != null && statusSession != _sessionId) return;
         _setStatus(data['message']?.toString() ?? '局域网状态已更新');
       case 'lan.progress':
         final String key = data['send_id']?.toString() ??

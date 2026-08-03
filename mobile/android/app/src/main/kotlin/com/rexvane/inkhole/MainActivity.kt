@@ -34,6 +34,7 @@ class MainActivity : FlutterActivity() {
         super.onCreate(savedInstanceState)
         startLanService()
         cleanupShareCache()
+        exportExecutor.execute { Exporter.cleanupPendingOrphans(this) }
         handleIncomingIntent(intent)
     }
 
