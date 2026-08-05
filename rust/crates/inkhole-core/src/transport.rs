@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::broadcast,
+    sync::{Semaphore, broadcast},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
@@ -42,6 +42,13 @@ const TRANSFER_BUFFER_SIZE: usize = 256 * 1024;
 /// Caps a single direct-address attempt so an unreachable endpoint cannot stall the
 /// serial walk over a peer's addresses before the relay fallback is reached.
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_ACTIVE_CONNECTIONS: usize = 128;
+const MAX_ACTIVE_STREAMS: usize = 64;
 
 enum OutboundPayload {
     File(PathBuf),
@@ -166,6 +173,7 @@ struct IncomingTransferContext {
     shared_secret: Arc<str>,
     events: TransferEventSink,
     on_inbound_peer: Option<InboundPeerCallback>,
+    stream_slots: Arc<Semaphore>,
 }
 
 pub struct QuicServer {
@@ -217,6 +225,7 @@ impl QuicServer {
                     callback,
                 },
                 on_inbound_peer: config.on_inbound_peer,
+                stream_slots: Arc::new(Semaphore::new(MAX_ACTIVE_STREAMS)),
             },
             cancellation.clone(),
         ));
@@ -301,7 +310,18 @@ pub async fn probe_peer(
     endpoint.set_default_client_config(client_config(&expected_fingerprint)?);
     let connection = tokio::select! {
         _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-        result = endpoint.connect(peer.address, "inkhole.local")? => result?,
+        result = tokio::time::timeout(
+            DIRECT_CONNECT_TIMEOUT,
+            endpoint.connect(peer.address, "inkhole.local")?,
+        ) => match result {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(CoreError::Protocol(format!(
+                    "direct QUIC connection to {} timed out",
+                    peer.address
+                )));
+            }
+        },
     };
     let (mut send, mut receive) = tokio::select! {
         _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
@@ -743,15 +763,32 @@ async fn run_server(
             _ = cancellation.cancelled() => break,
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
+                if connections.len() >= MAX_ACTIVE_CONNECTIONS {
+                    tracing::warn!(
+                        remote = %incoming.remote_address(),
+                        limit = MAX_ACTIVE_CONNECTIONS,
+                        "refusing QUIC connection because the server is busy"
+                    );
+                    incoming.refuse();
+                    continue;
+                }
+                let connecting = match incoming.accept() {
+                    Ok(connecting) => connecting,
+                    Err(error) => {
+                        tracing::debug!(%error, "failed to accept QUIC connection");
+                        continue;
+                    }
+                };
                 let context = context.clone();
                 let child_cancellation = cancellation.child_token();
                 connections.spawn(async move {
-                    match incoming.await {
-                        Ok(connection) => {
+                    match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting).await {
+                        Ok(Ok(connection)) => {
                             handle_connection(connection, context, child_cancellation)
                             .await;
                         }
-                        Err(error) => tracing::debug!(%error, "QUIC handshake failed"),
+                        Ok(Err(error)) => tracing::debug!(%error, "QUIC handshake failed"),
+                        Err(_) => tracing::debug!("QUIC handshake timed out"),
                     }
                 });
             }
@@ -781,10 +818,21 @@ async fn handle_connection(
         tokio::select! {
             _ = cancellation.cancelled() => break,
             stream = connection.accept_bi() => match stream {
-                Ok((send, receive)) => {
+                Ok((mut send, mut receive)) => {
+                    let Ok(stream_slot) = context.stream_slots.clone().try_acquire_owned() else {
+                        tracing::warn!(
+                            remote = %connection.remote_address(),
+                            limit = MAX_ACTIVE_STREAMS,
+                            "rejecting QUIC stream because the server is busy"
+                        );
+                        reject_busy(&mut send).await;
+                        let _ = receive.stop(2_u8.into());
+                        continue;
+                    };
                     let context = context.clone();
                     let cancellation = cancellation.child_token();
                     streams.spawn(async move {
+                        let _stream_slot = stream_slot;
                         if let Err(error) = handle_stream(send, receive, &context, cancellation)
                         .await
                         {
@@ -816,29 +864,14 @@ async fn handle_stream(
     context: &IncomingTransferContext,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let hello: AuthenticationHello = match read_frame(&mut receive).await {
-        Ok(hello) => hello,
-        Err(error) => {
-            reject_authentication(&mut send).await;
-            return Err(error);
-        }
-    };
-    let challenge = match AuthenticationChallenge::new(&hello) {
-        Ok(challenge) => challenge,
-        Err(error) => {
-            reject_authentication(&mut send).await;
-            return Err(error);
-        }
-    };
-    write_frame(&mut send, &challenge).await?;
-    let authenticated: AuthenticatedRequest = match read_frame(&mut receive).await {
-        Ok(request) => request,
-        Err(error) => {
-            reject_authentication(&mut send).await;
-            return Err(error);
-        }
-    };
-    let frame = match authenticated.authenticate(&challenge, &context.shared_secret) {
+    let frame = match authenticate_incoming_request(
+        &mut send,
+        &mut receive,
+        &context.shared_secret,
+        &cancellation,
+    )
+    .await
+    {
         Ok(frame) => frame,
         Err(error) => {
             reject_authentication(&mut send).await;
@@ -1160,6 +1193,41 @@ async fn reject_authentication(send: &mut quinn::SendStream) {
     let _ = send.finish();
 }
 
+async fn reject_busy(send: &mut quinn::SendStream) {
+    let _ = write_frame(
+        send,
+        &AuthenticationRejected {
+            frame_type: AUTH_REJECTED_TYPE.into(),
+            reason: "receiver is busy; retry later".into(),
+        },
+    )
+    .await;
+    let _ = send.finish();
+}
+
+async fn authenticate_incoming_request(
+    send: &mut quinn::SendStream,
+    receive: &mut quinn::RecvStream,
+    shared_secret: &str,
+    cancellation: &CancellationToken,
+) -> Result<Value> {
+    let exchange = async {
+        let hello: AuthenticationHello = read_frame(receive).await?;
+        let challenge = AuthenticationChallenge::new(&hello)?;
+        write_frame(send, &challenge).await?;
+        let authenticated: AuthenticatedRequest = read_frame(receive).await?;
+        authenticated.authenticate(&challenge, shared_secret)
+    };
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(CoreError::Cancelled),
+        result = tokio::time::timeout(AUTHENTICATION_TIMEOUT, exchange) => {
+            result.unwrap_or_else(|_| {
+                Err(CoreError::Protocol("QUIC authentication timed out".into()))
+            })
+        }
+    }
+}
+
 async fn write_authenticated_request<T>(
     send: &mut quinn::SendStream,
     receive: &mut quinn::RecvStream,
@@ -1170,20 +1238,26 @@ async fn write_authenticated_request<T>(
 where
     T: Serialize,
 {
-    let hello = AuthenticationHello::new();
-    tokio::select! {
-        _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-        result = write_frame(send, &hello) => result?,
-    }
-    let challenge: AuthenticationChallenge = tokio::select! {
-        _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-        result = read_frame(receive) => result?,
+    let exchange = async {
+        let hello = AuthenticationHello::new();
+        write_frame(send, &hello).await?;
+        let frame: Value = read_frame(receive).await?;
+        if frame.get("type").and_then(Value::as_str) == Some(AUTH_REJECTED_TYPE) {
+            let rejected: AuthenticationRejected = serde_json::from_value(frame)?;
+            return Err(CoreError::Protocol(rejected.reason));
+        }
+        let challenge: AuthenticationChallenge = serde_json::from_value(frame)?;
+        challenge.validate_for(&hello)?;
+        let request = AuthenticatedRequest::new(&challenge, payload, shared_secret)?;
+        write_frame(send, &request).await
     };
-    challenge.validate_for(&hello)?;
-    let request = AuthenticatedRequest::new(&challenge, payload, shared_secret)?;
     tokio::select! {
         _ = cancellation.cancelled() => Err(CoreError::Cancelled),
-        result = write_frame(send, &request) => result,
+        result = tokio::time::timeout(AUTHENTICATION_TIMEOUT, exchange) => {
+            result.unwrap_or_else(|_| {
+                Err(CoreError::Protocol("QUIC authentication timed out".into()))
+            })
+        }
     }
 }
 
@@ -1638,6 +1712,48 @@ mod tests {
                 .await
                 .unwrap()
         );
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_stream_that_stalls_before_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let receiver = DeviceIdentity::generate(None, "Receiver").unwrap();
+        let server = QuicServer::bind(QuicServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            inbox: root.path().join("inbox"),
+            inbox_category_roots: InboxCategoryRoots::default(),
+            identity: receiver.clone(),
+            capabilities: Vec::new(),
+            shared_secret: "room secret".into(),
+            on_inbound_peer: None,
+        })
+        .await
+        .unwrap();
+
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client
+            .set_default_client_config(client_config(receiver.certificate_fingerprint()).unwrap());
+        let connection = client
+            .connect(server.local_address(), "inkhole.local")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        // QUIC opens streams lazily. A partial frame header makes the stream visible
+        // to the server while still leaving authentication deliberately incomplete.
+        send.write_all(&[0]).await.unwrap();
+
+        let rejected: AuthenticationRejected =
+            tokio::time::timeout(Duration::from_secs(2), read_frame(&mut receive))
+                .await
+                .expect("server left an unauthenticated stream open")
+                .unwrap();
+        assert_eq!(rejected.frame_type, AUTH_REJECTED_TYPE);
+
+        connection.close(0_u8.into(), b"test complete");
+        client.close(0_u8.into(), b"test complete");
+        client.wait_idle().await;
         server.close().await.unwrap();
     }
 

@@ -14,14 +14,23 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.io.IOException
+import java.io.InterruptedIOException
 import java.util.LinkedHashSet
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
+    private data class SharedCopyOutcome(
+        val path: String? = null,
+        val error: String? = null,
+    )
+
     private val shareExecutor = Executors.newSingleThreadExecutor()
     private val pendingLock = Any()
     private val pendingSharedFiles = ArrayList<String>()
+    private val pendingShareErrors = ArrayList<String>()
     private var shareChannel: MethodChannel? = null
+    private var shareClientReady = false
     private var updaterChannel: MethodChannel? = null
     private val updateExecutor = Executors.newSingleThreadExecutor()
     private var exporterChannel: MethodChannel? = null
@@ -43,7 +52,11 @@ class MainActivity : FlutterActivity() {
         shareChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SHARE_CHANNEL).also { channel ->
             channel.setMethodCallHandler { call: MethodCall, result: MethodChannel.Result ->
                 when (call.method) {
-                    "consumeSharedFiles" -> result.success(drainPendingSharedFiles())
+                    "consumeSharedFiles" -> {
+                        shareClientReady = true
+                        result.success(drainPendingSharedFiles())
+                    }
+                    "consumeShareErrors" -> result.success(drainPendingShareErrors())
                     else -> result.notImplemented()
                 }
             }
@@ -281,11 +294,14 @@ class MainActivity : FlutterActivity() {
         shareExecutor.shutdownNow()
         updateExecutor.shutdownNow()
         exportExecutor.shutdownNow()
+        pendingDirectoryPick?.error("activity_destroyed", "Activity was destroyed before directory selection completed", null)
+        pendingScan?.error("activity_destroyed", "Activity was destroyed before scanning completed", null)
         exporterChannel = null
         pendingDirectoryPick = null
         pendingScan = null
         scannerChannel = null
         shareChannel = null
+        shareClientReady = false
         updaterChannel = null
         super.onDestroy()
     }
@@ -310,13 +326,23 @@ class MainActivity : FlutterActivity() {
         if (uris.isEmpty()) return
 
         shareExecutor.execute {
-            val copied = uris.mapIndexedNotNull { index, uri -> copyUriToCache(uri, index) }
-            if (copied.isEmpty()) return@execute
+            val outcomes = uris.mapIndexed { index, uri -> copyUriToCache(uri, index) }
+            val copied = outcomes.mapNotNull(SharedCopyOutcome::path)
+            val failures = outcomes.mapNotNull(SharedCopyOutcome::error)
+            if (copied.isEmpty() && failures.isEmpty()) return@execute
             runOnUiThread {
-                synchronized(pendingLock) {
-                    pendingSharedFiles.addAll(copied)
+                val channel = shareChannel
+                if (channel == null || !shareClientReady) {
+                    synchronized(pendingLock) {
+                        pendingSharedFiles.addAll(copied)
+                        pendingShareErrors.addAll(failures)
+                    }
+                } else {
+                    if (copied.isNotEmpty()) channel.invokeMethod("sharedFiles", copied)
+                    if (failures.isNotEmpty()) {
+                        channel.invokeMethod("shareError", shareFailureMessage(failures))
+                    }
                 }
-                shareChannel?.invokeMethod("sharedFiles", copied)
             }
         }
     }
@@ -361,20 +387,43 @@ class MainActivity : FlutterActivity() {
         return uris.toList()
     }
 
-    private fun copyUriToCache(uri: Uri, index: Int): String? {
+    private fun copyUriToCache(uri: Uri, index: Int): SharedCopyOutcome {
+        var targetDirectory: File? = null
         return try {
+            var declaredSize: Long? = null
             val displayName = contentResolver.query(
                 uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME),
+                arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
                 null,
                 null,
                 null,
             )?.use { cursor ->
                 val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (nameColumn >= 0 && cursor.moveToFirst()) cursor.getString(nameColumn) else null
+                val sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (!cursor.moveToFirst()) {
+                    null
+                } else {
+                    if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) {
+                        declaredSize = cursor.getLong(sizeColumn).takeIf { it >= 0 }
+                    }
+                    if (nameColumn >= 0 && !cursor.isNull(nameColumn)) {
+                        cursor.getString(nameColumn)
+                    } else {
+                        null
+                    }
+                }
             }
                 ?: uri.lastPathSegment
                 ?: "shared-file"
+
+            declaredSize?.let { size ->
+                if (size > MAX_SHARED_FILE_BYTES) {
+                    throw IOException("分享文件超过 1 TiB 上限")
+                }
+                if (!hasShareCacheCapacity(size)) {
+                    throw IOException("设备可用空间不足，无法缓存分享文件")
+                }
+            }
 
             val normalizedName = displayName
                 .substringAfterLast('/')
@@ -389,26 +438,70 @@ class MainActivity : FlutterActivity() {
             } else {
                 normalizedName
             }
-            val targetDirectory = File(
+            targetDirectory = File(
                 cacheDir,
                 "inkhole-share/${System.currentTimeMillis()}_${index}_${System.nanoTime()}",
-            ).apply { mkdirs() }
+            ).apply {
+                if (!mkdirs() && !isDirectory) {
+                    throw IOException("无法创建分享缓存目录")
+                }
+            }
             // Keep the original basename so the receiver sees the same filename as the share source.
             val target = File(targetDirectory, safeName)
-            val input = contentResolver.openInputStream(uri) ?: return null
+            val input = contentResolver.openInputStream(uri)
+                ?: throw IOException("无法打开分享文件")
             input.use { source ->
-                target.outputStream().use { destination -> source.copyTo(destination) }
+                target.outputStream().use { destination ->
+                    val buffer = ByteArray(SHARE_COPY_BUFFER_SIZE)
+                    var copied = 0L
+                    while (true) {
+                        if (Thread.currentThread().isInterrupted) {
+                            throw InterruptedIOException("分享文件复制已取消")
+                        }
+                        val read = source.read(buffer)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        if (copied > MAX_SHARED_FILE_BYTES - read) {
+                            throw IOException("分享文件超过 1 TiB 上限")
+                        }
+                        if (!hasShareCacheCapacity(read.toLong())) {
+                            throw IOException("设备可用空间不足，无法缓存分享文件")
+                        }
+                        destination.write(buffer, 0, read)
+                        copied += read
+                    }
+                }
             }
-            target.absolutePath
-        } catch (_: Exception) {
-            null
+            SharedCopyOutcome(path = target.absolutePath)
+        } catch (error: Exception) {
+            targetDirectory?.deleteRecursively()
+            SharedCopyOutcome(error = error.message ?: "无法读取分享文件")
         }
+    }
+
+    private fun hasShareCacheCapacity(bytes: Long): Boolean {
+        val available = cacheDir.usableSpace
+        return bytes >= 0 &&
+            available > SHARE_CACHE_RESERVE_BYTES &&
+            bytes <= available - SHARE_CACHE_RESERVE_BYTES
+    }
+
+    private fun shareFailureMessage(errors: List<String>): String = if (errors.size == 1) {
+        "分享文件未加入：${errors.first()}"
+    } else {
+        "有 ${errors.size} 个分享文件未加入：${errors.first()}"
     }
 
     private fun drainPendingSharedFiles(): List<String> = synchronized(pendingLock) {
         val files = pendingSharedFiles.toList()
         pendingSharedFiles.clear()
         files
+    }
+
+    private fun drainPendingShareErrors(): List<String> = synchronized(pendingLock) {
+        val errors = pendingShareErrors.toList()
+        pendingShareErrors.clear()
+        errors
     }
 
     companion object {
@@ -420,5 +513,8 @@ class MainActivity : FlutterActivity() {
         private const val REQUEST_SCAN = 9108
         private const val REQUEST_CAMERA = 9109
         private const val SHARE_CACHE_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
+        private const val SHARE_CACHE_RESERVE_BYTES = 128L * 1024 * 1024
+        private const val MAX_SHARED_FILE_BYTES = 1L shl 40
+        private const val SHARE_COPY_BUFFER_SIZE = 256 * 1024
     }
 }

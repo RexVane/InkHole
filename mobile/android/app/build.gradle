@@ -30,12 +30,51 @@ android {
         main.jniLibs.srcDirs += ['../../native/android']
     }
 
+    def releaseKeystorePath = System.getenv('INKHOLE_KEYSTORE_PATH')
+    def releaseKeystorePassword = System.getenv('INKHOLE_KEYSTORE_PASSWORD')
+    def releaseKeyAlias = System.getenv('INKHOLE_KEY_ALIAS')
+    def releaseKeyPassword = System.getenv('INKHOLE_KEY_PASSWORD')
+    def hasReleaseSigning = [
+        releaseKeystorePath,
+        releaseKeystorePassword,
+        releaseKeyAlias,
+        releaseKeyPassword,
+    ].every { value -> value != null && !value.trim().isEmpty() }
+    def allowDebugReleaseSigning = project.findProperty('inkholeAllowDebugSigning') == 'true'
+
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseKeystorePath)
+                storePassword releaseKeystorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // Signing is supplied by CI or a local Gradle signing configuration.
-            signingConfig = signingConfigs.debug
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.release
+            } else if (allowDebugReleaseSigning) {
+                // Debug signing is only allowed for explicitly requested local/CI artifacts.
+                signingConfig = signingConfigs.debug
+            }
             minifyEnabled = false
             shrinkResources = false
+        }
+    }
+
+    gradle.taskGraph.whenReady { graph ->
+        def runsReleaseTask = graph.allTasks.any { task ->
+            task.project == project && task.name.contains('Release')
+        }
+        if (runsReleaseTask && !hasReleaseSigning && !allowDebugReleaseSigning) {
+            throw new GradleException(
+                'Release signing is not configured. Provide INKHOLE_KEYSTORE_PATH, '
+                    + 'INKHOLE_KEYSTORE_PASSWORD, INKHOLE_KEY_ALIAS and INKHOLE_KEY_PASSWORD.'
+            )
         }
     }
 }

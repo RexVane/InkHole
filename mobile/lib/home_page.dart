@@ -82,6 +82,9 @@ class _HomePageState extends State<HomePage> {
   /// 仍在进行的发送，key 与 _progress 一致。接收方向没有 send_id，
   /// 分开记才不会在纯接收时冒出「取消发送」。
   final Set<String> _sendIds = <String>{};
+  final Map<String, Map<String, dynamic>> _earlySent =
+      <String, Map<String, dynamic>>{};
+  bool _sendRequestInFlight = false;
 
   /// 用户主动取消的发送。核心随后仍会回一条失败的 lan.sent，
   /// 不记下来就会把「已取消发送」盖成「发送失败」。
@@ -121,7 +124,17 @@ class _HomePageState extends State<HomePage> {
       final List<String> paths =
           await _shareChannel.invokeListMethod<String>('consumeSharedFiles') ??
               const <String>[];
+      final List<String> errors =
+          await _shareChannel.invokeListMethod<String>('consumeShareErrors') ??
+              const <String>[];
       _queueSharedFiles(paths);
+      if (errors.isNotEmpty) {
+        _setStatus(
+          errors.length == 1
+              ? '分享文件未加入：${errors.first}'
+              : '有 ${errors.length} 个分享文件未加入：${errors.first}',
+        );
+      }
     } catch (_) {
       // The channel is Android-only; other Flutter targets simply use the picker.
     }
@@ -130,6 +143,8 @@ class _HomePageState extends State<HomePage> {
   Future<dynamic> _onShareMethodCall(MethodCall call) async {
     if (call.method == 'sharedFiles' && call.arguments is List) {
       _queueSharedFiles((call.arguments as List<dynamic>).whereType<String>());
+    } else if (call.method == 'shareError' && call.arguments is String) {
+      _setStatus(call.arguments as String);
     }
     return null;
   }
@@ -147,14 +162,16 @@ class _HomePageState extends State<HomePage> {
   Future<void> _boot() async {
     try {
       _preferences = await SharedPreferences.getInstance();
-      _peerName = _preferences!.getString('peer_name') ?? Platform.localHostname;
+      _peerName =
+          _preferences!.getString('peer_name') ?? Platform.localHostname;
       if (_peerName.trim().isEmpty) _peerName = 'Android';
       _inbox = await _resolveInbox();
       _encryptionEnabled = _preferences!.getBool('encryption_enabled') ?? false;
       // The export contains the device TLS and signing private keys; keep it
       // in platform secure storage instead of ordinary app preferences.
       _identityPrivate = await _secureStorage.read(key: 'identity_private');
-      final String? legacyIdentity = _preferences!.getString('identity_private');
+      final String? legacyIdentity =
+          _preferences!.getString('identity_private');
       if (_identityPrivate == null || _identityPrivate!.trim().isEmpty) {
         if (legacyIdentity != null && legacyIdentity.trim().isNotEmpty) {
           await _secureStorage.write(
@@ -239,9 +256,13 @@ class _HomePageState extends State<HomePage> {
       'inbox_category_roots': <String, dynamic>{},
       'listen_port': _listenPort,
       'capabilities': const <String>['quic-v2', 'blake3', 'folder-v1'],
-      'discovery_targets': _manualPeers
-          .map((ManualPeer peer) => peer.host)
-          .toList(growable: false),
+      'discovery_targets': _manualPeers.map((ManualPeer peer) {
+        if (peer.port == 0) return peer.host;
+        if (peer.host.contains(':') && !peer.host.startsWith('[')) {
+          return '[${peer.host}]:${peer.port}';
+        }
+        return '${peer.host}:${peer.port}';
+      }).toList(growable: false),
     });
   }
 
@@ -255,7 +276,8 @@ class _HomePageState extends State<HomePage> {
       // 首启崩溃或安全存储写入失败会导致下次冷启生成全新身份,对端固定指纹
       // 失配(SSH 配对断裂、被当新设备)。await 而非 unawaited,失败时提示。
       try {
-        await _secureStorage.write(key: 'identity_private', value: identityPrivate);
+        await _secureStorage.write(
+            key: 'identity_private', value: identityPrivate);
       } catch (_) {
         _setStatus('身份保存失败,重启后可能需要重新配对');
       }
@@ -279,6 +301,8 @@ class _HomePageState extends State<HomePage> {
         _selectedInstance = null;
         _progress.clear();
         _sendIds.clear();
+        _earlySent.clear();
+        _sendRequestInFlight = false;
         _cancelledSends.clear();
         _sending = false;
       });
@@ -382,8 +406,16 @@ class _HomePageState extends State<HomePage> {
 
   void _onCoreEvent(Map<String, dynamic> event) {
     final String name = event['event']?.toString() ?? '';
-    final Map<String, dynamic> data =
-        Map<String, dynamic>.from(event['data'] as Map? ?? const <String, dynamic>{});
+    final Map<String, dynamic> data = Map<String, dynamic>.from(
+        event['data'] as Map? ?? const <String, dynamic>{});
+    if (name == 'lan.peers' ||
+        name == 'lan.status' ||
+        name == 'lan.progress' ||
+        name == 'lan.sent' ||
+        name == 'lan.received') {
+      final String? eventSession = data['session_id']?.toString();
+      if (eventSession != null && eventSession != _sessionId) return;
+    }
     switch (name) {
       case 'core.fatal':
         _joining.value = false;
@@ -395,6 +427,8 @@ class _HomePageState extends State<HomePage> {
           _sending = false;
           _progress.clear();
           _sendIds.clear();
+          _earlySent.clear();
+          _sendRequestInFlight = false;
           _cancelledSends.clear();
         });
       case 'lan.peers':
@@ -412,8 +446,8 @@ class _HomePageState extends State<HomePage> {
                   PeerView.fromJson(Map<String, dynamic>.from(value)))
               .toList(growable: false);
           if (_selectedInstance != null &&
-              !_peers.any((PeerView peer) =>
-                  peer.instanceId == _selectedInstance)) {
+              !_peers.any(
+                  (PeerView peer) => peer.instanceId == _selectedInstance)) {
             _selectedInstance = null;
           }
           if (_peers.isNotEmpty && _status == '等待附近的墨洞上线…') {
@@ -446,6 +480,12 @@ class _HomePageState extends State<HomePage> {
         });
       case 'lan.sent':
         final String? id = data['send_id']?.toString();
+        if (id != null && !_sendIds.contains(id)) {
+          if (_sendRequestInFlight) {
+            _earlySent[id] = Map<String, dynamic>.from(data);
+          }
+          return;
+        }
         final bool cancelled = id != null && _cancelledSends.remove(id);
         if (!mounted) return;
         setState(() {
@@ -580,12 +620,14 @@ class _HomePageState extends State<HomePage> {
         _selectedInstance == peer.instanceId ? null : peer.instanceId;
     setState(() => _selectedInstance = next);
     if (next == null || _sharedFiles.isEmpty) return;
+    if (_sendRequestInFlight || _sending) return;
     final List<String> queued = _sharedFiles.toList(growable: false);
     setState(() => _sharedFiles.clear());
     unawaited(_sendPaths(queued, peer));
   }
 
   Future<void> _chooseAndSend() async {
+    if (_sendRequestInFlight || _sending) return;
     if (_sessionId == null) {
       _setStatus('墨洞未就绪');
       return;
@@ -607,8 +649,15 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _sendPaths(List<String> paths, PeerView target) async {
+    if (_sendRequestInFlight || _sending) return;
+    _sendRequestInFlight = true;
+    if (mounted) setState(() => _sending = true);
     for (final String path in paths) {
-      if (_sessionId == null) return;
+      if (_sessionId == null) {
+        _sendRequestInFlight = false;
+        if (mounted && _sendIds.isEmpty) setState(() => _sending = false);
+        return;
+      }
       try {
         final Map<String, dynamic> response =
             await _core.call('lan.send', <String, dynamic>{
@@ -626,11 +675,20 @@ class _HomePageState extends State<HomePage> {
             _sendIds.add(id);
             _sending = true;
           });
+          final Map<String, dynamic>? early = _earlySent.remove(id);
+          if (early != null) {
+            _onCoreEvent(<String, dynamic>{
+              'event': 'lan.sent',
+              'data': early,
+            });
+          }
         }
       } catch (error) {
         _setStatus('发送失败：$error');
       }
     }
+    _sendRequestInFlight = false;
+    if (mounted && _sendIds.isEmpty) setState(() => _sending = false);
   }
 
   /// 中断所有在途发送。核心只提供 lan.send.cancel，接收方向没有
@@ -822,8 +880,8 @@ class _HomePageState extends State<HomePage> {
       context: context,
       barrierDismissible: false,
       builder: (BuildContext dialogContext) => WormholeOfferDialog(
-        summary:
-            Map<String, dynamic>.from(data['summary'] as Map? ?? const <String, dynamic>{}),
+        summary: Map<String, dynamic>.from(
+            data['summary'] as Map? ?? const <String, dynamic>{}),
       ),
     );
     if (session == null) return;
@@ -933,11 +991,22 @@ class _HomePageState extends State<HomePage> {
     if (prefs == null) return;
     final String previousSecret =
         await _secureStorage.read(key: 'transfer_secret') ?? '';
+    final String previousSshKey =
+        await _secureStorage.read(key: 'ssh_private_key') ?? '';
+    final String previousSshPassphrase =
+        await _secureStorage.read(key: 'ssh_passphrase') ?? '';
     final bool restartNeeded = settings.peerName != _peerName ||
         settings.listenPort != _listenPort ||
         settings.encryptionEnabled != _encryptionEnabled ||
         settings.secret != previousSecret ||
-        !_sameHosts(settings.manualPeers, _manualPeers);
+        !_sameManualPeers(settings.manualPeers, _manualPeers);
+    final bool sshRestartNeeded = settings.sshEnabled != _sshEnabled ||
+        settings.sshHost != _sshHost ||
+        settings.sshPort != _sshPort ||
+        settings.sshUser != _sshUser ||
+        settings.sshFingerprint != _sshFingerprint ||
+        settings.sshPrivateKey != previousSshKey ||
+        settings.sshPassphrase != previousSshPassphrase;
 
     await prefs.setString('peer_name', settings.peerName);
     await prefs.setInt('listen_port', settings.listenPort);
@@ -968,12 +1037,16 @@ class _HomePageState extends State<HomePage> {
         key: 'ssh_private_key',
         value: settings.sshPrivateKey,
       );
+    } else {
+      await _secureStorage.delete(key: 'ssh_private_key');
     }
     if (settings.sshPassphrase.isNotEmpty) {
       await _secureStorage.write(
         key: 'ssh_passphrase',
         value: settings.sshPassphrase,
       );
+    } else {
+      await _secureStorage.delete(key: 'ssh_passphrase');
     }
     final bool sshWasEnabled = _sshEnabled;
     if (!mounted) return;
@@ -998,21 +1071,38 @@ class _HomePageState extends State<HomePage> {
         );
       } catch (_) {}
       _sshSessionId = null;
+    } else if (settings.sshEnabled && sshRestartNeeded && !restartNeeded) {
+      if (_sshSessionId != null) {
+        try {
+          await _core.call(
+            'session.cancel',
+            <String, dynamic>{'session_id': _sshSessionId},
+          );
+        } catch (_) {}
+      }
+      _sshSessionId = null;
+      unawaited(_startSsh());
     }
     if (restartNeeded) {
       await _restartLan();
       return;
     }
-    if (settings.sshEnabled && (!sshWasEnabled || _sshSessionId == null)) {
+    if (settings.sshEnabled &&
+        !sshRestartNeeded &&
+        (!sshWasEnabled || _sshSessionId == null)) {
       unawaited(_startSsh());
     }
     _setStatus('设置已保存');
   }
 
-  bool _sameHosts(List<ManualPeer> left, List<ManualPeer> right) {
+  bool _sameManualPeers(List<ManualPeer> left, List<ManualPeer> right) {
     if (left.length != right.length) return false;
     for (int index = 0; index < left.length; index++) {
-      if (left[index].host != right[index].host) return false;
+      if (left[index].name != right[index].name ||
+          left[index].host != right[index].host ||
+          left[index].port != right[index].port) {
+        return false;
+      }
     }
     return true;
   }
@@ -1038,8 +1128,7 @@ class _HomePageState extends State<HomePage> {
   ///
   /// GB 级文件搬运要几十秒，期间进度条已经撤掉了，得用状态文字说明还在忙。
   Future<void> _exportReceived(String path) async {
-    final String target =
-        _exportTreeLabel.isEmpty ? '下载目录' : _exportTreeLabel;
+    final String target = _exportTreeLabel.isEmpty ? '下载目录' : _exportTreeLabel;
     _setStatus('正在保存到$target…');
     try {
       final ExportOutcome outcome = await ExporterChannel.export(
@@ -1158,10 +1247,10 @@ class _HomePageState extends State<HomePage> {
     if (_progress.isEmpty) return -1;
     final List<TransferProgress> values =
         _progress.values.toList(growable: false);
-    final int total =
-        values.fold<int>(0, (int sum, TransferProgress item) => sum + item.total);
-    final int done =
-        values.fold<int>(0, (int sum, TransferProgress item) => sum + item.done);
+    final int total = values.fold<int>(
+        0, (int sum, TransferProgress item) => sum + item.total);
+    final int done = values.fold<int>(
+        0, (int sum, TransferProgress item) => sum + item.done);
     return total <= 0 ? 0 : (done / total).clamp(0, 1).toDouble();
   }
 
@@ -1199,8 +1288,9 @@ class _HomePageState extends State<HomePage> {
             Expanded(
               child: LayoutBuilder(
                 builder: (BuildContext context, BoxConstraints constraints) {
-                  final double diameter =
-                      (constraints.maxHeight * 0.38).clamp(130.0, 230.0).toDouble();
+                  final double diameter = (constraints.maxHeight * 0.38)
+                      .clamp(130.0, 230.0)
+                      .toDouble();
                   return Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 18),
                     child: Column(
@@ -1209,8 +1299,9 @@ class _HomePageState extends State<HomePage> {
                           diameter: diameter,
                           transferPercent: _transferPercent,
                           searching: _peers.isEmpty && !_starting,
-                          onTap:
-                              _sending ? null : () => unawaited(_chooseAndSend()),
+                          onTap: _sending
+                              ? null
+                              : () => unawaited(_chooseAndSend()),
                         ),
                         _buildStatusLine(),
                         _buildHintLine(),

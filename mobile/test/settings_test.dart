@@ -18,7 +18,8 @@ void main() {
     });
 
     test('认直接编码的裸短码', () {
-      expect(parseScannedCode('  7-guitarist-revenge  '), '7-guitarist-revenge');
+      expect(
+          parseScannedCode('  7-guitarist-revenge  '), '7-guitarist-revenge');
     });
 
     test('拒绝无关链接和空内容', () {
@@ -59,7 +60,7 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(
-        find.widgetWithText(TextField, 'Tailscale IP 或 MagicDNS'),
+        find.byKey(const Key('manual-peer-host')),
         '100.64.0.7',
       );
       await tester.ensureVisible(find.text('添加设备'));
@@ -71,7 +72,7 @@ void main() {
       expect(
         tester
             .widget<TextField>(
-              find.widgetWithText(TextField, 'Tailscale IP 或 MagicDNS'),
+              find.byKey(const Key('manual-peer-host')),
             )
             .controller
             ?.text,
@@ -93,15 +94,15 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(
-        find.widgetWithText(TextField, '设备备注（可选）'),
+        find.byKey(const Key('manual-peer-name')),
         '书房台式机',
       );
       await tester.enterText(
-        find.widgetWithText(TextField, 'Tailscale IP 或 MagicDNS'),
+        find.byKey(const Key('manual-peer-host')),
         '100.64.0.7',
       );
       await tester.enterText(
-        find.widgetWithText(TextField, '对方监听端口（留空=自动）'),
+        find.byKey(const Key('manual-peer-port')),
         '41234',
       );
       await tester.tap(find.widgetWithText(FilledButton, '保存'));
@@ -123,7 +124,7 @@ void main() {
       await tester.pumpAndSettle();
 
       await tester.enterText(
-        find.widgetWithText(TextField, 'Tailscale IP 或 MagicDNS'),
+        find.byKey(const Key('manual-peer-host')),
         '100.64.0.7 备用',
       );
       await tester.tap(find.widgetWithText(FilledButton, '保存'));
@@ -157,7 +158,7 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('保存设备'), findsOneWidget);
       await tester.enterText(
-        find.widgetWithText(TextField, 'Tailscale IP 或 MagicDNS'),
+        find.byKey(const Key('manual-peer-host')),
         '100.64.0.9',
       );
       await tester.ensureVisible(find.text('保存设备'));

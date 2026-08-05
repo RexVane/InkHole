@@ -104,7 +104,7 @@ class ManualPeer {
   final String name;
   final String host;
 
-  /// 对方监听端口；0 表示未指定（与桌面端 manual_peers 一样仅随配置存储）。
+  /// 对方发现 UDP 端口；0 表示使用默认端口。
   final int port;
 
   String encode() => '${name.replaceAll('|', ' ')}|$host|$port';
@@ -151,7 +151,7 @@ class InkSettings {
 /// 显示在设置里的版本号；与 pubspec.yaml 的 version 保持一致，
 /// 需要时可用 `--dart-define=APP_VERSION=x.y.z` 在打包阶段覆盖。
 const String appVersion =
-    String.fromEnvironment('APP_VERSION', defaultValue: '2.0.7');
+    String.fromEnvironment('APP_VERSION', defaultValue: '2.0.9');
 
 /// 旧版设置里「GitHub 仓库」指向的地址。
 const String repositoryUrl = 'https://github.com/RexVane/InkHole';

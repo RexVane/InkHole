@@ -201,7 +201,6 @@ object Exporter {
             }
             val publicRoot = uniqueMediaStoreFolderName(ctx, src.name)
             val inserted = ArrayList<Uri>(files.size)
-            var publishedCount = 0
             try {
                 for (file in files) {
                     val relative = file.relativeTo(src).invariantSeparatorsPath
@@ -236,14 +235,12 @@ object Exporter {
                         put(MediaStore.MediaColumns.IS_PENDING, 0)
                     }, null, null)
                     if (published <= 0) throw IOException("无法发布下载文件夹")
-                    publishedCount++
                 }
                 src.deleteRecursively()
                 return@synchronized Outcome(publicRoot, "Download/InkHole")
             } catch (_: Exception) {
-                // 只回滚未发布的(从 publishedCount 开始的),保留已发布到
-                // Download/InkHole 的文件,避免用户看到文件先出现再消失。
-                for (uri in inserted.drop(publishedCount)) {
+                // Roll back every inserted MediaStore row, including already-published files.
+                for (uri in inserted) {
                     try { ctx.contentResolver.delete(uri, null, null) } catch (_: Exception) {}
                 }
                 return@synchronized Outcome(src.name, "")

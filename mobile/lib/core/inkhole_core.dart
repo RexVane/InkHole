@@ -447,6 +447,13 @@ class InkHoleCore {
           if (!pending.isCompleted) pending.completeError(error);
         }
         _pending.clear();
+        final ReceivePort? receive = _receive;
+        _receive = null;
+        _commands = null;
+        _ready = null;
+        _isolate?.kill(priority: Isolate.immediate);
+        _isolate = null;
+        receive?.close();
         if (!_events.isClosed) {
           _events.add(<String, dynamic>{
             'event': 'core.fatal',

@@ -79,7 +79,35 @@ jobs:
       - name: Build Rust Android libraries
         run: bash tool/build_native.sh
 
+      - name: Prepare release signing
+        if: env.RELEASE_TAG != ''
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for value in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!value}" ]; then
+              echo "Missing required Android signing secret: $value" >&2
+              exit 1
+            fi
+          done
+          keystore="$RUNNER_TEMP/inkhole-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          test -s "$keystore"
+          {
+            echo "INKHOLE_KEYSTORE_PATH=$keystore"
+            echo "INKHOLE_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+            echo "INKHOLE_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+            echo "INKHOLE_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
       - name: Build split APKs
+        env:
+          ORG_GRADLE_PROJECT_inkholeAllowDebugSigning: ${{ env.RELEASE_TAG == '' && 'true' || 'false' }}
         run: flutter build apk --release --split-per-abi
 
       - name: Upload workflow artifact

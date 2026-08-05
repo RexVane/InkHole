@@ -32,6 +32,8 @@ const animation = new InkHoleAnimation(byID<HTMLCanvasElement>("hole"));
 let peers: PeerView[] = [];
 let selectedID = "";
 let activeSendID = "";
+let sendRequestInFlight = false;
+const earlyFinishedSends = new Map<string, Record<string, any>>();
 let sendSessionID = "";
 let receiveSessionID = "";
 let pendingOfferID = "";
@@ -179,7 +181,10 @@ function renderPeers(): void {
         item.append(avatar, copy);
         item.addEventListener("click", () => void selectPeer(peer.instanceId));
         item.addEventListener("keydown", (event) => {
-            if (event.key === "Enter" || event.key === " ") void selectPeer(peer.instanceId);
+            if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                void selectPeer(peer.instanceId);
+            }
         });
         peerList.append(item);
     }
@@ -234,17 +239,28 @@ async function reloadRecent(): Promise<void> {
 
 async function sendPaths(paths: string[]): Promise<void> {
     if (!paths.length) return;
+    if (sendRequestInFlight || activeSendID) return;
+    sendRequestInFlight = true;
     let peer = selectedPeer();
     if (!peer && peers.length === 1) {
-        await selectPeer(peers[0].instanceId);
+        try {
+            await selectPeer(peers[0].instanceId);
+        } catch (error) {
+            sendRequestInFlight = false;
+            throw error;
+        }
         peer = peers[0];
     }
     if (!peer) {
+        sendRequestInFlight = false;
         toast("请先选择发送目标", true);
         return;
     }
+    let earlyFinished: Record<string, any> | undefined;
     try {
         activeSendID = await Service.SendPaths(peer.instanceId, paths);
+        earlyFinished = earlyFinishedSends.get(activeSendID);
+        if (earlyFinished) earlyFinishedSends.delete(activeSendID);
         animation.active = true;
         animation.progress = 0;
         byID("cancelSend").hidden = false;
@@ -253,6 +269,9 @@ async function sendPaths(paths: string[]): Promise<void> {
         byID("transferDetail").textContent = "正在建立传输通道";
     } catch (error) {
         toast(errorMessage(error), true);
+    } finally {
+        sendRequestInFlight = false;
+        if (earlyFinished) finishProgress(earlyFinished);
     }
 }
 
@@ -292,7 +311,12 @@ function finishProgress(data: Record<string, any>): void {
     // 旧批次的完成事件不应清空新批次状态:校验 sendId 匹配当前批次,
     // 否则发送中再发起的新批次会被旧批次的 transfer-finished 错误终结
     // (清空 activeSendID、隐藏取消按钮)。迟到的旧事件直接丢弃。
-    if (data.sendId && data.sendId !== activeSendID) return;
+    const sendId = String(data.sendId || "");
+    if (sendId && !activeSendID) {
+        if (sendRequestInFlight) earlyFinishedSends.set(sendId, data);
+        return;
+    }
+    if (sendId && sendId !== activeSendID) return;
     const succeeded = Number(data.succeeded || 0);
     const total = Number(data.total || 0);
     window.clearTimeout(recvIdleTimer);
@@ -711,23 +735,10 @@ async function saveSettings(): Promise<void> {
     setSettingsState("saving");
     byID("settingsMessage").textContent = "正在保存";
     try {
-        await Service.SaveConfig(
-            values.peerName,
-            values.inbox,
-            values.secret,
-            false,
-            values.port,
-            values.showPet,
-            values.encryptionEnabled,
-        );
-        await Service.SaveInboxClassification(values.autoClassify, values.categoryDirs);
-        await Service.SaveManualPeers(values.manualPeers);
-        await Service.SaveWormholeConfig(
-            values.wormholeRendezvous,
-            values.wormholeRelay,
-        );
-        await Service.SaveSSHConfig(values.ssh);
-        const actual = await Service.SetAutostart(values.autostart);
+        const actual = await (window as any).__TAURI__.core.invoke("frontend_call", {
+            method: "SaveSettings",
+            args: [{...values, clearSecret: false}],
+        });
         if (actual !== values.autostart) {
             throw new Error("系统未能应用开机自启设置");
         }
@@ -935,6 +946,19 @@ for (const tab of document.querySelectorAll<HTMLButtonElement>(".cross-tab")) {
         for (const panel of document.querySelectorAll<HTMLElement>(".cross-panel")) {
             panel.hidden = panel.id !== tab.getAttribute("aria-controls");
         }
+    });
+    tab.addEventListener("keydown", (event) => {
+        const tabs = [...document.querySelectorAll<HTMLButtonElement>(".cross-tab")];
+        const index = tabs.indexOf(tab);
+        let next = index;
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % tabs.length;
+        else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index - 1 + tabs.length) % tabs.length;
+        else if (event.key === "Home") next = 0;
+        else if (event.key === "End") next = tabs.length - 1;
+        else return;
+        event.preventDefault();
+        tabs[next].focus();
+        tabs[next].click();
     });
 }
 byID("minimiseWindow").addEventListener("click", () => void AppWindow.Minimise());

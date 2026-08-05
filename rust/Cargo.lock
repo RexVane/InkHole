@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "inkhole-core"
-version = "2.0.8"
+version = "2.0.9"
 dependencies = [
  "base64 0.22.1",
  "bip39",
@@ -2660,16 +2660,18 @@ dependencies = [
 
 [[package]]
 name = "inkhole-desktop"
-version = "2.0.8"
+version = "2.0.9"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
+ "hex",
  "inkhole-core",
  "keyring",
  "reqwest",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2686,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "inkhole-ffi"
-version = "2.0.8"
+version = "2.0.9"
 dependencies = [
  "inkhole-core",
  "serde_json",

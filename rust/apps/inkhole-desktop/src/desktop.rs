@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use inkhole_core::{DeviceIdentity, InboxCategoryRoots, JsonService, LanPeer, ServiceEvent};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, Position,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -228,6 +229,7 @@ impl DesktopState {
             }
             "GetConfig" => self.get_config().await,
             "SaveConfig" => self.save_config(app, &args).await,
+            "SaveSettings" => self.save_settings(app, &args).await,
             "SaveInboxClassification" => self.save_inbox_classification(app, &args).await,
             "ManualPeers" => self.manual_peers().await,
             "SaveManualPeers" => self.save_manual_peers(app, &args).await,
@@ -337,7 +339,16 @@ impl DesktopState {
         let discovery_targets = config
             .manual_peers
             .iter()
-            .map(|peer| peer.host.clone())
+            .filter(|peer| !peer.host.is_empty())
+            .map(|peer| {
+                if peer.port == 0 {
+                    peer.host.clone()
+                } else if peer.host.contains(':') && !peer.host.starts_with('[') {
+                    format!("[{}]:{}", peer.host, peer.port)
+                } else {
+                    format!("{}:{}", peer.host, peer.port)
+                }
+            })
             .collect::<Vec<_>>();
         let start = call_core(
             &self.service,
@@ -508,6 +519,204 @@ impl DesktopState {
             self.start(app).await?;
         }
         Ok(Value::Null)
+    }
+
+    async fn save_settings(&self, app: &AppHandle, args: &[Value]) -> Result<Value> {
+        let mut input: DesktopSettingsInput = argument(args, 0, "settings")?;
+        input.peer_name = input.peer_name.trim().to_owned();
+        input.inbox = input.inbox.trim().to_owned();
+        input.ssh.host = input.ssh.host.trim().to_owned();
+        input.ssh.user = input.ssh.user.trim().to_owned();
+        input.ssh.private_key_path = input.ssh.private_key_path.trim().to_owned();
+        input.ssh.host_key_sha256 = input.ssh.host_key_sha256.trim().to_owned();
+        if input.peer_name.is_empty() {
+            bail!("设备名称不能为空");
+        }
+        if input.peer_name.chars().count() > 40 {
+            bail!("设备名称不能超过 40 个字符");
+        }
+        if input.inbox.is_empty() {
+            bail!("收件箱目录不能为空");
+        }
+        if input.ssh.port == 0 {
+            input.ssh.port = 22;
+        }
+        if input.ssh.private_key_mode != "paste" {
+            input.ssh.private_key_mode = "file".into();
+        }
+        input.ssh.peers = normalize_ssh_peers(input.ssh.peers)?;
+
+        let current = self.runtime.lock().await.config.clone();
+        let transfer_secret = self.store.secret_entry(&current.instance_id)?;
+        let profile_id = current.cross_network.ssh.profile.id.clone();
+        let private_key = self.store.ssh_entry(&profile_id, "private-key")?;
+        let passphrase = self.store.ssh_entry(&profile_id, "passphrase")?;
+        let pasted_key_mode = input.ssh.private_key_mode == "paste";
+
+        if input.encryption_enabled {
+            let has_secret = if input.clear_secret {
+                false
+            } else if !input.secret.is_empty() {
+                true
+            } else {
+                credential_value(&transfer_secret, "读取端到端口令")?
+                    .is_some_and(|value| !value.is_empty())
+            };
+            if !has_secret {
+                bail!("启用加密前请先设置端到端口令");
+            }
+        }
+        if input.ssh.enabled {
+            if input.ssh.host.is_empty() || input.ssh.user.is_empty() {
+                bail!("SSH 主机和用户名不能为空");
+            }
+            if input.ssh.host_key_sha256.is_empty() {
+                bail!("请先检测并确认 SSH 主机指纹");
+            }
+            if pasted_key_mode {
+                let has_key = !input.ssh.pasted_key.is_empty()
+                    || credential_value(&private_key, "读取 SSH 私钥")?
+                        .is_some_and(|value| !value.is_empty());
+                if !has_key {
+                    bail!("请粘贴 SSH 私钥");
+                }
+            } else if input.ssh.private_key_path.is_empty() {
+                bail!("请选择 SSH 私钥文件");
+            }
+        }
+
+        let transfer_change = input.clear_secret || !input.secret.is_empty();
+        let inspect_private_key = !input.ssh.pasted_key.is_empty() || !pasted_key_mode;
+        let passphrase_change = input.ssh.clear_passphrase || !input.ssh.passphrase.is_empty();
+        let old_transfer = transfer_change
+            .then(|| credential_value(&transfer_secret, "读取旧端到端口令"))
+            .transpose()?;
+        let old_private_key = inspect_private_key
+            .then(|| credential_value(&private_key, "读取旧 SSH 私钥"))
+            .transpose()?;
+        let private_key_change = !input.ssh.pasted_key.is_empty()
+            || (!pasted_key_mode && old_private_key.as_ref().is_some_and(Option::is_some));
+        let old_passphrase = passphrase_change
+            .then(|| credential_value(&passphrase, "读取旧 SSH 私钥口令"))
+            .transpose()?;
+
+        let mut candidate = current.clone();
+        candidate.peer_name = input.peer_name.clone();
+        candidate.inbox = input.inbox.clone();
+        candidate.listen_port = input.port;
+        candidate.show_pet = input.show_pet;
+        candidate.encryption_enabled = input.encryption_enabled && !input.clear_secret;
+        candidate.inbox_auto_classify = input.auto_classify;
+        candidate.inbox_category_dirs = input.category_dirs.clone().into_iter().collect();
+        candidate.manual_peers = input.manual_peers.clone();
+        candidate.cross_network.wormhole.rendezvous_url = input.wormhole_rendezvous.clone();
+        candidate.cross_network.wormhole.transit_relay = input.wormhole_relay.clone();
+        candidate.cross_network.ssh.enabled = input.ssh.enabled;
+        candidate.cross_network.ssh.profile.host = input.ssh.host.clone();
+        candidate.cross_network.ssh.profile.port = input.ssh.port;
+        candidate.cross_network.ssh.profile.user = input.ssh.user.clone();
+        candidate.cross_network.ssh.profile.private_key_mode = input.ssh.private_key_mode.clone();
+        candidate.cross_network.ssh.profile.private_key_path = input.ssh.private_key_path.clone();
+        candidate.cross_network.ssh.profile.private_key_label = if pasted_key_mode {
+            "已存入系统安全存储".into()
+        } else {
+            String::new()
+        };
+        candidate.cross_network.ssh.profile.host_key_sha256 = input.ssh.host_key_sha256.clone();
+        candidate.cross_network.ssh.peers = input.ssh.peers.clone();
+        candidate.normalize()?;
+
+        let old_autostart = app.autolaunch().is_enabled()?;
+        let autostart_changed = old_autostart != input.autostart;
+        if autostart_changed {
+            let actual = match apply_autostart(app, input.autostart) {
+                Ok(actual) => actual,
+                Err(error) => {
+                    restore_autostart(app, old_autostart);
+                    return Err(error);
+                }
+            };
+            if actual != input.autostart {
+                restore_autostart(app, old_autostart);
+                bail!("系统未能应用开机自启动设置");
+            }
+        }
+
+        let lan_restart = current.peer_name != candidate.peer_name
+            || current.inbox != candidate.inbox
+            || current.listen_port != candidate.listen_port
+            || current.encryption_enabled != candidate.encryption_enabled
+            || current.inbox_auto_classify != candidate.inbox_auto_classify
+            || current.inbox_category_dirs != candidate.inbox_category_dirs
+            || current.manual_peers != candidate.manual_peers
+            || transfer_change;
+        let ssh_restart = current.cross_network.ssh != candidate.cross_network.ssh
+            || private_key_change
+            || passphrase_change;
+        let pet_changed = current.show_pet != candidate.show_pet;
+
+        let credential_update = (|| -> Result<()> {
+            if transfer_change {
+                let value = (!input.clear_secret).then_some(input.secret.as_str());
+                write_credential(&transfer_secret, value, "保存端到端口令")?;
+            }
+            if private_key_change {
+                let value = pasted_key_mode.then_some(input.ssh.pasted_key.as_str());
+                write_credential(&private_key, value, "保存 SSH 私钥")?;
+            }
+            if passphrase_change {
+                let value = (!input.ssh.clear_passphrase).then_some(input.ssh.passphrase.as_str());
+                write_credential(&passphrase, value, "保存 SSH 私钥口令")?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = credential_update {
+            restore_credential(&transfer_secret, old_transfer.as_ref(), "端到端口令");
+            restore_credential(&private_key, old_private_key.as_ref(), "SSH 私钥");
+            restore_credential(&passphrase, old_passphrase.as_ref(), "SSH 私钥口令");
+            if autostart_changed {
+                restore_autostart(app, old_autostart);
+            }
+            return Err(error);
+        }
+
+        let running = {
+            let mut runtime = self.runtime.lock().await;
+            if runtime.config != current {
+                drop(runtime);
+                restore_credential(&transfer_secret, old_transfer.as_ref(), "端到端口令");
+                restore_credential(&private_key, old_private_key.as_ref(), "SSH 私钥");
+                restore_credential(&passphrase, old_passphrase.as_ref(), "SSH 私钥口令");
+                if autostart_changed {
+                    restore_autostart(app, old_autostart);
+                }
+                bail!("设置已被其他操作修改，请重新打开设置后再保存");
+            }
+            let running = runtime.session_id.is_some();
+            if let Err(error) = self.store.save(&candidate) {
+                drop(runtime);
+                restore_credential(&transfer_secret, old_transfer.as_ref(), "端到端口令");
+                restore_credential(&private_key, old_private_key.as_ref(), "SSH 私钥");
+                restore_credential(&passphrase, old_passphrase.as_ref(), "SSH 私钥口令");
+                if autostart_changed {
+                    restore_autostart(app, old_autostart);
+                }
+                return Err(error);
+            }
+            runtime.config = candidate;
+            running
+        };
+
+        if pet_changed {
+            set_pet_window_visible(app, input.show_pet)?;
+        }
+        if running && lan_restart {
+            self.stop(app).await?;
+            self.start(app).await?;
+        } else if running && ssh_restart {
+            self.restart_ssh(app).await?;
+        }
+        Ok(Value::Bool(input.autostart))
     }
 
     async fn save_inbox_classification(&self, app: &AppHandle, args: &[Value]) -> Result<Value> {
@@ -1258,12 +1467,7 @@ impl DesktopState {
 
     fn set_autostart(&self, app: &AppHandle, args: &[Value]) -> Result<Value> {
         let enabled: bool = argument(args, 0, "enabled")?;
-        if enabled {
-            app.autolaunch().enable()?;
-        } else {
-            app.autolaunch().disable()?;
-        }
-        Ok(Value::Bool(app.autolaunch().is_enabled()?))
+        Ok(Value::Bool(apply_autostart(app, enabled)?))
     }
 
     async fn set_pet_visible(&self, app: &AppHandle, args: &[Value]) -> Result<Value> {
@@ -1648,7 +1852,30 @@ impl DesktopState {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSettingsInput {
+    peer_name: String,
+    inbox: String,
+    #[serde(default)]
+    secret: String,
+    #[serde(default)]
+    clear_secret: bool,
+    port: u16,
+    show_pet: bool,
+    autostart: bool,
+    encryption_enabled: bool,
+    auto_classify: bool,
+    #[serde(default)]
+    category_dirs: HashMap<String, String>,
+    #[serde(default)]
+    manual_peers: Vec<ManualPeerConfig>,
+    wormhole_rendezvous: String,
+    wormhole_relay: String,
+    ssh: SshSettingsInput,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SshSettingsInput {
     enabled: bool,
@@ -1669,6 +1896,48 @@ struct SshSettingsInput {
     host_key_sha256: String,
     #[serde(default)]
     peers: Vec<SshPeerConfig>,
+}
+
+fn credential_value(entry: &keyring::Entry, action: &str) -> Result<Option<String>> {
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error).with_context(|| action.to_owned()),
+    }
+}
+
+fn write_credential(entry: &keyring::Entry, value: Option<&str>, action: &str) -> Result<()> {
+    match value {
+        Some(value) => entry.set_password(value).with_context(|| action.to_owned()),
+        None => match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).with_context(|| action.to_owned()),
+        },
+    }
+}
+
+fn restore_credential(entry: &keyring::Entry, previous: Option<&Option<String>>, label: &str) {
+    let Some(previous) = previous else {
+        return;
+    };
+    if let Err(error) = write_credential(entry, previous.as_deref(), "恢复旧凭据") {
+        tracing::error!(%error, credential = label, "failed to roll back credential update");
+    }
+}
+
+fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<bool> {
+    if enabled {
+        app.autolaunch().enable()?;
+    } else {
+        app.autolaunch().disable()?;
+    }
+    Ok(app.autolaunch().is_enabled()?)
+}
+
+fn restore_autostart(app: &AppHandle, enabled: bool) {
+    if let Err(error) = apply_autostart(app, enabled) {
+        tracing::error!(%error, enabled, "failed to roll back autostart update");
+    }
 }
 
 fn normalize_ssh_peers(values: Vec<SshPeerConfig>) -> Result<Vec<SshPeerConfig>> {
@@ -1947,6 +2216,12 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
         bail!("更新地址不在允许范围");
     }
     let file_name = url.rsplit('/').next().unwrap_or("InkHole-update.bin");
+    if file_name.is_empty()
+        || !file_name.starts_with("InkHole-")
+        || file_name.contains(['/', '\\', '?', '#'])
+    {
+        bail!("invalid update file name");
+    }
     let target_dir = std::env::temp_dir().join("inkhole-update");
     tokio::fs::create_dir_all(&target_dir)
         .await
@@ -1957,6 +2232,24 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
         .user_agent(concat!("InkHole/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("初始化下载客户端失败")?;
+    let checksum_url = format!("{url}.sha256");
+    let checksum_text = client
+        .get(&checksum_url)
+        .send()
+        .await
+        .context("failed to download update checksum")?
+        .error_for_status()
+        .context("update checksum request failed")?
+        .text()
+        .await
+        .context("failed to read update checksum")?;
+    let expected_checksum = checksum_text
+        .split_whitespace()
+        .next()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .context("invalid update checksum format")?;
+
     let response = client
         .get(url)
         .send()
@@ -1973,6 +2266,7 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
         .await
         .context("无法写入更新缓存文件")?;
     let mut stream = response;
+    let mut hasher = Sha256::new();
     let mut done: u64 = 0;
     let mut last_percent: i64 = -1;
     while let Some(chunk) = stream.chunk().await.context("下载更新数据中断")? {
@@ -1980,6 +2274,7 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
         if done > MAX_UPDATE_SIZE {
             bail!("更新包大小异常");
         }
+        hasher.update(&chunk);
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
             .await
             .context("写入更新缓存失败")?;
@@ -1995,6 +2290,11 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
         .await
         .context("写入更新缓存失败")?;
     drop(file);
+    let actual_checksum = hex::encode(hasher.finalize());
+    if actual_checksum != expected_checksum {
+        let _ = tokio::fs::remove_file(&target_path).await;
+        bail!("update SHA-256 verification failed");
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -2334,6 +2634,44 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.host_key_sha256, "SHA256:abcdef");
+    }
+
+    #[test]
+    fn desktop_settings_input_accepts_the_batched_frontend_payload() {
+        let input: DesktopSettingsInput = serde_json::from_value(json!({
+            "peerName": "Desktop",
+            "inbox": "C:/Inbox",
+            "secret": "",
+            "clearSecret": false,
+            "port": 0,
+            "showPet": true,
+            "autostart": false,
+            "encryptionEnabled": false,
+            "autoClassify": true,
+            "categoryDirs": { "media": "C:/Media" },
+            "manualPeers": [],
+            "wormholeRendezvous": "wss://relay.example.invalid",
+            "wormholeRelay": "tcp://relay.example.invalid:4001",
+            "ssh": {
+                "enabled": false,
+                "host": "",
+                "port": 22,
+                "user": "",
+                "privateKeyMode": "file",
+                "privateKeyPath": "",
+                "pastedKey": "",
+                "passphrase": "",
+                "clearPassphrase": false,
+                "hostKeySHA256": "",
+                "peers": []
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(input.peer_name, "Desktop");
+        assert!(input.auto_classify);
+        assert_eq!(input.category_dirs["media"], "C:/Media");
+        assert_eq!(input.ssh.private_key_mode, "file");
     }
 
     #[test]

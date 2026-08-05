@@ -169,9 +169,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
       return false;
     }
     final String portText = _manualPort.text.trim();
-    final int manualPort = portText.isEmpty ? 0 : (int.tryParse(portText) ?? -1);
+    final int manualPort =
+        portText.isEmpty ? 0 : (int.tryParse(portText) ?? -1);
     if (manualPort < 0 || manualPort > 65535) {
-      setState(() => _manualError = '对方监听端口需为 1-65535 或留空');
+      setState(() => _manualError = '对方发现 UDP 端口需为 1-65535 或留空');
       return false;
     }
     final ManualPeer peer = ManualPeer(
@@ -366,7 +367,9 @@ class _SettingsDialogState extends State<SettingsDialog> {
     try {
       await UpdaterChannel.downloadInstall(url);
     } on Exception catch (error) {
-      if (mounted && dialogOpen) Navigator.of(context, rootNavigator: true).pop();
+      if (mounted && dialogOpen) {
+        Navigator.of(context, rootNavigator: true).pop();
+      }
       if (!mounted) return;
       await _showUpdateNotice('下载更新失败', friendlyError(error));
       return;
@@ -386,156 +389,156 @@ class _SettingsDialogState extends State<SettingsDialog> {
       content: SizedBox(
         width: double.maxFinite,
         child: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
-            SelectionArea(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Text(widget.deviceLine, style: _hintStyle),
-                  Text('版本：v$appVersion', style: _hintStyle),
-                  Text(widget.portLine, style: _hintStyle),
-                ],
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              SelectionArea(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(widget.deviceLine, style: _hintStyle),
+                    Text('版本：v$appVersion', style: _hintStyle),
+                    Text(widget.portLine, style: _hintStyle),
+                  ],
+                ),
               ),
-            ),
-            const SizedBox(height: 14),
-            const _SectionTitle('设备设置'),
-            const SizedBox(height: 6),
-            TextField(
-              controller: _name,
-              decoration: const InputDecoration(labelText: '设备名称'),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _listenPort,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: '本机监听端口（留空=自动）',
+              const SizedBox(height: 14),
+              const _SectionTitle('设备设置'),
+              const SizedBox(height: 6),
+              TextField(
+                controller: _name,
+                decoration: const InputDecoration(labelText: '设备名称'),
               ),
-            ),
-            const Padding(
-              padding: EdgeInsets.only(top: 4),
-              child: Text(
-                '局域网传输无需设置，保持自动即可；仅 Tailscale 直连时需要固定端口',
+              const SizedBox(height: 8),
+              TextField(
+                controller: _listenPort,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: '本机监听端口（留空=自动）',
+                ),
+              ),
+              const Padding(
+                padding: EdgeInsets.only(top: 4),
+                child: Text(
+                  '局域网传输无需设置，保持自动即可；仅 Tailscale 直连时需要固定端口',
+                  style: TextStyle(color: inkTextDim, fontSize: 11),
+                ),
+              ),
+              const SizedBox(height: 14),
+              const _SectionTitle('存储'),
+              const SizedBox(height: 4),
+              const Text(
+                '收件目录',
+                style: TextStyle(color: inkTextPrimary, fontSize: 13),
+              ),
+              SelectionArea(child: Text(_exportPath, style: _hintStyle)),
+              const Text(
+                '所有接收文件和文件夹统一保存在这里；未自定义时保存到系统下载目录的 InkHole 文件夹',
                 style: TextStyle(color: inkTextDim, fontSize: 11),
               ),
-            ),
-            const SizedBox(height: 14),
-            const _SectionTitle('存储'),
-            const SizedBox(height: 4),
-            const Text(
-              '收件目录',
-              style: TextStyle(color: inkTextPrimary, fontSize: 13),
-            ),
-            SelectionArea(child: Text(_exportPath, style: _hintStyle)),
-            const Text(
-              '所有接收文件和文件夹统一保存在这里；未自定义时保存到系统下载目录的 InkHole 文件夹',
-              style: TextStyle(color: inkTextDim, fontSize: 11),
-            ),
-            SelectionArea(
-              child: Text(
-                '导出失败时暂存于应用内：${widget.inboxPath}',
-                style: const TextStyle(color: inkTextDim, fontSize: 11),
+              SelectionArea(
+                child: Text(
+                  '导出失败时暂存于应用内：${widget.inboxPath}',
+                  style: const TextStyle(color: inkTextDim, fontSize: 11),
+                ),
               ),
-            ),
-            Row(
-              children: <Widget>[
-                TextButton(
-                  onPressed: () async {
-                    final String? path = await widget.onPickExportDirectory();
-                    if (path != null && mounted) {
-                      setState(() => _exportPath = path);
-                    }
-                  },
-                  child: const Text('选择目录'),
-                ),
-                TextButton(
-                  onPressed: () async {
-                    final String path = await widget.onResetExportDirectory();
-                    if (mounted) setState(() => _exportPath = path);
-                  },
-                  child: const Text('恢复默认'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            const _SectionTitle('传输安全'),
-            const SizedBox(height: 6),
-            TextField(
-              controller: _secret,
-              enabled: _encryption,
-              obscureText: true,
-              decoration: const InputDecoration(labelText: '加密口令 (两端一致)'),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: <Widget>[
-                const Expanded(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        '端到端加密',
-                        style: TextStyle(color: inkTextPrimary, fontSize: 14),
-                      ),
-                      Text(
-                        '使用 AES-256-GCM 保护传输内容，两端需使用相同口令',
-                        style: TextStyle(color: inkTextDim, fontSize: 11),
-                      ),
-                    ],
+              Row(
+                children: <Widget>[
+                  TextButton(
+                    onPressed: () async {
+                      final String? path = await widget.onPickExportDirectory();
+                      if (path != null && mounted) {
+                        setState(() => _exportPath = path);
+                      }
+                    },
+                    child: const Text('选择目录'),
+                  ),
+                  TextButton(
+                    onPressed: () async {
+                      final String path = await widget.onResetExportDirectory();
+                      if (mounted) setState(() => _exportPath = path);
+                    },
+                    child: const Text('恢复默认'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              const _SectionTitle('传输安全'),
+              const SizedBox(height: 6),
+              TextField(
+                controller: _secret,
+                enabled: _encryption,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '加密口令 (两端一致)'),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: <Widget>[
+                  const Expanded(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          '端到端加密',
+                          style: TextStyle(color: inkTextPrimary, fontSize: 14),
+                        ),
+                        Text(
+                          '使用 AES-256-GCM 保护传输内容，两端需使用相同口令',
+                          style: TextStyle(color: inkTextDim, fontSize: 11),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Switch(
+                    value: _encryption,
+                    onChanged: (bool value) =>
+                        setState(() => _encryption = value),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              const _SectionTitle('跨网络配置'),
+              const SizedBox(height: 6),
+              _tabBar(),
+              const SizedBox(height: 10),
+              if (_tab == 0) ..._tailscaleTab(),
+              if (_tab == 1) ..._wormholeTab(),
+              if (_tab == 2) ..._sshTab(),
+              if (_error.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Text(
+                    _error,
+                    style: const TextStyle(color: inkDanger, fontSize: 11),
                   ),
                 ),
-                const SizedBox(width: 8),
-                Switch(
-                  value: _encryption,
-                  onChanged: (bool value) =>
-                      setState(() => _encryption = value),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            const _SectionTitle('跨网络配置'),
-            const SizedBox(height: 6),
-            _tabBar(),
-            const SizedBox(height: 10),
-            if (_tab == 0) ..._tailscaleTab(),
-            if (_tab == 1) ..._wormholeTab(),
-            if (_tab == 2) ..._sshTab(),
-            if (_error.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 10),
-                child: Text(
-                  _error,
-                  style: const TextStyle(color: inkDanger, fontSize: 11),
-                ),
+              const Padding(
+                padding: EdgeInsets.only(top: 10, bottom: 8),
+                child: Divider(height: 1),
               ),
-            const Padding(
-              padding: EdgeInsets.only(top: 10, bottom: 8),
-              child: Divider(height: 1),
-            ),
-            const _SectionTitle('帮助与更新'),
-            Row(
-              children: <Widget>[
-                TextButton(
-                  onPressed: () => showUsageGuide(context),
-                  child: const Text('使用说明'),
-                ),
-                TextButton(
-                  onPressed: _checkingUpdate ? null : _checkUpdate,
-                  child: Text(_checkingUpdate ? '正在检查…' : '检查更新'),
-                ),
-                TextButton(
-                  onPressed: widget.onOpenRepository,
-                  child: const Text('GitHub 仓库'),
-                ),
-              ],
-            ),
-          ],
-        ),
+              const _SectionTitle('帮助与更新'),
+              Row(
+                children: <Widget>[
+                  TextButton(
+                    onPressed: () => showUsageGuide(context),
+                    child: const Text('使用说明'),
+                  ),
+                  TextButton(
+                    onPressed: _checkingUpdate ? null : _checkUpdate,
+                    child: Text(_checkingUpdate ? '正在检查…' : '检查更新'),
+                  ),
+                  TextButton(
+                    onPressed: widget.onOpenRepository,
+                    child: const Text('GitHub 仓库'),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
       actions: <Widget>[
@@ -590,19 +593,22 @@ class _SettingsDialogState extends State<SettingsDialog> {
       ),
       const SizedBox(height: 6),
       TextField(
+        key: const Key('manual-peer-name'),
         controller: _manualName,
         decoration: const InputDecoration(labelText: '设备备注（可选）'),
       ),
       const SizedBox(height: 6),
       TextField(
+        key: const Key('manual-peer-host'),
         controller: _manualHost,
         decoration: const InputDecoration(labelText: 'Tailscale IP 或 MagicDNS'),
       ),
       const SizedBox(height: 6),
       TextField(
+        key: const Key('manual-peer-port'),
         controller: _manualPort,
         keyboardType: TextInputType.number,
-        decoration: const InputDecoration(labelText: '对方监听端口（留空=自动）'),
+        decoration: const InputDecoration(labelText: '对方发现 UDP 端口（留空=默认）'),
       ),
       if (_manualError.isNotEmpty)
         Padding(

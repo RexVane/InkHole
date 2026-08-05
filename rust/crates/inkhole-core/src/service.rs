@@ -34,6 +34,7 @@ use crate::{
 };
 
 const DROPPABLE_EVENT_CAPACITY: usize = 128;
+const MAX_SNAPSHOT_QUEUE_CAPACITY: usize = DROPPABLE_EVENT_CAPACITY * 8;
 
 #[derive(Debug, Deserialize)]
 struct JsonRequest {
@@ -106,6 +107,18 @@ impl EventQueue {
                     .position(|queued| droppable_event(&queued.event))
             {
                 state.items.remove(index);
+            } else if state.items.len() >= MAX_SNAPSHOT_QUEUE_CAPACITY {
+                // Critical events stay lossless, but peer snapshots must not turn
+                // an unavailable consumer into an unbounded memory sink.
+                if let Some(index) = state
+                    .items
+                    .iter()
+                    .position(|queued| snapshot_event(&queued.event))
+                {
+                    state.items.remove(index);
+                } else {
+                    return;
+                }
             }
         } else if droppable_event(&event.event) && state.items.len() >= DROPPABLE_EVENT_CAPACITY {
             return;
@@ -2015,7 +2028,7 @@ async fn resolve_address(host: &str, port: u16) -> Result<SocketAddr> {
 async fn resolve_discovery_targets(hosts: &[String]) -> Vec<SocketAddr> {
     let mut targets = Vec::new();
     for raw_host in hosts.iter().take(64) {
-        let host = raw_host.trim();
+        let (host, port) = discovery_target_parts(raw_host);
         let host = host
             .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
@@ -2024,10 +2037,10 @@ async fn resolve_discovery_targets(hosts: &[String]) -> Vec<SocketAddr> {
             continue;
         }
         if let Ok(IpAddr::V4(address)) = host.parse::<IpAddr>() {
-            targets.push(SocketAddr::new(IpAddr::V4(address), UDP_DISCOVERY_PORT));
+            targets.push(SocketAddr::new(IpAddr::V4(address), port));
             continue;
         }
-        match tokio::net::lookup_host((host, UDP_DISCOVERY_PORT)).await {
+        match tokio::net::lookup_host((host, port)).await {
             Ok(addresses) => targets.extend(addresses.filter(SocketAddr::is_ipv4)),
             Err(error) => tracing::debug!(%host, %error, "manual discovery target did not resolve"),
         }
@@ -2035,6 +2048,25 @@ async fn resolve_discovery_targets(hosts: &[String]) -> Vec<SocketAddr> {
     targets.sort_unstable();
     targets.dedup();
     targets
+}
+
+fn discovery_target_parts(raw: &str) -> (&str, u16) {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[')
+        && let Some((host, port)) = rest.split_once("]:")
+        && let Ok(port) = port.parse::<u16>()
+        && port != 0
+    {
+        return (host, port);
+    }
+    if let Some((host, port)) = raw.rsplit_once(':')
+        && !host.contains(':')
+        && let Ok(port) = port.parse::<u16>()
+        && port != 0
+    {
+        return (host, port);
+    }
+    (raw, UDP_DISCOVERY_PORT)
 }
 
 fn emit_transfer_event(
@@ -2143,6 +2175,22 @@ mod tests {
 
     use crate::wormhole::test_support::MockRendezvous;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn manual_discovery_targets_preserve_custom_ports() {
+        assert_eq!(
+            discovery_target_parts("100.64.0.7:41234"),
+            ("100.64.0.7", 41234)
+        );
+        assert_eq!(
+            discovery_target_parts("[fd00::7]:41234"),
+            ("fd00::7", 41234)
+        );
+        assert_eq!(
+            discovery_target_parts("nas.tailnet.ts.net"),
+            ("nas.tailnet.ts.net", UDP_DISCOVERY_PORT)
+        );
+    }
 
     async fn call(service: &JsonService, method: &str, params: Value) -> Value {
         let response: Value = serde_json::from_str(
