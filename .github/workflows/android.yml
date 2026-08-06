@@ -135,8 +135,14 @@ jobs:
             echo "No split release APKs were produced" >&2
             exit 1
           fi
+          apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -perm -u+x |
+            sort -V | tail -n 1)"
+          if [ -z "$apksigner" ]; then
+            echo "Unable to locate Android apksigner" >&2
+            exit 1
+          fi
           for apk in "${apks[@]}"; do
-            actual="$(apksigner verify --print-certs "$apk" |
+            actual="$("$apksigner" verify --print-certs "$apk" |
               awk -F ': ' '/Signer #1 certificate SHA-256 digest/ { print tolower($2); exit }')"
             if [ -z "$actual" ]; then
               echo "Unable to read signing certificate from $apk" >&2
