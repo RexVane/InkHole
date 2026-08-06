@@ -18,8 +18,12 @@ on:
 permissions:
   contents: write
 
+env:
+  EXPECTED_RELEASE_CERT_SHA256: efcb56c58fb2b7d91120c7a810a04da672e0873f80c1b40cf376a84035bf7023
+
 jobs:
   build:
+    if: ${{ inputs.release_tag != '' || !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -79,8 +83,9 @@ jobs:
       - name: Build Rust Android libraries
         run: bash tool/build_native.sh
 
-      - name: Prepare release signing
-        if: env.RELEASE_TAG != ''
+      - name: Prepare trusted signing
+        id: signing
+        if: env.RELEASE_TAG != '' || github.ref == 'refs/heads/main'
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -89,12 +94,21 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          missing=()
           for value in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
             if [ -z "${!value}" ]; then
-              echo "Missing required Android signing secret: $value" >&2
-              exit 1
+              missing+=("$value")
             fi
           done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            if [ -n "$RELEASE_TAG" ]; then
+              printf 'Missing required Android signing secret: %s\n' "${missing[*]}" >&2
+              exit 1
+            fi
+            echo "::warning::Trusted signing is unavailable; this CI-only artifact cannot update release installs."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           keystore="$RUNNER_TEMP/inkhole-release.jks"
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
           test -s "$keystore"
@@ -104,21 +118,47 @@ jobs:
             echo "INKHOLE_KEY_ALIAS=$ANDROID_KEY_ALIAS"
             echo "INKHOLE_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
           } >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
 
       - name: Build split APKs
         env:
-          ORG_GRADLE_PROJECT_inkholeAllowDebugSigning: ${{ env.RELEASE_TAG == '' && 'true' || 'false' }}
+          ORG_GRADLE_PROJECT_inkholeAllowDebugSigning: ${{ steps.signing.outputs.signed != 'true' && env.RELEASE_TAG == '' && 'true' || 'false' }}
         run: flutter build apk --release --split-per-abi
+
+      - name: Verify APK signing certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(build/app/outputs/flutter-apk/app-*-release.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "No split release APKs were produced" >&2
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            actual="$(apksigner verify --print-certs "$apk" |
+              awk -F ': ' '/Signer #1 certificate SHA-256 digest/ { print tolower($2); exit }')"
+            if [ -z "$actual" ]; then
+              echo "Unable to read signing certificate from $apk" >&2
+              exit 1
+            fi
+            if [ "${{ steps.signing.outputs.signed }}" = "true" ] &&
+               [ "$actual" != "$EXPECTED_RELEASE_CERT_SHA256" ]; then
+              echo "Unexpected release certificate for $apk: $actual" >&2
+              exit 1
+            fi
+            echo "$apk certificate SHA-256: $actual"
+          done
 
       - name: Upload workflow artifact
         if: env.RELEASE_TAG == ''
         uses: actions/upload-artifact@v4
         with:
-          name: inkhole-android-apks
+          name: inkhole-android-apks-${{ steps.signing.outputs.signed == 'true' && 'release-signed' || 'debug-signed' }}
           path: mobile/build/app/outputs/flutter-apk/*.apk
 
       - name: Upload APKs to release
-        if: env.RELEASE_TAG != ''
+        if: env.RELEASE_TAG != '' && steps.signing.outputs.signed == 'true'
         shell: bash
         working-directory: .
         env:

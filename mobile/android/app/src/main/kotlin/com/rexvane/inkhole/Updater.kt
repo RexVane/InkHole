@@ -224,7 +224,11 @@ object Updater {
         val archiveSigners = signerDigests(archive)
         val installedSigners = signerDigests(installed)
         if (archiveSigners.isEmpty() || archiveSigners != installedSigners) {
-            throw IOException("安装包签名与当前版本不一致")
+            throw IOException(
+                "当前安装版本使用了与正式版不同的签名，Android 无法直接覆盖更新。" +
+                    "若当前版本为 v2.0.0-v2.0.8，请先记录设置并卸载旧版，" +
+                    "再仅从 GitHub Release 安装最新版；完成这次迁移后可正常应用内更新。",
+            )
         }
     }
 
