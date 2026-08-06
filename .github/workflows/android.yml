@@ -142,8 +142,22 @@ jobs:
             exit 1
           fi
           for apk in "${apks[@]}"; do
-            actual="$("$apksigner" verify --print-certs "$apk" |
-              awk -F ': ' '/Signer #1 certificate SHA-256 digest/ { print tolower($2); exit }')"
+            cert_output="$("$apksigner" verify --print-certs "$apk" 2>&1)"
+            printf '%s\n' "$cert_output"
+            actual="$(printf '%s\n' "$cert_output" | awk '
+              {
+                line = tolower($0)
+                if (line !~ /sha-256/) next
+                gsub(/[^0-9a-f]/, " ", line)
+                count = split(line, parts, /[[:space:]]+/)
+                for (i = 1; i <= count; i++) {
+                  if (length(parts[i]) == 64) {
+                    print parts[i]
+                    exit
+                  }
+                }
+              }
+            ')"
             if [ -z "$actual" ]; then
               echo "Unable to read signing certificate from $apk" >&2
               exit 1
