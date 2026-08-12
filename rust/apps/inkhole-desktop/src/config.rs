@@ -12,6 +12,9 @@ use uuid::Uuid;
 pub const CONFIG_SCHEMA_VERSION: u16 = 2;
 pub const MAXIMUM_MANUAL_PEERS: usize = 32;
 pub const MAXIMUM_RECENT_FILES: usize = 50;
+/// 新装用户的默认 QUIC 监听端口:固定端口便于防火墙放行、路由器端口转发与
+/// Tailscale 手动直连;被占用时核心会自动退回随机端口。0 仍表示随机。
+pub const DEFAULT_LISTEN_PORT: u16 = 41300;
 
 const CONFIG_FILENAME: &str = "desktop-v2.json";
 const IDENTITY_DIRECTORY: &str = "identities";
@@ -43,7 +46,7 @@ impl Default for DesktopConfig {
             inbox: default_inbox().to_string_lossy().into_owned(),
             inbox_auto_classify: false,
             inbox_category_dirs: empty_category_dirs(),
-            listen_port: 0,
+            listen_port: DEFAULT_LISTEN_PORT,
             encryption_enabled: false,
             manual_peers: Vec::new(),
             recent_files: Vec::new(),

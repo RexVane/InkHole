@@ -701,29 +701,59 @@ impl JsonService {
         let inbound_hint_slot: Arc<std::sync::OnceLock<mpsc::UnboundedSender<IpAddr>>> =
             Arc::new(std::sync::OnceLock::new());
         let inbound_hook_slot = Arc::clone(&inbound_hint_slot);
-        let server = Arc::new(
-            QuicServer::bind_with_event_handler(
-                QuicServerConfig {
-                    bind_address: SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                        params.listen_port,
-                    ),
-                    inbox: inbox.clone(),
-                    inbox_category_roots: inbox_category_roots.clone(),
-                    identity: identity.clone(),
-                    capabilities: capabilities.clone(),
-                    shared_secret: params.secret.clone(),
-                    on_inbound_peer: Some(Arc::new(move |ip| {
-                        if let Some(hints) = inbound_hook_slot.get() {
-                            let _ = hints.send(ip);
-                        }
-                    })),
-                },
-                Some(callback),
-            )
-            .await?,
-        );
+        let server_config = QuicServerConfig {
+            bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), params.listen_port),
+            inbox: inbox.clone(),
+            inbox_category_roots: inbox_category_roots.clone(),
+            identity: identity.clone(),
+            capabilities: capabilities.clone(),
+            shared_secret: params.secret.clone(),
+            on_inbound_peer: Some(Arc::new(move |ip| {
+                if let Some(hints) = inbound_hook_slot.get() {
+                    let _ = hints.send(ip);
+                }
+            })),
+        };
+        let mut fixed_port_fallback = None;
+        let server = match QuicServer::bind_with_event_handler(
+            server_config.clone(),
+            Some(callback.clone()),
+        )
+        .await
+        {
+            Ok(server) => Arc::new(server),
+            // 固定监听端口被占(同机他应用/另一实例)时不让局域网整体罢工:
+            // 退回随机端口继续服务,并把降级情况告诉 UI。
+            Err(error) if params.listen_port != 0 => {
+                tracing::warn!(
+                    %error,
+                    listen_port = params.listen_port,
+                    "QUIC listen port unavailable; falling back to an ephemeral port"
+                );
+                fixed_port_fallback = Some(params.listen_port);
+                let mut fallback_config = server_config;
+                fallback_config.bind_address =
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                Arc::new(
+                    QuicServer::bind_with_event_handler(fallback_config, Some(callback)).await?,
+                )
+            }
+            Err(error) => return Err(error),
+        };
         let port = server.local_address().port();
+        if let Some(requested) = fixed_port_fallback {
+            emit_session_event(
+                &self.inner.events,
+                &cancellation,
+                &session_id,
+                "lan.status",
+                json!({
+                    "message": format!(
+                        "listen port {requested} is in use; using ephemeral port {port} instead"
+                    )
+                }),
+            );
+        }
         let fingerprint = server.certificate_fingerprint().to_owned();
         let discovery = if params.disable_udp && params.disable_mdns {
             None

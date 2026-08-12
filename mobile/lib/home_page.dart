@@ -210,7 +210,9 @@ class _HomePageState extends State<HomePage> {
 
   void _loadStoredSettings() {
     final SharedPreferences prefs = _preferences!;
-    _listenPort = prefs.getInt('listen_port') ?? 0;
+    // 默认固定端口:便于防火墙放行与 Tailscale 手动直连;被占用时核心自动
+    // 退回随机端口。用户在设置里改为空则回到随机(0)。
+    _listenPort = prefs.getInt('listen_port') ?? 41300;
     _sshHost = prefs.getString('ssh_host') ?? '';
     _sshUser = prefs.getString('ssh_user') ?? '';
     _sshFingerprint = prefs.getString('ssh_fingerprint') ?? '';

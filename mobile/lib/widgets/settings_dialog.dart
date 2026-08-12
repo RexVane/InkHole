@@ -416,13 +416,13 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 controller: _listenPort,
                 keyboardType: TextInputType.number,
                 decoration: const InputDecoration(
-                  labelText: '本机监听端口（留空=自动）',
+                  labelText: '本机监听端口（默认 41300，留空=随机）',
                 ),
               ),
               const Padding(
                 padding: EdgeInsets.only(top: 4),
                 child: Text(
-                  '局域网传输无需设置，保持自动即可；仅 Tailscale 直连时需要固定端口',
+                  '固定端口便于防火墙放行与 Tailscale 直连；端口被占用时会自动改用随机端口',
                   style: TextStyle(color: inkTextDim, fontSize: 11),
                 ),
               ),
