@@ -69,6 +69,15 @@ fn run() -> Result<()> {
     let state = Arc::new(DesktopState::new(store, config));
 
     let app = tauri::Builder::default()
+        // 单实例:二次启动只聚焦已有主窗口。此前双实例会争抢 UDP 发现端口
+        // 41301,后启动的一方报"端口被占"且设备发现残废。需注册在最前。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
