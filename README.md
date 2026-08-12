@@ -53,7 +53,10 @@ devices with PAKE and authenticates the data channel end to end.
 
 All calls share the JSON service methods in `inkhole-core` (`lan.*`,
 `wormhole.*`, `ssh.*`). See [`docs/rust-architecture.md`](docs/rust-architecture.md)
-for the host lifetime and native library layout.
+for the host lifetime and native library layout. To speed up cross-network
+transfers, both the rendezvous and transit relay endpoints are configurable
+in the app settings; see [`docs/自建短码服务器.md`](docs/自建短码服务器.md)
+for a self-hosting guide.
 
 ## Security
 
