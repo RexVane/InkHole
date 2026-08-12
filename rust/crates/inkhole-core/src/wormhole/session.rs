@@ -489,4 +489,131 @@ mod tests {
         assert!(valid_fingerprint(&first));
         assert_ne!(first, second);
     }
+
+    /// 实弹测试:连真实的 magic-wormhole 公共服务器完成配对,并把 offer 裁成
+    /// 只剩 relay hint 强制数据走公共中继,测真实配对延迟与中继吞吐。
+    /// 手动运行:cargo test -p inkhole-core live_short_code -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires internet access to the public magic-wormhole servers"]
+    async fn live_short_code_pairs_and_relays_against_public_servers() {
+        use crate::{
+            DeviceIdentity, inbox::InboxCategoryRoots, transport::QuicServerConfig,
+            transport::send_file,
+        };
+
+        let overall = std::time::Instant::now();
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let source = root.path().join("live-payload.bin");
+        let payload = vec![0x42_u8; 8 * 1024 * 1024];
+        tokio::fs::write(&source, &payload).await.unwrap();
+
+        let sender_identity = DeviceIdentity::generate(None, "Live Sender").unwrap();
+        let receiver_identity = DeviceIdentity::generate(None, "Live Receiver").unwrap();
+        let summary = TransferSummary {
+            device_name: "Live Sender".into(),
+            instance_id: sender_identity.instance_id().to_owned(),
+            item_count: 1,
+            file_count: 1,
+            directory_count: 0,
+            total_bytes: payload.len() as u64,
+            names: vec!["live-payload.bin".into()],
+        };
+
+        let pairing = std::time::Instant::now();
+        let (code, sender_session) = SenderSession::create(
+            WormholeSettings::default(),
+            summary,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("create sender session against the public rendezvous");
+        eprintln!(
+            "[live] code allocated in {}ms: {code}",
+            pairing.elapsed().as_millis()
+        );
+
+        let receiver_task = tokio::spawn({
+            let inbox = inbox.clone();
+            let receiver_identity = receiver_identity.clone();
+            async move {
+                let mut offer = ReceivedOffer::join(
+                    WormholeSettings::default(),
+                    &code,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("join short code against the public rendezvous");
+                // 强制走公共中继:丢掉全部直连 hint,只留 RelayV1。
+                offer
+                    .offer
+                    .transit
+                    .hints
+                    .retain(|hint| hint.kind == super::transit::TransitHintKind::RelayV1);
+                assert!(
+                    !offer.offer.transit.hints.is_empty(),
+                    "sender offered no relay hint; relay reservation likely failed"
+                );
+                let server = crate::transport::QuicServer::bind(QuicServerConfig {
+                    bind_address: "127.0.0.1:0".parse().unwrap(),
+                    inbox: inbox.clone(),
+                    inbox_category_roots: InboxCategoryRoots::default(),
+                    identity: receiver_identity.clone(),
+                    capabilities: Vec::new(),
+                    shared_secret: "live secret 0123456789abcdef0123".into(),
+                    on_inbound_peer: None,
+                })
+                .await
+                .unwrap();
+                let tunnel = offer
+                    .accept(
+                        server.local_address(),
+                        receiver_identity.certificate_fingerprint().to_owned(),
+                        "live secret 0123456789abcdef0123".into(),
+                    )
+                    .await
+                    .expect("accept through the public transit relay");
+                (server, tunnel)
+            }
+        });
+
+        let connection = sender_session
+            .connect()
+            .await
+            .expect("sender connect through the public transit relay");
+        let (server, tunnel) = receiver_task.await.unwrap();
+        eprintln!(
+            "[live] transit established at {}ms total",
+            overall.elapsed().as_millis()
+        );
+
+        let transfer = std::time::Instant::now();
+        let receipt = send_file(
+            &sender_identity,
+            &connection.peer,
+            &source,
+            crate::transport::SendFileOptions {
+                shared_secret: connection.shared_secret.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("transfer through the public relay");
+        let seconds = transfer.elapsed().as_secs_f64();
+        let mbps = (receipt.size as f64 * 8.0) / (seconds * 1_000_000.0);
+        eprintln!(
+            "[live] {} bytes relayed in {seconds:.1}s = {mbps:.2} Mbps",
+            receipt.size
+        );
+
+        assert_eq!(
+            tokio::fs::read(inbox.join("live-payload.bin"))
+                .await
+                .unwrap(),
+            payload
+        );
+        connection.tunnel.close().await.unwrap();
+        tunnel.close().await.unwrap();
+        server.close().await.unwrap();
+    }
 }

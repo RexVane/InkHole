@@ -1493,6 +1493,15 @@ mod tests {
         let identity_c = DeviceIdentity::generate(None, "Gamma").unwrap();
         let ip_a = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let ip_c = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        // 测试用 127.0.0.2 模拟第二台主机;macOS 默认只配置 127.0.0.1,
+        // 绑定不了就跳过(Linux/Windows 及配置了环回别名的主机正常执行)。
+        if tokio::net::UdpSocket::bind(SocketAddr::new(ip_c, 0))
+            .await
+            .is_err()
+        {
+            eprintln!("skipping: loopback alias 127.0.0.2 is unavailable on this host");
+            return;
+        }
         let server_a = QuicServer::bind(QuicServerConfig {
             bind_address: SocketAddr::new(ip_a, 0),
             inbox: root.path().join("a"),
