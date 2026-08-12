@@ -1280,12 +1280,15 @@ where
 }
 
 /// 局域网大文件吞吐调优:quinn 默认流窗口 1.25MB 在 Wi-Fi RTT 下会钉住带宽,
-/// 放大到 16MB;初始 MTU 提到以太网安全值并保留 MTU 发现。
+/// 放大到 16MB。初始 MTU 保持 QUIC 规范安全的 1200:Tailscale(1280)与各类
+/// VPN 隧道的路径 MTU 低于以太网,初始就设 1452 会让超限包静默黑洞、拥塞
+/// 窗口反复坍缩(实测 tailnet 上吞吐掉到几百 KB/s);MTU 发现会在几个 RTT 内
+/// 自动探升到 1452 上限,局域网几乎无感。
 fn tune_transport(transport: &mut quinn::TransportConfig) {
     transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
     transport.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024));
     transport.send_window(32 * 1024 * 1024);
-    transport.initial_mtu(1452);
+    transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
 }
 
 fn server_config(identity: &DeviceIdentity) -> Result<ServerConfig> {

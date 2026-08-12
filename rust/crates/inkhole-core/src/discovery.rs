@@ -146,13 +146,30 @@ impl UdpDiscovery {
                     Some(Arc::new(socket))
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        bind_address = %config.bind_address,
-                        "UDP discovery bind failed (port 41301 likely in use); falling back to remaining transports"
-                    );
-                    startup_errors.push(format!("UDP: {error}"));
-                    None
+                    // 41301 被占(常见:同机双实例或其他应用)。退化绑定临时端口:
+                    // 本机 announce 照发,协议规定应答回到数据报源地址,发现仍然
+                    // 双向可用;只收不到别人主动的 41301 广播,周期 announce 会
+                    // 触发对方应答补齐设备表。
+                    match bind_udp_socket(SocketAddr::new(config.bind_address.ip(), 0)) {
+                        Ok(socket) => {
+                            tracing::warn!(
+                                %error,
+                                fallback = %socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                                "UDP discovery port is in use; bound an ephemeral port instead"
+                            );
+                            Some(Arc::new(socket))
+                        }
+                        Err(fallback_error) => {
+                            tracing::warn!(
+                                %error,
+                                %fallback_error,
+                                bind_address = %config.bind_address,
+                                "UDP discovery bind failed; falling back to remaining transports"
+                            );
+                            startup_errors.push(format!("UDP: {error}"));
+                            None
+                        }
+                    }
                 }
             }
         } else {
