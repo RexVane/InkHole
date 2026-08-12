@@ -4,10 +4,48 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::{CoreError, Result};
+
+/// 从受控的 ws/wss URL 中取出主机与端口(设置层已校验 scheme)。
+fn ws_endpoint(url: &str) -> Result<(String, u16)> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .filter(|(scheme, _)| matches!(*scheme, "ws" | "wss"))
+        .ok_or_else(|| {
+            CoreError::InvalidRequest("rendezvous URL must use ws:// or wss://".into())
+        })?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let default_port = if scheme == "wss" { 443 } else { 80 };
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let (host, tail) = inner
+            .split_once(']')
+            .ok_or_else(|| CoreError::InvalidRequest("invalid IPv6 rendezvous host".into()))?;
+        let port = match tail.strip_prefix(':') {
+            Some(port) => port
+                .parse::<u16>()
+                .map_err(|_| CoreError::InvalidRequest("invalid rendezvous port".into()))?,
+            None => default_port,
+        };
+        (host.to_owned(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        (
+            host.to_owned(),
+            port.parse::<u16>()
+                .map_err(|_| CoreError::InvalidRequest("invalid rendezvous port".into()))?,
+        )
+    } else {
+        (authority.to_owned(), default_port)
+    };
+    if host.is_empty() {
+        return Err(CoreError::InvalidRequest(
+            "rendezvous URL has no host".into(),
+        ));
+    }
+    Ok((host, port))
+}
 
 const MAX_RENDEZVOUS_MESSAGE: usize = 64 * 1024;
 const MAX_PENDING_MESSAGES: usize = 64;
@@ -26,6 +64,7 @@ pub(super) struct MailboxMessage {
 pub(super) struct RendezvousClient {
     socket: RendezvousSocket,
     pub(super) side_id: String,
+    app_id: String,
     mailbox_id: String,
     nameplate: Option<String>,
     pending: VecDeque<Value>,
@@ -35,18 +74,23 @@ pub(super) struct RendezvousClient {
 impl RendezvousClient {
     pub async fn connect(url: &str, side_id: String, app_id: &str) -> Result<Self> {
         let url = url.trim();
-        if !matches!(url.split_once("://"), Some(("ws" | "wss", _))) {
-            return Err(CoreError::InvalidRequest(
-                "rendezvous URL must use ws:// or wss://".into(),
-            ));
-        }
-        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url))
-            .await
-            .map_err(|_| protocol_error("connect rendezvous timed out"))?
-            .map_err(|error| protocol_error(format!("connect rendezvous: {error}")))?;
+        let (host, port) = ws_endpoint(url)?;
+        // 自己拨 TCP 再做 WS/TLS 握手:系统解析常把黑洞 IPv6 排最前,
+        // 顺序拨号会把整个超时耗在坏地址上(参见 crate::net)。
+        let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            let stream = crate::net::dial_host_port(&host, port, &CancellationToken::new())
+                .await
+                .map_err(|error| protocol_error(format!("connect rendezvous: {error}")))?;
+            client_async_tls(url, stream)
+                .await
+                .map_err(|error| protocol_error(format!("connect rendezvous: {error}")))
+        })
+        .await
+        .map_err(|_| protocol_error("connect rendezvous timed out"))??;
         let mut client = Self {
             socket,
             side_id,
+            app_id: app_id.to_owned(),
             mailbox_id: String::new(),
             nameplate: None,
             pending: VecDeque::new(),
@@ -65,25 +109,31 @@ impl RendezvousClient {
                 "rendezvous rejected client: {error}"
             )));
         }
-        client
-            .send_command(
-                "bind",
-                json!({
-                    "side": client.side_id,
-                    "appid": app_id,
-                    "client_version": ["inkhole-rust", env!("CARGO_PKG_VERSION")],
-                }),
-            )
-            .await?;
         Ok(client)
     }
 
+    /// bind 不再在 connect 里单发:服务器按接收顺序处理并逐条 ack,
+    /// 把 bind 与首个业务命令流水线成一次写出,公网高 RTT 下少等一个来回。
+    fn bind_command(&self) -> (&'static str, Value) {
+        (
+            "bind",
+            json!({
+                "side": self.side_id,
+                "appid": self.app_id,
+                "client_version": ["inkhole-rust", env!("CARGO_PKG_VERSION")],
+            }),
+        )
+    }
+
     pub async fn create_mailbox(&mut self) -> Result<String> {
-        self.send_command("allocate", Value::Object(Map::new()))
+        let bind = self.bind_command();
+        self.send_commands(vec![bind, ("allocate", Value::Object(Map::new()))])
             .await?;
         let allocated = self.read_type("allocated").await?;
         let nameplate = required_string(&allocated, "nameplate")?;
-        self.claim_and_open(&nameplate).await?;
+        self.send_commands(vec![("claim", json!({ "nameplate": nameplate }))])
+            .await?;
+        self.finish_open(&nameplate).await?;
         Ok(nameplate)
     }
 
@@ -93,15 +143,17 @@ impl RendezvousClient {
                 "short code has an invalid nameplate".into(),
             ));
         }
-        self.claim_and_open(nameplate).await
+        let bind = self.bind_command();
+        self.send_commands(vec![bind, ("claim", json!({ "nameplate": nameplate }))])
+            .await?;
+        self.finish_open(nameplate).await
     }
 
-    async fn claim_and_open(&mut self, nameplate: &str) -> Result<()> {
-        self.send_command("claim", json!({ "nameplate": nameplate }))
-            .await?;
+    /// open 依赖 claimed 返回的 mailbox id,无法并入上一批。
+    async fn finish_open(&mut self, nameplate: &str) -> Result<()> {
         let claimed = self.read_type("claimed").await?;
         let mailbox = required_string(&claimed, "mailbox")?;
-        self.send_command("open", json!({ "mailbox": mailbox }))
+        self.send_commands(vec![("open", json!({ "mailbox": mailbox }))])
             .await?;
         self.mailbox_id = mailbox;
         self.nameplate = Some(nameplate.to_owned());
@@ -174,30 +226,42 @@ impl RendezvousClient {
     }
 
     async fn send_command(&mut self, command: &str, fields: Value) -> Result<()> {
-        let id = format!("{:04x}", rand::random::<u16>());
-        let mut object = match fields {
-            Value::Object(object) => object,
-            _ => {
+        self.send_commands(vec![(command, fields)]).await
+    }
+
+    /// 流水线发送:先把整批命令写出,再按发送顺序逐一核对 ack。
+    /// 服务器按接收顺序处理并同步回 ack,批内后发命令不得依赖先发命令的响应。
+    async fn send_commands(&mut self, commands: Vec<(&str, Value)>) -> Result<()> {
+        let mut ids = Vec::with_capacity(commands.len());
+        for (command, fields) in commands {
+            let id = format!("{:04x}", rand::random::<u16>());
+            let mut object = match fields {
+                Value::Object(object) => object,
+                _ => {
+                    return Err(CoreError::InvalidRequest(
+                        "rendezvous command fields must be an object".into(),
+                    ));
+                }
+            };
+            object.insert("type".into(), Value::String(command.to_owned()));
+            object.insert("id".into(), Value::String(id.clone()));
+            let encoded = serde_json::to_string(&object)?;
+            if encoded.len() > MAX_RENDEZVOUS_MESSAGE {
                 return Err(CoreError::InvalidRequest(
-                    "rendezvous command fields must be an object".into(),
+                    "rendezvous command is too large".into(),
                 ));
             }
-        };
-        object.insert("type".into(), Value::String(command.to_owned()));
-        object.insert("id".into(), Value::String(id.clone()));
-        let encoded = serde_json::to_string(&object)?;
-        if encoded.len() > MAX_RENDEZVOUS_MESSAGE {
-            return Err(CoreError::InvalidRequest(
-                "rendezvous command is too large".into(),
-            ));
+            self.socket
+                .send(Message::Text(encoded.into()))
+                .await
+                .map_err(|error| protocol_error(format!("write rendezvous command: {error}")))?;
+            ids.push(id);
         }
-        self.socket
-            .send(Message::Text(encoded.into()))
-            .await
-            .map_err(|error| protocol_error(format!("write rendezvous command: {error}")))?;
-        let acknowledgement = self.read_type("ack").await?;
-        if acknowledgement.get("id").and_then(Value::as_str) != Some(id.as_str()) {
-            return Err(protocol_error("rendezvous acknowledgement ID mismatch"));
+        for id in ids {
+            let acknowledgement = self.read_type("ack").await?;
+            if acknowledgement.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+                return Err(protocol_error("rendezvous acknowledgement ID mismatch"));
+            }
         }
         Ok(())
     }

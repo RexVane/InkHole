@@ -4,6 +4,7 @@ mod folder;
 pub mod hash;
 pub mod identity;
 pub mod inbox;
+mod net;
 pub mod protocol;
 pub mod service;
 mod ssh;
