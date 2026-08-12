@@ -302,6 +302,13 @@ impl RendezvousClient {
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown rendezvous error");
+                // "crowded" = 信箱已满(短码只容两方)。反复重试会让旧连接的名额
+                // 还没被服务器回收就撞上,接收端无法自愈,只能换新码。给出可操作提示。
+                if message.contains("crowded") {
+                    return Err(protocol_error(
+                        "该短码的会话已被占用或已失效;请让发送端重新生成短码后再接收",
+                    ));
+                }
                 return Err(protocol_error(format!(
                     "rendezvous server error: {message}"
                 )));

@@ -21,8 +21,11 @@ use crate::{CoreError, Result};
 
 /// 相邻两次拨号尝试之间的错峰间隔。
 const ATTEMPT_STAGGER: Duration = Duration::from_millis(300);
-/// 系统解析器的耐心上限;超过就切换公共 DNS 兜底。
+/// 系统解析器的耐心上限;超过判定卡死,交给已并行启动的公共 DNS。
 const SYSTEM_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2_500);
+/// 给系统解析器的领跑窗口:健康域名与 .local/内网名系统解析近乎瞬时且是唯一
+/// 能答内网名的,让它先跑一小段;真卡住时公共 DNS 立刻接手,不再干等整个超时。
+const SYSTEM_RESOLVE_HEAD_START: Duration = Duration::from_millis(300);
 /// 兜底公共 DNS(国内可直连且未见污染;1.1.1.1 在部分网络被阻断,不列入)。
 const FALLBACK_DNS_SERVERS: [SocketAddr; 3] = [
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)), 53),
@@ -57,23 +60,47 @@ pub(crate) async fn dial_host_port(
     race_addresses(&addresses, cancellation).await
 }
 
+/// 系统解析器与公共 DNS 竞速:谁先给出可用应答用谁。系统解析器有 300ms 领跑
+/// (健康域名与内网名它最快且唯一能答);当它对某些国际域名整体卡死时,公共 DNS
+/// 立即接管,不再让每次 rendezvous 连接白等 2.5 秒系统超时。
 async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-    if let Ok(Ok(addresses)) = tokio::time::timeout(
-        SYSTEM_RESOLVE_TIMEOUT,
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    {
-        let addresses = addresses.collect::<Vec<_>>();
-        if !addresses.is_empty() {
-            return Ok(addresses);
+    let system = async {
+        match tokio::time::timeout(SYSTEM_RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+        {
+            Ok(Ok(iter)) => {
+                let addresses = iter.collect::<Vec<_>>();
+                (!addresses.is_empty()).then_some(addresses)
+            }
+            _ => None,
+        }
+    };
+    let public = async {
+        tokio::time::sleep(SYSTEM_RESOLVE_HEAD_START).await;
+        fallback_resolve(host, port).await.ok()
+    };
+    tokio::pin!(system, public);
+    let mut system_pending = true;
+    let mut public_pending = true;
+    while system_pending || public_pending {
+        tokio::select! {
+            biased;
+            addresses = &mut system, if system_pending => {
+                system_pending = false;
+                if let Some(addresses) = addresses {
+                    return Ok(addresses);
+                }
+                tracing::debug!(host, "system DNS unavailable; awaiting public resolvers");
+            }
+            addresses = &mut public, if public_pending => {
+                public_pending = false;
+                if let Some(addresses) = addresses {
+                    return Ok(addresses);
+                }
+            }
         }
     }
-    tracing::debug!(
-        host,
-        "system DNS unavailable; falling back to public resolvers"
-    );
-    fallback_resolve(host, port).await
+    Err(CoreError::Protocol(format!("failed to resolve {host}")))
 }
 
 /// 直查公共 DNS:对每个服务器并行发 A 与 AAAA 查询,汇总首批成功应答。
