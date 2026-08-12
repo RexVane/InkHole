@@ -8,7 +8,7 @@ use crypto_secretbox::{
     aead::{Aead, KeyInit},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::UdpSocket,
     sync::mpsc,
     task::JoinHandle,
@@ -22,7 +22,14 @@ const MAX_DATAGRAM: usize = 64 * 1024;
 const NONCE_SIZE: usize = 24;
 const TAG_SIZE: usize = 16;
 const MAX_RECORD: usize = NONCE_SIZE + TAG_SIZE + MAX_DATAGRAM;
-const WRITE_QUEUE: usize = 64;
+/// QUIC 发送窗口高达 16MB(transport.rs 为局域网调的),64 深度队列(≈93KB)
+/// 在突发下瞬间打满,大量丢报让 QUIC 拥塞窗口反复崩塌——中继链路吞吐锯齿的主因。
+/// 加深到 1024(典型 1452B 报文 ≈ 1.5MB)让队列起到削峰作用而不是丢包器。
+const WRITE_QUEUE: usize = 1024;
+/// 单次批量出队上限:攒批加密写入后只 flush 一次,把"每报文一次 write+flush
+/// 系统调用"摊薄成每批一次,中继路径 CPU 开销显著下降。
+const WRITE_BATCH_DATAGRAMS: usize = 128;
+const WRITE_BUFFER_BYTES: usize = 256 * 1024;
 const PEER_IDLE_REPLACE: Duration = Duration::from_secs(5);
 
 pub(crate) struct UdpTunnel {
@@ -312,15 +319,20 @@ where
     let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE);
     let task = tokio::spawn(async move {
         let mut writer = RecordWriter::new(writer, key);
+        let mut batch = Vec::with_capacity(WRITE_BATCH_DATAGRAMS);
         loop {
-            let payload = tokio::select! {
+            batch.clear();
+            let received = tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
-                payload = receiver.recv() => match payload {
-                    Some(payload) => payload,
-                    None => return Ok(()),
-                },
+                received = receiver.recv_many(&mut batch, WRITE_BATCH_DATAGRAMS) => received,
             };
-            writer.write(&payload).await?;
+            if received == 0 {
+                return Ok(());
+            }
+            for payload in batch.drain(..) {
+                writer.write_record(&payload).await?;
+            }
+            writer.flush().await?;
         }
     });
     (sender, task)
@@ -366,7 +378,7 @@ fn stream_ended(error: &CoreError) -> bool {
 }
 
 struct RecordWriter<W> {
-    writer: W,
+    writer: BufWriter<W>,
     cipher: XSalsa20Poly1305,
     counter: u64,
 }
@@ -374,13 +386,13 @@ struct RecordWriter<W> {
 impl<W: AsyncWrite + Unpin> RecordWriter<W> {
     fn new(writer: W, key: [u8; 32]) -> Self {
         Self {
-            writer,
+            writer: BufWriter::with_capacity(WRITE_BUFFER_BYTES, writer),
             cipher: XSalsa20Poly1305::new(Key::from_slice(&key)),
             counter: 0,
         }
     }
 
-    async fn write(&mut self, payload: &[u8]) -> Result<()> {
+    async fn write_record(&mut self, payload: &[u8]) -> Result<()> {
         if payload.len() > MAX_DATAGRAM || self.counter == u64::MAX {
             return Err(CoreError::Protocol("UDP tunnel record is too large".into()));
         }
@@ -400,6 +412,10 @@ impl<W: AsyncWrite + Unpin> RecordWriter<W> {
         self.writer.write_u32(record_len as u32).await?;
         self.writer.write_all(&nonce).await?;
         self.writer.write_all(&ciphertext).await?;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
         self.writer.flush().await?;
         Ok(())
     }

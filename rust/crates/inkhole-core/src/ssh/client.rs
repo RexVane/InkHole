@@ -443,13 +443,23 @@ async fn connect_authenticated(
         keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
         keepalive_max: 2,
         inactivity_timeout: Some(Duration::from_secs(120)),
+        // QUIC 隧道流量突发大,russh 默认 2MB 通道窗口在高 RTT 链路上频繁耗尽,
+        // 每次都要等一个 RTT 的窗口更新,中继吞吐被钉死;放大到 16MB 与 QUIC
+        // 发送窗口(transport.rs)同量级,流控不再是第一瓶颈。
+        window_size: 16 * 1024 * 1024,
         ..Config::default()
     });
-    let address = (profile.host.as_str(), profile.port);
+    // 自己拨 TCP 再交给 russh:v4 优先的错峰竞速拨号,避免黑洞 IPv6
+    // 吃掉整个连接超时(参见 crate::net)。
     let mut handle = cancellable_timeout(
         cancellation,
         SSH_CONNECT_TIMEOUT,
-        client::connect(config, address, handler),
+        async {
+            let stream = crate::net::dial_host_port(&profile.host, profile.port, cancellation)
+                .await
+                .map_err(|error| russh::Error::IO(std::io::Error::other(error.to_string())))?;
+            client::connect_stream(config, stream, handler).await
+        },
         "connect SSH server",
     )
     .await

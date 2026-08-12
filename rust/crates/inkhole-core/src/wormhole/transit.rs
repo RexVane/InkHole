@@ -1,4 +1,8 @@
-use std::{future::pending, net::Ipv4Addr, time::Duration};
+use std::{
+    future::pending,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -20,6 +24,10 @@ const HINT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Per-connection budget for an inbound handshake, so one dead peer cannot pin the acceptor.
 const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRANSIT_HINTS: usize = 32;
+/// 中继晚拨:直连与中继并行竞速时,中继握手可能比可用的直连早几毫秒完成,
+/// 白白多走一跳并占用中继带宽。给中继让出 400ms,直连(含 IPv6)可达时必胜;
+/// 直连全部不可达时整个流程只慢零点几秒。
+const RELAY_DIAL_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -43,6 +51,9 @@ pub(super) struct TransitOffer {
 
 pub(super) struct TransitAcceptor {
     listener: TcpListener,
+    /// IPv6 监听是尽力而为:双方都有公网 IPv6 时可以绕开中继直连,
+    /// 没有 IPv6 的主机绑定失败则静默降级为纯 IPv4。
+    listener_v6: Option<TcpListener>,
     relay: Option<TcpStream>,
     offer: TransitOffer,
     transit_key: [u8; 32],
@@ -68,20 +79,33 @@ impl TransitAcceptor {
     ) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
         let port = listener.local_addr()?.port();
-        let mut addresses = tokio::task::spawn_blocking(local_ipv4_addresses)
+        let listener_v6 = TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).await.ok();
+        let port_v6 = listener_v6
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|address| address.port());
+        let mut addresses = tokio::task::spawn_blocking(local_addresses)
             .await
             .map_err(|error| CoreError::Protocol(format!("enumerate local addresses: {error}")))?;
-        addresses.push(Ipv4Addr::LOCALHOST);
+        addresses.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
         addresses.sort_unstable();
         addresses.dedup();
         let mut hints = addresses
             .into_iter()
             .take(MAX_TRANSIT_HINTS - 1)
-            .map(|address| TransitHint {
-                kind: TransitHintKind::DirectTcpV1,
-                host: address.to_string(),
-                port,
-                priority: if address.is_loopback() { 2 } else { 0 },
+            .filter_map(|address| match address {
+                IpAddr::V4(address) => Some(TransitHint {
+                    kind: TransitHintKind::DirectTcpV1,
+                    host: address.to_string(),
+                    port,
+                    priority: if address.is_loopback() { 2 } else { 0 },
+                }),
+                IpAddr::V6(address) => port_v6.map(|port_v6| TransitHint {
+                    kind: TransitHintKind::DirectTcpV1,
+                    host: address.to_string(),
+                    port: port_v6,
+                    priority: 1,
+                }),
             })
             .collect::<Vec<_>>();
 
@@ -108,6 +132,7 @@ impl TransitAcceptor {
         };
         Ok(Self {
             listener,
+            listener_v6,
             relay,
             offer: TransitOffer { hints },
             transit_key,
@@ -122,46 +147,17 @@ impl TransitAcceptor {
     pub async fn accept(self) -> Result<TcpStream> {
         let Self {
             listener,
+            listener_v6,
             relay,
             transit_key,
             cancellation,
             ..
         } = self;
-        let direct_key = transit_key;
-        let direct_cancel = cancellation.clone();
-        // Inbound connections are handshaked concurrently: a peer that connects and then goes
-        // silent must not block the connections behind it in the accept queue.
-        let direct = async move {
-            let mut handshakes = JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (stream, address) = accepted?;
-                        let key = direct_key;
-                        let handshake_cancel = direct_cancel.child_token();
-                        handshakes.spawn(async move {
-                            tokio::time::timeout(
-                                INBOUND_HANDSHAKE_TIMEOUT,
-                                authenticate_incoming(stream, &key, &handshake_cancel),
-                            )
-                            .await
-                            .map_err(|_| {
-                                CoreError::Protocol(format!(
-                                    "transit handshake from {address} timed out"
-                                ))
-                            })?
-                        });
-                    }
-                    Some(finished) = handshakes.join_next() => match finished {
-                        Ok(Ok(stream)) => return Ok(stream),
-                        Ok(Err(error)) => {
-                            tracing::debug!(%error, "rejected unauthenticated transit peer");
-                        }
-                        Err(error) => {
-                            tracing::debug!(%error, "transit handshake task failed");
-                        }
-                    },
-                }
+        let direct = accept_direct(listener, transit_key, cancellation.clone());
+        let direct_v6 = async {
+            match listener_v6 {
+                Some(listener) => accept_direct(listener, transit_key, cancellation.clone()).await,
+                None => pending::<Result<TcpStream>>().await,
             }
         };
         let relay_cancel = cancellation.clone();
@@ -176,7 +172,48 @@ impl TransitAcceptor {
         tokio::select! {
             _ = cancellation.cancelled() => Err(CoreError::Cancelled),
             result = direct => result,
+            result = direct_v6 => result,
             result = relay_future => result,
+        }
+    }
+}
+
+/// Inbound connections are handshaked concurrently: a peer that connects and then goes
+/// silent must not block the connections behind it in the accept queue.
+async fn accept_direct(
+    listener: TcpListener,
+    transit_key: [u8; 32],
+    cancellation: CancellationToken,
+) -> Result<TcpStream> {
+    let mut handshakes = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, address) = accepted?;
+                let key = transit_key;
+                let handshake_cancel = cancellation.child_token();
+                handshakes.spawn(async move {
+                    tokio::time::timeout(
+                        INBOUND_HANDSHAKE_TIMEOUT,
+                        authenticate_incoming(stream, &key, &handshake_cancel),
+                    )
+                    .await
+                    .map_err(|_| {
+                        CoreError::Protocol(format!(
+                            "transit handshake from {address} timed out"
+                        ))
+                    })?
+                });
+            }
+            Some(finished) = handshakes.join_next() => match finished {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "rejected unauthenticated transit peer");
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "transit handshake task failed");
+                }
+            },
         }
     }
 }
@@ -225,7 +262,10 @@ async fn connect_hint(
 ) -> Result<TcpStream> {
     let address = format_host_port(&hint.host, hint.port);
     let connect = async {
-        let mut stream = TcpStream::connect(&address).await?;
+        if hint.kind == TransitHintKind::RelayV1 {
+            tokio::time::sleep(RELAY_DIAL_DELAY).await;
+        }
+        let mut stream = crate::net::dial_host_port(&hint.host, hint.port, &cancellation).await?;
         stream.set_nodelay(true)?;
         if hint.kind == TransitHintKind::RelayV1 {
             stream
@@ -247,8 +287,9 @@ async fn connect_relay(
     transit_key: &[u8; 32],
     cancellation: &CancellationToken,
 ) -> Result<TcpStream> {
+    let (relay_host, relay_port) = split_host_port(relay_address)?;
     let connect = async {
-        let mut stream = TcpStream::connect(relay_address).await?;
+        let mut stream = crate::net::dial_host_port(&relay_host, relay_port, cancellation).await?;
         stream.set_nodelay(true)?;
         stream
             .write_all(&relay_handshake_header(transit_key))
@@ -368,18 +409,28 @@ fn validate_offer(offer: &TransitOffer) -> Result<()> {
     Ok(())
 }
 
-fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
+fn local_addresses() -> Vec<IpAddr> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|interface| match interface.ip() {
-            std::net::IpAddr::V4(address)
+            IpAddr::V4(address)
                 if !address.is_unspecified()
                     && !address.is_multicast()
                     && !address.is_broadcast()
                     && !address.is_loopback() =>
             {
-                Some(address)
+                Some(IpAddr::V4(address))
+            }
+            // 链路本地(fe80::/10)地址跨主机连接需要 scope id,hint 里无法表达,跳过;
+            // 全局单播与 ULA 保留,双方有公网 IPv6 时可绕开中继直连。
+            IpAddr::V6(address)
+                if !address.is_unspecified()
+                    && !address.is_multicast()
+                    && !address.is_loopback()
+                    && (address.segments()[0] & 0xffc0) != 0xfe80 =>
+            {
+                Some(IpAddr::V6(address))
             }
             _ => None,
         })
@@ -436,6 +487,66 @@ mod tests {
         let mut from_receiver = [0_u8; 16];
         sender.read_exact(&mut from_receiver).await.unwrap();
         assert_eq!(&from_receiver, b"receiver payload");
+    }
+
+    /// 实弹基线:不套 QUIC,两条 TCP 经公共中继对拍 2MB,测中继裸吞吐。
+    /// 与 QUIC 隧道结果对比可切分"中继本身慢"和"QUIC-over-TCP 病理"。
+    /// 手动运行:cargo test -p inkhole-core live_relay_baseline -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires internet access to the public transit relay"]
+    async fn live_relay_baseline_raw_tcp_throughput() {
+        const RELAY: &str = "transit.magic-wormhole.io:4001";
+        const PAYLOAD: usize = 2 * 1024 * 1024;
+        let key: [u8; 32] = rand::random();
+        let cancellation = CancellationToken::new();
+
+        let side_a = connect_relay(RELAY, &key, &cancellation)
+            .await
+            .expect("reserve relay for side A");
+        let dial_cancellation = cancellation.clone();
+        let side_b = tokio::spawn(async move {
+            let hint = TransitHint {
+                kind: TransitHintKind::RelayV1,
+                host: RELAY.rsplit_once(':').unwrap().0.into(),
+                port: RELAY.rsplit_once(':').unwrap().1.parse().unwrap(),
+                priority: 3,
+            };
+            connect_hint(hint, key, dial_cancellation)
+                .await
+                .expect("side B relay dial")
+        });
+        let mut side_a = authenticate_relay_incoming(side_a, &key, &cancellation)
+            .await
+            .expect("side A relay handshake");
+        let mut side_b = side_b.await.unwrap();
+
+        let uploader = tokio::spawn(async move {
+            let chunk = vec![0x5a_u8; 64 * 1024];
+            let started = std::time::Instant::now();
+            let mut sent = 0_usize;
+            while sent < PAYLOAD {
+                side_a.write_all(&chunk).await.expect("relay upload");
+                sent += chunk.len();
+            }
+            side_a.flush().await.unwrap();
+            (side_a, started.elapsed())
+        });
+        let started = std::time::Instant::now();
+        let mut received = 0_usize;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while received < PAYLOAD {
+            let read = side_b.read(&mut buffer).await.expect("relay download");
+            assert!(read > 0, "relay closed early after {received} bytes");
+            received += read;
+        }
+        let download = started.elapsed();
+        let (_side_a, upload) = uploader.await.unwrap();
+        let mbps = (PAYLOAD as f64 * 8.0) / (download.as_secs_f64() * 1_000_000.0);
+        eprintln!(
+            "[baseline] raw TCP via public relay: {PAYLOAD} bytes, upload {}ms, download {}ms = {mbps:.2} Mbps",
+            upload.as_millis(),
+            download.as_millis(),
+        );
     }
 
     #[test]
