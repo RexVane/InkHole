@@ -2278,8 +2278,8 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
             .await
             .context("写入更新缓存失败")?;
-        if total > 0 {
-            let percent = (done * 100 / total) as i64;
+        if let Some(percent) = (done * 100).checked_div(total) {
+            let percent = percent as i64;
             if percent != last_percent {
                 last_percent = percent;
                 let _ = app.emit("update-progress", json!({ "percent": percent }));
@@ -2314,7 +2314,7 @@ async fn download_and_launch_update(app: &AppHandle, url: &str) -> Result<Value>
         app.opener()
             .open_path(target_path.to_string_lossy().to_string(), None::<&str>)
             .context("无法打开更新镜像")?;
-        return Ok(json!({ "launched": true, "restart": false }));
+        Ok(json!({ "launched": true, "restart": false }))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
