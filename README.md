@@ -45,18 +45,28 @@ The Flutter project is in [`mobile/`](mobile/). On a machine with Flutter
 ## Transport
 
 LAN discovery uses signed UDP/mDNS challenges and a pinned QUIC certificate.
-Direct sends support files, folders, progress, cancellation and resumable
-checkpoints. The one-time mode uses Magic Wormhole PAKE and exposes a QR code;
-the receiver must accept the summarized offer before a transfer starts. SSH
-relay setup requires a verified `SHA256:` host-key fingerprint, then pairs
-devices with PAKE and authenticates the data channel end to end.
+The QUIC listener defaults to a fixed port (41300, configurable; falls back to
+an ephemeral port if taken). Direct sends support files, folders, progress,
+cancellation and resumable checkpoints. The one-time mode uses Magic Wormhole
+PAKE and exposes a QR code; the receiver must accept the summarized offer
+before a transfer starts. SSH relay setup requires a verified `SHA256:`
+host-key fingerprint, then pairs devices with PAKE and authenticates the data
+channel end to end.
+
+Every outbound dial resolves through a public-DNS fallback and IPv4-first
+Happy-Eyeballs racing, so a blackholed system resolver or dead IPv6 route does
+not stall connections. Cross-network transfers pair over the rendezvous server
+and, when direct LAN/IPv6 is unavailable, relay data through a transit server.
+The default public Magic Wormhole servers are in the US and can be slow or
+unreachable from some networks (e.g. Chinese cellular); both endpoints are
+configurable. To make the one-time-code path reliably cross-network, self-host
+a relay (see [`docs/自建短码服务器.md`](docs/自建短码服务器.md)) or, for your
+own devices, use a Tailscale fixed address for direct QUIC with no relay.
 
 All calls share the JSON service methods in `inkhole-core` (`lan.*`,
 `wormhole.*`, `ssh.*`). See [`docs/rust-architecture.md`](docs/rust-architecture.md)
-for the host lifetime and native library layout. To speed up cross-network
-transfers, both the rendezvous and transit relay endpoints are configurable
-in the app settings; see [`docs/自建短码服务器.md`](docs/自建短码服务器.md)
-for a self-hosting guide.
+for the host lifetime and native library layout, and
+[`docs/跨网络传输方案.md`](docs/跨网络传输方案.md) for cross-network routing.
 
 ## Security
 

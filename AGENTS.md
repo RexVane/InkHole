@@ -42,6 +42,11 @@ taskkill //IM inkhole-desktop.exe //F
 - **事件队列**:快照类事件(`lan.peers`)满队时丢旧不丢新;`ssh.*` 事件无 session_id,桌面侧靠代际计数过滤旧会话残留。
 - **transfer_id** 用 blake3 对(instance、路径、大小、mtime、目标)确定性派生——换成随机 UUID 会杀死断点续传。
 - **UDP 发现**遇非致命 io 错误要 continue 不退出(Windows 常见 NetworkReset)。
+- **出站拨号一律走 `inkhole-core::net::dial_host_port`**:系统 DNS 与公共 DNS(阿里/腾讯/谷歌 UDP:53)竞速兜底 + IPv4 优先错峰竞速。别再直接 `TcpStream::connect(host)` 或 `connect_async(url)`——国内系统 DNS 常解析不了境外域名、且黑洞 IPv6 排最前会吃满超时(配对连不上的根因)。
+- **QUIC 初始 MTU 不要硬编码成 1452**:用 `mtu_discovery_config` 从 1200 起探测。Tailscale(1280)/VPN 隧道路径 MTU 低于以太网,1452 会让握手包静默黑洞、吞吐坍缩。
+- **QUIC 监听端口默认 41300**(设置可改/留空随机);固定端口被占时 core 自动退回随机端口并发 `lan.status`,不得让 `lan.start` 失败。UDP 发现端口 41301 被占时同理退回临时端口。
+- **桌面端注册 `tauri-plugin-single-instance`**:二次启动只聚焦已有窗口,避免双实例争抢发现端口(用户报过的"端口被占")。
+- **跨网络中继是硬约束不是 bug**:默认公共中继(美国)从国内蜂窝常不可达,配对成功但传输失败属预期;引导用户自建中继或 Tailscale,不要试图在代码里"修好"境外公共中继的可达性。
 
 ## 工程约定
 

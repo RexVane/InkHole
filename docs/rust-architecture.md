@@ -6,6 +6,13 @@ BLAKE3 for transfer and resume integrity. LAN discovery, direct transfers,
 folder manifests, one-time Magic Wormhole sessions, and SSH relay sessions
 all use the same `inkhole-core` service.
 
+`inkhole-core::net` centralizes every outbound TCP dial with a public-DNS
+fallback (system resolver raced against AliDNS/DNSPod/Google over UDP:53) and
+IPv4-first Happy-Eyeballs dialing, so blackholed system DNS or a dead IPv6
+route can no longer stall rendezvous, transit, or SSH connections. See
+[跨网络传输方案.md](跨网络传输方案.md) for the transport routes and the
+cross-network relay reality.
+
 ## Hosts
 
 ```text
@@ -48,6 +55,10 @@ iOS `Podfile` mounts the generated `InkHoleCore.xcframework` through the local
 discarding resumable checkpoints. The FFI worker closes the service before
 destroying its pointer, and the Flutter state stops the LAN session before the
 isolate exits.
+
+The desktop host also registers `tauri-plugin-single-instance`: launching a
+second copy just focuses the running window instead of spawning a rival process
+that would fight over the fixed UDP discovery port.
 
 ## Security boundary
 
