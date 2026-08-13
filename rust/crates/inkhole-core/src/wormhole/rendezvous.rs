@@ -75,6 +75,7 @@ impl RendezvousClient {
     pub async fn connect(url: &str, side_id: String, app_id: &str) -> Result<Self> {
         let url = url.trim();
         let (host, port) = ws_endpoint(url)?;
+        tracing::debug!(url, host, port, "rendezvous: connecting");
         // 自己拨 TCP 再做 WS/TLS 握手:系统解析常把黑洞 IPv6 排最前,
         // 顺序拨号会把整个超时耗在坏地址上(参见 crate::net)。
         let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, async {
@@ -87,6 +88,7 @@ impl RendezvousClient {
         })
         .await
         .map_err(|_| protocol_error("connect rendezvous timed out"))??;
+        tracing::debug!(url, "rendezvous: websocket established");
         let mut client = Self {
             socket,
             side_id,

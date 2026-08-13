@@ -140,6 +140,10 @@ impl SenderSession {
             cancellation.child_token(),
         )
         .await?;
+        tracing::debug!(
+            hints = acceptor.offer().hints.len(),
+            "wormhole sender: transit prepared, sending offer"
+        );
         send_message(
             &mut protocol,
             &SenderOffer {
@@ -149,10 +153,12 @@ impl SenderSession {
             &cancellation,
         )
         .await?;
+        tracing::debug!("wormhole sender: offer sent, awaiting receiver answer");
         let answer: ReceiverAnswer = tokio::select! {
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
             result = protocol.receive() => result?,
         };
+        tracing::debug!(accepted = answer.accepted, "wormhole sender: answer received");
         if !answer.accepted {
             return Err(CoreError::Protocol(if answer.error.is_empty() {
                 "receiver rejected the transfer".into()
@@ -174,10 +180,20 @@ impl SenderSession {
         let accept = tokio::spawn(acceptor.accept());
         close_protocol(protocol, "happy").await;
         let mut accept = accept;
+        tracing::debug!("wormhole sender: awaiting receiver transit connection");
         let accepted = tokio::select! {
             _ = cancellation.cancelled() => None,
             result = tokio::time::timeout(ACCEPT_TIMEOUT, &mut accept) => Some(result),
         };
+        tracing::debug!(
+            outcome = match &accepted {
+                None => "cancelled",
+                Some(Ok(Ok(_))) => "connected",
+                Some(Ok(Err(_))) => "task-failed",
+                Some(Err(_)) => "timeout",
+            },
+            "wormhole sender: transit accept resolved"
+        );
         let stream = match accepted {
             None => {
                 accept.abort();
@@ -244,6 +260,10 @@ impl ReceivedOffer {
             result = protocol.receive() => result?,
         };
         offer.summary.validate()?;
+        tracing::debug!(
+            hints = offer.transit.hints.len(),
+            "wormhole receiver: joined and received offer"
+        );
         Ok(Self {
             protocol,
             offer,
@@ -282,12 +302,14 @@ impl ReceivedOffer {
             &self.cancellation,
         )
         .await?;
+        tracing::debug!("wormhole receiver: answer sent, connecting transit");
         let stream = transit::connect(
             &self.offer.transit,
             self.transit_key,
             self.cancellation.child_token(),
         )
         .await?;
+        tracing::debug!("wormhole receiver: transit connected, starting tunnel");
         close_protocol(self.protocol, "happy").await;
         UdpTunnel::start_receiver(
             stream,

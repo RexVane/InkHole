@@ -151,6 +151,7 @@ impl WormholeProtocol {
         code: &str,
         role: PeerRole,
     ) -> Result<Self> {
+        tracing::debug!(?role, "wormhole: establishing (PAKE exchange)");
         let (spake, outbound) = Spake2::<Ed25519Group>::start_symmetric(
             &Password::new(code.as_bytes()),
             &Identity::new(WORMHOLE_APP_ID.as_bytes()),
@@ -206,6 +207,7 @@ impl WormholeProtocol {
                 "peer does not support InkHole short-code V2",
             ));
         }
+        tracing::debug!(?role, "wormhole: PAKE + version exchange complete");
         Ok(protocol)
     }
 

@@ -48,7 +48,13 @@ pub(crate) async fn dial_host_port(
     }
     let mut addresses = tokio::select! {
         _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-        resolved = resolve(host, port) => resolved?,
+        resolved = resolve(host, port) => match resolved {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                tracing::debug!(host, port, %error, "dial: DNS resolve failed");
+                return Err(error);
+            }
+        },
     };
     if addresses.is_empty() {
         return Err(CoreError::Protocol(format!(
@@ -57,7 +63,13 @@ pub(crate) async fn dial_host_port(
     }
     // 稳定排序:v4 在前,保持解析器给出的族内顺序。
     addresses.sort_by_key(|address| u8::from(address.is_ipv6()));
-    race_addresses(&addresses, cancellation).await
+    tracing::debug!(host, port, count = addresses.len(), first = %addresses[0], "dial: resolved, racing");
+    let result = race_addresses(&addresses, cancellation).await;
+    match &result {
+        Ok(stream) => tracing::debug!(host, port, peer = ?stream.peer_addr().ok(), "dial: connected"),
+        Err(error) => tracing::debug!(host, port, %error, "dial: all attempts failed"),
+    }
+    result
 }
 
 /// 系统解析器与公共 DNS 竞速:谁先给出可用应答用谁。系统解析器有 300ms 领跑
@@ -88,6 +100,7 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
             addresses = &mut system, if system_pending => {
                 system_pending = false;
                 if let Some(addresses) = addresses {
+                    tracing::debug!(host, count = addresses.len(), "resolve: system DNS won");
                     return Ok(addresses);
                 }
                 tracing::debug!(host, "system DNS unavailable; awaiting public resolvers");
@@ -95,8 +108,10 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
             addresses = &mut public, if public_pending => {
                 public_pending = false;
                 if let Some(addresses) = addresses {
+                    tracing::debug!(host, count = addresses.len(), "resolve: public DNS won");
                     return Ok(addresses);
                 }
+                tracing::debug!(host, "public DNS fallback failed");
             }
         }
     }

@@ -224,6 +224,10 @@ pub(super) async fn connect(
     cancellation: CancellationToken,
 ) -> Result<TcpStream> {
     validate_offer(offer)?;
+    tracing::debug!(
+        hints = ?offer.hints.iter().map(|h| format!("{:?} {}:{}", h.kind, h.host, h.port)).collect::<Vec<_>>(),
+        "transit: connecting to offered hints"
+    );
     let mut attempts = JoinSet::new();
     for hint in offer.hints.iter().cloned() {
         let key = transit_key;
@@ -275,11 +279,16 @@ async fn connect_hint(
         }
         authenticate_outgoing(stream, &transit_key, &cancellation).await
     };
-    tokio::select! {
+    let result = tokio::select! {
         _ = cancellation.cancelled() => Err(CoreError::Cancelled),
         result = tokio::time::timeout(HINT_TIMEOUT, connect) => result
             .map_err(|_| CoreError::Protocol(format!("transit connection to {address} timed out")))?,
+    };
+    match &result {
+        Ok(_) => tracing::debug!(kind = ?hint.kind, %address, "transit hint: connected"),
+        Err(error) => tracing::debug!(kind = ?hint.kind, %address, %error, "transit hint: failed"),
     }
+    result
 }
 
 async fn connect_relay(
