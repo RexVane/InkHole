@@ -414,7 +414,7 @@ class RadarView extends StatelessWidget {
           Container(
             width: 36,
             height: 3,
-            margin: const EdgeInsets.bottom: 10,
+            margin: const EdgeInsets.only(bottom: 10),
             decoration: BoxDecoration(
               color: textDim,
               borderRadius: BorderRadius.circular(2),

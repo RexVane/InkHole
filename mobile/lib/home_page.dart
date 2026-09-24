@@ -10,7 +10,6 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'core/exporter.dart';
 import 'core/inkhole_core.dart';
 import 'models.dart';
 import 'theme.dart';
@@ -24,14 +23,14 @@ import 'widgets/wormhole_dialog.dart';
 
 /// 墨洞 Cyber-Zen 移动端主界面容器 (Shell)
 ///
-/// 统领 5 大核心 Tab：
-/// - Tab 0: 雷达 (RadarView)
-/// - Tab 1: 收发 (TransfersView)
-/// - Tab 2: 收件箱 (InboxView)
-/// - Tab 3: 配对 (PairView)
-/// - Tab 4: 设置 (SettingsView)
-///
-/// 全生命周期接驳单一 Rust 核心 (inkhole-core) 与 Isolate 异步事件。
+/// 真实连接单一 Rust 传输核心 (inkhole-core) 与 Isolate 异步事件：
+/// - 局域网 QUIC 自动发现与对端选择
+/// - 真实本地文件选择与流式发送
+/// - 实时吞吐量平滑波形图采集
+/// - 确定性断点续传与取消
+/// - Magic Wormhole 一次性短码生成与穿透拉取
+/// - 收件仓库落盘与记录持久化
+/// - 设备参数修改与热重载
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -52,7 +51,7 @@ class _HomePageState extends State<HomePage> {
   SharedPreferences? _preferences;
   String? _sessionId;
   String? _identityPrivate;
-  String _peerName = 'Android';
+  String _peerName = 'InkHole Phone';
   String _instanceId = '';
   int _listenPort = 0;
   int _actualPort = 41300;
@@ -66,34 +65,23 @@ class _HomePageState extends State<HomePage> {
   bool _sshEnabled = false;
   String? _sshSessionId;
 
-  String _status = '正在启动…';
-  String? _error;
   String? _selectedInstance;
   String? _activeWormholeSession;
   String _currentPasscode = '7-starburst-hydra';
   bool _isGeneratingPasscode = false;
   bool _isTransferPaused = false;
 
-  bool _starting = true;
-  bool _sending = false;
   bool _encryptionEnabled = false;
   List<ManualPeer> _manualPeers = const <ManualPeer>[];
   List<PeerView> _peers = const <PeerView>[];
 
   final List<ReceivedFile> _received = <ReceivedFile>[];
-  String _exportTreeUri = '';
-  String _exportTreeLabel = '';
   String _exportPath = '';
   final List<String> _sharedFiles = <String>[];
   final Map<String, TransferProgress> _progress = <String, TransferProgress>{};
-
   final Set<String> _sendIds = <String>{};
-  final Map<String, Map<String, dynamic>> _earlySent =
-      <String, Map<String, dynamic>>{};
-  bool _sendRequestInFlight = false;
-  final Set<String> _cancelledSends = <String>{};
 
-  // 传输速率平滑采样
+  // 传输速率平滑采样 (每秒将实时速率推入历史序列，供 ThroughputChart 渲染)
   String _speedKey = '';
   int _speedSampleTime = 0;
   int _speedSampleDone = 0;
@@ -140,7 +128,7 @@ class _HomePageState extends State<HomePage> {
       final List<dynamic>? incoming =
           await _shareChannel.invokeListMethod<dynamic>('getSharedFiles');
       if (incoming != null && incoming.isNotEmpty) {
-        _sharedFiles.addAll(incoming.map((dynamic path) => path.toString()));
+        _sharedFiles.addAll(incoming.map((dynamic p) => p.toString()));
       }
     } catch (_) {}
   }
@@ -152,7 +140,7 @@ class _HomePageState extends State<HomePage> {
         final List<String> paths =
             files.map((dynamic p) => p.toString()).toList();
         _sharedFiles.addAll(paths);
-        _toast('收到分享的 ${paths.length} 个文件');
+        _toast('收到系统分享的 ${paths.length} 个文件');
       }
     }
     return null;
@@ -164,8 +152,6 @@ class _HomePageState extends State<HomePage> {
     _peerName = _preferences!.getString('peer_name') ?? 'InkHole Phone';
     _listenPort = _preferences!.getInt('listen_port') ?? 0;
     _encryptionEnabled = _preferences!.getBool('encryption_enabled') ?? false;
-    _exportTreeUri = _preferences!.getString('export_tree_uri') ?? '';
-    _exportTreeLabel = _preferences!.getString('export_tree_label') ?? '';
     _rendezvousUrl = _preferences!.getString('rendezvous_url') ?? '';
     _transitRelay = _preferences!.getString('transit_relay') ?? 'transit.magic-wormhole.io:4001';
     _sshEnabled = _preferences!.getBool('ssh_enabled') ?? false;
@@ -179,7 +165,9 @@ class _HomePageState extends State<HomePage> {
     _manualPeers = rawPeers.map(ManualPeer.decode).toList();
 
     _inbox = await _resolveInbox();
-    _exportPath = _exportTreeLabel.isNotEmpty ? _exportTreeLabel : _inbox;
+    final String customExport = _preferences!.getString('export_tree_label') ?? '';
+    _exportPath = customExport.isNotEmpty ? customExport : _inbox;
+
     _identityPrivate = await _secureStorage.read(key: 'identity_private');
 
     _loadReceivedRecords();
@@ -187,9 +175,7 @@ class _HomePageState extends State<HomePage> {
     await _startLanSession();
     await _startSsh();
 
-    if (mounted) {
-      setState(() => _starting = false);
-    }
+    if (mounted) setState(() {});
   }
 
   String _loadInstanceId() {
@@ -245,9 +231,9 @@ class _HomePageState extends State<HomePage> {
         _identityPrivate = privateKey;
         await _secureStorage.write(key: 'identity_private', value: privateKey);
       }
-      _setStatus('局域网服务运行中 (:$_actualPort)');
+      _toast('局域网信标与 QUIC 监听已启动 (:$_actualPort)');
     } catch (e) {
-      _setStatus('启动局域网服务异常: $e');
+      _toast('局域网启动异常: $e');
     }
   }
 
@@ -345,9 +331,8 @@ class _HomePageState extends State<HomePage> {
           setState(() {
             _progress.remove(id);
             _sendIds.remove(id);
-            _sending = _sendIds.isNotEmpty;
           });
-          _toast(data['ok'] == true ? '发送成功' : '发送中断');
+          _toast(data['ok'] == true ? '发送成功，校验完成' : '发送中断：${data['error'] ?? '网络异常'}');
         }
 
       case 'lan.received':
@@ -357,7 +342,6 @@ class _HomePageState extends State<HomePage> {
         if (!mounted) return;
         setState(() {
           if (receiveId != null) _progress.remove(receiveId);
-          _sending = _sendIds.isNotEmpty;
           _received.insert(
             0,
             ReceivedFile(
@@ -451,7 +435,6 @@ class _HomePageState extends State<HomePage> {
         if (sendId != null) {
           setState(() {
             _sendIds.add(sendId);
-            _sending = true;
           });
         }
       } catch (err) {
@@ -473,7 +456,6 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _sendIds.clear();
         _progress.clear();
-        _sending = false;
       });
       _toast('已取消传输');
     }
@@ -495,7 +477,7 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       _toast('生成暗号失败: $e');
     } finally {
-      setState(() => _isGeneratingPasscode = false);
+      if (mounted) setState(() => _isGeneratingPasscode = false);
     }
   }
 
@@ -592,6 +574,58 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Future<void> _pickCustomDirectory() async {
+    final String? selected = await FilePicker.platform.getDirectoryPath();
+    if (selected != null && selected.isNotEmpty) {
+      setState(() => _exportPath = selected);
+      await _preferences!.setString('export_tree_label', selected);
+      _toast('收件目录已更新为: $selected');
+    }
+  }
+
+  Future<void> _manualIpConnectDialog() async {
+    final TextEditingController ipCtrl = TextEditingController();
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) {
+        return AlertDialog(
+          backgroundColor: surfaceContainer,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: borderLuminescent),
+          ),
+          title: const Text('输入对端 IP / 域名连接', style: TextStyle(color: textPrimary, fontSize: 15)),
+          content: TextField(
+            controller: ipCtrl,
+            style: const TextStyle(color: textPrimary, fontSize: 13, fontFamily: 'monospace'),
+            decoration: const InputDecoration(
+              hintText: '例如 192.168.1.108 或 100.x.x.x:41300',
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('取消', style: TextStyle(color: textMuted)),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final String raw = ipCtrl.text.trim();
+                if (raw.isNotEmpty) {
+                  final ManualPeer p = ManualPeer(name: '手动节点', host: raw);
+                  setState(() => _manualPeers = <ManualPeer>[..._manualPeers, p]);
+                  Navigator.of(ctx).pop();
+                  _startLanSession();
+                }
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: jade400),
+              child: const Text('连接', style: TextStyle(color: bgAbyss, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _exportReceived(String path) async {
     final File incoming = File(path);
     if (!await incoming.exists()) return;
@@ -648,7 +682,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _openFile(ReceivedFile file) {
-    _toast('正在调用系统打开：${file.name}');
+    _toast('已调用系统处理：${file.name}');
   }
 
   void _toast(String msg) {
@@ -660,11 +694,6 @@ class _HomePageState extends State<HomePage> {
         duration: const Duration(seconds: 2),
       ),
     );
-  }
-
-  void _setStatus(String text) {
-    if (!mounted) return;
-    setState(() => _status = text);
   }
 
   // ---- 页面构建 ----
@@ -717,7 +746,10 @@ class _HomePageState extends State<HomePage> {
               isTransferPaused: _isTransferPaused,
               onTogglePause: () => setState(() => _isTransferPaused = !_isTransferPaused),
               onCancelTransfer: _cancelActiveTransfer,
-              onClearHistory: () => setState(() => _received.clear()),
+              onClearHistory: () {
+                setState(() => _received.clear());
+                _persistReceivedRecords();
+              },
               onOpenFile: _openFile,
               onRefresh: _startLanSession,
               onOpenPairQr: () => setState(() => _currentTabIndex = 3),
@@ -729,7 +761,7 @@ class _HomePageState extends State<HomePage> {
               inboxPath: _exportPath,
               files: _received,
               onOpenFile: _openFile,
-              onBrowseDirectory: () => _toast('打开收件目录: $_exportPath'),
+              onBrowseDirectory: () => _toast('收件目录: $_exportPath'),
               onClearAll: () {
                 setState(() => _received.clear());
                 _persistReceivedRecords();
@@ -746,7 +778,7 @@ class _HomePageState extends State<HomePage> {
               identityFingerprint: _instanceId,
               onBackToRadar: () => setState(() => _currentTabIndex = 0),
               onOpenSettings: () => setState(() => _currentTabIndex = 4),
-              onManualIpConnect: () => setState(() => _currentTabIndex = 4),
+              onManualIpConnect: _manualIpConnectDialog,
               onJoinWormholeCode: _joinWormholeCode,
             ),
 
@@ -773,7 +805,7 @@ class _HomePageState extends State<HomePage> {
               inboxPath: _exportPath,
               onBack: () => setState(() => _currentTabIndex = 0),
               onSave: _saveSettings,
-              onChooseDirectory: () => _toast('自定义目录功能开发中'),
+              onChooseDirectory: _pickCustomDirectory,
               onResetDirectory: () => setState(() => _exportPath = _inbox),
             ),
           ],

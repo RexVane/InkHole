@@ -244,7 +244,7 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                   offset: Offset(0, 8),
                 ),
               ],
-            ],
+            ),
             child: Column(
               children: <Widget>[
                 // 顶部状态与倒计时

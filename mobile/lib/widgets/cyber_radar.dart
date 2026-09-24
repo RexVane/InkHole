@@ -190,7 +190,7 @@ class _CyberRadarState extends State<CyberRadar>
                           Container(
                             width: 34,
                             height: 34,
-                            margin: const EdgeInsets.bottom: 4,
+                            margin: const EdgeInsets.only(bottom: 4),
                             decoration: BoxDecoration(
                               shape: BoxShape.circle,
                               color: jade400.withValues(alpha: 0.12),
