@@ -16,14 +16,12 @@ cross-network relay reality.
 ## Hosts
 
 ```text
-Tauri 2 desktop UI  ──┐
-                       ├── JsonService (Tokio) ── QUIC / LAN / Wormhole / SSH
-Flutter mobile UI ────┘
-                       └── inkhole-ffi C ABI
+Flutter mobile UI (Android / iOS)
+       └── dedicated Dart isolate
+              └── inkhole-ffi C ABI ── JsonService (Tokio) ── QUIC / LAN / Wormhole / SSH
 ```
 
-The desktop host calls `JsonService` directly from the Tauri runtime. The
-mobile host loads `inkhole-ffi` and keeps one native service handle in a
+The mobile host loads `inkhole-ffi` and keeps one native service handle in a
 dedicated Dart isolate. Requests are serialized in that isolate and native
 events are polled without blocking Flutter's frame scheduler. The FFI ABI is
 versioned independently from the JSON protocol; strings returned by native
@@ -56,9 +54,6 @@ discarding resumable checkpoints. The FFI worker closes the service before
 destroying its pointer, and the Flutter state stops the LAN session before the
 isolate exits.
 
-The desktop host also registers `tauri-plugin-single-instance`: launching a
-second copy just focuses the running window instead of spawning a rival process
-that would fight over the fixed UDP discovery port.
 
 ## Security boundary
 

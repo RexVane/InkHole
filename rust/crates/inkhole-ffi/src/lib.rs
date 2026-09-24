@@ -1,4 +1,4 @@
-//! Stable native boundary shared by Flutter and non-Tauri hosts.
+//! Stable native boundary for Flutter mobile hosts (Android / iOS).
 
 use std::{
     any::Any,

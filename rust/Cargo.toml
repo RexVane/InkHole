@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "apps/inkhole-desktop",
     "crates/inkhole-core",
     "crates/inkhole-ffi",
 ]

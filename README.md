@@ -1,80 +1,59 @@
-# 墨洞 InkHole
+# 墨洞 InkHole (Mobile)
 
-InkHole 2.0 is a local-first file transfer tool. It discovers peers on the
-LAN, prefers direct authenticated QUIC, and falls back to one-time Wormhole
-codes or an SSH relay for devices that cannot connect directly. Files stay on
-the participating devices; the relay only forwards encrypted traffic.
+InkHole 2.0 是一款本地优先 (Local-first) 的跨平台 P2P 移动端大文件传输应用 (Android / iOS)。
+它优先在局域网内通过经过证书指纹固定的 QUIC 协议极速直连传输；当无法直接直连时，无缝回退到一次性 Wormhole 短码或 SSH 中继通道。文件数据始终驻留在对端设备中，中继仅转发加密流量。
 
-## Architecture
+## 架构概览
 
-- Rust 1.93 is the only transport implementation.
-- Tokio owns asynchronous sessions and cancellation.
-- Quinn provides certificate-pinned QUIC streams.
-- BLAKE3 validates files, folders, and resumable checkpoints.
-- Tauri 2 hosts the Windows/macOS desktop UI and the floating desktop pet.
-- Flutter hosts the Android/iOS UI and mounts the same Rust core through the
-  versioned `inkhole-ffi` C ABI in a Dart isolate.
+- **Rust 1.93** 作为唯一核心传输实现 (`crates/inkhole-core`)。
+- **Tokio** 提供高性能异步执行环境与基于 Token 的全生命周期取消机制。
+- **Quinn** 提供证书指纹固定的安全 QUIC 流式数据传输，自适应 MTU 探测。
+- **BLAKE3** 提供毫秒级文件完整性校验与基于元数据的确定性断点续传。
+- **inkhole-ffi** 提供稳定的 C ABI，将 Rust 运行时安全桥接到移动端。
+- **Flutter** 驱动移动端 UI (Android / iOS)，在专用的 Background Dart Isolate 中加载 Rust 核心。
 
-The existing dark InkHole surface is kept: the hero animation, peer chips,
-received-file list, short-code confirmation and SSH pairing remain in the
-same layout and use the same user-facing actions.
+## 构建与测试
 
-## Build And Test
-
-Rust checks require Rust 1.93 or newer:
-
+### Rust 核心检查
 ```bash
 cargo fmt --all --manifest-path rust/Cargo.toml -- --check
 cargo clippy --workspace --all-targets --manifest-path rust/Cargo.toml -- -D warnings
 cargo test --workspace --manifest-path rust/Cargo.toml
 ```
 
-Desktop development requires Node.js 22 and Tauri CLI:
+### 移动端开发与打包
+
+移动端项目位于 [`mobile/`](mobile/)。在装有 Flutter 3.24+ 的环境中：
 
 ```bash
-cd desktop/frontend && npm ci && cd ../..
-cd rust/apps/inkhole-desktop && cargo tauri dev
+cd mobile
+
+# 1. 获取依赖并进行静态分析
+flutter pub get
+flutter analyze
+flutter test
+
+# 2. 编译 Rust 原生库并打包 Android APK
+bash tool/build_native.sh
+flutter build apk --release
+
+# iOS XCFramework 构建见：
+bash tool/build_native_ios.sh
 ```
 
-The Flutter project is in [`mobile/`](mobile/). On a machine with Flutter
-3.24+, run `flutter pub get`, build the Rust libraries with
-`mobile/tool/build_native.ps1` or `mobile/tool/build_native.sh`, then run
-`flutter build apk --release`. The iOS XCFramework recipe is in
-`mobile/tool/build_native_ios.sh`.
+## 传输协议
 
-## Transport
+* **局域网发现**：使用带数字签名的 UDP 广播与 mDNS-SD，并使用固定 QUIC 证书指纹相互验证。QUIC 监听端口默认为 41300（被占时自动回退临时端口）。
+* **断点续传**：大文件与文件夹均支持流式切片传输，传输进度通过 BLAKE3 校验并在中断后依据 `.part` 临时文件平滑恢复。
+* **短码跨网穿透**：基于 Magic Wormhole SPAKE2 PAKE 协议，双端生成并扫描二维码，经由 Rendezvous 服务器完成密钥协商；数据传输优先尝试 IPv6/局域网直连打洞，打洞失败回退到 Transit TCP 中继（隧道内仍封装原生 QUIC 数据包）。
+* **网络韧性**：所有出站拨号均集成系统 DNS 与公共 DNS (阿里/腾讯/谷歌 UDP:53) 竞速兜底以及 IPv4 优先错峰竞速 (Happy Eyeballs)。
 
-LAN discovery uses signed UDP/mDNS challenges and a pinned QUIC certificate.
-The QUIC listener defaults to a fixed port (41300, configurable; falls back to
-an ephemeral port if taken). Direct sends support files, folders, progress,
-cancellation and resumable checkpoints. The one-time mode uses Magic Wormhole
-PAKE and exposes a QR code; the receiver must accept the summarized offer
-before a transfer starts. SSH relay setup requires a verified `SHA256:`
-host-key fingerprint, then pairs devices with PAKE and authenticates the data
-channel end to end.
+## 安全设计
 
-Every outbound dial resolves through a public-DNS fallback and IPv4-first
-Happy-Eyeballs racing, so a blackholed system resolver or dead IPv6 route does
-not stall connections. Cross-network transfers pair over the rendezvous server
-and, when direct LAN/IPv6 is unavailable, relay data through a transit server.
-The default public Magic Wormhole servers are in the US and can be slow or
-unreachable from some networks (e.g. Chinese cellular); both endpoints are
-configurable. To make the one-time-code path reliably cross-network, self-host
-a relay (see [`docs/自建短码服务器.md`](docs/自建短码服务器.md)) or, for your
-own devices, use a Tailscale fixed address for direct QUIC with no relay.
+* 每次设备发现与传输握手均包含 Ed25519 签名验证。
+* 证书指纹与 SSH Host Key 在建立数据通道前严格比对。
+* 设备密钥对安全保存在系统的安全凭据存储中（KeyStore / Keychain）。
 
-All calls share the JSON service methods in `inkhole-core` (`lan.*`,
-`wormhole.*`, `ssh.*`). See [`docs/rust-architecture.md`](docs/rust-architecture.md)
-for the host lifetime and native library layout, and
-[`docs/跨网络传输方案.md`](docs/跨网络传输方案.md) for cross-network routing.
+## 开源协议
 
-## Security
-
-Peer identities are signed on every discovery and transfer. Certificate
-fingerprints and SSH host keys are checked before data channels are accepted.
-Optional LAN shared secrets and private keys are stored by the host's secure
-credential service; they are never written to ordinary JSON configuration.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+MIT License. 详见 [LICENSE](LICENSE)。

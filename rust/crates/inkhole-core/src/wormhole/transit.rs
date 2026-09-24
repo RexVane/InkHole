@@ -228,11 +228,29 @@ pub(super) async fn connect(
         hints = ?offer.hints.iter().map(|h| format!("{:?} {}:{}", h.kind, h.host, h.port)).collect::<Vec<_>>(),
         "transit: connecting to offered hints"
     );
+    let mut sorted_hints = offer.hints.clone();
+    sorted_hints.sort_by(|a, b| b.priority.cmp(&a.priority));
+
     let mut attempts = JoinSet::new();
-    for hint in offer.hints.iter().cloned() {
+    let mut direct_stagger = Duration::ZERO;
+    const DIRECT_STAGGER_INTERVAL: Duration = Duration::from_millis(30);
+
+    for hint in sorted_hints {
         let key = transit_key;
         let attempt_cancellation = cancellation.child_token();
-        attempts.spawn(async move { connect_hint(hint, key, attempt_cancellation).await });
+        let delay = if hint.kind == TransitHintKind::RelayV1 {
+            RELAY_DIAL_DELAY
+        } else {
+            let current = direct_stagger;
+            direct_stagger += DIRECT_STAGGER_INTERVAL;
+            current
+        };
+        attempts.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            connect_hint(hint, key, attempt_cancellation).await
+        });
     }
     let mut errors = Vec::new();
     loop {
@@ -266,9 +284,6 @@ async fn connect_hint(
 ) -> Result<TcpStream> {
     let address = format_host_port(&hint.host, hint.port);
     let connect = async {
-        if hint.kind == TransitHintKind::RelayV1 {
-            tokio::time::sleep(RELAY_DIAL_DELAY).await;
-        }
         let mut stream = crate::net::dial_host_port(&hint.host, hint.port, &cancellation).await?;
         stream.set_nodelay(true)?;
         if hint.kind == TransitHintKind::RelayV1 {

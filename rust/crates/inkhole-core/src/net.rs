@@ -66,7 +66,9 @@ pub(crate) async fn dial_host_port(
     tracing::debug!(host, port, count = addresses.len(), first = %addresses[0], "dial: resolved, racing");
     let result = race_addresses(&addresses, cancellation).await;
     match &result {
-        Ok(stream) => tracing::debug!(host, port, peer = ?stream.peer_addr().ok(), "dial: connected"),
+        Ok(stream) => {
+            tracing::debug!(host, port, peer = ?stream.peer_addr().ok(), "dial: connected")
+        }
         Err(error) => tracing::debug!(host, port, %error, "dial: all attempts failed"),
     }
     result
@@ -77,8 +79,11 @@ pub(crate) async fn dial_host_port(
 /// 立即接管,不再让每次 rendezvous 连接白等 2.5 秒系统超时。
 async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let system = async {
-        match tokio::time::timeout(SYSTEM_RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
-            .await
+        match tokio::time::timeout(
+            SYSTEM_RESOLVE_TIMEOUT,
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
         {
             Ok(Ok(iter)) => {
                 let addresses = iter.collect::<Vec<_>>();

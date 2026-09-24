@@ -1,7 +1,7 @@
 # InkHole 2.0 文件传输
 
-InkHole 2.0 使用 Rust 统一实现局域网、短码和 SSH 中继。桌面端是
-Tauri 2.0，移动端是 Flutter；两端调用同一个 Tokio 异步核心。
+InkHole 2.0 使用 Rust 统一实现局域网、短码和 SSH 中继。移动端使用
+Flutter，通过 dart:ffi 调用同一个 Tokio 异步核心。
 
 ## 局域网
 
@@ -52,8 +52,7 @@ SSH 中继需要用户提供服务器、端口、用户名、私钥和 `SHA256:`
 ## 主机和构建
 
 ```text
-Tauri 2 desktop  -> inkhole-core (Tokio/Quinn/BLAKE3)
-Flutter mobile   -> inkhole-ffi C ABI -> inkhole-core
+Flutter mobile (Android / iOS) -> inkhole-ffi C ABI -> inkhole-core (Tokio/Quinn/BLAKE3)
 ```
 
 Rust 检查：

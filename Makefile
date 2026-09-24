@@ -1,4 +1,4 @@
-.PHONY: test test-rust test-flutter fmt lint build-desktop build-android clean
+.PHONY: test test-rust test-flutter fmt lint build-android clean
 
 RUST_DIR := rust
 MOBILE_DIR := mobile
@@ -17,9 +17,6 @@ fmt:
 lint:
 	cargo clippy --workspace --all-targets --manifest-path $(RUST_DIR)/Cargo.toml -- -D warnings
 	cd $(MOBILE_DIR) && flutter analyze
-
-build-desktop:
-	cd $(RUST_DIR)/apps/inkhole-desktop && cargo tauri build
 
 build-android:
 	cd $(MOBILE_DIR) && bash tool/build_native.sh

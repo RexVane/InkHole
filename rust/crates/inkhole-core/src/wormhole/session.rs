@@ -158,7 +158,10 @@ impl SenderSession {
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
             result = protocol.receive() => result?,
         };
-        tracing::debug!(accepted = answer.accepted, "wormhole sender: answer received");
+        tracing::debug!(
+            accepted = answer.accepted,
+            "wormhole sender: answer received"
+        );
         if !answer.accepted {
             return Err(CoreError::Protocol(if answer.error.is_empty() {
                 "receiver rejected the transfer".into()

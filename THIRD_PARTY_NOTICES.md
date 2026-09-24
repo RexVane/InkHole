@@ -9,7 +9,7 @@ dependencies are:
 - mdns-sd and if-addrs for LAN discovery.
 - BLAKE3, Ed25519, SPAKE2, and russh for integrity and authenticated relay
   sessions.
-- Tauri 2 for the desktop host and Flutter plugins for the mobile host.
+- Flutter and dart:ffi for the mobile host (Android / iOS).
 
-No vendored Go, Python, Kotlin, gomobile, or Wails transport implementation is
+No vendored Go, Python, Kotlin, or gomobile transport implementation is
 part of the 2.0 source tree.
