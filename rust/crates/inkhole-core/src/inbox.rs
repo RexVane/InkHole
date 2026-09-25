@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::TransferKind;
 
+/// 收件分类根目录。只从 FFI 参数读入,从不来自对端报文或磁盘,
+/// 因此收紧未知字段没有前向兼容代价。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct InboxCategoryRoots {
     pub media: Option<PathBuf>,
     pub archive: Option<PathBuf>,

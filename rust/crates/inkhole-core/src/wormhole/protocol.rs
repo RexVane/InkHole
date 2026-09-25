@@ -325,14 +325,33 @@ pub(super) fn derive_key(input: &[u8], purpose: &[u8]) -> Result<[u8; 32]> {
     Ok(output)
 }
 
+/// 短码里 nameplate 之外的人类可读单词数。
+///
+/// 这几个单词就是 SPAKE2 的口令，是整条短码通道**唯一**的秘密：nameplate 由
+/// rendezvous 服务器分配、公开可枚举，服务器与任何旁观者都看得到。
+/// BIP39 英文词表 2048 词，两个单词只有 22 bit，在公共 rendezvous 上被人
+/// 枚举 nameplate 后在线爆破并不是纯理论问题。
+///
+/// 三个单词 = 33 bit。配合短码的一次性语义（每次 `wormhole.create` 只接受
+/// 一轮 PAKE，口令猜错则后续加密阶段解密失败、整条会话作废，要再猜必须让
+/// 受害端重新出一码），把在线爆破推到不可行。
+///
+/// **不要为了"好念"缩回两个单词。** 接收端 `normalize_code` 允许 2 个及以上
+/// 单词，是为了让**已经发出去的旧短码**仍然可用，不是给新版留偷懒的口子。
+const SHORT_CODE_WORDS: usize = 3;
+
 fn generate_code(nameplate: &str) -> String {
     let words = Language::English.word_list();
     let mut rng = rand::rng();
-    let first = words[rng.random_range(0..words.len())];
-    let second = words[rng.random_range(0..words.len())];
-    format!("{nameplate}-{first}-{second}")
+    let suffix = (0..SHORT_CODE_WORDS)
+        .map(|_| words[rng.random_range(0..words.len())])
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("{nameplate}-{suffix}")
 }
 
+/// 规范化短码。单词数下界是 2，**故意**不收紧到 `SHORT_CODE_WORDS`：
+/// 老版本 App 发出的两词短码要能继续被新版接收端解析。
 fn normalize_code(raw: &str) -> Result<String> {
     let code = raw.trim().to_ascii_lowercase();
     if code.is_empty()
@@ -373,6 +392,8 @@ fn protocol_error(message: impl Into<String>) -> CoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::wormhole::test_support::MockRendezvous;
 
@@ -412,6 +433,72 @@ mod tests {
             ..WormholeSettings::default()
         };
         assert!(invalid_relay.normalize().is_err());
+    }
+
+    #[test]
+    fn generated_short_codes_carry_three_words_of_entropy() {
+        // nameplate 是公开的，这几个单词是 SPAKE2 唯一的口令来源：
+        // 两词只有 22 bit，三词 33 bit。缩回去等于把短码通道唯一的秘密削薄。
+        assert_eq!(SHORT_CODE_WORDS, 3);
+        let vocabulary = Language::English.word_list();
+        // 熵就是从这个词表大小算出来的（2048^3 = 2^33）。
+        // 词表被换小必须立刻在这里暴露，否则注释里的位数就成了空话。
+        assert_eq!(vocabulary.len(), 2048, "BIP39 英文词表应为 2048 词");
+        for _ in 0..64 {
+            let code = generate_code("7");
+            assert_eq!(normalize_code(&code).unwrap(), code);
+            let words = code.split('-').skip(1).collect::<Vec<_>>();
+            assert_eq!(words.len(), SHORT_CODE_WORDS, "{code}");
+            assert!(words.iter().all(|word| vocabulary.contains(word)), "{code}");
+            // 刻意**不**断言"单词互不相同"：`generate_code` 不做去重采样
+            // （SSH 的 `generate_pair_code` 才重采样，因为 `normalize_pair_code`
+            // 会拒绝重复词）。这里偶然抽到重复词只是让那一条码的熵略低，
+            // 不影响正确性——加这种断言只会造出一个偶发失败的测试。
+        }
+    }
+
+    #[test]
+    fn legacy_two_word_short_codes_still_parse() {
+        // 单词数下界保持在 2：升级后，老版本已经发出去的短码必须继续可用。
+        assert_eq!(
+            normalize_code(" 7-ABANDON-Ability ").unwrap(),
+            "7-abandon-ability"
+        );
+        assert!(normalize_code("7").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_short_code_cannot_pair() {
+        let rendezvous = MockRendezvous::start().await;
+        let settings = WormholeSettings {
+            rendezvous_url: rendezvous.url().into(),
+            transit_relay: "127.0.0.1:1".into(),
+        };
+        let (code, pending) = WormholeProtocol::allocate(&settings).await.unwrap();
+        // 同一个 nameplate、不同的单词：攻击者拿到了信箱位置但猜错了口令。
+        let nameplate = code.split('-').next().unwrap();
+        let wrong = format!("{nameplate}-abandon-ability-zoom");
+
+        let (sender, receiver) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                pending.establish(),
+                WormholeProtocol::join(&settings, &wrong)
+            )
+        })
+        .await
+        .expect("wrong-code pairing must terminate, not hang");
+
+        // 双方口令不同 → 派生密钥不同 → version 阶段解密失败。关键是**不能**
+        // 出现"用错码也能建会话"的情况，否则熵再高也没有意义。
+        assert!(
+            receiver.is_err(),
+            "joiner must not establish with a wrong code"
+        );
+        assert!(
+            sender.is_err(),
+            "sender must not treat a wrong-code peer as paired"
+        );
+        rendezvous.close().await;
     }
 
     #[tokio::test]

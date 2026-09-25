@@ -3,10 +3,19 @@ package com.rexvane.inkhole
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.RGBLuminanceSource
+import com.google.zxing.ReaderException
+import com.google.zxing.common.GlobalHistogramBinarizer
+import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.integration.android.IntentIntegrator
 import com.journeyapps.barcodescanner.ScanIntentResult
 import io.flutter.embedding.engine.FlutterEngine
@@ -38,13 +47,36 @@ class MainActivity : FlutterActivity() {
     private var pendingDirectoryPick: MethodChannel.Result? = null
     private var scannerChannel: MethodChannel? = null
     private var pendingScan: MethodChannel.Result? = null
+    private var pendingImageScan: MethodChannel.Result? = null
+    private var pendingTorch = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestNotificationPermissionIfNeeded()
         startLanService()
         cleanupShareCache()
         exportExecutor.execute { Exporter.cleanupPendingOrphans(this) }
         handleIncomingIntent(intent)
+    }
+
+    /**
+     * Android 13+ 的前台服务通知需要运行时授权；不请求的话通知永远不显示，
+     * 而 START_STICKY 重启后的服务会变成一个用户看不见的僵尸。
+     * 与相机权限一样走异步回调，拒绝也不影响主流程。
+     */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) return
+        try {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                REQUEST_NOTIFICATIONS,
+            )
+        } catch (_: Exception) {
+            // 权限请求本身失败不应阻止 UI 启动。
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -119,7 +151,8 @@ class MainActivity : FlutterActivity() {
         scannerChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SCANNER_CHANNEL).also { channel ->
             channel.setMethodCallHandler { call: MethodCall, result: MethodChannel.Result ->
                 when (call.method) {
-                    "scan" -> startScan(result)
+                    "scan" -> startScan(call.argument<Boolean>("torch") == true, result)
+                    "scanImage" -> startScanImage(result)
                     else -> result.notImplemented()
                 }
             }
@@ -184,6 +217,7 @@ class MainActivity : FlutterActivity() {
                 // contents 为 null 表示用户按返回键放弃了扫码。
                 pending.success(ScanIntentResult.parseActivityResult(resultCode, data).contents)
             }
+            REQUEST_SCAN_IMAGE -> completeImageScan(resultCode, data)
         }
     }
 
@@ -197,6 +231,7 @@ class MainActivity : FlutterActivity() {
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             launchScanner()
         } else {
+            pendingTorch = false
             val pending = pendingScan ?: return
             pendingScan = null
             pending.error("camera_denied", "需要相机权限才能扫描二维码", null)
@@ -223,12 +258,13 @@ class MainActivity : FlutterActivity() {
     }
 
     /** 扫码前先要相机权限;权限回调里再真正拉起取景界面。 */
-    private fun startScan(result: MethodChannel.Result) {
-        if (pendingScan != null) {
+    private fun startScan(torch: Boolean, result: MethodChannel.Result) {
+        if (pendingScan != null || pendingImageScan != null) {
             result.error("busy", "扫码进行中", null)
             return
         }
         pendingScan = result
+        pendingTorch = torch
         if (checkSelfPermission(android.Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
         ) {
@@ -238,7 +274,92 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun startScanImage(result: MethodChannel.Result) {
+        if (pendingScan != null || pendingImageScan != null) {
+            result.error("busy", "扫码进行中", null)
+            return
+        }
+        pendingImageScan = result
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            type = "image/*"
+            addCategory(Intent.CATEGORY_OPENABLE)
+        }
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(Intent.createChooser(intent, "选择二维码图片"), REQUEST_SCAN_IMAGE)
+        } catch (e: ActivityNotFoundException) {
+            pendingImageScan = null
+            result.error("scan_unavailable", e.message ?: "无法打开相册", null)
+        }
+    }
+
+    private fun completeImageScan(resultCode: Int, data: Intent?) {
+        val pending = pendingImageScan ?: return
+        pendingImageScan = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            pending.success(null)
+            return
+        }
+        shareExecutor.execute {
+            val text = try {
+                decodeQr(uri)
+            } catch (_: Exception) {
+                null
+            }
+            runOnUiThread {
+                if (text.isNullOrEmpty()) {
+                    pending.error("scan_not_found", "图片里没有识别到二维码", null)
+                } else {
+                    pending.success(text)
+                }
+            }
+        }
+    }
+
+    private fun decodeQr(uri: Uri): String? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize(bounds.outWidth, bounds.outHeight, 1600)
+        }
+        val bitmap = contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, options)
+        } ?: return null
+        return try {
+            val pixels = IntArray(bitmap.width * bitmap.height)
+            bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            val source = RGBLuminanceSource(bitmap.width, bitmap.height, pixels)
+            val reader = MultiFormatReader().apply {
+                setHints(mapOf(DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)))
+            }
+            try {
+                reader.decode(BinaryBitmap(HybridBinarizer(source))).text
+            } catch (_: ReaderException) {
+                reader.reset()
+                try {
+                    reader.decode(BinaryBitmap(GlobalHistogramBinarizer(source))).text
+                } catch (_: ReaderException) {
+                    null
+                }
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun sampleSize(width: Int, height: Int, maxEdge: Int): Int {
+        var sample = 1
+        while (width / sample > maxEdge || height / sample > maxEdge) sample *= 2
+        return sample
+    }
+
     private fun launchScanner() {
+        val torch = pendingTorch
+        pendingTorch = false
         val intent = IntentIntegrator(this)
             .setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
             .setPrompt("将一次性短码二维码放入框内")
@@ -246,6 +367,8 @@ class MainActivity : FlutterActivity() {
             .setOrientationLocked(true)
             .setCaptureActivity(PortraitCaptureActivity::class.java)
             .createScanIntent()
+        // zxing-android-embedded 认这个 extra，取景界面打开后点亮补光灯。
+        intent.putExtra("TORCH_ENABLED", torch)
         try {
             @Suppress("DEPRECATION")
             startActivityForResult(intent, REQUEST_SCAN)
@@ -296,9 +419,11 @@ class MainActivity : FlutterActivity() {
         exportExecutor.shutdownNow()
         pendingDirectoryPick?.error("activity_destroyed", "Activity was destroyed before directory selection completed", null)
         pendingScan?.error("activity_destroyed", "Activity was destroyed before scanning completed", null)
+        pendingImageScan?.error("activity_destroyed", "Activity was destroyed before scanning completed", null)
         exporterChannel = null
         pendingDirectoryPick = null
         pendingScan = null
+        pendingImageScan = null
         scannerChannel = null
         shareChannel = null
         shareClientReady = false
@@ -512,6 +637,8 @@ class MainActivity : FlutterActivity() {
         private const val REQUEST_PICK_DIRECTORY = 9107
         private const val REQUEST_SCAN = 9108
         private const val REQUEST_CAMERA = 9109
+        private const val REQUEST_SCAN_IMAGE = 9110
+        private const val REQUEST_NOTIFICATIONS = 9111
         private const val SHARE_CACHE_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
         private const val SHARE_CACHE_RESERVE_BYTES = 128L * 1024 * 1024
         private const val MAX_SHARED_FILE_BYTES = 1L shl 40

@@ -414,6 +414,8 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 mod tests {
     use std::{
         ffi::CStr,
+        fs,
+        path::{Path, PathBuf},
         sync::{Arc, Barrier},
         thread,
     };
@@ -421,6 +423,78 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    /// 版本号在仓库里出现在三处，必须保持一致：
+    ///   1. `rust/Cargo.toml`  `[workspace.package] version`（= `CORE_VERSION`）
+    ///   2. `mobile/pubspec.yaml` `version`                 —— 权威来源
+    ///   3. `mobile/lib/models.dart` `APP_VERSION` 的兜底默认值
+    ///
+    /// 第 2 项决定 Android `versionName` / iOS `CFBundleShortVersionString`，
+    /// 也是构建脚本注入 `--dart-define=APP_VERSION` 的来源；第 3 项只在
+    /// `flutter run` 这类没注入 dart-define 的开发构建里生效，但**更新检查
+    /// 拿它和线上 tag 比对**，漂移会让用户反复被提示"有新版本"。
+    /// 以前靠人记得三处同改，改漏了没有任何反馈，所以这里用机械校验钉住。
+    ///
+    /// 只比较语义版本，不含 pubspec 的 `+构建号`（构建号由 Flutter 单调递增，
+    /// 不参与版本比较）。
+    #[test]
+    fn version_sources_agree() {
+        let Some(root) = repo_root() else {
+            eprintln!("skipping version check: mobile/ workspace is not present");
+            return;
+        };
+        let core = env!("CARGO_PKG_VERSION");
+
+        let pubspec_path = root.join("mobile/pubspec.yaml");
+        let pubspec_raw = fs::read_to_string(&pubspec_path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", pubspec_path.display()));
+        let pubspec = pubspec_raw
+            .lines()
+            .find_map(|line| line.strip_prefix("version:"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|| panic!("{} has no version field", pubspec_path.display()));
+        let pubspec_semver = pubspec.split('+').next().unwrap_or_default().to_owned();
+
+        assert_eq!(
+            core, pubspec_semver,
+            "rust/Cargo.toml [workspace.package] version ({core}) and \
+             mobile/pubspec.yaml version ({pubspec_semver}) disagree; \
+             pubspec.yaml is the source of truth, update Cargo.toml to match"
+        );
+
+        let models_path = root.join("mobile/lib/models.dart");
+        let models = fs::read_to_string(&models_path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", models_path.display()));
+        let dart_default = default_app_version(&models).unwrap_or_else(|| {
+            panic!(
+                "{} has no `String.fromEnvironment('APP_VERSION', defaultValue: ...)`",
+                models_path.display()
+            )
+        });
+        assert_eq!(
+            pubspec_semver, dart_default,
+            "mobile/lib/models.dart APP_VERSION default ({dart_default}) and \
+             mobile/pubspec.yaml version ({pubspec_semver}) disagree; \
+             update the models.dart default to match pubspec.yaml"
+        );
+    }
+
+    /// 从 `../..` 相对 `inkhole-ffi` 定位仓库根；根下有 `mobile/` 才启用版本校验。
+    fn repo_root() -> Option<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let root = root.canonicalize().ok()?;
+        root.join("mobile/pubspec.yaml").is_file().then_some(root)
+    }
+
+    /// 抽取 `String.fromEnvironment('APP_VERSION', defaultValue: '2.0.14')` 里的
+    /// 字面量。先抹掉全部空白，这样调用被换行排版也不影响匹配，也免去为一行
+    /// 解析引入正则依赖。
+    fn default_app_version(source: &str) -> Option<String> {
+        const MARKER: &str = "String.fromEnvironment('APP_VERSION',defaultValue:'";
+        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        let value = compact.split_once(MARKER)?.1.split('\'').next()?;
+        (!value.is_empty()).then(|| value.to_owned())
+    }
 
     unsafe fn take_output(value: *mut c_char) -> String {
         assert!(!value.is_null());

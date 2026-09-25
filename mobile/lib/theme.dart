@@ -15,6 +15,7 @@ const Color surfaceBorder = Color(0xFF172623);
 const Color surfaceBorderSubtle = Color(0x33172623);
 
 /// 翡翠青玉强调色系 (Jade & Phosphor Cyan)
+const Color jade200 = Color(0xFF8BFFD3);
 const Color jade300 = Color(0xFF7EEDC6);
 const Color jade400 = Color(0xFF52E5B5);
 const Color jade500 = Color(0xFF2DD4BF);

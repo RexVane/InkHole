@@ -120,28 +120,14 @@ class DeviceOrbitNode extends StatelessWidget {
                     children: <Widget>[
                       Text(
                         peer.viaSsh
-                            ? 'Tailscale · 12ms'
-                            : (peer.host.isNotEmpty ? peer.host : 'QUIC 直连'),
+                            ? '中继'
+                            : (peer.host.isNotEmpty ? peer.host : '已发现'),
                         style: TextStyle(
                           color: isSelected ? jade400 : textMuted,
                           fontSize: 9,
                           fontFamily: 'monospace',
                         ),
                       ),
-                      if (!peer.viaSsh) ...<Widget>[
-                        const Text(
-                          ' · ',
-                          style: TextStyle(color: textDim, fontSize: 9),
-                        ),
-                        const Text(
-                          '580M',
-                          style: TextStyle(
-                            color: Color(0xFF34D399),
-                            fontSize: 9,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ],
                     ],
                   ),
                 ],

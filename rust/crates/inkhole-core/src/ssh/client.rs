@@ -28,8 +28,10 @@ const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const INCOMING_CHANNEL_CAPACITY: usize = 64;
 const MAX_PRIVATE_KEY_BYTES: usize = 1024 * 1024;
 
+/// SSH 中继连接档案。只从 FFI 参数读入(mobile 端逐字段拼装后下发),
+/// 不来自对端报文,因此 `deny_unknown_fields` 不会破坏前向兼容。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct SshProfile {
     pub id: String,
     pub host: String,

@@ -36,15 +36,17 @@ class CyberRadar extends StatefulWidget {
 }
 
 class _CyberRadarState extends State<CyberRadar>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController _sweepAnim;
   late final AnimationController _spinSlow;
   late final AnimationController _spinReverse;
   late final AnimationController _pulseRing;
+  bool _ticking = true;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // 雷达扫描锥面 5s 周期
     _sweepAnim = AnimationController(
       vsync: this,
@@ -71,7 +73,33 @@ class _CyberRadarState extends State<CyberRadar>
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 应用退到后台时停掉 4 个常驻动画，避免持续耗电。
+    final bool shouldTick = state == AppLifecycleState.resumed;
+    if (shouldTick != _ticking) _setTicking(shouldTick);
+  }
+
+  void _setTicking(bool value) {
+    _ticking = value;
+    for (final AnimationController controller in <AnimationController>[
+      _sweepAnim,
+      _spinSlow,
+      _spinReverse,
+      _pulseRing,
+    ]) {
+      if (value) {
+        if (!controller.isAnimating) {
+          controller.repeat(reverse: identical(controller, _pulseRing));
+        }
+      } else if (controller.isAnimating) {
+        controller.stop();
+      }
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _sweepAnim.dispose();
     _spinSlow.dispose();
     _spinReverse.dispose();

@@ -23,3 +23,4 @@ received/
 
 # 本地会话工具目录
 .zcode/
+.workbuddy/

@@ -45,6 +45,12 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>InkHole uses the camera to scan a pairing code inside the connect screen.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>InkHole uses the local network to discover nearby devices and transfer files.</string>
 	<key>NSBonjourServices</key>

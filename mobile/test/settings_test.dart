@@ -22,6 +22,16 @@ void main() {
           parseScannedCode('  7-guitarist-revenge  '), '7-guitarist-revenge');
     });
 
+    test('认 inkhole: 前缀和接收链接编码', () {
+      expect(parseScannedCode('inkhole:7-guitarist-revenge'), '7-guitarist-revenge');
+      expect(
+        parseScannedCode(wormholeReceiveUri('7-guitarist-revenge')),
+        '7-guitarist-revenge',
+      );
+      expect(looksLikeShortCode('7-guitarist-revenge'), isTrue);
+      expect(looksLikeShortCode('inkhole:7-guitarist-revenge'), isFalse);
+    });
+
     test('拒绝无关链接和空内容', () {
       expect(parseScannedCode('https://example.com'), isNull);
       expect(parseScannedCode('inkhole://pair?code=abc'), isNull);
@@ -39,6 +49,54 @@ void main() {
       expect(decoded.name, peer.name);
       expect(decoded.host, peer.host);
       expect(decoded.port, peer.port);
+    });
+
+    test('QUIC 端口不会被当成发现端口', () {
+      final ManualPeer quic = parseManualEndpoint('100.64.0.2:41300', name: 'Tailscale');
+      expect(quic.host, '100.64.0.2');
+      expect(quic.port, 0);
+      expect(discoveryTargetFor(quic), '100.64.0.2');
+
+      final ManualPeer custom = parseManualEndpoint('nas.local:42000');
+      expect(custom.port, 42000);
+      expect(discoveryTargetFor(custom), 'nas.local:42000');
+
+      final ManualPeer v6 = parseManualEndpoint('[fe80::1]:41300');
+      expect(v6.host, 'fe80::1');
+      expect(v6.port, 0);
+      expect(sameEndpointHost('100.64.0.2:41300', '100.64.0.2'), isTrue);
+    });
+
+    test('IPv6 节点往返设置页不会被损坏', () {
+      // 设置页把 ManualPeer 渲染成可编辑文本；拼接时必须给 IPv6 加方括号，
+      // 否则二次解析会把 `fe80::1:41301` 当成"含多个冒号的主机名"而整串损坏，
+      // 存入配置并下发为无效的 discovery_targets。
+      final ManualPeer v6 = parseManualEndpoint('[fe80::1]:42000', name: 'Tailscale');
+      expect(v6.host, 'fe80::1');
+      expect(v6.port, 42000);
+
+      final String rendered = formatManualEndpoint(v6);
+      expect(rendered, '[fe80::1]:42000');
+
+      final ManualPeer roundTripped = parseManualEndpoint(rendered, name: 'Tailscale');
+      expect(roundTripped.host, 'fe80::1');
+      expect(roundTripped.port, 42000);
+
+      // 连往返两轮也要保持一致，避免每次保存都累积污染。
+      expect(formatManualEndpoint(roundTripped), rendered);
+
+      // 无端口的 IPv6 只渲染主机，不画蛇添足加括号。
+      final ManualPeer bare = parseManualEndpoint('[fe80::1]', name: 'Tailscale');
+      expect(bare.port, 0);
+      expect(formatManualEndpoint(bare), 'fe80::1');
+    });
+
+    test('废弃的明文会合点交给核心默认地址', () {      expect(normalizeRendezvousUrl('ws://relay.magic-wormhole.io:4000/v1'), '');
+      expect(normalizeRendezvousUrl(''), '');
+      expect(
+        normalizeRendezvousUrl('wss://relay.example/v1'),
+        'wss://relay.example/v1',
+      );
     });
 
     test('无备注无端口也能往返', () {

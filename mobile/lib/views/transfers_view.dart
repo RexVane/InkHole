@@ -18,7 +18,6 @@ class TransfersView extends StatelessWidget {
     required this.onClearHistory,
     required this.onOpenFile,
     required this.onRefresh,
-    required this.onOpenPairQr,
     required this.onOpenSettings,
   });
 
@@ -34,7 +33,6 @@ class TransfersView extends StatelessWidget {
   final VoidCallback onClearHistory;
   final ValueChanged<ReceivedFile> onOpenFile;
   final VoidCallback onRefresh;
-  final VoidCallback onOpenPairQr;
   final VoidCallback onOpenSettings;
 
   @override
@@ -74,12 +72,6 @@ class TransfersView extends StatelessWidget {
           IconButton(
             onPressed: onRefresh,
             icon: const Icon(Icons.refresh, size: 21),
-            color: textMuted,
-            splashRadius: 18,
-          ),
-          IconButton(
-            onPressed: onOpenPairQr,
-            icon: const Icon(Icons.language, size: 21),
             color: textMuted,
             splashRadius: 18,
           ),
@@ -158,7 +150,7 @@ class TransfersView extends StatelessWidget {
                   ),
                   const SizedBox(width: 6),
                   Text(
-                    hasActive ? 'TRANSFERRING · QUIC_STREAM' : 'STANDBY · READY',
+                    hasActive ? '传输中' : '空闲',
                     style: const TextStyle(
                       color: jade400,
                       fontSize: 10,
@@ -169,36 +161,7 @@ class TransfersView extends StatelessWidget {
                   ),
                 ],
               ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: surfaceActive,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: borderLuminescent),
-                ),
-                child: Row(
-                  children: <Widget>[
-                    Container(
-                      width: 5,
-                      height: 5,
-                      decoration: const BoxDecoration(
-                        color: jade400,
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 5),
-                    const Text(
-                      'TLS 1.3 ENCRYPTED',
-                      style: TextStyle(
-                        color: badgeRoute,
-                        fontSize: 9,
-                        fontFamily: 'monospace',
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+              const SizedBox.shrink(),
             ],
           ),
           const SizedBox(height: 14),
@@ -287,7 +250,7 @@ class TransfersView extends StatelessWidget {
                 ),
               ),
               FractionallySizedBox(
-                widthFactor: fraction.clamp(0.01, 1.0),
+                widthFactor: fraction <= 0 ? 0 : fraction.clamp(0.0, 1.0),
                 child: Container(
                   height: 6,
                   decoration: BoxDecoration(
@@ -302,26 +265,6 @@ class TransfersView extends StatelessWidget {
                       ),
                     ],
                   ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-
-          // 校验与断点提示
-          const Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: <Widget>[
-              Text(
-                'BLAKE3 树状并行块流水线',
-                style: TextStyle(color: textDim, fontSize: 10),
-              ),
-              Text(
-                '断点续传就绪',
-                style: TextStyle(
-                  color: badgeRoute,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w600,
                 ),
               ),
             ],
@@ -351,7 +294,7 @@ class TransfersView extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       const Text(
-                        'TRANSPORT MODE',
+                        '监听端口',
                         style: TextStyle(
                           color: textDim,
                           fontSize: 9,
@@ -360,7 +303,7 @@ class TransfersView extends StatelessWidget {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        'QUIC 直连 :$listenPort',
+                        ':$listenPort',
                         style: const TextStyle(
                           color: textPrimary,
                           fontSize: 11,
@@ -368,54 +311,11 @@ class TransfersView extends StatelessWidget {
                           fontFamily: 'monospace',
                         ),
                       ),
-                      const SizedBox(height: 1),
-                      const Text(
-                        '双向对称多路复用',
-                        style: TextStyle(color: textMuted, fontSize: 9),
-                      ),
                     ],
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: surfaceLowest,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: surfaceBorder),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      const Text(
-                        'LATENCY & MTU',
-                        style: TextStyle(
-                          color: textDim,
-                          fontSize: 9,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      const Text(
-                        '2.4 ms (1280 字节)',
-                        style: TextStyle(
-                          color: textPrimary,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                      const SizedBox(height: 1),
-                      const Text(
-                        'PMTU 自适应探测',
-                        style: TextStyle(color: textMuted, fontSize: 9),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+
             ],
           ),
           const SizedBox(height: 14),
@@ -592,12 +492,7 @@ class TransfersView extends StatelessWidget {
                                 ),
                               ),
                             ),
-                            const SizedBox(width: 4),
-                            const Icon(
-                              Icons.verified,
-                              color: jade400,
-                              size: 14,
-                            ),
+
                           ],
                         ),
                         const SizedBox(height: 2),
@@ -613,7 +508,7 @@ class TransfersView extends StatelessWidget {
                             ),
                             const Text(' · ', style: TextStyle(color: textDim, fontSize: 10)),
                             Text(
-                              file.sender.isNotEmpty ? file.sender : '来自对端',
+                              file.sender.isNotEmpty ? file.sender : '来源未知',
                               style: const TextStyle(color: textMuted, fontSize: 10),
                             ),
                           ],

@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import '../models.dart';
 import '../theme.dart';
 
 /// Tab 3: 配对与扫码互联视图 (Pair Qr)
@@ -15,15 +17,33 @@ class PairView extends StatefulWidget {
     required this.onOpenSettings,
     required this.onManualIpConnect,
     required this.onJoinWormholeCode,
+    this.passcodeExpiresAt,
+    this.cameraEnabled = false,
+    this.onScanned,
+    this.onScanImage,
+    this.onPickAndCreateWormhole,
+    this.onPasscodeExpired,
+    this.scanRequest = 0,
   });
 
   final int listenPort;
   final String passcode;
+  final DateTime? passcodeExpiresAt;
   final String identityFingerprint;
   final VoidCallback onBackToRadar;
   final VoidCallback onOpenSettings;
   final VoidCallback onManualIpConnect;
   final ValueChanged<String> onJoinWormholeCode;
+
+  /// 配对页正在前台时才打开框内相机，避免切到别的页还占着摄像头。
+  final bool cameraEnabled;
+  final ValueChanged<String>? onScanned;
+  final VoidCallback? onScanImage;
+  final VoidCallback? onPickAndCreateWormhole;
+  final VoidCallback? onPasscodeExpired;
+
+  /// 雷达上的「扫码配对」每次加一，用来切到扫一扫并打开相机。
+  final int scanRequest;
 
   @override
   State<PairView> createState() => _PairViewState();
@@ -31,37 +51,61 @@ class PairView extends StatefulWidget {
 
 class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin {
   int _activeTab = 0; // 0 = 我的动态码, 1 = 扫一扫互联
+  late int _seenScanRequest;
   bool _copied = false;
-  bool _flashlightOn = false;
+  bool _expiryNotified = false;
 
   Timer? _countdownTimer;
-  int _remainingSeconds = 272; // 04:32
 
   late final AnimationController _laserAnim;
 
   @override
   void initState() {
     super.initState();
-    _startCountdown();
+    _seenScanRequest = widget.scanRequest;
+    if (widget.scanRequest > 0) _activeTab = 1;
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (Timer timer) {
+      _tickCountdown();
+    });
     _laserAnim = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1800),
     )..repeat(reverse: true);
   }
 
-  void _startCountdown() {
-    _countdownTimer?.cancel();
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (Timer timer) {
-      if (mounted) {
-        setState(() {
-          if (_remainingSeconds > 0) {
-            _remainingSeconds--;
-          } else {
-            _remainingSeconds = 300;
-          }
-        });
-      }
-    });
+  @override
+  void didUpdateWidget(covariant PairView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.passcode != widget.passcode ||
+        oldWidget.passcodeExpiresAt != widget.passcodeExpiresAt) {
+      _expiryNotified = false;
+    }
+    if (widget.scanRequest != _seenScanRequest) {
+      _seenScanRequest = widget.scanRequest;
+      setState(() => _activeTab = 1);
+    }
+  }
+
+  int get _remainingSeconds {
+    final DateTime? expiry = widget.passcodeExpiresAt;
+    if (widget.passcode.trim().isEmpty || expiry == null) return 0;
+    final int next = expiry.difference(DateTime.now()).inSeconds;
+    return next > 0 ? next : 0;
+  }
+
+  void _tickCountdown() {
+    if (!mounted) return;
+    final DateTime? expiry = widget.passcodeExpiresAt;
+    final bool hasCode = widget.passcode.trim().isNotEmpty;
+    final int next = (!hasCode || expiry == null)
+        ? 0
+        : expiry.difference(DateTime.now()).inSeconds;
+    if (hasCode && expiry != null && next <= 0 && !_expiryNotified) {
+      _expiryNotified = true;
+      widget.onPasscodeExpired?.call();
+    }
+    if (next > 0) _expiryNotified = false;
+    setState(() {});
   }
 
   @override
@@ -72,10 +116,19 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
   }
 
   String get _formattedCountdown {
+    if (widget.passcode.trim().isEmpty || widget.passcodeExpiresAt == null) {
+      return '未生成';
+    }
+    if (_remainingSeconds <= 0) return '已过期';
     final int minutes = _remainingSeconds ~/ 60;
     final int seconds = _remainingSeconds % 60;
     return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
   }
+
+  bool get _countdownActive =>
+      widget.passcode.trim().isNotEmpty &&
+      widget.passcodeExpiresAt != null &&
+      _remainingSeconds > 0;
 
   @override
   Widget build(BuildContext context) {
@@ -95,12 +148,6 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
           ),
         ),
         actions: <Widget>[
-          IconButton(
-            onPressed: () {},
-            icon: const Icon(Icons.language, size: 20),
-            color: textMuted,
-            splashRadius: 18,
-          ),
           IconButton(
             onPressed: widget.onOpenSettings,
             icon: const Icon(Icons.settings_outlined, size: 20),
@@ -222,9 +269,8 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
   }
 
   Widget _buildMyQrView() {
-    final String codeText = widget.passcode.isNotEmpty
-        ? widget.passcode
-        : '7-starburst-hydra-quantum';
+    final String codeText = widget.passcode.trim();
+    final bool hasCode = codeText.isNotEmpty;
 
     return Container(
       constraints: const BoxConstraints(maxWidth: 340),
@@ -292,11 +338,13 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                               fontWeight: FontWeight.w700,
                             ),
                           ),
-                          const SizedBox(width: 3),
-                          const Text(
-                            '有效',
-                            style: TextStyle(color: textDim, fontSize: 10),
-                          ),
+                          if (_countdownActive) ...<Widget>[
+                            const SizedBox(width: 3),
+                            const Text(
+                              '有效',
+                              style: TextStyle(color: textDim, fontSize: 10),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -339,9 +387,9 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                         child: _CornerReticle(isTop: false, isLeft: false),
                       ),
 
-                      // 二维码本体
+                      if (hasCode)
                       QrImageView(
-                        data: 'inkhole:$codeText',
+                        data: wormholeReceiveUri(codeText),
                         version: QrVersions.auto,
                         size: 180,
                         eyeStyle: const QrEyeStyle(
@@ -352,7 +400,16 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                           dataModuleShape: QrDataModuleShape.square,
                           color: textPrimary,
                         ),
-                      ),
+                      )
+                      else
+                        const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 16),
+                          child: Text(
+                            '选择文件后生成暗号',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: textMuted, fontSize: 12),
+                          ),
+                        ),
 
                       // 中心微型墨洞图腾点
                       Container(
@@ -405,6 +462,7 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                           ),
                           GestureDetector(
                             onTap: () {
+                              if (!hasCode) return;
                               Clipboard.setData(ClipboardData(text: codeText));
                               setState(() => _copied = true);
                               Future<void>.delayed(const Duration(seconds: 2), () {
@@ -434,7 +492,7 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        '# $codeText',
+                        hasCode ? '# $codeText' : '# 尚未生成',
                         style: const TextStyle(
                           color: jade400,
                           fontSize: 13,
@@ -492,32 +550,31 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
           ),
           const SizedBox(height: 14),
 
-          // 开启摄像头扫码 CTA 按钮
-          SizedBox(
-            width: double.infinity,
-            height: 44,
-            child: ElevatedButton.icon(
-              onPressed: () => setState(() => _activeTab = 1),
-              icon: const Icon(Icons.photo_camera, size: 18, color: bgAbyss),
-              label: const Text(
-                '开启摄像头扫码',
-                style: TextStyle(
-                  color: bgAbyss,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+          if (widget.onPickAndCreateWormhole != null) ...<Widget>[
+            SizedBox(
+              width: double.infinity,
+              height: 42,
+              child: OutlinedButton.icon(
+                onPressed: widget.onPickAndCreateWormhole,
+                icon: const Icon(Icons.key, size: 16, color: jade400),
+                label: const Text(
+                  '选择待发文件生成专属暗号',
+                  style: TextStyle(
+                    color: textPrimary,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: jade400,
-                elevation: 4,
-                shadowColor: jade400.withValues(alpha: 0.35),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(22),
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: surfaceBorder),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(20),
+                  ),
                 ),
               ),
             ),
-          ),
-          const SizedBox(height: 8),
+            const SizedBox(height: 10),
+          ],
 
           // 直接输入 IP 入口
           GestureDetector(
@@ -530,92 +587,26 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                   Icon(Icons.link, color: textMuted, size: 14),
                   SizedBox(width: 4),
                   Text(
-                    '直接输入对端 IP / 域名连接',
+                    '添加对端地址，发现后再发送',
                     style: TextStyle(color: textMuted, fontSize: 11),
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(height: 14),
-
-          // 对等安全探针卡片
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: surfaceContainer,
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: borderLuminescent),
+          if (widget.identityFingerprint.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 14),
+            Text(
+              '证书指纹 ${widget.identityFingerprint}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: textMuted,
+                fontSize: 10,
+                fontFamily: 'monospace',
+              ),
             ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                const Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: <Widget>[
-                    Row(
-                      children: <Widget>[
-                        Icon(Icons.security, color: jade400, size: 16),
-                        SizedBox(width: 6),
-                        Text(
-                          '对等加密与打洞探针',
-                          style: TextStyle(
-                            color: textPrimary,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ],
-                    ),
-                    Text(
-                      'ED25519-P2P',
-                      style: TextStyle(
-                        color: badgeRoute,
-                        fontSize: 9,
-                        fontFamily: 'monospace',
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: surfaceLowest,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: <Widget>[
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            const Text(
-                              '通道公钥指纹 (BLAKE3)',
-                              style: TextStyle(color: textDim, fontSize: 9),
-                            ),
-                            Text(
-                              'ed25519:${widget.identityFingerprint}:quic-v1',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: textMuted,
-                                fontSize: 10,
-                                fontFamily: 'monospace',
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const Icon(Icons.verified, color: jade400, size: 16),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
+          ],
         ],
       ),
     );
@@ -626,157 +617,11 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
       constraints: const BoxConstraints(maxWidth: 340),
       child: Column(
         children: <Widget>[
-          // 仿相机取景器
-          Container(
-            width: double.infinity,
-            height: 320,
-            decoration: BoxDecoration(
-              color: surfaceLowest,
-              borderRadius: BorderRadius.circular(24),
-              border: Border.all(color: borderLuminescent),
-            ),
-            child: Stack(
-              alignment: Alignment.center,
-              children: <Widget>[
-                // 扫描框与四角
-                Container(
-                  width: 220,
-                  height: 220,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: surfaceBorder),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Stack(
-                    children: <Widget>[
-                      const Positioned(
-                        top: -1,
-                        left: -1,
-                        child: _CornerReticle(isTop: true, isLeft: true),
-                      ),
-                      const Positioned(
-                        top: -1,
-                        right: -1,
-                        child: _CornerReticle(isTop: true, isLeft: false),
-                      ),
-                      const Positioned(
-                        bottom: -1,
-                        left: -1,
-                        child: _CornerReticle(isTop: false, isLeft: true),
-                      ),
-                      const Positioned(
-                        bottom: -1,
-                        right: -1,
-                        child: _CornerReticle(isTop: false, isLeft: false),
-                      ),
-
-                      // 动画量子激光扫描线
-                      AnimatedBuilder(
-                        animation: _laserAnim,
-                        builder: (BuildContext context, Widget? child) {
-                          return Positioned(
-                            top: _laserAnim.value * 200,
-                            left: 0,
-                            right: 0,
-                            child: Container(
-                              height: 2,
-                              decoration: BoxDecoration(
-                                gradient: const LinearGradient(
-                                  colors: <Color>[
-                                    Colors.transparent,
-                                    jade400,
-                                    Colors.transparent,
-                                  ],
-                                ),
-                                boxShadow: <BoxShadow>[
-                                  BoxShadow(
-                                    color: jade400.withValues(alpha: 0.8),
-                                    blurRadius: 8,
-                                    spreadRadius: 1,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ],
-                  ),
-                ),
-
-                // 底部文字提示
-                Positioned(
-                  bottom: 16,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-                    decoration: BoxDecoration(
-                      color: surfaceContainer.withValues(alpha: 0.9),
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: surfaceBorder),
-                    ),
-                    child: const Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: <Widget>[
-                        Icon(Icons.center_focus_strong, color: jade400, size: 14),
-                        SizedBox(width: 6),
-                        Text(
-                          '将对端墨洞二维码置于框内',
-                          style: TextStyle(color: textPrimary, fontSize: 11),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 14),
-
-          // 补光灯与相册导入
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: <Widget>[
-              ElevatedButton.icon(
-                onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('已选择相册导入二维码'),
-                      duration: Duration(seconds: 1),
-                    ),
-                  );
-                },
-                icon: const Icon(Icons.photo_library, size: 16, color: jade400),
-                label: const Text(
-                  '相册导入',
-                  style: TextStyle(color: textPrimary, fontSize: 11),
-                ),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: surfaceContainer,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    side: const BorderSide(color: surfaceBorder),
-                  ),
-                ),
-              ),
-              ElevatedButton.icon(
-                onPressed: () => setState(() => _flashlightOn = !_flashlightOn),
-                icon: Icon(
-                  _flashlightOn ? Icons.flash_on : Icons.flash_off,
-                  size: 16,
-                  color: jade400,
-                ),
-                label: Text(
-                  _flashlightOn ? '关闭补光' : '补光灯',
-                  style: const TextStyle(color: textPrimary, fontSize: 11),
-                ),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: surfaceContainer,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
-                    side: const BorderSide(color: surfaceBorder),
-                  ),
-                ),
-              ),
-            ],
+          _LiveFinder(
+            active: widget.cameraEnabled && _activeTab == 1,
+            laser: _laserAnim,
+            onScanned: widget.onScanned ?? widget.onJoinWormholeCode,
+            onScanImage: widget.onScanImage,
           ),
           const SizedBox(height: 14),
 
@@ -805,6 +650,265 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
           ),
         ],
       ),
+    );
+  }
+}
+
+class _LiveFinder extends StatefulWidget {
+  const _LiveFinder({
+    required this.active,
+    required this.laser,
+    required this.onScanned,
+    this.onScanImage,
+  });
+
+  final bool active;
+  final Animation<double> laser;
+  final ValueChanged<String> onScanned;
+  final VoidCallback? onScanImage;
+
+  @override
+  State<_LiveFinder> createState() => _LiveFinderState();
+}
+
+class _LiveFinderState extends State<_LiveFinder> {
+  MobileScannerController? _controller;
+  String? _lastRaw;
+  bool _torchOn = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.active) {
+      _controller = MobileScannerController(
+        detectionSpeed: DetectionSpeed.normal,
+        formats: const <BarcodeFormat>[BarcodeFormat.qrCode],
+        facing: CameraFacing.back,
+        torchEnabled: _torchOn,
+      );
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _LiveFinder oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.active != widget.active) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _syncCamera();
+      });
+    }
+  }
+
+  void _syncCamera() {
+    if (widget.active && _controller == null) {
+      setState(() {
+        _controller = MobileScannerController(
+          detectionSpeed: DetectionSpeed.normal,
+          formats: const <BarcodeFormat>[BarcodeFormat.qrCode],
+          facing: CameraFacing.back,
+          torchEnabled: _torchOn,
+        );
+      });
+      return;
+    }
+    if (!widget.active && _controller != null) {
+      final MobileScannerController old = _controller!;
+      setState(() {
+        _controller = null;
+        _lastRaw = null;
+      });
+      old.dispose();
+    }
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    for (final Barcode barcode in capture.barcodes) {
+      final String raw = (barcode.rawValue ?? '').trim();
+      if (raw.isEmpty || raw == _lastRaw) continue;
+      _lastRaw = raw;
+      widget.onScanned(raw);
+      return;
+    }
+  }
+
+  Future<void> _toggleTorch() async {
+    final MobileScannerController? controller = _controller;
+    if (controller == null) return;
+    await controller.toggleTorch();
+    if (!mounted) return;
+    setState(() => _torchOn = !_torchOn);
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final MobileScannerController? controller = _controller;
+    return Column(
+      children: <Widget>[
+        ClipRRect(
+          borderRadius: BorderRadius.circular(24),
+          child: Container(
+            width: double.infinity,
+            height: 320,
+            decoration: BoxDecoration(
+              color: surfaceLowest,
+              border: Border.all(color: borderLuminescent),
+            ),
+            child: Stack(
+              alignment: Alignment.center,
+              children: <Widget>[
+                if (controller != null)
+                  MobileScanner(
+                    controller: controller,
+                    onDetect: _onDetect,
+                    fit: BoxFit.cover,
+                    errorBuilder: (BuildContext context, MobileScannerException error, Widget? child) {
+                      return const ColoredBox(
+                        color: surfaceLowest,
+                        child: Center(
+                          child: Padding(
+                            padding: EdgeInsets.all(24),
+                            child: Text(
+                              '需要相机权限，才能在这个框里直接扫描',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: textMuted, fontSize: 12),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  )
+                else
+                  const ColoredBox(color: surfaceLowest),
+                IgnorePointer(
+                  child: Container(
+                    width: 220,
+                    height: 220,
+                    decoration: BoxDecoration(
+                      border: Border.all(color: surfaceBorder),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Stack(
+                      children: <Widget>[
+                        const Positioned(
+                          top: -1,
+                          left: -1,
+                          child: _CornerReticle(isTop: true, isLeft: true),
+                        ),
+                        const Positioned(
+                          top: -1,
+                          right: -1,
+                          child: _CornerReticle(isTop: true, isLeft: false),
+                        ),
+                        const Positioned(
+                          bottom: -1,
+                          left: -1,
+                          child: _CornerReticle(isTop: false, isLeft: true),
+                        ),
+                        const Positioned(
+                          bottom: -1,
+                          right: -1,
+                          child: _CornerReticle(isTop: false, isLeft: false),
+                        ),
+                        AnimatedBuilder(
+                          animation: widget.laser,
+                          builder: (BuildContext context, Widget? child) {
+                            return Positioned(
+                              top: widget.laser.value * 200,
+                              left: 0,
+                              right: 0,
+                              child: Container(
+                                height: 2,
+                                decoration: BoxDecoration(
+                                  gradient: const LinearGradient(
+                                    colors: <Color>[
+                                      Colors.transparent,
+                                      jade400,
+                                      Colors.transparent,
+                                    ],
+                                  ),
+                                  boxShadow: <BoxShadow>[
+                                    BoxShadow(
+                                      color: jade400,
+                                      blurRadius: 8,
+                                      spreadRadius: 1,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const Positioned(
+                  bottom: 16,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: Color(0xE60D1516),
+                      borderRadius: BorderRadius.all(Radius.circular(16)),
+                    ),
+                    child: Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                      child: Text(
+                        '将二维码放入框内',
+                        style: TextStyle(color: textPrimary, fontSize: 11),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: <Widget>[
+            ElevatedButton.icon(
+              onPressed: widget.onScanImage,
+              icon: const Icon(Icons.photo_library, size: 16, color: jade400),
+              label: const Text(
+                '相册导入',
+                style: TextStyle(color: textPrimary, fontSize: 11),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: surfaceContainer,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                  side: const BorderSide(color: surfaceBorder),
+                ),
+              ),
+            ),
+            ElevatedButton.icon(
+              onPressed: controller == null ? null : _toggleTorch,
+              icon: Icon(
+                _torchOn ? Icons.flash_on : Icons.flash_off,
+                size: 16,
+                color: jade400,
+              ),
+              label: Text(
+                _torchOn ? '关闭补光' : '补光灯',
+                style: const TextStyle(color: textPrimary, fontSize: 11),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: surfaceContainer,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                  side: const BorderSide(color: surfaceBorder),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

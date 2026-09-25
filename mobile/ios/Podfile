@@ -1,4 +1,5 @@
-platform :ios, '12.0'
+# mobile_scanner 6.0.11 的 podspec 要求 iOS >= 15.5，低于此版本 pod install 会直接失败。
+platform :ios, '15.5'
 
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 

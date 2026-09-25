@@ -34,6 +34,9 @@ const MAX_PENDING_PROBES: usize = 16;
 const MAX_DISCOVERED_PEERS: usize = 256;
 const MAX_MDNS_EVENTS: usize = 128;
 const MDNS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+/// 立即关停时给 run 循环收尾(mDNS 注销/关停)的宽限时间。
+/// 正常路径是毫秒级:两次 MDNS_CLEANUP_TIMEOUT 上界约 2s，取 3s 留余量。
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const MAX_UDP_ERROR_STREAK: u32 = 50;
 const UDP_ERROR_BACKOFF: Duration = Duration::from_millis(250);
 /// 同一入站 IP 的反向信标最小间隔。
@@ -262,12 +265,26 @@ impl UdpDiscovery {
         self.hints.clone()
     }
 
+    /// 立即关停发现。
+    ///
+    /// 不能只 `abort()`:run 循环的 mDNS 清理(`shutdown_mdns`)是异步的，
+    /// abort 会在 await 点直接砍掉 future，导致每次会话启停都泄漏一个
+    /// mDNS 守护线程 + 5353 socket + 一条永久应答的死注册(重启后还会与
+    /// 同名注册冲突)。
+    ///
+    /// 因此这里先 cancel(让 run 循环自然走到清理段)，并 spawn 一个带超时的
+    /// 等待任务:正常情况在毫秒级释放全部资源，异常情况也不会挂住调用方。
     pub fn close_immediately(&self) {
         self.cancellation.cancel();
-        if let Ok(mut task) = self.task.lock()
-            && let Some(task) = task.take()
-        {
-            task.abort();
+        let task = self.task.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(task) = task {
+            // 调用点都在同步上下文(析构/Drop)里，起一个后台任务等它收尾。
+            tokio::spawn(async move {
+                if tokio::time::timeout(SHUTDOWN_GRACE, task).await.is_err() {
+                    // 超时说明 run 循环卡在某个 socket 操作上，此时才放弃等待。
+                    tracing::debug!("discovery task did not shut down within grace period");
+                }
+            });
         }
     }
 
@@ -1180,6 +1197,14 @@ fn validate_config(config: &mut UdpDiscoveryConfig) -> Result<()> {
 
 fn bind_udp_socket(address: SocketAddr) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    // SO_REUSEADDR 是刻意的:同机多实例要能共享 41301，各自收广播并做本机
+    // 互发现(有测试覆盖:json_services_discover_send_by_instance_id_*，
+    // 仅在 macOS 上跳过，因为 macOS 的广播扇出不投递给多个 socket)。
+    //
+    // 需要留意它的代价:Windows 上是"后绑者劫持"语义，所以同机双实例时
+    // 单播 reply 只会投给其中一个，且端口被占时不会走到下面那段"回退临时
+    // 端口"的分支——那是给"被其他程序占用"准备的，不是给本应用第二实例的。
+    // 本机互发现靠周期 announce + 对方应答补齐，不依赖单播 reply。
     socket.set_reuse_address(true)?;
     socket.set_broadcast(true)?;
     socket.set_nonblocking(true)?;

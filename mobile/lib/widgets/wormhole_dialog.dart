@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import '../models.dart';
 import '../theme.dart';
 
 /// 暗号直连模态浮层 (Wormhole Code Pairing Modal)
@@ -18,7 +19,9 @@ class WormholePairingDialog extends StatefulWidget {
     required this.isGenerating,
     required this.onRefreshCode,
     required this.onJoinCode,
+    this.onPickFilesToSend,
     this.initialTab = 0,
+    this.expiresAt,
   });
 
   /// 当前生成的暗号 (例如 7-starburst-hydra)
@@ -33,7 +36,11 @@ class WormholePairingDialog extends StatefulWidget {
   /// 提交输入的暗号进行连接
   final ValueChanged<String> onJoinCode;
 
+  /// 选择待发文件并生成口令
+  final VoidCallback? onPickFilesToSend;
+
   final int initialTab;
+  final DateTime? expiresAt;
 
   @override
   State<WormholePairingDialog> createState() => _WormholePairingDialogState();
@@ -46,29 +53,21 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
   bool _showQrCode = false;
 
   Timer? _countdownTimer;
-  int _remainingSeconds = 300; // 5分钟
 
   @override
   void initState() {
     super.initState();
     _tabIndex = widget.initialTab;
-    _startCountdown();
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (Timer timer) {
+      if (mounted) setState(() {});
+    });
   }
 
-  void _startCountdown() {
-    _countdownTimer?.cancel();
-    _remainingSeconds = 300;
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (Timer timer) {
-      if (mounted) {
-        setState(() {
-          if (_remainingSeconds > 0) {
-            _remainingSeconds--;
-          } else {
-            _remainingSeconds = 300;
-          }
-        });
-      }
-    });
+  int get _remainingSeconds {
+    final DateTime? expiry = widget.expiresAt;
+    if (widget.passcode.trim().isEmpty || expiry == null) return 0;
+    final int next = expiry.difference(DateTime.now()).inSeconds;
+    return next > 0 ? next : 0;
   }
 
   @override
@@ -79,6 +78,8 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
   }
 
   String get _formattedCountdown {
+    if (widget.expiresAt == null || widget.passcode.trim().isEmpty) return '';
+    if (_remainingSeconds <= 0) return '已过期';
     final int minutes = _remainingSeconds ~/ 60;
     final int seconds = _remainingSeconds % 60;
     return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
@@ -310,7 +311,7 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: QrImageView(
-                      data: widget.passcode,
+                      data: wormholeReceiveUri(widget.passcode),
                       version: QrVersions.auto,
                       size: 150.0,
                       eyeStyle: const QrEyeStyle(
@@ -339,7 +340,7 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
                       TextSpan(
                         text: widget.passcode.isNotEmpty
                             ? widget.passcode
-                            : (widget.isGenerating ? '正在生成...' : '7-starburst-hydra'),
+                            : (widget.isGenerating ? '正在生成...' : '点击下方选择文件'),
                         style: const TextStyle(
                           color: jade400,
                           fontSize: 22,
@@ -375,7 +376,9 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
               child: SizedBox(
                 height: 40,
                 child: ElevatedButton.icon(
-                  onPressed: () {
+                  onPressed: widget.passcode.trim().isEmpty
+                      ? null
+                      : () {
                     Clipboard.setData(ClipboardData(text: widget.passcode));
                     setState(() => _copied = true);
                     Future<void>.delayed(const Duration(seconds: 2), () {
@@ -462,9 +465,11 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  const Text(
-                    '等待对方连接...',
-                    style: TextStyle(
+                  Text(
+                    widget.passcode.trim().isEmpty
+                        ? '先选择文件生成暗号'
+                        : '把暗号交给对方',
+                    style: const TextStyle(
                       color: textPrimary,
                       fontSize: 11,
                       fontWeight: FontWeight.w500,
@@ -483,6 +488,7 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
                   children: <Widget>[
                     const Icon(Icons.timer_outlined, color: textMuted, size: 12),
                     const SizedBox(width: 4),
+                    if (_formattedCountdown.isNotEmpty)
                     Text(
                       _formattedCountdown,
                       style: const TextStyle(
@@ -504,11 +510,11 @@ class _WormholePairingDialogState extends State<WormholePairingDialog> {
         SizedBox(
           height: 44,
           child: ElevatedButton.icon(
-            onPressed: widget.onRefreshCode,
+            onPressed: widget.onPickFilesToSend ?? widget.onRefreshCode,
             icon: const Icon(Icons.bolt, size: 18, color: bgAbyss),
-            label: const Text(
-              '开启通道穿透直连',
-              style: TextStyle(
+            label: Text(
+              widget.passcode.isEmpty ? '选择文件生成暗号' : '选择新文件发送',
+              style: const TextStyle(
                 color: bgAbyss,
                 fontSize: 13,
                 fontWeight: FontWeight.w700,

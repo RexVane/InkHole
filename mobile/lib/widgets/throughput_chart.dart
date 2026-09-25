@@ -33,26 +33,33 @@ class ThroughputChart extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          // 顶部栏：标题与峰值
+          // 顶部栏：标题与峰值。标题侧用 Expanded 兜底——峰值数字变宽时
+          // 标题收缩省略，避免整行溢出（debug 包会画溢出警告横幅）。
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: <Widget>[
-              Row(
-                children: <Widget>[
-                  Icon(Icons.speed, color: secondaryTeal, size: 16),
-                  const SizedBox(width: 6),
-                  const Text(
-                    'THROUGHPUT GRAPH (LAST 30S)',
-                    style: TextStyle(
-                      color: textMuted,
-                      fontSize: 10,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 0.5,
+              Expanded(
+                child: Row(
+                  children: <Widget>[
+                    Icon(Icons.speed, color: secondaryTeal, size: 16),
+                    const SizedBox(width: 6),
+                    const Flexible(
+                      child: Text(
+                        'THROUGHPUT GRAPH (LAST 30S)',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: textMuted,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
               Row(
+                mainAxisSize: MainAxisSize.min,
                 children: <Widget>[
                   const Text(
                     '峰值  ',
@@ -114,12 +121,16 @@ class ThroughputChart extends StatelessWidget {
                   ),
                 ],
               ),
-              const Text(
-                '无丢包 · 无套接字黑洞',
-                style: TextStyle(
-                  color: badgeRoute,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w500,
+              Flexible(
+                child: Text(
+                  speeds.isEmpty ? '等待传输数据' : '最近一分钟',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: badgeRoute,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w500,
+                  ),
                 ),
               ),
             ],
@@ -155,9 +166,8 @@ class _SparklinePainter extends CustomPainter {
     );
 
     // 如果数据不足，绘制一条平缓波纹
-    final List<double> data = speeds.isEmpty
-        ? const <double>[10, 15, 20, 18, 30, 45, 55, 60, 58, 70, 85, 92, 98]
-        : speeds;
+    if (speeds.length < 2) return;
+    final List<double> data = speeds;
 
     final double maxVal = data.reduce((double a, double b) => a > b ? a : b).clamp(20.0, 1000.0);
     final double stepX = size.width / (data.length - 1);

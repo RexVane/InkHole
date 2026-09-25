@@ -319,11 +319,21 @@ class InkHoleCore {
   SendPort? _commands;
   Completer<void>? _ready;
   Future<void>? _starting;
+  bool _shutdownTimedOut = false;
+  bool _disposed = false;
   int _nextRequest = 1;
 
   Stream<Map<String, dynamic>> get events => _events.stream;
 
+  /// 启动原生核心。失败时抛出异常，调用方可重试。
+  ///
+  /// worker 上报 fatal 时 [events] 会收到一条 `core.fatal` 事件，
+  /// 且所有在途请求以错误结束——调用方必须监听该事件，否则用户看到的是
+  /// 静默失灵(下一次 call() 会再 spawn 出第二个原生服务)。
   Future<void> start() {
+    if (_disposed) {
+      return Future<void>.error(StateError('InkHole core was disposed'));
+    }
     if (_commands != null) return Future<void>.value();
     final inFlight = _starting;
     if (inFlight != null) return inFlight;
@@ -391,6 +401,7 @@ class InkHoleCore {
   Future<void> close() async {
     final commands = _commands;
     if (commands == null) return;
+    var handedOff = false;
     final id = _nextRequest++;
     final completer = Completer<dynamic>();
     _pending[id] = completer;
@@ -400,15 +411,30 @@ class InkHoleCore {
       // SendPort 已关,直接走强制清理。
     }
     // worker 的命令处理是串行的:若正阻塞在 in-flight native 调用(如大文件
-    // lan.send),shutdown 命令排队等待,completer 永不完成。给一个超时,
-    // 超时后强杀 isolate 兜底,避免 close() 永久挂起。
+    // lan.send),shutdown 命令排队等待,completer 永不完成。
+    //
+    // 超时必须覆盖 Rust 侧的完整预算:FFI close 最长 10s(CLOSE_TIMEOUT)
+    // 之后 destroy 还要 2s(RUNTIME_SHUTDOWN_TIMEOUT)。若这里只等 3s 就
+    // 强杀 isolate,worker 会在 close() 中途被打断,destroy() 永远执行不到,
+    // 整个 tokio runtime 与 QUIC/UDP 监听器随之泄漏——旧核心继续占着
+    // 41300/41301 端口收文件。故给 13s(10s + 2s + 1s 余量)。
+    _shutdownTimedOut = false;
     try {
-      await completer.future.timeout(const Duration(seconds: 3));
+      await completer.future.timeout(_shutdownBudget);
+      handedOff = true;
     } on TimeoutException {
-      // 优雅关闭超时,强制释放。
+      _shutdownTimedOut = true;
     }
     _receive?.close();
-    _isolate?.kill(priority: Isolate.immediate);
+    final isolate = _isolate;
+    if (!handedOff) {
+      // 只有真正超时才强杀:此时 worker 大概率卡在 native 调用里。
+      isolate?.kill(priority: Isolate.immediate);
+    } else {
+      // 已收到 shutdown 回执,worker 正在自行 Isolate.exit();给一小段缓冲
+      // 避免在 destroy() 刚跑完时多补一刀。
+      isolate?.kill(priority: Isolate.beforeNextEvent);
+    }
     _isolate = null;
     _receive = null;
     _commands = null;
@@ -420,9 +446,25 @@ class InkHoleCore {
     _pending.clear();
   }
 
-  Future<void> dispose() async {
+  /// 关停时是否因超时被迫强杀 isolate。
+  ///
+  /// 为 true 说明原生核心可能没走完 destroy，调用方应提示用户重启应用，
+  /// 否则残留核心会继续占用监听端口。
+  bool get shutdownTimedOut => _shutdownTimedOut;
+
+  /// 与 Rust 侧预算对齐:CLOSE_TIMEOUT(10s) + RUNTIME_SHUTDOWN_TIMEOUT(2s) + 余量。
+  static const Duration _shutdownBudget = Duration(seconds: 13);
+
+  /// 关停并释放。默认**不**关闭事件流——本类是进程级单例，关闭事件流会让
+  /// 后续所有监听者永久收不到事件(Activity 重建即触发)。
+  ///
+  /// [release] 为 true 时才彻底关闭并允许下次访问重建单例，仅供测试使用。
+  Future<void> dispose({bool release = false}) async {
     await close();
-    await _events.close();
+    if (!release) return;
+    _disposed = true;
+    if (!_events.isClosed) await _events.close();
+    if (identical(_instance, this)) _instance = null;
   }
 
   void _handleMessage(dynamic raw) {
@@ -433,7 +475,7 @@ class InkHoleCore {
         if (!(_ready?.isCompleted ?? true)) _ready!.complete();
       case 'event':
         final event = message['event'];
-        if (event is Map) _events.add(Map<String, dynamic>.from(event));
+        if (event is Map) _emit(Map<String, dynamic>.from(event));
       case 'response':
       case 'shutdown':
         _complete(message['id'], message['result']);
@@ -454,12 +496,24 @@ class InkHoleCore {
         _isolate?.kill(priority: Isolate.immediate);
         _isolate = null;
         receive?.close();
-        if (!_events.isClosed) {
-          _events.add(<String, dynamic>{
-            'event': 'core.fatal',
-            'data': <String, dynamic>{'message': reason},
-          });
-        }
+        _emit(<String, dynamic>{
+          'event': 'core.fatal',
+          'data': <String, dynamic>{'message': reason},
+        });
+    }
+  }
+
+  /// 向事件流投递一条事件。
+  ///
+  /// start() 与 close() 天然存在竞争:关闭流程里 worker 可能正好推来最后
+  /// 一批事件，若此时事件流已关闭，`add` 会抛 StateError。事件是尽力而为的
+  /// 通道，投递失败直接丢弃即可。
+  void _emit(Map<String, dynamic> event) {
+    if (_events.isClosed) return;
+    try {
+      _events.add(event);
+    } on StateError {
+      // 事件流在写入瞬间被关闭,丢弃这条事件。
     }
   }
 

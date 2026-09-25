@@ -20,7 +20,7 @@ lint:
 
 build-android:
 	cd $(MOBILE_DIR) && bash tool/build_native.sh
-	cd $(MOBILE_DIR) && flutter build apk --release
+	cd $(MOBILE_DIR) && flutter build apk --release --dart-define=APP_VERSION=$$(bash tool/app_version.sh --semver)
 
 clean:
 	cargo clean --manifest-path $(RUST_DIR)/Cargo.toml

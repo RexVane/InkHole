@@ -13,7 +13,6 @@ class InboxView extends StatefulWidget {
     required this.onBrowseDirectory,
     required this.onClearAll,
     required this.onRefresh,
-    required this.onOpenPairQr,
     required this.onOpenSettings,
   });
 
@@ -23,7 +22,6 @@ class InboxView extends StatefulWidget {
   final VoidCallback onBrowseDirectory;
   final VoidCallback onClearAll;
   final VoidCallback onRefresh;
-  final VoidCallback onOpenPairQr;
   final VoidCallback onOpenSettings;
 
   @override
@@ -107,12 +105,6 @@ class _InboxViewState extends State<InboxView> {
           IconButton(
             onPressed: widget.onRefresh,
             icon: const Icon(Icons.refresh, size: 21),
-            color: textMuted,
-            splashRadius: 18,
-          ),
-          IconButton(
-            onPressed: widget.onOpenPairQr,
-            icon: const Icon(Icons.language, size: 21),
             color: textMuted,
             splashRadius: 18,
           ),
@@ -305,32 +297,7 @@ class _InboxViewState extends State<InboxView> {
                   ),
                 ],
               ),
-              const Text(
-                '剩余空间充足',
-                style: TextStyle(color: textDim, fontSize: 11),
-              ),
             ],
-          ),
-          const SizedBox(height: 6),
-
-          // 容量进度条
-          Container(
-            height: 4,
-            width: double.infinity,
-            decoration: BoxDecoration(
-              color: surfaceLowest,
-              borderRadius: BorderRadius.circular(2),
-            ),
-            child: FractionallySizedBox(
-              alignment: Alignment.centerLeft,
-              widthFactor: 0.12,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: jade400,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-            ),
           ),
         ],
       ),
@@ -532,56 +499,12 @@ class _InboxViewState extends State<InboxView> {
                         ),
                         const Text(' / ', style: TextStyle(color: textDim, fontSize: 10)),
                         Text(
-                          file.sender.isNotEmpty ? file.sender : '局域网直连',
+                          file.sender.isNotEmpty ? file.sender : '来源未知',
                           style: const TextStyle(color: textMuted, fontSize: 10),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 6),
 
-                    // 安全校验标签
-                    Row(
-                      children: <Widget>[
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: surfaceLowest,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: const Row(
-                            children: <Widget>[
-                              Icon(Icons.verified, color: badgeRoute, size: 10),
-                              SizedBox(width: 3),
-                              Text(
-                                'BLAKE3 校验完成',
-                                style: TextStyle(
-                                  color: badgeRoute,
-                                  fontSize: 9,
-                                  fontFamily: 'monospace',
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: jade400.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: const Text(
-                            'ED25519-OK',
-                            style: TextStyle(
-                              color: jade300,
-                              fontSize: 9,
-                              fontFamily: 'monospace',
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
                   ],
                 ),
               ),

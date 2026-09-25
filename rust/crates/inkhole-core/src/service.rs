@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    CORE_PROTOCOL_VERSION, CoreError, DeviceIdentity, InboxCategoryRoots, Result,
+    CORE_PROTOCOL_VERSION, CORE_VERSION, CoreError, DeviceIdentity, InboxCategoryRoots, Result,
     discovery::{
         DiscoveredPeer, DiscoveryPeersCallback, UDP_DISCOVERY_PORT, UdpDiscovery,
         UdpDiscoveryConfig, UdpDiscoveryTimings,
@@ -36,7 +36,15 @@ use crate::{
 const DROPPABLE_EVENT_CAPACITY: usize = 128;
 const MAX_SNAPSHOT_QUEUE_CAPACITY: usize = DROPPABLE_EVENT_CAPACITY * 8;
 
+/// FFI 请求信封。
+///
+/// 边界策略(与下面所有 `*Params` 结构体一致):一律 `deny_unknown_fields`。
+/// 调用方(移动端 Dart)与本 crate 同一版本发布,不存在跨版本字段漂移,所以
+/// 收紧的代价为零;收益是字段名拼错(`instace_id`、`listenPort`)会立刻返回
+/// `invalid params: unknown field ...`,而不是静默落到 `Default` 变成空值,
+/// 让调用方在几百行之外看到"会话不存在"这类风马牛不相及的报错。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonRequest {
     #[serde(default)]
     id: String,
@@ -224,7 +232,7 @@ struct ServiceState {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct LanStartParams {
     peer_name: String,
     instance_id: String,
@@ -240,7 +248,7 @@ struct LanStartParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct LanSendParams {
     session_id: String,
     path: String,
@@ -258,20 +266,20 @@ struct SendRoutes {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SessionParams {
     session_id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SendCancelParams {
     session_id: String,
     send_id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct WormholeSettingsParams {
     rendezvous_url: String,
     transit_relay: String,
@@ -286,13 +294,27 @@ impl WormholeSettingsParams {
         }
     }
 
+    /// 配对窗口时长。
+    ///
+    /// `timeout_minutes` 为 0 表示"调用方没给"(结构体有 `#[serde(default)]`，
+    /// 字段缺失或拼错都会落到 0)，此时用默认 10 分钟——旧实现把它 clamp 到
+    /// 1 分钟，用户看着自己设的 10 分钟实际只有 1 分钟，且毫无提示。
+    /// 非 0 值按 1..=60 收敛，防止异常输入造成过短或过长的窗口。
     fn timeout(&self) -> Duration {
-        Duration::from_secs(u64::from(self.timeout_minutes.clamp(1, 60)) * 60)
+        let minutes = if self.timeout_minutes == 0 {
+            DEFAULT_WORMHOLE_TIMEOUT_MINUTES
+        } else {
+            self.timeout_minutes.clamp(1, 60)
+        };
+        Duration::from_secs(u64::from(minutes) * 60)
     }
 }
 
+/// 短码配对窗口的默认时长(分钟)，与 Dart 侧 `_wormholeSettings()` 的取值一致。
+const DEFAULT_WORMHOLE_TIMEOUT_MINUTES: u32 = 10;
+
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct WormholeCreateParams {
     session_id: String,
     paths: Vec<String>,
@@ -300,7 +322,7 @@ struct WormholeCreateParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct WormholeJoinParams {
     session_id: String,
     code: String,
@@ -308,19 +330,19 @@ struct WormholeJoinParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct WormholeSessionParams {
     session_id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SshCheckParams {
     profile: SshProfile,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SshListenParams {
     session_id: String,
     profile: SshProfile,
@@ -329,7 +351,7 @@ struct SshListenParams {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct SshPairJoinParams {
     session_id: String,
     code: String,
@@ -586,7 +608,12 @@ impl JsonService {
     async fn handle(&self, method: String, params: Value) -> Result<Value> {
         self.ensure_open().await?;
         match method.as_str() {
-            "ping" => Ok(json!({ "protocol": CORE_PROTOCOL_VERSION })),
+            // `core_version` 让宿主能把"App 版本"和"核心版本"分开显示，
+            // 排查问题时不必再去猜打包进 APK 的是哪一版 .so。
+            "ping" => Ok(json!({
+                "protocol": CORE_PROTOCOL_VERSION,
+                "core_version": CORE_VERSION,
+            })),
             "lan.start" => self.start_lan(decode_params(params)?).await,
             "lan.stop" => self.stop_lan(decode_params(params)?).await,
             "lan.peers" => self.lan_peers(decode_params(params)?, false).await,
@@ -958,8 +985,13 @@ impl JsonService {
         } else {
             routes.instance_id.clone()
         };
-        let transfer_id =
-            derive_transfer_id(session.identity.instance_id(), &source, &metadata, &target);
+        let content_marker = content_marker_for(&source, &metadata).await;
+        let transfer_id = derive_transfer_id(
+            session.identity.instance_id(),
+            &source,
+            &content_marker,
+            &target,
+        );
         let cancellation = session.cancellation.child_token();
         let mut sends = session.sends.lock().await;
         if sends.closed || session.cancellation.is_cancelled() {
@@ -1292,26 +1324,26 @@ impl JsonService {
         let task_session_id = session_id.clone();
         let task_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                timeout,
-                run_wormhole_sender(
-                    inner.clone(),
-                    task_session_id.clone(),
-                    lan,
-                    sender,
-                    paths,
-                    send_ids,
-                    task_cancellation.clone(),
-                ),
+            // 超时只覆盖"等对端"的配对阶段，不包住整个传输。
+            //
+            // 旧实现把 timeout 套在最外层:10 分钟窗口同时约束配对 + 传输，
+            // 于是"等了 9 分钟才配上"的大文件只剩 1 分钟，传到一半被强行
+            // 掐断。配对窗口过期本就是配对语义，传输一旦建立就按自己的
+            // 生命周期和取消信号走。
+            let result = run_wormhole_sender(
+                inner.clone(),
+                task_session_id.clone(),
+                lan,
+                sender,
+                paths,
+                send_ids,
+                WormholeTaskControl {
+                    cancellation: task_cancellation.clone(),
+                    pairing_timeout: timeout,
+                },
             )
             .await;
-            finish_wormhole_task(
-                &inner,
-                &task_session_id,
-                &task_cancellation,
-                timeout_result(result),
-            )
-            .await;
+            finish_wormhole_task(&inner, &task_session_id, &task_cancellation, result).await;
         });
         session.set_handle(handle).await;
 
@@ -1351,26 +1383,21 @@ impl JsonService {
         let task_session_id = session_id.clone();
         let task_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                timeout,
-                run_wormhole_receiver(
-                    inner.clone(),
-                    task_session_id.clone(),
-                    lan,
-                    settings,
-                    code,
-                    decision_rx,
-                    task_cancellation.clone(),
-                ),
+            // 同 sender:超时只约束配对阶段(join + 等用户决定)。
+            let result = run_wormhole_receiver(
+                inner.clone(),
+                task_session_id.clone(),
+                lan,
+                settings,
+                code,
+                decision_rx,
+                WormholeTaskControl {
+                    cancellation: task_cancellation.clone(),
+                    pairing_timeout: timeout,
+                },
             )
             .await;
-            finish_wormhole_task(
-                &inner,
-                &task_session_id,
-                &task_cancellation,
-                timeout_result(result),
-            )
-            .await;
+            finish_wormhole_task(&inner, &task_session_id, &task_cancellation, result).await;
         });
         session.set_handle(handle).await;
         Ok(json!({ "session_id": session_id }))
@@ -1446,6 +1473,18 @@ impl JsonService {
     }
 }
 
+/// 短码任务的控制面参数。
+///
+/// 打包成结构体而不是继续摊平参数:这两个值总是同时产生、同时消费，
+/// 且函数参数一超限就触发 clippy::too_many_arguments。
+#[derive(Clone)]
+struct WormholeTaskControl {
+    cancellation: CancellationToken,
+    /// 配对窗口:等对端出现 + 建立隧道(或接收端等用户决定)。
+    /// 只约束配对阶段，不约束已建立连接的传输。
+    pairing_timeout: Duration,
+}
+
 async fn run_wormhole_sender(
     inner: Arc<ServiceInner>,
     wormhole_session_id: String,
@@ -1453,13 +1492,25 @@ async fn run_wormhole_sender(
     sender: SenderSession,
     paths: Vec<PathBuf>,
     send_ids: Vec<String>,
-    cancellation: CancellationToken,
+    control: WormholeTaskControl,
 ) -> Result<()> {
+    let WormholeTaskControl {
+        cancellation,
+        pairing_timeout,
+    } = control;
+    // 配对窗口:等对端出现 + 建立隧道。超时只作用到这里。
     let SenderConnection {
         peer,
         shared_secret,
         tunnel,
-    } = sender.connect().await?;
+    } = match tokio::time::timeout(pairing_timeout, sender.connect()).await {
+        Ok(connected) => connected?,
+        Err(_) => {
+            return Err(CoreError::Protocol(
+                "short-code pairing window expired".into(),
+            ));
+        }
+    };
     let send_tokens = send_ids
         .iter()
         .map(|send_id| (send_id.clone(), cancellation.child_token()))
@@ -1566,12 +1617,15 @@ async fn execute_wormhole_send(
     // Keyed on the peer certificate rather than its address: a wormhole tunnel gets a
     // fresh ephemeral port every session, but resuming the same file must reuse the id.
     let transfer_id = match tokio::fs::metadata(&path).await {
-        Ok(metadata) => derive_transfer_id(
-            lan.identity.instance_id(),
-            &path,
-            &metadata,
-            &peer.certificate_fingerprint,
-        ),
+        Ok(metadata) => {
+            let content_marker = content_marker_for(&path, &metadata).await;
+            derive_transfer_id(
+                lan.identity.instance_id(),
+                &path,
+                &content_marker,
+                &peer.certificate_fingerprint,
+            )
+        }
         Err(_) => Uuid::new_v4(),
     };
     let progress_events = events.clone();
@@ -1631,9 +1685,26 @@ async fn run_wormhole_receiver(
     settings: WormholeSettings,
     code: String,
     mut decision: mpsc::Receiver<ReceiverDecision>,
-    cancellation: CancellationToken,
+    control: WormholeTaskControl,
 ) -> Result<()> {
-    let offer = ReceivedOffer::join(settings, &code, cancellation.child_token()).await?;
+    let WormholeTaskControl {
+        cancellation,
+        pairing_timeout,
+    } = control;
+    // 配对窗口:加入会合点 + 等用户接受/拒绝。超时只作用到这里。
+    let offer = match tokio::time::timeout(
+        pairing_timeout,
+        ReceivedOffer::join(settings, &code, cancellation.child_token()),
+    )
+    .await
+    {
+        Ok(joined) => joined?,
+        Err(_) => {
+            return Err(CoreError::Protocol(
+                "short-code pairing window expired".into(),
+            ));
+        }
+    };
     emit_session_event(
         &inner.events,
         &cancellation,
@@ -1643,8 +1714,15 @@ async fn run_wormhole_receiver(
     );
     let selected = tokio::select! {
         _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
-        selected = decision.recv() => selected
-            .ok_or_else(|| CoreError::InvalidRequest("wormhole offer was cancelled".into()))?,
+        result = tokio::time::timeout(pairing_timeout, decision.recv()) => match result {
+            Ok(selected) => selected
+                .ok_or_else(|| CoreError::InvalidRequest("wormhole offer was cancelled".into()))?,
+            Err(_) => {
+                return Err(CoreError::Protocol(
+                    "short-code pairing window expired".into(),
+                ));
+            }
+        },
     };
     if matches!(selected, ReceiverDecision::Reject) {
         return offer.reject("transfer rejected").await;
@@ -1692,12 +1770,6 @@ async fn run_wormhole_receiver(
     let tunnel_result = tunnel.wait().await;
     let server_result = server.close().await;
     tunnel_result.and(server_result)
-}
-
-fn timeout_result(
-    result: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
-) -> Result<()> {
-    result.unwrap_or_else(|_| Err(CoreError::Protocol("short-code session expired".into())))
 }
 
 async fn finish_wormhole_task(
@@ -1936,21 +2008,56 @@ async fn send_with_routes(
     send_result.and(close_result)
 }
 
-/// Derives a stable transfer id from the sender, the source file and the destination.
-/// Resending the same unchanged file to the same peer reproduces the id, which is what
-/// lets the receiver resume its `.part` file instead of starting over.
-fn derive_transfer_id(
-    instance_id: &str,
-    source: &Path,
-    metadata: &std::fs::Metadata,
-    target: &str,
-) -> Uuid {
+/// 计算 transfer_id 要绑定的内容指纹。
+///
+/// - 普通文件:整文件 blake3 摘要(与 offer 的 digest 同源)，内容一变 id 就变；
+/// - 文件夹:清单摘要(逐文件的相对路径 + 大小 + mtime)，**不是**目录自身的
+///   len/mtime——后者在目录内文件被改写时不变，会导致"改了内容再重发"派生出
+///   同一个 transfer_id 却带不同 offer 摘要，被接收端永久判为冲突。走
+///   manifest.digest() 与 offer 侧的摘要口径完全一致。
+/// - 其他类型(符号链接/设备等)或读取失败:退化为 len+mtime，保证仍有稳定值。
+async fn content_marker_for(path: &Path, metadata: &std::fs::Metadata) -> Vec<u8> {
+    let cancellation = CancellationToken::new();
+    if metadata.is_file()
+        && let Ok(digest) = crate::hash::blake3_file_cancellable(path, &cancellation).await
+    {
+        return digest.as_bytes().to_vec();
+    }
+    if metadata.is_dir()
+        && let Ok(folder) = crate::folder::scan_folder(path, &cancellation).await
+        && let Ok(digest) = folder.manifest.digest()
+    {
+        return digest.as_bytes().to_vec();
+    }
     let modified_ms = metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default();
+    let mut fallback = Vec::with_capacity(16);
+    fallback.extend_from_slice(&metadata.len().to_le_bytes());
+    fallback.extend_from_slice(&modified_ms.to_le_bytes());
+    fallback
+}
+
+/// Derives a stable transfer id from the sender, the source path and the destination.
+/// Resending the same unchanged item to the same peer reproduces the id, which is what
+/// lets the receiver resume its `.part` file instead of starting over.
+///
+/// [content_marker] 必须反映**实际传输内容**:
+/// - 文件:该文件的 blake3 摘要(或退化到 len+mtime)；
+/// - 文件夹:清单摘要(逐文件的路径 + 大小 + mtime)，**不能**用目录自身的
+///   metadata。目录的 len/mtime 在目录内文件内容被改写时完全不变，于是
+///   "改了内容再重发"会派生出同一个 transfer_id、却带着不同的 offer 摘要，
+///   接收端 `ensure_same_offer` 判定为冲突后**永久硬拒**(直到 30 天 prune)。
+///   用户看到的现象是"这个文件夹重发永远失败"，且没有任何解释。
+fn derive_transfer_id(
+    instance_id: &str,
+    source: &Path,
+    content_marker: &[u8],
+    target: &str,
+) -> Uuid {
     let mut hasher = blake3::Hasher::new();
     // Windows 文件系统不区分大小写,同一文件可能以不同大小写路径发起发送;
     // 归一化为小写再哈希,保证断点续传复用同一 transfer_id(与
@@ -1967,8 +2074,8 @@ fn derive_transfer_id(
         hasher.update(&(field.len() as u64).to_le_bytes());
         hasher.update(field);
     }
-    hasher.update(&metadata.len().to_le_bytes());
-    hasher.update(&modified_ms.to_le_bytes());
+    hasher.update(&(content_marker.len() as u64).to_le_bytes());
+    hasher.update(content_marker);
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     uuid::Builder::from_random_bytes(bytes).into_uuid()
@@ -2240,6 +2347,71 @@ mod tests {
         response["result"].clone()
     }
 
+    /// 与 [`call`] 相同,但允许失败——用于断言"请求应当被拒绝"。
+    async fn raw_call(service: &JsonService, method: &str, params: Value) -> Value {
+        serde_json::from_str(
+            &service
+                .call_json(
+                    &json!({
+                        "id": format!("test-{method}"),
+                        "method": method,
+                        "params": params,
+                    })
+                    .to_string(),
+                )
+                .await,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ffi_params_reject_misspelled_fields_instead_of_silently_defaulting() {
+        let service = JsonService::new();
+
+        // 顶层字段拼错:旧行为静默变成空 instance_id,启动出一个"没有身份"的
+        // 会话,后续所有定位操作都报"会话不存在",与真正的原因隔着几百行。
+        let response = raw_call(&service, "lan.start", json!({ "instace_id": "abc" })).await;
+        assert_eq!(response["ok"], false, "{response}");
+        let error = response["error"].as_str().unwrap_or_default();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("instace_id"), "{error}");
+
+        // 嵌套结构体同样收紧(serde 的 deny_unknown_fields 不递归,必须逐层声明)。
+        let response = raw_call(
+            &service,
+            "ssh.listen",
+            json!({
+                "session_id": "missing",
+                "profile": { "pivate_key": "x" },
+            }),
+        )
+        .await;
+        assert_eq!(response["ok"], false, "{response}");
+        let error = response["error"].as_str().unwrap_or_default();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains("pivate_key"), "{error}");
+
+        let response = raw_call(
+            &service,
+            "lan.start",
+            json!({ "inbox_category_roots": { "medi": "/tmp" } }),
+        )
+        .await;
+        assert_eq!(response["ok"], false, "{response}");
+        let error = response["error"].as_str().unwrap_or_default();
+        assert!(error.contains("unknown field"), "{error}");
+
+        // 但"字段缺省"仍然走 Default:收紧未知字段不等于把所有字段变必填,
+        // 调用方只传关心的一两个字段的用法必须继续有效。
+        let response = raw_call(&service, "ping", json!({})).await;
+        assert_eq!(response["ok"], true, "{response}");
+        let response = raw_call(&service, "lan.send", json!({ "path": "x" })).await;
+        assert_eq!(response["ok"], false, "{response}");
+        let error = response["error"].as_str().unwrap_or_default();
+        assert!(!error.contains("unknown field"), "{error}");
+        assert!(!error.contains("invalid params"), "{error}");
+    }
+
     async fn wait_event(service: &JsonService, name: &str) -> Value {
         loop {
             let encoded = service
@@ -2372,33 +2544,76 @@ mod tests {
         let source = root.path().join("resumable.bin");
         tokio::fs::write(&source, b"resume me").await.unwrap();
         let metadata = tokio::fs::metadata(&source).await.unwrap();
+        let marker = content_marker_for(&source, &metadata).await;
         let sender = "12121212121212121212121212121212";
         let target = "34343434343434343434343434343434";
 
-        let first = derive_transfer_id(sender, &source, &metadata, target);
+        let first = derive_transfer_id(sender, &source, &marker, target);
         assert_eq!(
             first,
-            derive_transfer_id(sender, &source, &metadata, target),
+            derive_transfer_id(sender, &source, &marker, target),
             "resending the same file must reuse the id so the receiver can resume"
         );
-        assert_ne!(
-            first,
-            derive_transfer_id(sender, &source, &metadata, "other")
-        );
+        assert_ne!(first, derive_transfer_id(sender, &source, &marker, "other"));
 
         let other = root.path().join("other.bin");
         tokio::fs::write(&other, b"resume me").await.unwrap();
         let other_metadata = tokio::fs::metadata(&other).await.unwrap();
+        let other_marker = content_marker_for(&other, &other_metadata).await;
         assert_ne!(
             first,
-            derive_transfer_id(sender, &other, &other_metadata, target)
+            derive_transfer_id(sender, &other, &other_marker, target)
         );
 
         tokio::fs::write(&source, b"changed contents")
             .await
             .unwrap();
         let changed = tokio::fs::metadata(&source).await.unwrap();
-        assert_ne!(first, derive_transfer_id(sender, &source, &changed, target));
+        let changed_marker = content_marker_for(&source, &changed).await;
+        assert_ne!(
+            first,
+            derive_transfer_id(sender, &source, &changed_marker, target)
+        );
+    }
+
+    /// 目录的 len/mtime 不会随目录内文件内容变化，若 transfer_id 只绑目录自身
+    /// 的 metadata，"改了内容再重发"会得到同一个 id 却带不同 offer 摘要，
+    /// 接收端 `ensure_same_offer` 永久拒收。这条测试钉住"内容变了 id 就得变"。
+    #[tokio::test]
+    async fn folder_transfer_ids_track_the_manifest_not_the_directory_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("bundle");
+        tokio::fs::create_dir_all(&folder).await.unwrap();
+        let inner = folder.join("note.txt");
+        tokio::fs::write(&inner, b"first revision").await.unwrap();
+
+        let metadata = tokio::fs::metadata(&folder).await.unwrap();
+        let marker = content_marker_for(&folder, &metadata).await;
+        let sender = "12121212121212121212121212121212";
+        let target = "34343434343434343434343434343434";
+        let first = derive_transfer_id(sender, &folder, &marker, target);
+
+        assert_eq!(
+            first,
+            derive_transfer_id(sender, &folder, &marker, target),
+            "unchanged folder must reuse the id"
+        );
+
+        // 只改内部文件的内容，目录自身的 len/mtime 保持不变。
+        tokio::fs::write(&inner, b"second revision with a different length")
+            .await
+            .unwrap();
+        let same_dir_metadata = tokio::fs::metadata(&folder).await.unwrap();
+        let changed_marker = content_marker_for(&folder, &same_dir_metadata).await;
+        assert_ne!(
+            marker, changed_marker,
+            "content marker must reflect inner file changes"
+        );
+        assert_ne!(
+            first,
+            derive_transfer_id(sender, &folder, &changed_marker, target),
+            "a folder whose contents changed must derive a new transfer id"
+        );
     }
 
     #[tokio::test]

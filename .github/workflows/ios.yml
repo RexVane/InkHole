@@ -68,7 +68,12 @@ jobs:
         run: bash tool/build_native_ios.sh
 
       - name: Build unsigned iOS app
-        run: flutter build ios --release --no-codesign
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(bash tool/app_version.sh --semver)"
+          echo "Injecting APP_VERSION=$version"
+          flutter build ios --release --no-codesign --dart-define=APP_VERSION="$version"
 
       - name: Archive unsigned app
         run: ditto -c -k --sequesterRsrc --keepParent build/ios/iphoneos/Runner.app InkHole-${GITHUB_SHA}-ios.zip

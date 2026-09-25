@@ -35,8 +35,12 @@ const CHANNEL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_RECONNECT_WAIT: Duration = Duration::from_secs(45);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
+/// 已配对的 SSH 中继对端。
+///
+/// 只从 FFI 参数(`ssh.listen` 的 `peers`)反序列化;向外只会被序列化进事件,
+/// 所以 `deny_unknown_fields` 只作用于本地调用方,不影响与对端的互操作。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct SshPeer {
     pub id: String,
     pub name: String,
@@ -142,10 +146,78 @@ impl std::fmt::Debug for SshRelayConfig {
     }
 }
 
+/// 单个配对码允许的失败尝试次数。
+///
+/// 中继主机（或任何能连到转发端口的人）可以对同一份配对码反复开新通道试口令：
+/// 每轮 PAKE 只是一次往返，`PAIRING_LIFETIME` 的十分钟窗口内尝试次数原本不受限。
+/// 配对码有 44 bit 熵（端口 + 4 个 BIP39 词），爆破本身不现实，但"无限重试"这个
+/// 形状不该留着——它是唯一一层能挡住长期悬挂式猜测的本地约束。
+///
+/// 取 5 是给正常使用留出余量（SSH 中继抖动导致的握手超时也计在这里），
+/// 超过就作废、由用户重新出码。
+const MAX_PAIRING_ATTEMPTS: u32 = 5;
+
+/// 一个配对码的一次性预算。
+///
+/// 状态机单独抽出来是为了能在不启动 SSH 会话的前提下测试
+/// （见 `pairing_code_burns_after_repeated_failures`）——挂在
+/// [`SshRelaySession`] 上就需要整套中继装置才能验证。
+#[derive(Debug)]
 struct ActivePairing {
     code: String,
     expires_at: Instant,
+    /// 是否已有一次尝试正在进行。同一配对码同时只允许一个对端接入，
+    /// 否则两个对端会先后进入 `add_peer`，后到的静默顶掉先到的。
     in_use: bool,
+    failed_attempts: u32,
+}
+
+impl ActivePairing {
+    fn new(code: String, expires_at: Instant) -> Self {
+        Self {
+            code,
+            expires_at,
+            in_use: false,
+            failed_attempts: 0,
+        }
+    }
+
+    fn is_live(&self, now: Instant) -> bool {
+        self.expires_at > now
+    }
+
+    /// 认领一次配对尝试，返回本次应当使用的配对码。
+    fn begin(&mut self, now: Instant) -> Result<String> {
+        if !self.is_live(now) {
+            return Err(CoreError::Protocol(
+                "SSH pairing code is unavailable".into(),
+            ));
+        }
+        if self.in_use {
+            return Err(CoreError::Protocol(
+                "SSH pairing is already in progress".into(),
+            ));
+        }
+        if self.failed_attempts >= MAX_PAIRING_ATTEMPTS {
+            return Err(CoreError::Protocol(
+                "SSH pairing code was invalidated after repeated failed attempts; create a new code"
+                    .into(),
+            ));
+        }
+        self.in_use = true;
+        Ok(self.code.clone())
+    }
+
+    /// 结束一次尝试。返回 `true` 表示这个配对码应当被丢弃——成功则一次性用掉，
+    /// 失败则计入预算、用尽即作废。
+    fn finish(&mut self, success: bool) -> bool {
+        if success {
+            return true;
+        }
+        self.in_use = false;
+        self.failed_attempts += 1;
+        self.failed_attempts >= MAX_PAIRING_ATTEMPTS
+    }
 }
 
 pub(crate) struct SshRelaySession {
@@ -299,18 +371,17 @@ impl SshRelaySession {
         // old code, so a new code must not silently replace it.
         if pairing
             .as_ref()
-            .is_some_and(|active| active.in_use && active.expires_at > Instant::now())
+            .is_some_and(|active| active.in_use && active.is_live(Instant::now()))
         {
             return Err(CoreError::Protocol(
                 "SSH pairing is already in progress".into(),
             ));
         }
         let code = generate_pair_code(self.remote_port)?;
-        *pairing = Some(ActivePairing {
-            code: code.clone(),
-            expires_at: Instant::now() + PAIRING_LIFETIME,
-            in_use: false,
-        });
+        *pairing = Some(ActivePairing::new(
+            code.clone(),
+            Instant::now() + PAIRING_LIFETIME,
+        ));
         Ok(code)
     }
 
@@ -588,6 +659,19 @@ impl SshRelaySession {
         tunnel_result.and(server_result)
     }
 
+    /// 把对端写入本次中继会话的受信列表。
+    ///
+    /// 信任模型（做 SSH UI 时必须知道）：
+    /// - **有凭据门槛**：只有完成 PAKE 的对端能走到这里，而 PAKE 的口令就是配对码，
+    ///   配对码一次性（`finish_pairing_attempt` 成功后即作废）且失败次数有上限
+    ///   （`MAX_PAIRING_ATTEMPTS`）。
+    /// - **没有二次确认**：PAKE 成功即入库，用户看不到"刚配对的是哪台设备"。
+    ///   所以出码方要把配对码当凭据对待，UI 侧应在配对成功后把对端身份展示出来。
+    /// - **不落盘**：`peers` 只存在于内存，每次 `ssh.listen` 都从参数里的
+    ///   `peers` 重新播种（移动端目前恒传空列表），因此信任是单次会话级的。
+    /// - 按 `instance_id` 索引即意味着同 id 的对端会**替换**既有记录；
+    ///   而 `instance_id` 是对端自述的，只做了格式校验。若日后要做"设备级"信任，
+    ///   应改为按公钥索引。
     async fn add_peer(&self, peer: SshPeer) -> Result<SshPeer> {
         let peer = peer.normalize(self.identity.instance_id())?;
         self.peers
@@ -598,28 +682,22 @@ impl SshRelaySession {
     }
 
     async fn begin_pairing_attempt(&self) -> Result<String> {
+        let now = Instant::now();
         let mut pairing = self.pairing.lock().await;
         let active = pairing
             .as_mut()
-            .filter(|active| active.expires_at > Instant::now())
             .ok_or_else(|| CoreError::Protocol("SSH pairing code is unavailable".into()))?;
-        if active.in_use {
-            return Err(CoreError::Protocol(
-                "SSH pairing is already in progress".into(),
-            ));
-        }
-        active.in_use = true;
-        Ok(active.code.clone())
+        active.begin(now)
     }
 
     async fn finish_pairing_attempt(&self, code: &str, success: bool) {
         let mut pairing = self.pairing.lock().await;
-        if pairing.as_ref().is_some_and(|active| active.code == code) {
-            if success {
-                pairing.take();
-            } else if let Some(active) = pairing.as_mut() {
-                active.in_use = false;
-            }
+        let mut discard = false;
+        if let Some(active) = pairing.as_mut().filter(|active| active.code == code) {
+            discard = active.finish(success);
+        }
+        if discard {
+            *pairing = None;
         }
     }
 
@@ -750,6 +828,62 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// 配对码的失败预算必须真的会烧码，否则"防爆破"只是注释里的愿望。
+    #[test]
+    fn pairing_code_burns_after_repeated_failures() {
+        let now = Instant::now();
+        let mut pairing = ActivePairing::new("code".into(), now + PAIRING_LIFETIME);
+
+        for attempt in 1..=MAX_PAIRING_ATTEMPTS {
+            assert_eq!(
+                pairing.begin(now).unwrap(),
+                "code",
+                "attempt {attempt} should be allowed to use the live code"
+            );
+            assert_eq!(
+                pairing.finish(false),
+                attempt == MAX_PAIRING_ATTEMPTS,
+                "code must only be discarded once the budget runs out"
+            );
+        }
+
+        let error = pairing
+            .begin(now)
+            .expect_err("an exhausted code must stop accepting attempts");
+        assert!(
+            error.to_string().contains("repeated failed attempts"),
+            "{error}"
+        );
+    }
+
+    /// 成功配对把码用掉（一次性），过期码直接不可用，同时只允许一个接入者。
+    #[test]
+    fn pairing_code_is_single_use_unexpired_and_serialized() {
+        let now = Instant::now();
+
+        let mut consumed = ActivePairing::new("code".into(), now + PAIRING_LIFETIME);
+        assert_eq!(consumed.begin(now).unwrap(), "code");
+        assert!(
+            consumed.finish(true),
+            "a successful pairing must consume the code"
+        );
+
+        let mut expired = ActivePairing::new("code".into(), now);
+        assert!(
+            expired.begin(now).is_err(),
+            "an expired code must not accept attempts"
+        );
+
+        // 每码同时只有一个接入者：第二个对端必须被挡住，否则两者会先后
+        // 进入 add_peer，后到的静默顶掉先到的信任记录。
+        let mut busy = ActivePairing::new("code".into(), now + PAIRING_LIFETIME);
+        assert!(busy.begin(now).is_ok());
+        let error = busy
+            .begin(now)
+            .expect_err("a second concurrent attempt must be rejected");
+        assert!(error.to_string().contains("already in progress"), "{error}");
     }
 
     async fn send_over_relay(

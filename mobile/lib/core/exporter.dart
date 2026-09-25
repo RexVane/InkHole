@@ -24,7 +24,24 @@ class ExporterChannel {
       MethodChannel('com.rexvane.inkhole/exporter');
 
   /// 把私有收件箱里的成品导出到公共位置;[treeUri] 为空走默认下载目录。
+  ///
+  /// 平台未实现该通道(MissingPluginException)或原生导出失败时返回空
+  /// location，由调用方按"文件仍在应用内"提示。绝不能把异常抛给收件流程，
+  /// 否则用户每收到一个文件都会看到一次导出失败弹窗。
   static Future<ExportOutcome> export(String path, {String? treeUri}) async {
+    try {
+      return await _export(path: path, treeUri: treeUri);
+    } on MissingPluginException {
+      return const ExportOutcome(name: '', location: '');
+    } on PlatformException {
+      return const ExportOutcome(name: '', location: '');
+    }
+  }
+
+  static Future<ExportOutcome> _export({
+    required String path,
+    String? treeUri,
+  }) async {
     final Map<Object?, Object?> raw = await _channel
         .invokeMethod<Map<Object?, Object?>>('export', <String, String?>{
           'path': path,
@@ -37,8 +54,18 @@ class ExporterChannel {
     );
   }
 
-  /// 弹系统目录选择器;用户取消返回 null。
+  /// 弹系统目录选择器;用户取消或平台不支持返回 null。
   static Future<PickedDirectory?> pickDirectory() async {
+    try {
+      return await _pickDirectory();
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  static Future<PickedDirectory?> _pickDirectory() async {
     final Map<Object?, Object?>? raw =
         await _channel.invokeMethod<Map<Object?, Object?>>('pickDirectory');
     if (raw == null) return null;
@@ -50,6 +77,20 @@ class ExporterChannel {
   /// 打开一条收件记录。返回 [openedExact] 表示直接打开了该文件，
   /// [openedDownloads] 表示只能回退到系统下载管理(文件夹或记录已被移走)。
   static Future<String> open({
+    required String path,
+    required String name,
+    String? treeUri,
+  }) async {
+    try {
+      return await _open(path: path, name: name, treeUri: treeUri);
+    } on MissingPluginException {
+      return openedDownloads;
+    } on PlatformException {
+      return openedDownloads;
+    }
+  }
+
+  static Future<String> _open({
     required String path,
     required String name,
     String? treeUri,
@@ -69,6 +110,8 @@ class ExporterChannel {
       return await _channel.invokeMethod<String>('downloadsPath');
     } on MissingPluginException {
       return null;
+    } on PlatformException {
+      return null;
     }
   }
 
@@ -79,6 +122,8 @@ class ExporterChannel {
       return await _channel
           .invokeMethod<String>('describeTree', <String, String>{'uri': uri});
     } on MissingPluginException {
+      return null;
+    } on PlatformException {
       return null;
     }
   }

@@ -129,9 +129,17 @@ jobs:
           echo "signed=true" >> "$GITHUB_OUTPUT"
 
       - name: Build split APKs
+        shell: bash
         env:
           ORG_GRADLE_PROJECT_inkholeAllowDebugSigning: ${{ steps.signing.outputs.signed != 'true' && env.RELEASE_TAG == '' && 'true' || 'false' }}
-        run: flutter build apk --release --split-per-abi
+        run: |
+          set -euo pipefail
+          # 版本号只有 pubspec.yaml 一个来源：由脚本读出后注入 Dart，
+          # 避免 models.dart 里的兜底字面量与真实安装版本悄悄漂移
+          # （更新检查拿它做比较，漂移会导致反复提示"有新版本"）。
+          version="$(bash tool/app_version.sh --semver)"
+          echo "Injecting APP_VERSION=$version"
+          flutter build apk --release --split-per-abi --dart-define=APP_VERSION="$version"
 
       - name: Verify APK signing certificate
         shell: bash
