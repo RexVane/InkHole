@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "inkhole-core"
-version = "2.0.14"
+version = "2.1.0"
 dependencies = [
  "base64",
  "bip39",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "inkhole-ffi"
-version = "2.0.14"
+version = "2.1.0"
 dependencies = [
  "inkhole-core",
  "serde_json",
