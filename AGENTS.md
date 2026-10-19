@@ -1,5 +1,7 @@
 # InkHole(墨洞)— 移动端开发指南
 
+> 继承全局：全局规则正本 `~/.codex/AGENTS.md`（同步副本 `~/.grok/AGENTS.md`、`~/.claude/AGENTS.md`）自动生效；本文件未写明处按全局执行，冲突时以本文件为准。
+
 跨平台 P2P 文件传输移动端(Android / iOS):局域网自动发现 + 跨网络(一次性短码 / SSH 中继 / Tailscale 固定地址)。
 
 ## 仓库结构
