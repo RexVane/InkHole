@@ -2,11 +2,12 @@ include: package:flutter_lints/flutter.yaml
 
 analyzer:
   exclude:
+    # 仓库根的 backups/ 不在包内，analyzer 本来就不会扫；
+    # 这条只为防御「哪天在 mobile/ 下也建了备份目录」的情况。
+    # 注意：exclude 只认包内相对路径，写 `../backups/**` 是无效配置。
     - backups/**
-    - ../backups/**
 
 linter:
   rules:
     avoid_print: true
     prefer_single_quotes: true
-

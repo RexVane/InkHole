@@ -73,8 +73,10 @@ ThemeData buildInkHoleTheme() {
     dividerColor: surfaceBorder,
     cardColor: surfaceContainer,
     iconTheme: const IconThemeData(color: textMuted),
+    // 不带自定义字体：`pubspec.yaml` 没有声明 `fonts:`，写在这里的家族名
+    // （如 Outfit）永远不会被加载，只会静默回退到系统字体，让人误以为
+    // 已经生效。要那个观感就得把 ttf 打包进来再写名字。
     fontFamilyFallback: const <String>[
-      'Outfit',
       'PingFang SC',
       'Heiti SC',
       'Microsoft YaHei',

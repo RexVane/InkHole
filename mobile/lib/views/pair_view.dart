@@ -494,23 +494,34 @@ class _PairViewState extends State<PairView>
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
+                      // 左侧标题可收缩：320dp 窄屏下「口令密文 / Secret Token」
+                      // 与右侧复制按钮的自然宽度之和会超出卡片（+27px）。
                       Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: <Widget>[
-                          const Row(
-                            children: <Widget>[
-                              IconsaxIcon(
-                                Iconsax.key,
-                                color: jade400,
-                                size: 13,
-                              ),
-                              SizedBox(width: 4),
-                              Text(
-                                '口令密文 / Secret Token',
-                                style: TextStyle(color: textMuted, fontSize: 10),
-                              ),
-                            ],
+                          const Expanded(
+                            child: Row(
+                              children: <Widget>[
+                                IconsaxIcon(
+                                  Iconsax.key,
+                                  color: jade400,
+                                  size: 13,
+                                ),
+                                SizedBox(width: 4),
+                                Flexible(
+                                  child: Text(
+                                    '口令密文 / Secret Token',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: textMuted,
+                                      fontSize: 10,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
+                          const SizedBox(width: 8),
                           GestureDetector(
                             onTap: () {
                               if (!hasCode) return;

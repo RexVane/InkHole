@@ -895,13 +895,19 @@ class _SettingsViewState extends State<SettingsView> {
               ),
               const SizedBox(height: 12),
 
+              // 标题行必须可收缩：360dp 宽下这两段文字的自然宽度会超过卡片，
+              // spaceBetween + 定宽文本会直接画溢出条纹（+9.8px @360dp）。
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: <Widget>[
-                  const Text(
-                    '本机监听端口 (默认 41300，留空=随机)',
-                    style: TextStyle(color: textMuted, fontSize: 11),
+                  const Expanded(
+                    child: Text(
+                      '本机监听端口 (默认 41300，留空=随机)',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: textMuted, fontSize: 11),
+                    ),
                   ),
+                  const SizedBox(width: 8),
                   Container(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 6,
@@ -1418,7 +1424,9 @@ class _SettingsViewState extends State<SettingsView> {
     );
   }
 
-  /// SSH 配置摘要
+  /// SSH 配置摘要：连接参数与私钥都在控制台里编辑，这里只显示当前值是否齐备。
+  /// 私钥不在这里显示——本页拿到的 `sshPrivateKey` 恒为空串（home_page 不把
+  /// 密钥下发给设置页），据此判断"是否已导入"只会得出永远错误的结论。
   Widget _buildSshSummaryCard() {
     final InkSettings settings = widget.initialSettings;
     final bool hasFingerprint =
@@ -1531,6 +1539,8 @@ class _SettingsViewState extends State<SettingsView> {
         const SizedBox(width: 10),
         Switch(
           value: value,
+          // 用 WidgetStateProperty 指定选中色:activeColor 在 3.29 已弃用，
+          // activeThumbColor 又要 3.27+，这个写法两个版本都无告警。
           thumbColor: WidgetStateProperty.resolveWith<Color?>(
             (Set<WidgetState> states) =>
                 states.contains(WidgetState.selected) ? jade400 : null,

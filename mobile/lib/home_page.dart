@@ -1985,12 +1985,21 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  /// 暗号过期 = 配对窗口关闭，**不等于**会话结束。
+  ///
+  /// 核心的配对超时只约束「等对端 + 建隧道」这一阶段
+  /// (`run_wormhole_sender` 的 `pairing_timeout`)，传输一旦建立就按自己的
+  /// 生命周期走。所以这里只在「还没有实际传输在跑」时才丢掉会话 id：否则
+  /// 对端在第 9 分钟连上、大文件还在传时，倒计时归零会让 UI 立刻失去中止、
+  /// 暂停(提示从「短码传输不能暂停」退化成「当前没有进行中的传输」)与会话级
+  /// `session.cancel` 的能力，只剩 send_id 级别的拼命取消。真正结束时由
+  /// `wormhole.error` / 完成事件负责清空。
   void _forgetPasscode() {
     if (_currentPasscode.isEmpty) return;
     setState(() {
       _currentPasscode = '';
       _passcodeExpiresAt = null;
-      _activeWormholeSession = null;
+      if (_sendIds.isEmpty) _activeWormholeSession = null;
     });
     _toast('一次性暗号已过期');
   }

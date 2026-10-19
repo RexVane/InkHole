@@ -170,50 +170,60 @@ class _InboxViewState extends State<InboxView> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           // 标题与浏览目录按钮
+          //
+          // 左侧标题组必须是可收缩的：360dp 宽（最常见安卓宽度）下
+          // 「收件仓库 + LOCAL-STORAGE + 浏览目录」的自然宽度会超出卡片，
+          // 用 spaceBetween + 定宽文本会直接画溢出条纹。
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: <Widget>[
-              Row(
-                children: <Widget>[
-                  Container(
-                    width: 4,
-                    height: 14,
-                    decoration: BoxDecoration(
-                      color: jade400,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  const Text(
-                    '收件仓库',
-                    style: TextStyle(
-                      color: textPrimary,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 6,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: surfaceActive,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: const Text(
-                      'LOCAL-STORAGE',
-                      style: TextStyle(
+              Expanded(
+                child: Row(
+                  children: <Widget>[
+                    Container(
+                      width: 4,
+                      height: 14,
+                      decoration: BoxDecoration(
                         color: jade400,
-                        fontSize: 9,
-                        fontFamily: 'monospace',
-                        fontWeight: FontWeight.w700,
+                        borderRadius: BorderRadius.circular(2),
                       ),
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 8),
+                    const Flexible(
+                      child: Text(
+                        '收件仓库',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: textPrimary,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: surfaceActive,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text(
+                        'LOCAL-STORAGE',
+                        style: TextStyle(
+                          color: jade400,
+                          fontSize: 9,
+                          fontFamily: 'monospace',
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
+              const SizedBox(width: 8),
               InkWell(
                 onTap: widget.onBrowseDirectory,
                 borderRadius: BorderRadius.circular(16),

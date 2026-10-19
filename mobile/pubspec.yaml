@@ -4,7 +4,8 @@ publish_to: "none"
 version: 2.1.0+16
 environment:
   sdk: ">=3.5.0 <4.0.0"
-  flutter: ">=3.24.0"
+  # 代码里用了 `Color.withValues`（3.27 才引入），声明 3.24 会让老版本直接编译失败。
+  flutter: ">=3.27.0"
 
 dependencies:
   flutter:
