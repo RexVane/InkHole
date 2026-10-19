@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
-// ==================== 墨洞 Cyber-Zen 赛博禅意色板 ====================
-// 深度对齐 Tailwind 配置与设计稿：Void 深渊背景 + Jade 翡翠青光
+// ==================== 墨洞 Cyber-Zen × Iconsax 色板 ====================
+// 深度对齐原版设计稿与 Iconsax 视觉规范：Void 深渊背景 + Jade 翡翠青光
 
 /// 深渊墨黑底色系
 const Color void950 = Color(0xFF040708);
@@ -52,7 +52,7 @@ const Color inkDanger = dangerCoral;
 const Color inkRouteBadgeText = badgeRoute;
 const Color inkRouteBadgeBorder = badgeRouteBorder;
 
-/// 构建 Cyber-Zen 主题
+/// 构建 Cyber-Zen × Iconsax 主题
 ThemeData buildInkHoleTheme() {
   const ColorScheme scheme = ColorScheme.dark(
     primary: jade400,
@@ -74,6 +74,7 @@ ThemeData buildInkHoleTheme() {
     cardColor: surfaceContainer,
     iconTheme: const IconThemeData(color: textMuted),
     fontFamilyFallback: const <String>[
+      'Outfit',
       'PingFang SC',
       'Heiti SC',
       'Microsoft YaHei',
@@ -99,15 +100,15 @@ ThemeData buildInkHoleTheme() {
       floatingLabelStyle: const TextStyle(color: jade400, fontSize: 13),
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(12),
         borderSide: const BorderSide(color: surfaceBorder),
       ),
       enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(12),
         borderSide: const BorderSide(color: surfaceBorder),
       ),
       focusedBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(12),
         borderSide: const BorderSide(color: jade400, width: 1.5),
       ),
     ),

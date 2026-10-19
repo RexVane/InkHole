@@ -1,6 +1,12 @@
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  exclude:
+    - backups/**
+    - ../backups/**
+
 linter:
   rules:
     avoid_print: true
     prefer_single_quotes: true
+

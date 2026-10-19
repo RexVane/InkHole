@@ -23,14 +23,14 @@ import 'views/settings_view.dart';
 import 'views/ssh_relay_view.dart';
 import 'views/transfers_view.dart';
 import 'widgets/bottom_nav_bar.dart';
-import 'widgets/wormhole_dialog.dart';
+import 'widgets/iconsax.dart';
 
 /// 墨洞 Cyber-Zen 移动端主界面容器 (Shell)
 ///
 /// 真实连接单一 Rust 传输核心 (inkhole-core) 与 Isolate 异步事件：
 /// - 局域网 QUIC 自动发现与对端选择
 /// - 真实本地文件选择与流式发送
-/// - 实时吞吐量平滑波形图采集
+/// - 实时吞吐量平滑波形图采集（通过 ValueNotifier 局部刷新，避免全局重绘风暴）
 /// - 确定性断点续传与取消
 /// - Magic Wormhole 一次性短码生成与穿透拉取
 /// - 收件仓库落盘与记录持久化
@@ -81,8 +81,14 @@ class _HomePageState extends State<HomePage> {
   final ValueNotifier<SshRelayStatus> _sshRelay =
       ValueNotifier<SshRelayStatus>(const SshRelayStatus());
 
+  /// 高频传输进度与速率状态（10–20 次/秒 progress + 1 次/秒速率采样）。
+  /// 单独通过 ValueNotifier 推送给 RadarView 与 TransfersView，
+  /// 避免每次进度事件都触发 HomePage.setState 重建全部 5 个 Tab。
+  final ValueNotifier<_TransferTelemetry> _telemetry =
+      ValueNotifier<_TransferTelemetry>(const _TransferTelemetry());
+
   /// dispose 已开始：此后任何异步回写（_stopCore 等）不得再触碰
-  /// [_sshRelay]，否则是 use-after-dispose。
+  /// [_sshRelay] 或 [_telemetry]，否则是 use-after-dispose。
   bool _teardown = false;
 
   String? _selectedInstance;
@@ -123,6 +129,18 @@ class _HomePageState extends State<HomePage> {
   final List<double> _speedHistory = <double>[];
   Timer? _speedSamplerTimer;
 
+  void _publishTelemetry() {
+    if (_teardown) return;
+    final TransferProgress? active =
+        _progress.isNotEmpty ? _progress.values.first : null;
+    _telemetry.value = _TransferTelemetry(
+      activeProgress: active,
+      speedBytesPerSec: _speedBytes,
+      speedHistory: List<double>.unmodifiable(_speedHistory),
+      isTransferPaused: _isTransferPaused,
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -142,28 +160,37 @@ class _HomePageState extends State<HomePage> {
     _events?.cancel();
     _shareChannel.setMethodCallHandler(null);
     _sshRelay.dispose();
+    _telemetry.dispose();
     unawaited(_stopCore());
     super.dispose();
   }
 
   void _startSpeedSampler() {
     _speedSamplerTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) return;
+      if (!mounted || _teardown) return;
+      final bool hasActiveWork = _progress.isNotEmpty ||
+          _sendIds.isNotEmpty ||
+          _activeWormholeSession != null;
+      final bool hasResidualCurve =
+          _speedBytes > 0 || _speedHistory.any((double v) => v > 0);
+      // 完全空闲且波形已归零时不触发任何通知与重绘。
+      if (!hasActiveWork && !hasResidualCurve && _speedHistory.length >= 30) {
+        return;
+      }
       final double mbPerSec = _speedBytes / (1024 * 1024);
-      setState(() {
-        if (_speedHistory.length >= 30) {
-          _speedHistory.removeAt(0);
-        }
-        _speedHistory.add(mbPerSec > 0 ? mbPerSec : 0.0);
-      });
+      if (_speedHistory.length >= 30) {
+        _speedHistory.removeAt(0);
+      }
+      _speedHistory.add(mbPerSec > 0 ? mbPerSec : 0.0);
       // 传输结束后必须把速率清零，否则采样器会一直把最后一段陈旧速率
       // 推入图表，看起来像"传输完了还在跑"。
-      if (_sendIds.isEmpty && _activeWormholeSession == null) {
+      if (!hasActiveWork) {
         _speedKey = '';
         _speedBytes = 0;
         _speedSampleTime = 0;
         _speedSampleDone = 0;
       }
+      _publishTelemetry();
     });
   }
 
@@ -797,6 +824,7 @@ class _HomePageState extends State<HomePage> {
           _progress.clear();
           _sendIds.clear();
         });
+        _publishTelemetry();
         _toast('传输核心已停止: $reason');
 
       case 'lan.peers':
@@ -826,9 +854,8 @@ class _HomePageState extends State<HomePage> {
         _calculateSpeed(data['kind']?.toString() ?? 'send', filename, done, total);
 
         if (!mounted) return;
-        setState(() {
-          _progress[key] = TransferProgress(filename, done, total);
-        });
+        _progress[key] = TransferProgress(filename, done, total);
+        _publishTelemetry();
 
       case 'lan.sent':
         final String? id = data['send_id']?.toString();
@@ -841,6 +868,7 @@ class _HomePageState extends State<HomePage> {
             _sendIds.remove(id);
             _trackedSends.removeWhere((_TrackedSend job) => job.sendId == id);
           });
+          _publishTelemetry();
           if (paused && data['ok'] != true) return;
           _toast(data['ok'] == true ? '发送成功，校验完成' : '发送中断：${data['error'] ?? '网络异常'}');
         }
@@ -863,6 +891,7 @@ class _HomePageState extends State<HomePage> {
             ),
           );
         });
+        _publishTelemetry();
         _persistReceivedRecords();
         if (path.isNotEmpty) {
           unawaited(_exportReceived(path));
@@ -1046,7 +1075,7 @@ class _HomePageState extends State<HomePage> {
           ),
           title: const Row(
             children: <Widget>[
-              Icon(Icons.share, color: jade400, size: 20),
+              IconsaxIcon(Iconsax.send, color: jade400, size: 20),
               SizedBox(width: 8),
               Text('发现分享文件', style: TextStyle(color: textPrimary, fontSize: 16)),
             ],
@@ -1133,7 +1162,7 @@ class _HomePageState extends State<HomePage> {
           ),
           title: const Row(
             children: <Widget>[
-              Icon(Icons.radar, color: jade400, size: 20),
+              IconsaxIcon(Iconsax.radar, color: jade400, size: 20),
               SizedBox(width: 8),
               Text('选择传输方式', style: TextStyle(color: textPrimary, fontSize: 16)),
             ],
@@ -1152,7 +1181,7 @@ class _HomePageState extends State<HomePage> {
                   Navigator.of(ctx).pop();
                   _createWormholeSend(paths);
                 },
-                icon: const Icon(Icons.key, size: 16, color: bgAbyss),
+                icon: const IconsaxIcon(Iconsax.key, size: 16, color: bgAbyss),
                 label: const Text(
                   '生成一次性暗号 (跨网穿透)',
                   style: TextStyle(
@@ -1175,7 +1204,7 @@ class _HomePageState extends State<HomePage> {
                   Navigator.of(ctx).pop();
                   _manualIpSendDialog(paths);
                 },
-                icon: const Icon(Icons.settings_ethernet, size: 16, color: jade400),
+                icon: const IconsaxIcon(Iconsax.route, size: 16, color: jade400),
                 label: const Text(
                   '指定目标 IP 直连',
                   style: TextStyle(
@@ -1202,7 +1231,7 @@ class _HomePageState extends State<HomePage> {
                   });
                   _toast('已加入待发队列，附近设备上线后将自动发送');
                 },
-                icon: const Icon(Icons.schedule, size: 16, color: textMuted),
+                icon: const IconsaxIcon(Iconsax.update, size: 16, color: textMuted),
                 label: const Text(
                   '加入待发队列 (等待设备上线)',
                   style: TextStyle(
@@ -1227,61 +1256,82 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _manualIpSendDialog(List<String> paths) async {
     final TextEditingController ipCtrl = TextEditingController();
-    await showDialog<void>(
-      context: context,
-      builder: (BuildContext ctx) {
-        return AlertDialog(
-          backgroundColor: surfaceContainer,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: borderLuminescent),
-          ),
-          title: const Text('输入对端 IP / 域名',
-              style: TextStyle(color: textPrimary, fontSize: 15)),
-          content: TextField(
-            controller: ipCtrl,
-            style: const TextStyle(
-                color: textPrimary, fontSize: 13, fontFamily: 'monospace'),
-            decoration: const InputDecoration(
-              hintText: '例如 192.168.1.108 或 100.64.0.2',
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (BuildContext ctx) {
+          return AlertDialog(
+            backgroundColor: surfaceContainer,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+              side: const BorderSide(color: borderLuminescent),
             ),
-          ),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('取消', style: TextStyle(color: textMuted)),
+            title: const Row(
+              children: <Widget>[
+                IconsaxIcon(Iconsax.route, color: jade400, size: 18),
+                SizedBox(width: 8),
+                Text(
+                  '输入对端 IP / 域名',
+                  style: TextStyle(
+                    color: textPrimary,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
             ),
-            ElevatedButton(
-              onPressed: () {
-                final String raw = ipCtrl.text.trim();
-                final ManualPeer peer =
-                    parseManualEndpoint(raw, name: '目标设备');
-                if (peer.host.isNotEmpty) {
-                  setState(() {
-                    _manualPeers = <ManualPeer>[
-                      ..._manualPeers.where(
-                        (ManualPeer item) =>
-                            !sameEndpointHost(item.host, peer.host),
-                      ),
-                      peer,
-                    ];
-                    _pendingSendPaths = List<String>.from(paths);
-                    _pendingSendHost = peer.host;
-                  });
-                  Navigator.of(ctx).pop();
-                  unawaited(_persistManualPeers());
-                  unawaited(_startLanSession());
-                  _toast('正在发现 ${peer.host} 并准备发送...');
-                }
-              },
-              style: ElevatedButton.styleFrom(backgroundColor: jade400),
-              child: const Text('发现后发送',
-                  style: TextStyle(color: bgAbyss, fontWeight: FontWeight.bold)),
+            content: TextField(
+              controller: ipCtrl,
+              style: const TextStyle(
+                color: textPrimary,
+                fontSize: 13,
+                fontFamily: 'monospace',
+              ),
+              decoration: const InputDecoration(
+                hintText: '例如 192.168.1.108 或 100.64.0.2',
+              ),
             ),
-          ],
-        );
-      },
-    );
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('取消', style: TextStyle(color: textMuted)),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  final String raw = ipCtrl.text.trim();
+                  final ManualPeer peer =
+                      parseManualEndpoint(raw, name: '目标设备');
+                  if (peer.host.isNotEmpty) {
+                    setState(() {
+                      _manualPeers = <ManualPeer>[
+                        ..._manualPeers.where(
+                          (ManualPeer item) =>
+                              !sameEndpointHost(item.host, peer.host),
+                        ),
+                        peer,
+                      ];
+                      _pendingSendPaths = List<String>.from(paths);
+                      _pendingSendHost = peer.host;
+                    });
+                    Navigator.of(ctx).pop();
+                    unawaited(_persistManualPeers());
+                    unawaited(_startLanSession());
+                    _toast('正在发现 ${peer.host} 并准备发送...');
+                  }
+                },
+                style: ElevatedButton.styleFrom(backgroundColor: jade400),
+                child: const Text(
+                  '发现后发送',
+                  style: TextStyle(color: bgAbyss, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          );
+        },
+      );
+    } finally {
+      ipCtrl.dispose();
+    }
   }
 
   Future<void> _sendToPeer(PeerView peer, List<String> paths) async {
@@ -1325,6 +1375,7 @@ class _HomePageState extends State<HomePage> {
           _sendIds.add(sendId);
           _isTransferPaused = false;
         });
+        _publishTelemetry();
       } catch (err) {
         _trackedSends.remove(tracked);
         _toast('发起传输失败: $err');
@@ -1375,6 +1426,7 @@ class _HomePageState extends State<HomePage> {
         _passcodeExpiresAt = null;
       }
     });
+    _publishTelemetry();
     _toast('已取消传输');
   }
 
@@ -1386,6 +1438,7 @@ class _HomePageState extends State<HomePage> {
           _isTransferPaused = false;
           _pauseInProgress = false;
         });
+        _publishTelemetry();
         _toast('没有可恢复的传输');
         return;
       }
@@ -1396,6 +1449,7 @@ class _HomePageState extends State<HomePage> {
         _pauseInProgress = false;
         _pausedSends.clear();
       });
+      _publishTelemetry();
       final Map<String, List<String>> pathsByPeer = <String, List<String>>{};
       final Map<String, PeerView> peers = <String, PeerView>{};
       for (final _TrackedSend job in jobs) {
@@ -1456,6 +1510,7 @@ class _HomePageState extends State<HomePage> {
         if (job.sendId != null) _progress.remove(job.sendId);
       }
     });
+    _publishTelemetry();
     _toast('已暂停，进度保存在断点里');
   }
 
@@ -1465,7 +1520,10 @@ class _HomePageState extends State<HomePage> {
       await _startLanSession();
       if (_sessionId == null) return;
     }
-    setState(() => _isGeneratingPasscode = true);
+    setState(() {
+      _isGeneratingPasscode = true;
+      _currentTabIndex = 3;
+    });
     _toast('正在向中继注册一次性暗号...');
     try {
       final Map<String, dynamic> res =
@@ -1475,30 +1533,16 @@ class _HomePageState extends State<HomePage> {
         'settings': _wormholeSettings(),
       });
       final String? code = res['code']?.toString();
-      if (code != null && code.isNotEmpty) {
+      if (code != null && code.isNotEmpty && mounted) {
         setState(() {
           _currentPasscode = code;
           _activeWormholeSession = res['session_id']?.toString();
           _passcodeExpiresAt = DateTime.tryParse(
             res['expires_at']?.toString() ?? '',
           );
+          _currentTabIndex = 3;
         });
-        if (mounted) {
-          showDialog<void>(
-            context: context,
-            builder: (BuildContext ctx) {
-              return WormholePairingDialog(
-                passcode: code,
-                isGenerating: false,
-                onRefreshCode: () => _createWormholeSend(paths),
-                onJoinCode: _joinWormholeCode,
-                onPickFilesToSend: _pickFilesForWormhole,
-                initialTab: 0,
-                expiresAt: _passcodeExpiresAt,
-              );
-            },
-          );
-        }
+        _toast('一次性暗号已生成，请在配对页展示给对端');
       }
     } catch (e) {
       _toast('生成暗号失败: $e');
@@ -1578,16 +1622,20 @@ class _HomePageState extends State<HomePage> {
         return AlertDialog(
           backgroundColor: surfaceContainer,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(18),
+            borderRadius: BorderRadius.circular(14),
             side: const BorderSide(color: borderLuminescent),
           ),
           title: const Row(
             children: <Widget>[
-              Icon(Icons.bolt, color: jade400, size: 20),
+              IconsaxIcon(Iconsax.key, color: jade400, size: 18),
               SizedBox(width: 8),
               Text(
-                '收到穿透传输请求',
-                style: TextStyle(color: textPrimary, fontSize: 16),
+                '收到跨网传书请求',
+                style: TextStyle(
+                  color: textPrimary,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ],
           ),
@@ -1598,7 +1646,8 @@ class _HomePageState extends State<HomePage> {
               Text('发送方：$sender', style: const TextStyle(color: textMuted, fontSize: 12)),
               const SizedBox(height: 6),
               Text('文件：$filename', style: const TextStyle(color: textPrimary, fontSize: 13, fontWeight: FontWeight.w600)),
-              Text('大小：${formatBytes(size)}', style: const TextStyle(color: textMuted, fontSize: 12, fontFamily: 'monospace')),
+              const SizedBox(height: 4),
+              Text('大小：${formatBytes(size)}', style: const TextStyle(color: jade400, fontSize: 12, fontFamily: 'monospace')),
             ],
           ),
           actions: <Widget>[
@@ -1610,7 +1659,7 @@ class _HomePageState extends State<HomePage> {
               onPressed: () => Navigator.of(ctx).pop(true),
               style: ElevatedButton.styleFrom(
                 backgroundColor: jade400,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               ),
               child: const Text('接收', style: TextStyle(color: bgAbyss, fontWeight: FontWeight.bold)),
             ),
@@ -1628,23 +1677,6 @@ class _HomePageState extends State<HomePage> {
         'session_id': _activeWormholeSession,
       });
     }
-  }
-
-  void _openWormholeModal() {
-    showDialog<void>(
-      context: context,
-      builder: (BuildContext ctx) {
-        return WormholePairingDialog(
-          passcode: _currentPasscode,
-          isGenerating: _isGeneratingPasscode,
-          onRefreshCode: _pickFilesForWormhole,
-          onJoinCode: _joinWormholeCode,
-          onPickFilesToSend: _pickFilesForWormhole,
-          initialTab: 0,
-          expiresAt: _passcodeExpiresAt,
-        );
-      },
-    );
   }
 
   Future<void> _pickCustomDirectory() async {
@@ -1693,47 +1725,64 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _manualIpConnectDialog() async {
     final TextEditingController ipCtrl = TextEditingController();
-    await showDialog<void>(
-      context: context,
-      builder: (BuildContext ctx) {
-        return AlertDialog(
-          backgroundColor: surfaceContainer,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: borderLuminescent),
-          ),
-          title: const Text('添加对端地址', style: TextStyle(color: textPrimary, fontSize: 15)),
-          content: TextField(
-            controller: ipCtrl,
-            style: const TextStyle(color: textPrimary, fontSize: 13, fontFamily: 'monospace'),
-            decoration: const InputDecoration(
-              hintText: '例如 192.168.1.108 或 100.64.0.2',
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (BuildContext ctx) {
+          return AlertDialog(
+            backgroundColor: surfaceContainer,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+              side: const BorderSide(color: borderLuminescent),
             ),
-          ),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('取消', style: TextStyle(color: textMuted)),
+            title: const Row(
+              children: <Widget>[
+                IconsaxIcon(Iconsax.route, color: jade400, size: 18),
+                SizedBox(width: 8),
+                Text(
+                  '添加对端地址',
+                  style: TextStyle(
+                    color: textPrimary,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
             ),
-            ElevatedButton(
-              onPressed: () {
-                final ManualPeer peer = parseManualEndpoint(
-                  ipCtrl.text.trim(),
-                  name: '手动节点',
-                );
-                if (peer.host.isNotEmpty) {
-                  Navigator.of(ctx).pop();
-                  _rememberManualPeer(peer);
-                  _toast('正在发现 ${peer.host}');
-                }
-              },
-              style: ElevatedButton.styleFrom(backgroundColor: jade400),
-              child: const Text('加入发现', style: TextStyle(color: bgAbyss, fontWeight: FontWeight.bold)),
+            content: TextField(
+              controller: ipCtrl,
+              style: const TextStyle(color: textPrimary, fontSize: 13, fontFamily: 'monospace'),
+              decoration: const InputDecoration(
+                hintText: '例如 192.168.1.108 或 100.64.0.2',
+              ),
             ),
-          ],
-        );
-      },
-    );
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('取消', style: TextStyle(color: textMuted)),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  final ManualPeer peer = parseManualEndpoint(
+                    ipCtrl.text.trim(),
+                    name: '手动节点',
+                  );
+                  if (peer.host.isNotEmpty) {
+                    Navigator.of(ctx).pop();
+                    _rememberManualPeer(peer);
+                    _toast('正在发现 ${peer.host}');
+                  }
+                },
+                style: ElevatedButton.styleFrom(backgroundColor: jade400),
+                child: const Text('加入发现', style: TextStyle(color: bgAbyss, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          );
+        },
+      );
+    } finally {
+      ipCtrl.dispose();
+    }
   }
 
   Future<void> _exportReceived(String path) async {
@@ -1938,12 +1987,10 @@ class _HomePageState extends State<HomePage> {
 
   void _forgetPasscode() {
     if (_currentPasscode.isEmpty) return;
-    // 暗号过期只是配对窗口结束，但会话本身还在核心侧跑着——不清掉
-    // _activeWormholeSession，后续判定(中止/暂停/速度采样)都会以为还有
-    // 一条活的短码传输，UI 与核心状态脱节。
     setState(() {
       _currentPasscode = '';
       _passcodeExpiresAt = null;
+      _activeWormholeSession = null;
     });
     _toast('一次性暗号已过期');
   }
@@ -1972,68 +2019,74 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    TransferProgress? active;
-    if (_progress.isNotEmpty) {
-      active = _progress.values.first;
-    }
-
-    final double transferPct = active != null ? active.fraction * 100 : -1.0;
-
     return Scaffold(
       backgroundColor: bgAbyss,
       body: SafeArea(
         child: IndexedStack(
           index: _currentTabIndex,
           children: <Widget>[
-            // Tab 0: 量子雷达
-            RadarView(
-              listenPort: _actualPort,
-              identityFingerprint: _certificateFingerprint,
-              peers: _peers,
-              selectedPeerInstance: _selectedInstance,
-              searching: _peers.isEmpty,
-              transferPercent: transferPct,
-              recentReceived: _received,
-              onSelectPeer: (PeerView peer) {
-                setState(() => _selectedInstance = peer.instanceId);
-                _toast('已锁定设备: ${peer.name}');
+            // Tab 0: 砚心墨池 · 雷达发现
+            ValueListenableBuilder<_TransferTelemetry>(
+              valueListenable: _telemetry,
+              builder: (BuildContext context, _TransferTelemetry t, Widget? _) {
+                final double transferPct = t.activeProgress != null
+                    ? t.activeProgress!.fraction * 100
+                    : -1.0;
+                return RadarView(
+                  listenPort: _actualPort,
+                  identityFingerprint: _certificateFingerprint,
+                  peers: _peers,
+                  selectedPeerInstance: _selectedInstance,
+                  searching: _peers.isEmpty,
+                  transferPercent: transferPct,
+                  recentReceived: _received,
+                  onSelectPeer: (PeerView peer) {
+                    setState(() => _selectedInstance = peer.instanceId);
+                    _toast('已锁定设备: ${peer.name}');
+                  },
+                  onTapCore: () {
+                    if (_progress.isNotEmpty) {
+                      setState(() => _currentTabIndex = 1);
+                      return;
+                    }
+                    unawaited(_pickAndSendFiles());
+                  },
+                  onSendFile: _pickAndSendFiles,
+                  onOpenWormhole: () => setState(() => _currentTabIndex = 3),
+                  onOpenPairQr: _openScannerPairing,
+                  onOpenSettings: () => setState(() => _currentTabIndex = 4),
+                  onRefreshDiscovery: () => unawaited(_refreshDiscovery()),
+                  onOpenInbox: () => setState(() => _currentTabIndex = 2),
+                  onOpenFile: _openFile,
+                );
               },
-              onTapCore: () {
-                if (_progress.isNotEmpty) {
-                  setState(() => _currentTabIndex = 1);
-                  return;
-                }
-                unawaited(_pickAndSendFiles());
-              },
-              onSendFile: _pickAndSendFiles,
-              onOpenWormhole: _openWormholeModal,
-              onOpenPairQr: _openScannerPairing,
-              onOpenSettings: () => setState(() => _currentTabIndex = 4),
-              onRefreshDiscovery: () => unawaited(_refreshDiscovery()),
-              onOpenInbox: () => setState(() => _currentTabIndex = 2),
-              onOpenFile: _openFile,
             ),
 
-            // Tab 1: 收发详情
-            TransfersView(
-              activeProgress: active,
-              speedBytesPerSec: _speedBytes,
-              speedHistory: _speedHistory,
-              listenPort: _actualPort,
-              receivedFiles: _received,
-              isTransferPaused: _isTransferPaused,
-              onTogglePause: () => unawaited(_togglePause()),
-              onCancelTransfer: _cancelActiveTransfer,
-              onClearHistory: () {
-                setState(() => _received.clear());
-                _persistReceivedRecords();
+            // Tab 1: 传书 · 流转详情
+            ValueListenableBuilder<_TransferTelemetry>(
+              valueListenable: _telemetry,
+              builder: (BuildContext context, _TransferTelemetry t, Widget? _) {
+                return TransfersView(
+                  activeProgress: t.activeProgress,
+                  speedBytesPerSec: t.speedBytesPerSec,
+                  speedHistory: t.speedHistory,
+                  listenPort: _actualPort,
+                  receivedFiles: _received,
+                  isTransferPaused: t.isTransferPaused,
+                  onTogglePause: () => unawaited(_togglePause()),
+                  onCancelTransfer: _cancelActiveTransfer,
+                  onClearHistory: () {
+                    setState(() => _received.clear());
+                    _persistReceivedRecords();
+                  },
+                  onOpenFile: _openFile,
+                  onRefresh: _reloadReceivedRecords,
+                  onOpenSettings: () => setState(() => _currentTabIndex = 4),
+                );
               },
-              onOpenFile: _openFile,
-              onRefresh: _reloadReceivedRecords,
-              onOpenSettings: () => setState(() => _currentTabIndex = 4),
             ),
 
-            // Tab 2: 收件箱
+            // Tab 2: 藏卷 · 收件箱
             InboxView(
               inboxPath: _exportPath,
               files: _received,
@@ -2050,11 +2103,12 @@ class _HomePageState extends State<HomePage> {
               onOpenSettings: () => setState(() => _currentTabIndex = 4),
             ),
 
-            // Tab 3: 配对与二维码
+            // Tab 3: 符契 · 配对与二维码
             PairView(
               listenPort: _actualPort,
               passcode: _currentPasscode,
               passcodeExpiresAt: _passcodeExpiresAt,
+              isGeneratingPasscode: _isGeneratingPasscode,
               identityFingerprint: _certificateFingerprint,
               onBackToRadar: () => setState(() => _currentTabIndex = 0),
               onOpenSettings: () => setState(() => _currentTabIndex = 4),
@@ -2070,7 +2124,7 @@ class _HomePageState extends State<HomePage> {
               scanRequest: _scanRequest,
             ),
 
-            // Tab 4: 设置
+            // Tab 4: 规制 · 设置
             SettingsView(
               initialSettings: InkSettings(
                 peerName: _peerName,
@@ -2092,6 +2146,7 @@ class _HomePageState extends State<HomePage> {
               instanceId: _instanceId,
               actualPort: _actualPort,
               inboxPath: _exportPath,
+              appInboxPath: _inbox,
               onBack: () => setState(() => _currentTabIndex = 0),
               onSave: _saveSettings,
               onChooseDirectory: _pickCustomDirectory,
@@ -2107,6 +2162,20 @@ class _HomePageState extends State<HomePage> {
       ),
     );
   }
+}
+
+class _TransferTelemetry {
+  const _TransferTelemetry({
+    this.activeProgress,
+    this.speedBytesPerSec = 0,
+    this.speedHistory = const <double>[],
+    this.isTransferPaused = false,
+  });
+
+  final TransferProgress? activeProgress;
+  final double speedBytesPerSec;
+  final List<double> speedHistory;
+  final bool isTransferPaused;
 }
 
 class _TrackedSend {

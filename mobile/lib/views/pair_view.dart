@@ -5,8 +5,10 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import '../models.dart';
 import '../theme.dart';
+import '../widgets/iconsax.dart';
 
 /// Tab 3: 配对与扫码互联视图 (Pair Qr)
+/// 保持原版布局、文案与 Void+Jade 配色，融合 Iconsax 双色调图标与按需动画省电控制
 class PairView extends StatefulWidget {
   const PairView({
     super.key,
@@ -18,6 +20,7 @@ class PairView extends StatefulWidget {
     required this.onManualIpConnect,
     required this.onJoinWormholeCode,
     this.passcodeExpiresAt,
+    this.isGeneratingPasscode = false,
     this.cameraEnabled = false,
     this.onScanned,
     this.onScanImage,
@@ -29,6 +32,7 @@ class PairView extends StatefulWidget {
   final int listenPort;
   final String passcode;
   final DateTime? passcodeExpiresAt;
+  final bool isGeneratingPasscode;
   final String identityFingerprint;
   final VoidCallback onBackToRadar;
   final VoidCallback onOpenSettings;
@@ -49,14 +53,14 @@ class PairView extends StatefulWidget {
   State<PairView> createState() => _PairViewState();
 }
 
-class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin {
+class _PairViewState extends State<PairView>
+    with SingleTickerProviderStateMixin {
   int _activeTab = 0; // 0 = 我的动态码, 1 = 扫一扫互联
   late int _seenScanRequest;
   bool _copied = false;
   bool _expiryNotified = false;
 
   Timer? _countdownTimer;
-
   late final AnimationController _laserAnim;
 
   @override
@@ -64,13 +68,11 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
     super.initState();
     _seenScanRequest = widget.scanRequest;
     if (widget.scanRequest > 0) _activeTab = 1;
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (Timer timer) {
-      _tickCountdown();
-    });
     _laserAnim = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1800),
-    )..repeat(reverse: true);
+    );
+    _syncTimersAndAnimations();
   }
 
   @override
@@ -83,6 +85,27 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
     if (widget.scanRequest != _seenScanRequest) {
       _seenScanRequest = widget.scanRequest;
       setState(() => _activeTab = 1);
+    }
+    _syncTimersAndAnimations();
+  }
+
+  void _syncTimersAndAnimations() {
+    final bool shouldRunLaser = widget.cameraEnabled && _activeTab == 1;
+    if (shouldRunLaser && !_laserAnim.isAnimating) {
+      _laserAnim.repeat(reverse: true);
+    } else if (!shouldRunLaser && _laserAnim.isAnimating) {
+      _laserAnim.stop();
+    }
+
+    final bool hasActiveCode =
+        widget.passcode.trim().isNotEmpty && widget.passcodeExpiresAt != null;
+    if (hasActiveCode && _countdownTimer == null) {
+      _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        _tickCountdown();
+      });
+    } else if (!hasActiveCode && _countdownTimer != null) {
+      _countdownTimer?.cancel();
+      _countdownTimer = null;
     }
   }
 
@@ -102,6 +125,8 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
         : expiry.difference(DateTime.now()).inSeconds;
     if (hasCode && expiry != null && next <= 0 && !_expiryNotified) {
       _expiryNotified = true;
+      _countdownTimer?.cancel();
+      _countdownTimer = null;
       widget.onPasscodeExpired?.call();
     }
     if (next > 0) _expiryNotified = false;
@@ -136,7 +161,11 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
       backgroundColor: Colors.transparent,
       appBar: AppBar(
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: textMuted),
+          icon: const IconsaxIcon(
+            Iconsax.arrowLeft,
+            size: 20,
+            color: textMuted,
+          ),
           onPressed: widget.onBackToRadar,
         ),
         title: const Text(
@@ -150,8 +179,11 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
         actions: <Widget>[
           IconButton(
             onPressed: widget.onOpenSettings,
-            icon: const Icon(Icons.settings_outlined, size: 20),
-            color: textMuted,
+            icon: const IconsaxIcon(
+              Iconsax.settings,
+              size: 20,
+              color: textMuted,
+            ),
             splashRadius: 18,
           ),
         ],
@@ -165,7 +197,7 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
             _buildSegmentedSwitcher(),
             const SizedBox(height: 14),
 
-            // 模式 1：我的动态码
+            // 模式 1：我的动态码 / 模式 2：扫一扫互联
             if (_activeTab == 0) _buildMyQrView() else _buildScannerView(),
             const SizedBox(height: 24),
           ],
@@ -188,7 +220,10 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
           children: <Widget>[
             Expanded(
               child: GestureDetector(
-                onTap: () => setState(() => _activeTab = 0),
+                onTap: () {
+                  setState(() => _activeTab = 0);
+                  _syncTimersAndAnimations();
+                },
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 180),
                   padding: const EdgeInsets.symmetric(vertical: 8),
@@ -203,8 +238,8 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: <Widget>[
-                      Icon(
-                        Icons.qr_code_2,
+                      IconsaxIcon(
+                        Iconsax.pairQr,
                         size: 16,
                         color: _activeTab == 0 ? jade400 : textMuted,
                       ),
@@ -226,7 +261,10 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
             ),
             Expanded(
               child: GestureDetector(
-                onTap: () => setState(() => _activeTab = 1),
+                onTap: () {
+                  setState(() => _activeTab = 1);
+                  _syncTimersAndAnimations();
+                },
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 180),
                   padding: const EdgeInsets.symmetric(vertical: 8),
@@ -241,8 +279,8 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: <Widget>[
-                      Icon(
-                        Icons.document_scanner_outlined,
+                      IconsaxIcon(
+                        Iconsax.scanner,
                         size: 16,
                         color: _activeTab == 1 ? jade400 : textMuted,
                       ),
@@ -320,14 +358,21 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                       ],
                     ),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 3,
+                      ),
                       decoration: BoxDecoration(
                         color: surfaceHigh,
                         borderRadius: BorderRadius.circular(16),
                       ),
                       child: Row(
                         children: <Widget>[
-                          const Icon(Icons.autorenew, color: jade400, size: 12),
+                          const IconsaxIcon(
+                            Iconsax.refresh,
+                            color: jade400,
+                            size: 12,
+                          ),
                           const SizedBox(width: 4),
                           Text(
                             _formattedCountdown,
@@ -365,7 +410,6 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                   child: Stack(
                     alignment: Alignment.center,
                     children: <Widget>[
-                      // 四角准星
                       const Positioned(
                         top: 2,
                         left: 2,
@@ -388,19 +432,19 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                       ),
 
                       if (hasCode)
-                      QrImageView(
-                        data: wormholeReceiveUri(codeText),
-                        version: QrVersions.auto,
-                        size: 180,
-                        eyeStyle: const QrEyeStyle(
-                          eyeShape: QrEyeShape.square,
-                          color: jade400,
-                        ),
-                        dataModuleStyle: const QrDataModuleStyle(
-                          dataModuleShape: QrDataModuleShape.square,
-                          color: textPrimary,
-                        ),
-                      )
+                        QrImageView(
+                          data: wormholeReceiveUri(codeText),
+                          version: QrVersions.auto,
+                          size: 180,
+                          eyeStyle: const QrEyeStyle(
+                            eyeShape: QrEyeShape.square,
+                            color: jade400,
+                          ),
+                          dataModuleStyle: const QrDataModuleStyle(
+                            dataModuleShape: QrDataModuleShape.square,
+                            color: textPrimary,
+                          ),
+                        )
                       else
                         const Padding(
                           padding: EdgeInsets.symmetric(horizontal: 16),
@@ -438,7 +482,10 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
 
                 // 口令密文框
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
                   decoration: BoxDecoration(
                     color: surfaceHigh,
                     borderRadius: BorderRadius.circular(12),
@@ -452,7 +499,11 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                         children: <Widget>[
                           const Row(
                             children: <Widget>[
-                              Icon(Icons.vpn_key, color: jade400, size: 13),
+                              IconsaxIcon(
+                                Iconsax.key,
+                                color: jade400,
+                                size: 13,
+                              ),
                               SizedBox(width: 4),
                               Text(
                                 '口令密文 / Secret Token',
@@ -465,18 +516,21 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
                               if (!hasCode) return;
                               Clipboard.setData(ClipboardData(text: codeText));
                               setState(() => _copied = true);
-                              Future<void>.delayed(const Duration(seconds: 2), () {
-                                if (mounted) setState(() => _copied = false);
-                              });
+                              Future<void>.delayed(
+                                const Duration(seconds: 2),
+                                () {
+                                  if (mounted) setState(() => _copied = false);
+                                },
+                              );
                             },
                             child: Row(
                               children: <Widget>[
-                                Icon(
-                                  _copied ? Icons.check : Icons.copy,
+                                IconsaxIcon(
+                                  _copied ? Iconsax.check : Iconsax.copy,
                                   color: jade400,
                                   size: 12,
                                 ),
-                                const SizedBox(width: 2),
+                                const SizedBox(width: 3),
                                 Text(
                                   _copied ? '已复制' : '复制',
                                   style: const TextStyle(
@@ -519,7 +573,12 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
             child: const Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Icon(Icons.wifi_tethering, color: jade400, size: 20),
+                IconsaxBox(
+                  icon: Iconsax.wifiTethering,
+                  size: 36,
+                  iconSize: 18,
+                  borderRadius: 10,
+                ),
                 SizedBox(width: 10),
                 Expanded(
                   child: Column(
@@ -555,11 +614,24 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
               width: double.infinity,
               height: 42,
               child: OutlinedButton.icon(
-                onPressed: widget.onPickAndCreateWormhole,
-                icon: const Icon(Icons.key, size: 16, color: jade400),
-                label: const Text(
-                  '选择待发文件生成专属暗号',
-                  style: TextStyle(
+                onPressed: widget.isGeneratingPasscode
+                    ? null
+                    : widget.onPickAndCreateWormhole,
+                icon: widget.isGeneratingPasscode
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: jade400,
+                        ),
+                      )
+                    : const IconsaxIcon(Iconsax.key, size: 16, color: jade400),
+                label: Text(
+                  widget.isGeneratingPasscode
+                      ? '正在生成专属暗号…'
+                      : '选择待发文件生成专属暗号',
+                  style: const TextStyle(
                     color: textPrimary,
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -584,7 +656,7 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: <Widget>[
-                  Icon(Icons.link, color: textMuted, size: 14),
+                  IconsaxIcon(Iconsax.link, color: textMuted, size: 14),
                   SizedBox(width: 4),
                   Text(
                     '添加对端地址，发现后再发送',
@@ -630,8 +702,16 @@ class _PairViewState extends State<PairView> with SingleTickerProviderStateMixin
             width: double.infinity,
             height: 44,
             child: ElevatedButton.icon(
-              onPressed: () => setState(() => _activeTab = 0),
-              icon: const Icon(Icons.qr_code, size: 18, color: bgAbyss),
+              onPressed: () {
+                setState(() => _activeTab = 0);
+                _syncTimersAndAnimations();
+              },
+              icon: const IconsaxIcon(
+                Iconsax.pairQr,
+                size: 18,
+                color: bgAbyss,
+                secondaryOpacity: 0.25,
+              ),
               label: const Text(
                 '展示我的动态码',
                 style: TextStyle(
@@ -767,7 +847,11 @@ class _LiveFinderState extends State<_LiveFinder> {
                     controller: controller,
                     onDetect: _onDetect,
                     fit: BoxFit.cover,
-                    errorBuilder: (BuildContext context, MobileScannerException error, Widget? child) {
+                    errorBuilder: (
+                      BuildContext context,
+                      MobileScannerException error,
+                      Widget? child,
+                    ) {
                       return const ColoredBox(
                         color: surfaceLowest,
                         child: Center(
@@ -824,8 +908,8 @@ class _LiveFinderState extends State<_LiveFinder> {
                               right: 0,
                               child: Container(
                                 height: 2,
-                                decoration: BoxDecoration(
-                                  gradient: const LinearGradient(
+                                decoration: const BoxDecoration(
+                                  gradient: LinearGradient(
                                     colors: <Color>[
                                       Colors.transparent,
                                       jade400,
@@ -856,7 +940,10 @@ class _LiveFinderState extends State<_LiveFinder> {
                       borderRadius: BorderRadius.all(Radius.circular(16)),
                     ),
                     child: Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+                      padding: EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 5,
+                      ),
                       child: Text(
                         '将二维码放入框内',
                         style: TextStyle(color: textPrimary, fontSize: 11),
@@ -874,7 +961,11 @@ class _LiveFinderState extends State<_LiveFinder> {
           children: <Widget>[
             ElevatedButton.icon(
               onPressed: widget.onScanImage,
-              icon: const Icon(Icons.photo_library, size: 16, color: jade400),
+              icon: const IconsaxIcon(
+                Iconsax.gallery,
+                size: 16,
+                color: jade400,
+              ),
               label: const Text(
                 '相册导入',
                 style: TextStyle(color: textPrimary, fontSize: 11),
@@ -889,8 +980,8 @@ class _LiveFinderState extends State<_LiveFinder> {
             ),
             ElevatedButton.icon(
               onPressed: controller == null ? null : _toggleTorch,
-              icon: Icon(
-                _torchOn ? Icons.flash_on : Icons.flash_off,
+              icon: IconsaxIcon(
+                _torchOn ? Iconsax.flash : Iconsax.flashOff,
                 size: 16,
                 color: jade400,
               ),

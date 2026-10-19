@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import '../models.dart';
 import '../theme.dart';
 import '../widgets/cross_network_dialog.dart' show FingerprintConfirmDialog;
+import '../widgets/iconsax.dart';
 
 /// SSH 反向隧道中继控制台。
 ///
@@ -18,20 +19,6 @@ import '../widgets/cross_network_dialog.dart' show FingerprintConfirmDialog;
 ///   1. 核心事件流是单一广播源，监听与去重集中在 home_page 一处；
 ///   2. 本页是 Navigator.push 出来的路由，父页面 setState 不会重建它，
 ///      所以必须用可监听对象而不是普通参数来传递实时状态。
-///
-/// 与设计稿的**有意偏差**（都是为了不说谎，逐条说明）：
-///   - 设计稿有「Ed25519 密钥认证 / 密码认证」页签：核心的 `SshProfile` 只有
-///     `private_key` + `passphrase`（密钥口令），不支持密码登录，故只保留密钥认证。
-///   - 设计稿的「墨洞本机 Ed25519 公钥 → 复制 → 加进 VPS authorized_keys」：
-///     核心用**你提供的私钥**登录，`ssh.listen` 回传的 `noise_public` 是设备
-///     身份公钥（给对端配对握手用的），拿它去 VPS 登录是登不上的。故这里改成
-///     导入私钥 + 密钥口令 + 主机指纹——核心真正需要的三项。
-///   - 设计稿的「动态流压缩 (zlib)」：核心没有实现，删除。
-///   - 设计稿的「连接保活 / 自动重连」开关：核心里是硬编码常开
-///     （`SSH_KEEPALIVE_INTERVAL = 30s`、重连退避固定），无法关闭，
-///     故改为只读状态展示而不是可以拨动却无效的开关。
-///   - 设计稿的「~14ms RTT」：核心没有 RTT 接口，改为显示**实测**的
-///     `ssh.check` 握手耗时。
 class SshRelayView extends StatefulWidget {
   const SshRelayView({
     super.key,
@@ -131,8 +118,6 @@ class _SshRelayViewState extends State<SshRelayView> {
         manualPeers: widget.initial.manualPeers,
         rendezvousUrl: widget.initial.rendezvousUrl,
         transitRelay: widget.initial.transitRelay,
-        // 透传而不是硬写 true：控制台只能从「SSH 中继」开关打开时进入，
-        // 但保存动作不该顺手改动用户没碰过的开关。
         sshEnabled: widget.initial.sshEnabled,
         sshHost: _host.text.trim(),
         sshPort: _portValue,
@@ -217,7 +202,6 @@ class _SshRelayViewState extends State<SshRelayView> {
         _notify('握手成功，主机指纹与已固定的一致');
         return;
       }
-      // 未固定过、或与本地记录不一致：交给用户核对。
       final String? confirmed = await showDialog<String>(
         context: context,
         builder: (BuildContext dialogContext) => FingerprintConfirmDialog(
@@ -267,7 +251,7 @@ class _SshRelayViewState extends State<SshRelayView> {
       backgroundColor: Colors.transparent,
       appBar: AppBar(
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: textMuted),
+          icon: const IconsaxIcon(Iconsax.arrowLeft, color: textMuted, size: 20),
           onPressed: widget.onBack,
         ),
         title: const Text(
@@ -330,15 +314,12 @@ class _SshRelayViewState extends State<SshRelayView> {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        Container(
-          width: 32,
-          height: 32,
-          decoration: BoxDecoration(
-            color: surfaceContainer,
-            shape: BoxShape.circle,
-            border: Border.all(color: surfaceBorder),
-          ),
-          child: const Icon(Icons.terminal, size: 18, color: jade400),
+        const IconsaxBox(
+          icon: Iconsax.terminal,
+          color: jade400,
+          size: 34,
+          iconSize: 18,
+          borderRadius: 10,
         ),
         const SizedBox(width: 10),
         Expanded(
@@ -411,7 +392,7 @@ class _SshRelayViewState extends State<SshRelayView> {
         children: <Widget>[
           const Padding(
             padding: EdgeInsets.only(top: 1),
-            child: Icon(Icons.shield_outlined, size: 18, color: jade400),
+            child: IconsaxIcon(Iconsax.shield, size: 18, color: jade400),
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -465,7 +446,7 @@ class _SshRelayViewState extends State<SshRelayView> {
         crossAxisAlignment: CrossAxisAlignment.center,
         children: <Widget>[
           _buildNode(
-            icon: Icons.smartphone,
+            icon: Iconsax.devicePhone,
             title: '本端节点',
             detail: '127.0.0.1:${widget.localPort}',
             tone: jade400,
@@ -490,10 +471,12 @@ class _SshRelayViewState extends State<SshRelayView> {
                           color: live ? jade400 : surfaceBorder,
                         ),
                       ),
-                      child: Icon(
-                        status.active ? Icons.lock : Icons.lock_open,
-                        size: 13,
-                        color: live ? jade400 : textDim,
+                      child: Center(
+                        child: IconsaxIcon(
+                          Iconsax.lock,
+                          size: 13,
+                          color: live ? jade400 : textDim,
+                        ),
                       ),
                     ),
                     Expanded(
@@ -530,7 +513,7 @@ class _SshRelayViewState extends State<SshRelayView> {
             ),
           ),
           _buildNode(
-            icon: Icons.dns_outlined,
+            icon: Iconsax.server,
             title: '远端服务器',
             detail: status.displayRemotePort == 0
                 ? '端口待分配'
@@ -544,7 +527,7 @@ class _SshRelayViewState extends State<SshRelayView> {
   }
 
   Widget _buildNode({
-    required IconData icon,
+    required Iconsax icon,
     required String title,
     required String detail,
     required Color tone,
@@ -568,7 +551,9 @@ class _SshRelayViewState extends State<SshRelayView> {
                     shape: BoxShape.circle,
                     border: Border.all(color: tone.withValues(alpha: 0.35)),
                   ),
-                  child: Icon(icon, size: 18, color: tone),
+                  child: Center(
+                    child: IconsaxIcon(icon, size: 17, color: tone),
+                  ),
                 ),
               ],
             ),
@@ -604,7 +589,7 @@ class _SshRelayViewState extends State<SshRelayView> {
 
   Widget _buildServerCard(SshRelayStatus status) {
     return _card(
-      icon: Icons.router_outlined,
+      icon: Iconsax.server,
       title: '中继服务器节点',
       trailing: const Text(
         'NODE CONFIG',
@@ -646,7 +631,7 @@ class _SshRelayViewState extends State<SshRelayView> {
           controller: _user,
           hint: 'root',
           mono: true,
-          leadingIcon: Icons.person_outline,
+          leadingIcon: Iconsax.fingerprint,
         ),
         const SizedBox(height: 8),
         _field(
@@ -654,20 +639,16 @@ class _SshRelayViewState extends State<SshRelayView> {
           controller: _fingerprint,
           hint: 'SHA256:...',
           mono: true,
-          leadingIcon: Icons.verified_user_outlined,
+          leadingIcon: Iconsax.shield,
           trailing: _fingerprint.text.trim().isEmpty
               ? null
               : IconButton(
                   tooltip: '复制指纹',
-                  icon: const Icon(Icons.content_copy, size: 16),
-                  color: textDim,
+                  icon: const IconsaxIcon(Iconsax.copy, size: 16, color: textDim),
                   onPressed: () => _copy(_fingerprint.text.trim(), '主机指纹'),
                 ),
         ),
         const SizedBox(height: 8),
-        // 核心真正需要的凭据：OpenSSH 私钥 + 可选的密钥口令。
-        // 设计稿这里放的是"本机公钥拿去加 authorized_keys"，与核心认证方式不符，
-        // 照做会让用户把一把用不上的钥匙加到服务器上。
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
@@ -679,7 +660,7 @@ class _SshRelayViewState extends State<SshRelayView> {
             children: <Widget>[
               Row(
                 children: <Widget>[
-                  const Icon(Icons.key_outlined, size: 16, color: jade400),
+                  const IconsaxIcon(Iconsax.key, size: 16, color: jade400),
                   const SizedBox(width: 6),
                   const Expanded(
                     child: Text(
@@ -693,7 +674,7 @@ class _SshRelayViewState extends State<SshRelayView> {
                   ),
                   TextButton.icon(
                     onPressed: _busy ? null : _importPrivateKey,
-                    icon: const Icon(Icons.file_open_outlined, size: 15),
+                    icon: const IconsaxIcon(Iconsax.folder, size: 15, color: jade400),
                     label: const Text('从文件导入', style: TextStyle(fontSize: 11)),
                     style: TextButton.styleFrom(
                       foregroundColor: jade400,
@@ -729,13 +710,11 @@ class _SshRelayViewState extends State<SshRelayView> {
                   ),
                   suffixIcon: IconButton(
                     tooltip: _keyVisible ? '隐藏' : '展开',
-                    icon: Icon(
-                      _keyVisible
-                          ? Icons.visibility_off_outlined
-                          : Icons.visibility_outlined,
+                    icon: IconsaxIcon(
+                      _keyVisible ? Iconsax.lock : Iconsax.unlock,
                       size: 16,
+                      color: textDim,
                     ),
-                    color: textDim,
                     onPressed: () => setState(() => _keyVisible = !_keyVisible),
                   ),
                 ),
@@ -754,7 +733,7 @@ class _SshRelayViewState extends State<SshRelayView> {
                 children: <Widget>[
                   Padding(
                     padding: EdgeInsets.only(top: 1),
-                    child: Icon(Icons.info_outline, size: 13, color: textMuted),
+                    child: IconsaxIcon(Iconsax.layers, size: 13, color: textMuted),
                   ),
                   SizedBox(width: 6),
                   Expanded(
@@ -776,7 +755,7 @@ class _SshRelayViewState extends State<SshRelayView> {
         if (status.initialError.isNotEmpty) ...<Widget>[
           const SizedBox(height: 8),
           _inlineNotice(
-            icon: Icons.error_outline,
+            icon: Iconsax.layers,
             tone: dangerCoral,
             text: '上次建立会话时出错：${status.initialError}',
           ),
@@ -789,7 +768,7 @@ class _SshRelayViewState extends State<SshRelayView> {
 
   Widget _buildTunnelCard() {
     return _card(
-      icon: Icons.alt_route,
+      icon: Iconsax.route,
       title: '转发与隧道流控',
       trailing: Text(
         _remotePortValue == sshRemotePortAuto
@@ -859,8 +838,6 @@ class _SshRelayViewState extends State<SshRelayView> {
           ),
         ),
         const SizedBox(height: 10),
-        // 核心把这两项做成了硬编码常开（SSH_KEEPALIVE_INTERVAL 30s、重连退避
-        // 固定），FFI 没有开关；所以这里只陈述事实，不提供拨不动的假开关。
         _alwaysOnRow(
           title: '连接保活心跳 (KeepAlive)',
           badge: '30s',
@@ -953,7 +930,7 @@ class _SshRelayViewState extends State<SshRelayView> {
       children: <Widget>[
         const Padding(
           padding: EdgeInsets.only(top: 1),
-          child: Icon(Icons.info_outline, size: 14, color: textDim),
+          child: IconsaxIcon(Iconsax.layers, size: 14, color: textDim),
         ),
         const SizedBox(width: 6),
         Expanded(
@@ -983,7 +960,7 @@ class _SshRelayViewState extends State<SshRelayView> {
 
   Widget _buildPairingCard(SshRelayStatus status) {
     return _card(
-      icon: Icons.hub_outlined,
+      icon: Iconsax.link,
       title: '设备配对',
       trailing: Text(
         '${status.peers.length} 台已配对',
@@ -1024,8 +1001,7 @@ class _SshRelayViewState extends State<SshRelayView> {
                 ),
                 IconButton(
                   tooltip: '复制配对码',
-                  icon: const Icon(Icons.content_copy, size: 16),
-                  color: jade400,
+                  icon: const IconsaxIcon(Iconsax.copy, size: 16, color: jade400),
                   onPressed: () => _copy(status.pendingPairCode, '配对码'),
                 ),
               ],
@@ -1034,7 +1010,7 @@ class _SshRelayViewState extends State<SshRelayView> {
           const SizedBox(height: 8),
         ],
         _dashedAction(
-          icon: Icons.qr_code_2,
+          icon: Iconsax.scanner,
           label: status.pendingPairCode.isEmpty ? '生成配对码（本机作为等待方）' : '重新生成配对码',
           enabled: !_busy && status.active,
           onTap: () async {
@@ -1109,7 +1085,6 @@ class _SshRelayViewState extends State<SshRelayView> {
           ),
         ],
         const SizedBox(height: 12),
-        // 对端身份列表：核心不会弹二次确认，所以把身份摊开给用户核对。
         const Text(
           '已配对设备（本次会话）',
           style: TextStyle(
@@ -1149,8 +1124,11 @@ class _SshRelayViewState extends State<SshRelayView> {
                 children: <Widget>[
                   Row(
                     children: <Widget>[
-                      const Icon(Icons.devices_other,
-                          size: 15, color: badgeRoute),
+                      const IconsaxIcon(
+                        Iconsax.devicePhone,
+                        size: 15,
+                        color: badgeRoute,
+                      ),
                       const SizedBox(width: 6),
                       Expanded(
                         child: Text(
@@ -1216,7 +1194,7 @@ class _SshRelayViewState extends State<SshRelayView> {
                       height: 14,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Icon(Icons.network_check, size: 16),
+                  : const IconsaxIcon(Iconsax.wifiTethering, size: 16, color: textPrimary),
               label: Text(
                 _handshake == null ? '测试握手' : _handshake!.elapsedLabel,
                 style: const TextStyle(fontSize: 12),
@@ -1239,9 +1217,10 @@ class _SshRelayViewState extends State<SshRelayView> {
             height: 46,
             child: FilledButton.icon(
               onPressed: _busy ? null : (active ? _disconnect : _connect),
-              icon: Icon(
-                active ? Icons.link_off : Icons.bolt,
-                size: 18,
+              icon: IconsaxIcon(
+                active ? Iconsax.closeCircle : Iconsax.flash,
+                size: 17,
+                color: active ? dangerCoral : bgAbyss,
               ),
               label: Text(
                 active ? '断开隧道' : '保存并建立隧道',
@@ -1382,7 +1361,7 @@ class _SshRelayViewState extends State<SshRelayView> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          const Icon(Icons.verified_user_outlined, size: 18, color: badgeRoute),
+          const IconsaxIcon(Iconsax.shield, size: 18, color: badgeRoute),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
@@ -1404,7 +1383,7 @@ class _SshRelayViewState extends State<SshRelayView> {
   // ---------- 通用小件 ----------
 
   Widget _card({
-    required IconData icon,
+    required Iconsax icon,
     required String title,
     Widget? trailing,
     required List<Widget> children,
@@ -1421,7 +1400,13 @@ class _SshRelayViewState extends State<SshRelayView> {
         children: <Widget>[
           Row(
             children: <Widget>[
-              Icon(icon, size: 18, color: jade400),
+              IconsaxBox(
+                icon: icon,
+                color: jade400,
+                size: 28,
+                iconSize: 15,
+                borderRadius: 8,
+              ),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
@@ -1449,7 +1434,7 @@ class _SshRelayViewState extends State<SshRelayView> {
     String? hint,
     bool mono = false,
     bool obscure = false,
-    IconData? leadingIcon,
+    Iconsax? leadingIcon,
     Widget? trailing,
     TextInputType? keyboardType,
   }) {
@@ -1470,7 +1455,7 @@ class _SshRelayViewState extends State<SshRelayView> {
           Row(
             children: <Widget>[
               if (leadingIcon != null) ...<Widget>[
-                Icon(leadingIcon, size: 16, color: textDim),
+                IconsaxIcon(leadingIcon, size: 15, color: textDim),
                 const SizedBox(width: 6),
               ],
               Expanded(
@@ -1510,7 +1495,7 @@ class _SshRelayViewState extends State<SshRelayView> {
   }
 
   Widget _dashedAction({
-    required IconData icon,
+    required Iconsax icon,
     required String label,
     required bool enabled,
     required VoidCallback onTap,
@@ -1519,7 +1504,7 @@ class _SshRelayViewState extends State<SshRelayView> {
       width: double.infinity,
       child: OutlinedButton.icon(
         onPressed: enabled ? onTap : null,
-        icon: Icon(icon, size: 16),
+        icon: IconsaxIcon(icon, size: 16, color: enabled ? jade400 : textDim),
         label: Text(label, style: const TextStyle(fontSize: 12)),
         style: OutlinedButton.styleFrom(
           foregroundColor: jade400,
@@ -1535,7 +1520,7 @@ class _SshRelayViewState extends State<SshRelayView> {
   }
 
   Widget _inlineNotice({
-    required IconData icon,
+    required Iconsax icon,
     required Color tone,
     required String text,
   }) {
@@ -1551,7 +1536,7 @@ class _SshRelayViewState extends State<SshRelayView> {
         children: <Widget>[
           Padding(
             padding: const EdgeInsets.only(top: 1),
-            child: Icon(icon, size: 14, color: tone),
+            child: IconsaxIcon(icon, size: 14, color: tone),
           ),
           const SizedBox(width: 6),
           Expanded(
@@ -1640,7 +1625,7 @@ class _ParticleTrack extends StatefulWidget {
     required this.tone,
   });
 
-  /// 隧道连通时光点提速并加亮，断开时保持缓慢流动表示"待建立"。
+  /// 隧道连通时光点提速并加亮，断开时静止以节省帧重绘开销。
   final bool active;
   final Color tone;
 
@@ -1652,33 +1637,34 @@ class _ParticleTrackState extends State<_ParticleTrack>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller = AnimationController(
     vsync: this,
-    duration: _duration(),
+    duration: const Duration(milliseconds: 650),
   );
-
-  Duration _duration() => widget.active
-      ? const Duration(milliseconds: 650)
-      : const Duration(milliseconds: 1800);
 
   @override
   void initState() {
     super.initState();
-    _start();
+    _syncAnimation();
   }
 
   @override
   void didUpdateWidget(_ParticleTrack oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.active != widget.active) {
-      _controller.duration = _duration();
-      _start();
+      _syncAnimation();
     }
   }
 
-  void _start() {
-    _controller
-      ..stop()
-      ..reset()
-      ..repeat();
+  void _syncAnimation() {
+    if (widget.active) {
+      _controller
+        ..stop()
+        ..reset()
+        ..repeat();
+    } else {
+      _controller
+        ..stop()
+        ..reset();
+    }
   }
 
   @override
@@ -1696,43 +1682,44 @@ class _ParticleTrackState extends State<_ParticleTrack>
         child: Stack(
           children: <Widget>[
             Container(color: widget.tone.withValues(alpha: 0.18)),
-            AnimatedBuilder(
-              animation: _controller,
-              builder: (BuildContext context, Widget? _) {
-                return LayoutBuilder(
-                  builder: (BuildContext context, BoxConstraints constraints) {
-                    final double width = constraints.maxWidth;
-                    final double t = _controller.value;
-                    // 0\~30% 渐显、70%\~100% 渐隐，模拟光带穿过。
-                    final double opacity = t < 0.3
-                        ? t / 0.3
-                        : (t > 0.7 ? (1 - t) / 0.3 : 1);
-                    return Transform.translate(
-                      offset: Offset((t * 2 - 1) * width, 0),
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: Opacity(
-                          opacity: opacity.clamp(0.0, 1.0),
-                          child: Container(
-                            width: 14,
-                            height: 2,
-                            decoration: BoxDecoration(
-                              color: widget.tone,
-                              boxShadow: <BoxShadow>[
-                                BoxShadow(
-                                  color: widget.tone.withValues(alpha: 0.6),
-                                  blurRadius: widget.active ? 10 : 5,
-                                ),
-                              ],
+            if (widget.active)
+              AnimatedBuilder(
+                animation: _controller,
+                builder: (BuildContext context, Widget? _) {
+                  return LayoutBuilder(
+                    builder: (BuildContext context, BoxConstraints constraints) {
+                      final double width = constraints.maxWidth;
+                      final double t = _controller.value;
+                      // 0~30% 渐显、70%~100% 渐隐，模拟光带穿过。
+                      final double opacity = t < 0.3
+                          ? t / 0.3
+                          : (t > 0.7 ? (1 - t) / 0.3 : 1);
+                      return Transform.translate(
+                        offset: Offset((t * 2 - 1) * width, 0),
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: Opacity(
+                            opacity: opacity.clamp(0.0, 1.0),
+                            child: Container(
+                              width: 14,
+                              height: 2,
+                              decoration: BoxDecoration(
+                                color: widget.tone,
+                                boxShadow: <BoxShadow>[
+                                  BoxShadow(
+                                    color: widget.tone.withValues(alpha: 0.6),
+                                    blurRadius: 10,
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
+                      );
+                    },
+                  );
+                },
+              ),
           ],
         ),
       ),

@@ -3,8 +3,10 @@ import '../models.dart';
 import '../theme.dart';
 import '../widgets/cyber_radar.dart';
 import '../widgets/device_orbit_node.dart';
+import '../widgets/iconsax.dart';
 
-/// Tab 0: 量子雷达主控视图 (Transfer Radar)
+/// Tab 0: 量子雷达发现主视图 (Quantum Radar Discovery View)
+/// 保持原版布局、文案与 Void+Jade 配色，融合 Iconsax 双色调图标与超椭圆容器
 class RadarView extends StatelessWidget {
   const RadarView({
     super.key,
@@ -51,6 +53,9 @@ class RadarView extends StatelessWidget {
         Column(
           children: <Widget>[
             _buildTopHeader(context),
+            const IconsaxLineDots(
+              margin: EdgeInsets.symmetric(horizontal: 18),
+            ),
             Expanded(
               child: SingleChildScrollView(
                 physics: const BouncingScrollPhysics(),
@@ -133,20 +138,26 @@ class RadarView extends StatelessWidget {
                 ],
               ),
 
-              // 右侧操作按钮
+              // 右侧 Iconsax 操作按钮
               Row(
                 children: <Widget>[
                   IconButton(
                     onPressed: onRefreshDiscovery,
-                    icon: const Icon(Icons.refresh, size: 21),
-                    color: textMuted,
+                    icon: const IconsaxIcon(
+                      Iconsax.refresh,
+                      size: 20,
+                      color: textMuted,
+                    ),
                     splashRadius: 18,
                     tooltip: '刷新雷达扫描',
                   ),
                   IconButton(
                     onPressed: onOpenSettings,
-                    icon: const Icon(Icons.settings_outlined, size: 21),
-                    color: textMuted,
+                    icon: const IconsaxIcon(
+                      Iconsax.settings,
+                      size: 20,
+                      color: textMuted,
+                    ),
                     splashRadius: 18,
                     tooltip: '墨洞配置',
                   ),
@@ -212,11 +223,9 @@ class RadarView extends StatelessWidget {
   }
 
   Widget _buildRadarSection() {
-    // 根据当前发现的设备计算环绕轨道上的位置
     final List<Widget> orbitNodes = <Widget>[];
 
     if (peers.isNotEmpty) {
-      // 节点 1：右上
       orbitNodes.add(
         DeviceOrbitNode(
           peer: peers[0],
@@ -228,7 +237,6 @@ class RadarView extends StatelessWidget {
       );
     }
     if (peers.length > 1) {
-      // 节点 2：左下
       orbitNodes.add(
         DeviceOrbitNode(
           peer: peers[1],
@@ -240,7 +248,6 @@ class RadarView extends StatelessWidget {
       );
     }
     if (peers.length > 2) {
-      // 节点 3：左上
       orbitNodes.add(
         DeviceOrbitNode(
           peer: peers[2],
@@ -315,17 +322,22 @@ class RadarView extends StatelessWidget {
 
   Widget _buildQuickActions() {
     return Container(
-      constraints: const BoxConstraints(maxWidth: 340),
+      constraints: const BoxConstraints(maxWidth: 348),
       padding: const EdgeInsets.symmetric(horizontal: 14),
       child: Row(
         children: <Widget>[
-          // 发文件按钮 (高亮翡翠绿)
+          // 发文件按钮 (Iconsax 胶囊高亮)
           Expanded(
             child: SizedBox(
-              height: 40,
+              height: 42,
               child: ElevatedButton.icon(
                 onPressed: onSendFile,
-                icon: const Icon(Icons.arrow_upward, size: 16, color: bgAbyss),
+                icon: const IconsaxIcon(
+                  Iconsax.send,
+                  size: 16,
+                  color: bgAbyss,
+                  secondaryOpacity: 0.25,
+                ),
                 label: const Text(
                   '发文件',
                   style: TextStyle(
@@ -339,7 +351,7 @@ class RadarView extends StatelessWidget {
                   elevation: 6,
                   shadowColor: jade400.withValues(alpha: 0.35),
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(14),
                   ),
                 ),
               ),
@@ -350,10 +362,10 @@ class RadarView extends StatelessWidget {
           // 暗号直连
           Expanded(
             child: SizedBox(
-              height: 40,
+              height: 42,
               child: ElevatedButton.icon(
                 onPressed: onOpenWormhole,
-                icon: const Icon(Icons.key, size: 15, color: jade400),
+                icon: const IconsaxIcon(Iconsax.key, size: 15, color: jade400),
                 label: const Text(
                   '暗号直连',
                   style: TextStyle(
@@ -363,10 +375,10 @@ class RadarView extends StatelessWidget {
                   ),
                 ),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: surfaceContainer.withValues(alpha: 0.9),
+                  backgroundColor: surfaceContainer.withValues(alpha: 0.92),
                   elevation: 0,
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(14),
                     side: const BorderSide(color: surfaceBorder),
                   ),
                 ),
@@ -378,10 +390,14 @@ class RadarView extends StatelessWidget {
           // 扫码配对
           Expanded(
             child: SizedBox(
-              height: 40,
+              height: 42,
               child: ElevatedButton.icon(
                 onPressed: onOpenPairQr,
-                icon: const Icon(Icons.qr_code_scanner, size: 15, color: jade400),
+                icon: const IconsaxIcon(
+                  Iconsax.scanner,
+                  size: 15,
+                  color: jade400,
+                ),
                 label: const Text(
                   '扫码配对',
                   style: TextStyle(
@@ -391,10 +407,10 @@ class RadarView extends StatelessWidget {
                   ),
                 ),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: surfaceContainer.withValues(alpha: 0.9),
+                  backgroundColor: surfaceContainer.withValues(alpha: 0.92),
                   elevation: 0,
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(14),
                     side: const BorderSide(color: surfaceBorder),
                   ),
                 ),
@@ -405,7 +421,6 @@ class RadarView extends StatelessWidget {
       ),
     );
   }
-
 }
 
 class _TransfersDrawer extends StatelessWidget {
@@ -426,14 +441,14 @@ class _TransfersDrawer extends StatelessWidget {
     return DecoratedBox(
       decoration: BoxDecoration(
         color: surfaceContainer.withValues(alpha: 0.98),
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
         border: const Border(
           top: BorderSide(color: borderLuminescent, width: 1.0),
         ),
         boxShadow: const <BoxShadow>[
           BoxShadow(
-            color: Color(0x66000000),
-            blurRadius: 20,
+            color: Color(0x77000000),
+            blurRadius: 24,
             offset: Offset(0, -4),
           ),
         ],
@@ -495,7 +510,7 @@ class _TransfersDrawer extends StatelessWidget {
                 onTap: onOpenInbox,
                 child: const Row(
                   children: <Widget>[
-                    Icon(Icons.folder_open, size: 14, color: jade400),
+                    IconsaxIcon(Iconsax.inbox, size: 14, color: jade400),
                     SizedBox(width: 4),
                     Text(
                       '收件箱',
@@ -537,32 +552,24 @@ class _TransfersDrawer extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Material(
-        color: surfaceLowest.withValues(alpha: 0.8),
-        borderRadius: BorderRadius.circular(12),
+        color: surfaceLowest.withValues(alpha: 0.85),
+        borderRadius: BorderRadius.circular(14),
         child: InkWell(
           onTap: () => onOpenFile(file),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(14),
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(14),
               border: Border.all(color: surfaceBorder),
             ),
             child: Row(
               children: <Widget>[
-                Container(
-                  width: 34,
-                  height: 34,
-                  decoration: BoxDecoration(
-                    color: surfaceHigh,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: borderLuminescent),
-                  ),
-                  child: const Icon(
-                    Icons.insert_drive_file_outlined,
-                    color: jade400,
-                    size: 18,
-                  ),
+                const IconsaxBox(
+                  icon: Iconsax.fileDoc,
+                  size: 36,
+                  iconSize: 18,
+                  borderRadius: 10,
                 ),
                 const SizedBox(width: 10),
                 Expanded(
@@ -591,7 +598,11 @@ class _TransfersDrawer extends StatelessWidget {
                     ],
                   ),
                 ),
-                const Icon(Icons.chevron_right, color: textDim, size: 18),
+                const IconsaxIcon(
+                  Iconsax.openExternal,
+                  color: textDim,
+                  size: 16,
+                ),
               ],
             ),
           ),

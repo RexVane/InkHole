@@ -1,13 +1,10 @@
 import 'package:flutter/material.dart';
 import '../theme.dart';
+import 'iconsax.dart';
 
 /// 实时吞吐量波形图 (Throughput Sparkline Graph)
 ///
-/// 1:1 对标设计图 5：
-/// - 顶部峰值显示
-/// - 平滑贝塞尔拟合曲线
-/// - 渐变区域填充 (Surface to Jade)
-/// - 实时动态末端脉冲发光节点
+/// 1:1 保持原版结构与文案，融合 Iconsax 双色调图标与细腻光晕
 class ThroughputChart extends StatelessWidget {
   const ThroughputChart({
     super.key,
@@ -24,25 +21,28 @@ class ThroughputChart extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: surfaceLowest,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(14),
         border: Border.all(color: surfaceBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          // 顶部栏：标题与峰值。标题侧用 Expanded 兜底——峰值数字变宽时
-          // 标题收缩省略，避免整行溢出（debug 包会画溢出警告横幅）。
+          // 顶部栏：标题与峰值
           Row(
             children: <Widget>[
-              Expanded(
+              const Expanded(
                 child: Row(
                   children: <Widget>[
-                    Icon(Icons.speed, color: secondaryTeal, size: 16),
-                    const SizedBox(width: 6),
-                    const Flexible(
+                    IconsaxIcon(
+                      Iconsax.transfer,
+                      color: secondaryTeal,
+                      size: 16,
+                    ),
+                    SizedBox(width: 6),
+                    Flexible(
                       child: Text(
                         'THROUGHPUT GRAPH (LAST 30S)',
                         maxLines: 1,
@@ -126,7 +126,7 @@ class ThroughputChart extends StatelessWidget {
                   speeds.isEmpty ? '等待传输数据' : '最近一分钟',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
+                  style: const TextStyle(
                     color: badgeRoute,
                     fontSize: 10,
                     fontWeight: FontWeight.w500,
@@ -148,7 +148,6 @@ class _SparklinePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // 背景参考虚线
     final Paint gridPaint = Paint()
       ..color = surfaceBorder
       ..style = PaintingStyle.stroke
@@ -165,11 +164,12 @@ class _SparklinePainter extends CustomPainter {
       gridPaint,
     );
 
-    // 如果数据不足，绘制一条平缓波纹
     if (speeds.length < 2) return;
     final List<double> data = speeds;
 
-    final double maxVal = data.reduce((double a, double b) => a > b ? a : b).clamp(20.0, 1000.0);
+    final double maxVal = data
+        .reduce((double a, double b) => a > b ? a : b)
+        .clamp(20.0, 1000.0);
     final double stepX = size.width / (data.length - 1);
 
     final Path linePath = Path();
@@ -178,7 +178,9 @@ class _SparklinePainter extends CustomPainter {
     final List<Offset> points = <Offset>[];
     for (int i = 0; i < data.length; i++) {
       final double x = i * stepX;
-      final double y = size.height - (data[i] / maxVal) * (size.height * 0.82) - (size.height * 0.08);
+      final double y = size.height -
+          (data[i] / maxVal) * (size.height * 0.82) -
+          (size.height * 0.08);
       points.add(Offset(x, y.clamp(4.0, size.height - 4.0)));
     }
 
@@ -197,7 +199,6 @@ class _SparklinePainter extends CustomPainter {
     fillPath.lineTo(points.last.dx, size.height);
     fillPath.close();
 
-    // 渐变填充
     final Paint fillPaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topCenter,
@@ -209,7 +210,6 @@ class _SparklinePainter extends CustomPainter {
       ).createShader(Rect.fromLTWH(0, 0, size.width, size.height));
     canvas.drawPath(fillPath, fillPaint);
 
-    // 翡翠绿平滑折线
     final Paint linePaint = Paint()
       ..color = jade400
       ..style = PaintingStyle.stroke
@@ -218,7 +218,6 @@ class _SparklinePainter extends CustomPainter {
       ..strokeJoin = StrokeJoin.round;
     canvas.drawPath(linePath, linePaint);
 
-    // 末端动态脉冲圆点
     final Offset last = points.last;
     canvas.drawCircle(
       last,
@@ -233,5 +232,7 @@ class _SparklinePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _SparklinePainter oldDelegate) => true;
+  bool shouldRepaint(covariant _SparklinePainter oldDelegate) {
+    return oldDelegate.speeds != speeds;
+  }
 }

@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import '../models.dart';
 import '../theme.dart';
+import '../widgets/iconsax.dart';
 import '../widgets/throughput_chart.dart';
 
 /// Tab 1: 收发详情与传输队列视图 (Transfers Detail & Active Stream)
+/// 保持原版布局、文案与 Void+Jade 配色，融合 Iconsax `.card-percent` 环形进度与超椭圆容器
 class TransfersView extends StatelessWidget {
   const TransfersView({
     super.key,
@@ -71,14 +73,20 @@ class TransfersView extends StatelessWidget {
         actions: <Widget>[
           IconButton(
             onPressed: onRefresh,
-            icon: const Icon(Icons.refresh, size: 21),
-            color: textMuted,
+            icon: const IconsaxIcon(
+              Iconsax.refresh,
+              size: 20,
+              color: textMuted,
+            ),
             splashRadius: 18,
           ),
           IconButton(
             onPressed: onOpenSettings,
-            icon: const Icon(Icons.settings_outlined, size: 21),
-            color: textMuted,
+            icon: const IconsaxIcon(
+              Iconsax.settings,
+              size: 20,
+              color: textMuted,
+            ),
             splashRadius: 18,
           ),
         ],
@@ -109,7 +117,6 @@ class TransfersView extends StatelessWidget {
   ) {
     final bool hasActive = activeProgress != null && activeProgress!.total > 0;
     final double fraction = hasActive ? activeProgress!.fraction : 0.0;
-    final int percent = (fraction * 100).toInt();
 
     final String filename = hasActive ? activeProgress!.filename : '待机空闲中';
     final String sizeInfo = hasActive
@@ -120,7 +127,7 @@ class TransfersView extends StatelessWidget {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: surfaceContainer,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(20),
         border: Border.all(color: borderLuminescent),
         boxShadow: const <BoxShadow>[
           BoxShadow(
@@ -140,13 +147,18 @@ class TransfersView extends StatelessWidget {
               Row(
                 children: <Widget>[
                   Container(
-                    width: 22,
-                    height: 22,
-                    decoration: BoxDecoration(
+                    width: 24,
+                    height: 24,
+                    decoration: const BoxDecoration(
                       color: surfaceActive,
                       shape: BoxShape.circle,
                     ),
-                    child: const Icon(Icons.cloud_sync, color: jade400, size: 14),
+                    alignment: Alignment.center,
+                    child: const IconsaxIcon(
+                      Iconsax.cloud,
+                      color: jade400,
+                      size: 14,
+                    ),
                   ),
                   const SizedBox(width: 6),
                   Text(
@@ -166,23 +178,15 @@ class TransfersView extends StatelessWidget {
           ),
           const SizedBox(height: 14),
 
-          // 主文件名与百分比
+          // 主文件名与 Iconsax `.circle-progress` 环形进度
           Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: <Widget>[
-              Container(
-                width: 40,
-                height: 40,
-                decoration: BoxDecoration(
-                  color: surfaceActive,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: borderLuminescent),
-                ),
-                child: const Icon(
-                  Icons.folder_zip_outlined,
-                  color: jade400,
-                  size: 22,
-                ),
+              const IconsaxBox(
+                icon: Iconsax.fileArchive,
+                size: 44,
+                iconSize: 22,
+                borderRadius: 12,
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -211,7 +215,10 @@ class TransfersView extends StatelessWidget {
                           ),
                         ),
                         if (hasActive) ...<Widget>[
-                          const Text(' · ', style: TextStyle(color: textDim, fontSize: 10)),
+                          const Text(
+                            ' · ',
+                            style: TextStyle(color: textDim, fontSize: 10),
+                          ),
                           const Text(
                             '传输中',
                             style: TextStyle(
@@ -225,14 +232,11 @@ class TransfersView extends StatelessWidget {
                   ],
                 ),
               ),
-              Text(
-                '$percent%',
-                style: const TextStyle(
-                  color: jade400,
-                  fontSize: 22,
-                  fontFamily: 'monospace',
-                  fontWeight: FontWeight.w800,
-                ),
+              const SizedBox(width: 8),
+              IconsaxRingProgress(
+                fraction: fraction,
+                size: 46,
+                color: jade400,
               ),
             ],
           ),
@@ -254,13 +258,13 @@ class TransfersView extends StatelessWidget {
                 child: Container(
                   height: 6,
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(3),
                     gradient: const LinearGradient(
-                      colors: <Color>[secondaryTeal, jade400],
+                      colors: <Color>[jade600, jade400, jade200],
                     ),
+                    borderRadius: BorderRadius.circular(3),
                     boxShadow: <BoxShadow>[
                       BoxShadow(
-                        color: jade400.withValues(alpha: 0.6),
+                        color: jade400.withValues(alpha: 0.45),
                         blurRadius: 8,
                       ),
                     ],
@@ -269,58 +273,17 @@ class TransfersView extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 16),
 
-          // 实时吞吐量波形图 (Sparkline)
+          // 实时吞吐频谱图
           ThroughputChart(
             speeds: speedHistory,
             currentSpeedMb: speedMb,
             peakSpeedMb: peakSpeed,
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 16),
 
-          // 遥测参数小卡片网格
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: surfaceLowest,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: surfaceBorder),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      const Text(
-                        '监听端口',
-                        style: TextStyle(
-                          color: textDim,
-                          fontSize: 9,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        ':$listenPort',
-                        style: const TextStyle(
-                          color: textPrimary,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          fontFamily: 'monospace',
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-            ],
-          ),
-          const SizedBox(height: 14),
-
-          // 交互按钮：暂停传输 / 中止
+          // 控制按钮组
           Row(
             children: <Widget>[
               Expanded(
@@ -329,10 +292,11 @@ class TransfersView extends StatelessWidget {
                   height: 42,
                   child: ElevatedButton.icon(
                     onPressed: onTogglePause,
-                    icon: Icon(
-                      isTransferPaused ? Icons.play_arrow : Icons.pause,
+                    icon: IconsaxIcon(
+                      isTransferPaused ? Iconsax.play : Iconsax.pause,
                       size: 18,
                       color: bgAbyss,
+                      secondaryOpacity: 0.25,
                     ),
                     label: Text(
                       isTransferPaused ? '恢复传输' : '暂停传输',
@@ -360,7 +324,11 @@ class TransfersView extends StatelessWidget {
                   height: 42,
                   child: ElevatedButton.icon(
                     onPressed: onCancelTransfer,
-                    icon: const Icon(Icons.close, size: 16, color: dangerCoral),
+                    icon: const IconsaxIcon(
+                      Iconsax.closeCircle,
+                      size: 17,
+                      color: dangerCoral,
+                    ),
                     label: const Text(
                       '中止',
                       style: TextStyle(
@@ -405,7 +373,10 @@ class TransfersView extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 7,
+                    vertical: 2,
+                  ),
                   decoration: BoxDecoration(
                     color: surfaceContainer,
                     borderRadius: BorderRadius.circular(10),
@@ -439,7 +410,7 @@ class TransfersView extends StatelessWidget {
             alignment: Alignment.center,
             decoration: BoxDecoration(
               color: surfaceContainer,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(16),
               border: Border.all(color: surfaceBorder),
             ),
             child: const Text(
@@ -454,46 +425,32 @@ class TransfersView extends StatelessWidget {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: surfaceContainer,
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(16),
                 border: Border.all(color: surfaceBorder),
               ),
               child: Row(
                 children: <Widget>[
-                  Container(
-                    width: 36,
-                    height: 36,
-                    decoration: BoxDecoration(
-                      color: surfaceActive,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: borderLuminescent),
-                    ),
-                    child: const Icon(
-                      Icons.insert_drive_file_outlined,
-                      color: badgeRoute,
-                      size: 18,
-                    ),
+                  const IconsaxBox(
+                    icon: Iconsax.fileDoc,
+                    size: 40,
+                    iconSize: 20,
+                    borderRadius: 11,
+                    color: badgeRoute,
                   ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: <Widget>[
-                        Row(
-                          children: <Widget>[
-                            Flexible(
-                              child: Text(
-                                file.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: textPrimary,
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-
-                          ],
+                        Text(
+                          file.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: textPrimary,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
                         const SizedBox(height: 2),
                         Row(
@@ -506,10 +463,16 @@ class TransfersView extends StatelessWidget {
                                 fontFamily: 'monospace',
                               ),
                             ),
-                            const Text(' · ', style: TextStyle(color: textDim, fontSize: 10)),
+                            const Text(
+                              ' · ',
+                              style: TextStyle(color: textDim, fontSize: 10),
+                            ),
                             Text(
                               file.sender.isNotEmpty ? file.sender : '来源未知',
-                              style: const TextStyle(color: textMuted, fontSize: 10),
+                              style: const TextStyle(
+                                color: textMuted,
+                                fontSize: 10,
+                              ),
                             ),
                           ],
                         ),
@@ -521,7 +484,10 @@ class TransfersView extends StatelessWidget {
                     onPressed: () => onOpenFile(file),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: surfaceActive,
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 6,
+                      ),
                       minimumSize: Size.zero,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),

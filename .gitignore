@@ -21,6 +21,24 @@ mobile/native/ios/*.xcframework/
 # Runtime inbox files are kept outside version control.
 received/
 
-# 本地会话工具目录
+# 本地会话与 AI 工具私有目录
 .zcode/
 .workbuddy/
+.claude/
+.codex/
+.gemini/
+.cursor/
+.windsurf/
+
+# 备份目录（仅索引进 git，实体不进）
+backups/*
+!backups/INDEX.md
+
+# 环境变量与日志
+.env*
+!.env.example
+*.log
+dist/
+node_modules/
+.venv/
+

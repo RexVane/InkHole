@@ -1,35 +1,31 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../theme.dart';
+import 'iconsax.dart';
 
-/// 墨洞量子雷达与深渊引力核心 (Quantum InkHole Radar)
+/// 墨洞量子引力雷达组件 (Cyber-Zen Radar & Singularity Core)
 ///
-/// 1:1 还原 Cyber-Zen 视觉：
-/// - 双层反向缓慢旋转的虚线轨道
-/// - 顺时针雷达波束扫掠锥体 (Radar Sweeper Cone)
-/// - 脉冲呼吸外环
-/// - 中心墨洞深渊引力球 (径向深渊渐变 + 旋转吸积弧 + 点击选文件)
-/// - 环绕子组件插槽 (用于动态放置被发现的设备节点)
+/// 在原版 Void + Jade 结构基础上融合 Iconsax 几何质感与精细同心刻度
 class CyberRadar extends StatefulWidget {
   const CyberRadar({
     super.key,
     required this.transferPercent,
     required this.searching,
-    this.orbitChildren = const <Widget>[],
-    this.onTapCore,
+    required this.orbitChildren,
+    required this.onTapCore,
   });
 
-  /// -1 表示空闲待机；0..100 表示正在传输
+  /// 传输进度（0-100），小于 0 表示空闲
   final double transferPercent;
 
-  /// true 表示未锁定设备，雷达波纹与扫掠保持活跃
+  /// 是否正在搜索局域网设备
   final bool searching;
 
-  /// 环绕在雷达四周的设备卡片
+  /// 环绕在轨道上的设备节点组件
   final List<Widget> orbitChildren;
 
-  /// 点击中心墨洞引力球
-  final VoidCallback? onTapCore;
+  /// 点击中心黑洞触发操作（如选择文件）
+  final VoidCallback onTapCore;
 
   @override
   State<CyberRadar> createState() => _CyberRadarState();
@@ -47,25 +43,21 @@ class _CyberRadarState extends State<CyberRadar>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // 雷达扫描锥面 5s 周期
     _sweepAnim = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 5),
     )..repeat();
 
-    // 外轨道顺时针 24s
     _spinSlow = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 24),
     )..repeat();
 
-    // 内轨道逆时针 32s
     _spinReverse = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 32),
     )..repeat();
 
-    // 呼吸脉冲 4s
     _pulseRing = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 3600),
@@ -74,7 +66,6 @@ class _CyberRadarState extends State<CyberRadar>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 应用退到后台时停掉 4 个常驻动画，避免持续耗电。
     final bool shouldTick = state == AppLifecycleState.resumed;
     if (shouldTick != _ticking) _setTicking(shouldTick);
   }
@@ -128,9 +119,11 @@ class _CyberRadarState extends State<CyberRadar>
                 shape: BoxShape.circle,
                 gradient: RadialGradient(
                   colors: <Color>[
-                    jade400.withValues(alpha: 0.12),
+                    jade400.withValues(alpha: 0.13),
+                    jade400.withValues(alpha: 0.03),
                     Colors.transparent,
                   ],
+                  stops: const <double>[0.0, 0.55, 1.0],
                 ),
               ),
             ),
@@ -145,13 +138,12 @@ class _CyberRadarState extends State<CyberRadar>
               ]),
               builder: (BuildContext context, Widget? child) {
                 return CustomPaint(
-                  size: const Size.square(containerSize),
+                  size: const Size(containerSize, containerSize),
                   painter: _RadarBackgroundPainter(
                     sweepAngle: _sweepAnim.value * 2 * math.pi,
-                    spinSlowAngle: _spinSlow.value * 2 * math.pi,
-                    spinReverseAngle: -_spinReverse.value * 2 * math.pi,
-                    pulseFactor: 0.94 + 0.08 * Curves.easeInOut.transform(_pulseRing.value),
-                    pulseAlpha: 0.35 + 0.35 * _pulseRing.value,
+                    slowAngle: _spinSlow.value * 2 * math.pi,
+                    reverseAngle: -_spinReverse.value * 2 * math.pi,
+                    pulseFactor: _pulseRing.value,
                     searching: widget.searching,
                     transferPercent: widget.transferPercent,
                   ),
@@ -159,111 +151,105 @@ class _CyberRadarState extends State<CyberRadar>
               },
             ),
 
-            // 3. 中心墨洞引力核心 (The Central Ink Void)
+            // 3. 中心黑洞核心 (Singularity Event Horizon)
             GestureDetector(
               onTap: widget.onTapCore,
               behavior: HitTestBehavior.opaque,
-              child: AnimatedScale(
-                scale: 1.0,
-                duration: const Duration(milliseconds: 150),
-                child: Container(
-                  width: coreSize,
-                  height: coreSize,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: const RadialGradient(
-                      center: Alignment.center,
-                      radius: 0.9,
-                      colors: <Color>[
-                        Color(0xFF000000),
-                        Color(0xFF020505),
-                        Color(0xFF081819),
-                        Color(0xFF143533),
-                      ],
-                      stops: <double>[0.0, 0.50, 0.80, 1.0],
-                    ),
-                    border: Border.all(
-                      color: jade400.withValues(alpha: 0.35),
-                      width: 1.2,
-                    ),
-                    boxShadow: <BoxShadow>[
-                      BoxShadow(
-                        color: jade400.withValues(alpha: 0.25),
-                        blurRadius: 36,
-                        spreadRadius: 2,
-                      ),
-                      const BoxShadow(
-                        color: Color(0xFF010404),
-                        blurRadius: 20,
-                        spreadRadius: -4,
-                      ),
+              child: Container(
+                width: coreSize,
+                height: coreSize,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: const RadialGradient(
+                    colors: <Color>[
+                      Color(0xFF112622),
+                      Color(0xFF0A1415),
+                      void950,
                     ],
+                    stops: <double>[0.0, 0.58, 1.0],
                   ),
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: <Widget>[
-                      // 旋转虚线吸积圆环
-                      RotationTransition(
-                        turns: _spinSlow,
-                        child: CustomPaint(
-                          size: const Size.square(coreSize - 20),
-                          painter: _AccretionRingPainter(),
-                        ),
-                      ),
+                  border: Border.all(
+                    color: jade400.withValues(alpha: 0.35),
+                    width: 1.5,
+                  ),
+                  boxShadow: <BoxShadow>[
+                    BoxShadow(
+                      color: jade400.withValues(alpha: 0.18),
+                      blurRadius: 36,
+                      spreadRadius: 2,
+                    ),
+                    const BoxShadow(
+                      color: Color(0xCC000000),
+                      blurRadius: 24,
+                      offset: Offset(0, 10),
+                    ),
+                  ],
+                ),
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: <Widget>[
+                    // 内部旋轉虚线圈
+                    AnimatedBuilder(
+                      animation: _spinSlow,
+                      builder: (BuildContext context, Widget? child) {
+                        return Transform.rotate(
+                          angle: -_spinSlow.value * 2 * math.pi,
+                          child: CustomPaint(
+                            size: const Size(coreSize - 24, coreSize - 24),
+                            painter: _AccretionRingPainter(),
+                          ),
+                        );
+                      },
+                    ),
 
-                      // 核心文字与图标
-                      Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: <Widget>[
-                          Container(
-                            width: 34,
-                            height: 34,
-                            margin: const EdgeInsets.only(bottom: 4),
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: jade400.withValues(alpha: 0.12),
-                            ),
-                            child: Icon(
-                              widget.transferPercent >= 0
-                                  ? Icons.sync
-                                  : Icons.add,
-                              color: jade300,
-                              size: 19,
-                            ),
+                    // 中心文案与 Iconsax 图标
+                    Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        IconsaxBox(
+                          icon: widget.transferPercent >= 0
+                              ? Iconsax.transfer
+                              : Iconsax.send,
+                          size: 38,
+                          iconSize: 20,
+                          borderRadius: 11,
+                          color: jade400,
+                          backgroundColor: jade400.withValues(alpha: 0.12),
+                          borderColor: jade400.withValues(alpha: 0.28),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          widget.transferPercent >= 0
+                              ? '${widget.transferPercent.toStringAsFixed(0)}%'
+                              : '轻触选择文件',
+                          style: TextStyle(
+                            color: textPrimary,
+                            fontSize: widget.transferPercent >= 0 ? 22 : 14,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.5,
+                            fontFamily:
+                                widget.transferPercent >= 0 ? 'monospace' : null,
                           ),
-                          Text(
-                            widget.transferPercent >= 0
-                                ? '${widget.transferPercent.toInt()}%'
-                                : '投放文件',
-                            style: const TextStyle(
-                              color: textPrimary,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w700,
-                              letterSpacing: 1.2,
-                            ),
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          widget.transferPercent >= 0
+                              ? '正在高速传输...'
+                              : '先点周围设备，再发文件',
+                          style: const TextStyle(
+                            color: textMuted,
+                            fontSize: 10,
+                            letterSpacing: 0.3,
                           ),
-                          const SizedBox(height: 2),
-                          Text(
-                            widget.transferPercent >= 0
-                                ? 'SYNCING DATA'
-                                : 'READY TO SYNC',
-                            style: TextStyle(
-                              color: jade400.withValues(alpha: 0.75),
-                              fontSize: 9,
-                              fontFamily: 'monospace',
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 0.8,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
             ),
 
-            // 4. 动态环绕设备节点
+            // 4. 外部轨道上的设备节点
             ...widget.orbitChildren,
           ],
         ),
@@ -272,23 +258,20 @@ class _CyberRadarState extends State<CyberRadar>
   }
 }
 
-/// 绘制同心圆轨道、旋转雷达波束和呼吸脉冲光环
 class _RadarBackgroundPainter extends CustomPainter {
-  const _RadarBackgroundPainter({
+  _RadarBackgroundPainter({
     required this.sweepAngle,
-    required this.spinSlowAngle,
-    required this.spinReverseAngle,
+    required this.slowAngle,
+    required this.reverseAngle,
     required this.pulseFactor,
-    required this.pulseAlpha,
     required this.searching,
     required this.transferPercent,
   });
 
   final double sweepAngle;
-  final double spinSlowAngle;
-  final double spinReverseAngle;
+  final double slowAngle;
+  final double reverseAngle;
   final double pulseFactor;
-  final double pulseAlpha;
   final bool searching;
   final double transferPercent;
 
@@ -297,35 +280,86 @@ class _RadarBackgroundPainter extends CustomPainter {
     final Offset center = Offset(size.width / 2, size.height / 2);
     final double maxRadius = size.shortestSide / 2;
 
-    // 1. 外轨道 1 (细虚线，缓慢顺时针)
-    final Paint trackPaint1 = Paint()
-      ..color = jade500.withValues(alpha: 0.18)
+    // 0. 极细十字准星与四向锚点（Iconsax .line-dots 风格）
+    final Paint crossPaint = Paint()
+      ..color = jade400.withValues(alpha: 0.07)
+      ..strokeWidth = 1.0;
+    canvas.drawLine(
+      Offset(center.dx - maxRadius * 0.96, center.dy),
+      Offset(center.dx + maxRadius * 0.96, center.dy),
+      crossPaint,
+    );
+    canvas.drawLine(
+      Offset(center.dx, center.dy - maxRadius * 0.96),
+      Offset(center.dx, center.dy + maxRadius * 0.96),
+      crossPaint,
+    );
+
+    final Paint dotPaint = Paint()..color = jade400.withValues(alpha: 0.45);
+    for (final Offset pt in <Offset>[
+      Offset(center.dx - maxRadius * 0.94, center.dy),
+      Offset(center.dx + maxRadius * 0.94, center.dy),
+      Offset(center.dx, center.dy - maxRadius * 0.94),
+      Offset(center.dx, center.dy + maxRadius * 0.94),
+    ]) {
+      canvas.drawCircle(pt, 2.0, dotPaint);
+    }
+
+    // 1. 最外层静态细环
+    final Paint outerRingPaint = Paint()
+      ..color = jade400.withValues(alpha: 0.14)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
-    _drawDashedCircle(canvas, center, maxRadius * 0.96, trackPaint1, spinSlowAngle, 40, 8);
+    canvas.drawCircle(center, maxRadius * 0.94, outerRingPaint);
 
-    // 2. 外轨道 2 (逆时针)
-    final Paint trackPaint2 = Paint()
-      ..color = jade400.withValues(alpha: 0.22)
+    // 2. 旋转虚线轨道 1 & 2
+    final Paint dashedPaint1 = Paint()
+      ..color = jade400.withValues(alpha: 0.20)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0;
-    _drawDashedCircle(canvas, center, maxRadius * 0.82, trackPaint2, spinReverseAngle, 32, 6);
+    _drawDashedCircle(
+      canvas,
+      center,
+      maxRadius * 0.78,
+      dashedPaint1,
+      slowAngle,
+      36,
+      5.0,
+    );
 
-    // 3. 脉冲光环 (围绕核心呼吸)
-    final double pulseRadius = (maxRadius * 0.72) * pulseFactor;
+    final Paint dashedPaint2 = Paint()
+      ..color = secondaryTeal.withValues(alpha: 0.16)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.0;
+    _drawDashedCircle(
+      canvas,
+      center,
+      maxRadius * 0.64,
+      dashedPaint2,
+      reverseAngle,
+      28,
+      6.0,
+    );
+
+    // 3. 呼吸扩散脉冲环
+    final double pulseRadius =
+        maxRadius * (0.54 + 0.38 * Curves.easeOutQuad.transform(pulseFactor));
+    final double pulseAlpha =
+        (1.0 - Curves.easeInQuad.transform(pulseFactor)).clamp(0.0, 1.0);
     final Paint pulsePaint = Paint()
-      ..color = jade400.withValues(alpha: pulseAlpha * 0.45)
+      ..color = jade400.withValues(alpha: pulseAlpha * 0.42)
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.8;
+      ..strokeWidth = 1.6;
     canvas.drawCircle(center, pulseRadius, pulsePaint);
 
-    // 4. 雷达扇面扫掠波束 (仅在 searching 或空闲时扫掠)
+    // 4. 雷达扇面扫掠波束
     if (searching || transferPercent < 0) {
-      final Rect sweepRect = Rect.fromCircle(center: center, radius: maxRadius * 0.94);
+      final Rect sweepRect =
+          Rect.fromCircle(center: center, radius: maxRadius * 0.94);
       final Paint sweepPaint = Paint()
         ..shader = SweepGradient(
           startAngle: 0.0,
-          endAngle: math.pi / 2.5,
+          endAngle: math.pi / 2.4,
           colors: <Color>[
             jade400.withValues(alpha: 0.24),
             Colors.transparent,
@@ -350,7 +384,8 @@ class _RadarBackgroundPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeCap = StrokeCap.round
         ..strokeWidth = 4.0;
-      final double sweepRadian = (transferPercent.clamp(0, 100) / 100.0) * 2 * math.pi;
+      final double sweepRadian =
+          (transferPercent.clamp(0, 100) / 100.0) * 2 * math.pi;
       canvas.drawArc(
         Rect.fromCircle(center: center, radius: progressRadius),
         -math.pi / 2,

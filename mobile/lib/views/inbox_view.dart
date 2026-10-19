@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models.dart';
 import '../theme.dart';
+import '../widgets/iconsax.dart';
 
 /// Tab 2: 收件仓库与文件流视图 (Inbox & Storage Stream)
+/// 保持原版布局、文案与 Void+Jade 配色，融合 Iconsax 双色调图标与超椭圆容器
 class InboxView extends StatefulWidget {
   const InboxView({
     super.key,
@@ -104,14 +106,20 @@ class _InboxViewState extends State<InboxView> {
         actions: <Widget>[
           IconButton(
             onPressed: widget.onRefresh,
-            icon: const Icon(Icons.refresh, size: 21),
-            color: textMuted,
+            icon: const IconsaxIcon(
+              Iconsax.refresh,
+              size: 20,
+              color: textMuted,
+            ),
             splashRadius: 18,
           ),
           IconButton(
             onPressed: widget.onOpenSettings,
-            icon: const Icon(Icons.settings_outlined, size: 21),
-            color: textMuted,
+            icon: const IconsaxIcon(
+              Iconsax.settings,
+              size: 20,
+              color: textMuted,
+            ),
             splashRadius: 18,
           ),
         ],
@@ -148,7 +156,7 @@ class _InboxViewState extends State<InboxView> {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: surfaceContainer,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(20),
         border: Border.all(color: borderLuminescent),
         boxShadow: const <BoxShadow>[
           BoxShadow(
@@ -186,7 +194,10 @@ class _InboxViewState extends State<InboxView> {
                   ),
                   const SizedBox(width: 8),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 2,
+                    ),
                     decoration: BoxDecoration(
                       color: surfaceActive,
                       borderRadius: BorderRadius.circular(4),
@@ -207,7 +218,10 @@ class _InboxViewState extends State<InboxView> {
                 onTap: widget.onBrowseDirectory,
                 borderRadius: BorderRadius.circular(16),
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
                   decoration: BoxDecoration(
                     color: surfaceActive,
                     borderRadius: BorderRadius.circular(16),
@@ -215,7 +229,7 @@ class _InboxViewState extends State<InboxView> {
                   ),
                   child: const Row(
                     children: <Widget>[
-                      Icon(Icons.folder_open, color: jade400, size: 14),
+                      IconsaxIcon(Iconsax.folder, color: jade400, size: 14),
                       SizedBox(width: 4),
                       Text(
                         '浏览目录',
@@ -248,12 +262,16 @@ class _InboxViewState extends State<InboxView> {
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
               decoration: BoxDecoration(
                 color: surfaceLowest,
-                borderRadius: BorderRadius.circular(10),
+                borderRadius: BorderRadius.circular(12),
                 border: Border.all(color: surfaceBorder),
               ),
               child: Row(
                 children: <Widget>[
-                  const Icon(Icons.terminal, color: textMuted, size: 14),
+                  const IconsaxIcon(
+                    Iconsax.terminal,
+                    color: textMuted,
+                    size: 15,
+                  ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
@@ -269,7 +287,7 @@ class _InboxViewState extends State<InboxView> {
                       ),
                     ),
                   ),
-                  const Icon(Icons.copy, color: textDim, size: 13),
+                  const IconsaxIcon(Iconsax.copy, color: textDim, size: 13),
                 ],
               ),
             ),
@@ -290,7 +308,10 @@ class _InboxViewState extends State<InboxView> {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-                  const Text(' · ', style: TextStyle(color: textDim, fontSize: 11)),
+                  const Text(
+                    ' · ',
+                    style: TextStyle(color: textDim, fontSize: 11),
+                  ),
                   Text(
                     '占用 ${formatBytes(_totalBytes)}',
                     style: const TextStyle(color: textMuted, fontSize: 11),
@@ -307,10 +328,10 @@ class _InboxViewState extends State<InboxView> {
   Widget _buildCategoryFilterRibbon() {
     final List<Map<String, dynamic>> categories = <Map<String, dynamic>>[
       <String, dynamic>{'label': '全部', 'count': widget.files.length},
-      <String, dynamic>{'label': '文档', 'icon': Icons.description},
-      <String, dynamic>{'label': '媒体', 'icon': Icons.perm_media},
-      <String, dynamic>{'label': '代码归档', 'icon': Icons.code},
-      <String, dynamic>{'label': '安装与压缩', 'icon': Icons.archive},
+      <String, dynamic>{'label': '文档', 'icon': Iconsax.fileDoc},
+      <String, dynamic>{'label': '媒体', 'icon': Iconsax.fileMedia},
+      <String, dynamic>{'label': '代码归档', 'icon': Iconsax.fileCode},
+      <String, dynamic>{'label': '安装与压缩', 'icon': Iconsax.fileArchive},
     ];
 
     return SingleChildScrollView(
@@ -327,7 +348,10 @@ class _InboxViewState extends State<InboxView> {
               onTap: () => setState(() => _selectedCategory = index),
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 160),
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 7,
+                ),
                 decoration: BoxDecoration(
                   color: active ? jade400 : surfaceContainer,
                   borderRadius: BorderRadius.circular(20),
@@ -346,8 +370,8 @@ class _InboxViewState extends State<InboxView> {
                 child: Row(
                   children: <Widget>[
                     if (item['icon'] != null) ...<Widget>[
-                      Icon(
-                        item['icon'] as IconData,
+                      IconsaxIcon(
+                        item['icon'] as Iconsax,
                         size: 13,
                         color: active ? bgAbyss : textMuted,
                       ),
@@ -364,7 +388,10 @@ class _InboxViewState extends State<InboxView> {
                     if (item['count'] != null) ...<Widget>[
                       const SizedBox(width: 4),
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 1,
+                        ),
                         decoration: BoxDecoration(
                           color: active
                               ? bgAbyss.withValues(alpha: 0.15)
@@ -401,13 +428,19 @@ class _InboxViewState extends State<InboxView> {
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: surfaceContainer,
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(20),
           border: Border.all(color: surfaceBorder),
         ),
         child: const Column(
           children: <Widget>[
-            Icon(Icons.inbox_outlined, color: textDim, size: 36),
-            SizedBox(height: 8),
+            IconsaxBox(
+              icon: Iconsax.inbox,
+              size: 48,
+              iconSize: 24,
+              borderRadius: 14,
+              color: textDim,
+            ),
+            SizedBox(height: 10),
             Text(
               '当前筛选分类下无文件',
               style: TextStyle(color: textDim, fontSize: 13),
@@ -430,7 +463,7 @@ class _InboxViewState extends State<InboxView> {
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: surfaceContainer,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(18),
         border: Border.all(color: surfaceBorder),
       ),
       child: Column(
@@ -439,20 +472,13 @@ class _InboxViewState extends State<InboxView> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              // 文件图标
-              Container(
-                width: 40,
-                height: 40,
-                decoration: BoxDecoration(
-                  color: surfaceHigh,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: borderLuminescent),
-                ),
-                child: Icon(
-                  _fileTypeIcon(file.name),
-                  color: jade400,
-                  size: 22,
-                ),
+              // Iconsax 超椭圆文件图标
+              IconsaxBox(
+                icon: _fileTypeIcon(file.name),
+                size: 42,
+                iconSize: 21,
+                borderRadius: 12,
+                color: jade400,
               ),
               const SizedBox(width: 12),
 
@@ -497,14 +523,16 @@ class _InboxViewState extends State<InboxView> {
                             fontFamily: 'monospace',
                           ),
                         ),
-                        const Text(' / ', style: TextStyle(color: textDim, fontSize: 10)),
+                        const Text(
+                          ' / ',
+                          style: TextStyle(color: textDim, fontSize: 10),
+                        ),
                         Text(
                           file.sender.isNotEmpty ? file.sender : '来源未知',
                           style: const TextStyle(color: textMuted, fontSize: 10),
                         ),
                       ],
                     ),
-
                   ],
                 ),
               ),
@@ -516,8 +544,8 @@ class _InboxViewState extends State<InboxView> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             decoration: BoxDecoration(
-              color: surfaceLowest.withValues(alpha: 0.5),
-              borderRadius: BorderRadius.circular(8),
+              color: surfaceLowest.withValues(alpha: 0.6),
+              borderRadius: BorderRadius.circular(10),
             ),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
@@ -534,8 +562,8 @@ class _InboxViewState extends State<InboxView> {
                   },
                   child: const Row(
                     children: <Widget>[
-                      Icon(Icons.copy, size: 12, color: textMuted),
-                      SizedBox(width: 3),
+                      IconsaxIcon(Iconsax.copy, size: 12, color: textMuted),
+                      SizedBox(width: 4),
                       Text(
                         '复制路径',
                         style: TextStyle(color: textMuted, fontSize: 11),
@@ -545,14 +573,21 @@ class _InboxViewState extends State<InboxView> {
                 ),
                 const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 8),
-                  child: Text('|', style: TextStyle(color: textDim, fontSize: 10)),
+                  child: Text(
+                    '|',
+                    style: TextStyle(color: textDim, fontSize: 10),
+                  ),
                 ),
                 InkWell(
                   onTap: () => widget.onOpenFile(file),
                   child: const Row(
                     children: <Widget>[
-                      Icon(Icons.open_in_new, size: 12, color: jade400),
-                      SizedBox(width: 3),
+                      IconsaxIcon(
+                        Iconsax.openExternal,
+                        size: 13,
+                        color: jade400,
+                      ),
+                      SizedBox(width: 4),
                       Text(
                         '打开',
                         style: TextStyle(
@@ -572,18 +607,28 @@ class _InboxViewState extends State<InboxView> {
     );
   }
 
-  IconData _fileTypeIcon(String name) {
+  Iconsax _fileTypeIcon(String name) {
     final String ext = name.toLowerCase();
-    if (ext.endsWith('.pdf')) return Icons.picture_as_pdf;
-    if (ext.endsWith('.zip') || ext.endsWith('.tar') || ext.endsWith('.gz') || ext.endsWith('.zst')) {
-      return Icons.folder_zip;
+    if (ext.endsWith('.pdf')) return Iconsax.filePdf;
+    if (ext.endsWith('.zip') ||
+        ext.endsWith('.tar') ||
+        ext.endsWith('.gz') ||
+        ext.endsWith('.zst')) {
+      return Iconsax.fileArchive;
     }
-    if (ext.endsWith('.apk')) return Icons.android;
-    if (ext.endsWith('.bin')) return Icons.memory;
-    if (ext.endsWith('.png') || ext.endsWith('.jpg') || ext.endsWith('.jpeg')) {
-      return Icons.image;
+    if (ext.endsWith('.apk')) return Iconsax.fileApk;
+    if (ext.endsWith('.bin') ||
+        ext.endsWith('.rs') ||
+        ext.endsWith('.dart') ||
+        ext.endsWith('.py')) {
+      return Iconsax.fileCode;
     }
-    return Icons.insert_drive_file;
+    if (ext.endsWith('.png') ||
+        ext.endsWith('.jpg') ||
+        ext.endsWith('.jpeg')) {
+      return Iconsax.fileMedia;
+    }
+    return Iconsax.fileDoc;
   }
 
   Widget _buildBatchControlBar(BuildContext context) {
@@ -591,7 +636,7 @@ class _InboxViewState extends State<InboxView> {
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: surfaceHigh,
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(16),
         border: Border.all(color: surfaceBorder),
       ),
       child: Row(
@@ -599,7 +644,7 @@ class _InboxViewState extends State<InboxView> {
         children: <Widget>[
           const Row(
             children: <Widget>[
-              Icon(Icons.auto_awesome_motion, color: jade400, size: 16),
+              IconsaxIcon(Iconsax.layers, color: jade400, size: 16),
               SizedBox(width: 6),
               Text(
                 '收件箱归档管理',
@@ -609,7 +654,11 @@ class _InboxViewState extends State<InboxView> {
           ),
           ElevatedButton.icon(
             onPressed: widget.onClearAll,
-            icon: const Icon(Icons.delete_sweep, size: 14, color: dangerCoral),
+            icon: const IconsaxIcon(
+              Iconsax.trash,
+              size: 14,
+              color: dangerCoral,
+            ),
             label: const Text(
               '清空记录',
               style: TextStyle(

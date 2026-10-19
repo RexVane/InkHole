@@ -58,8 +58,19 @@ typedef _Destroy = int Function(
 typedef _FreeNative = Void Function(Pointer<Char> value);
 typedef _Free = void Function(Pointer<Char> value);
 
-const int _statusOk = 0;
-const int _statusNoEvent = 1;
+/// 与 `rust/crates/inkhole-ffi/include/inkhole.h` 及 `src/lib.rs` 保持严格一致。
+const int inkholeFfiAbiVersion = 1;
+const int inkholeStatusOk = 0;
+const int inkholeStatusNoEvent = 1;
+const int inkholeStatusInvalidArgument = 2;
+const int inkholeStatusInvalidUtf8 = 3;
+const int inkholeStatusClosed = 4;
+const int inkholeStatusInternalError = 5;
+const int inkholeStatusPanic = 6;
+const int inkholeStatusWrongThread = 7;
+
+const int _statusOk = inkholeStatusOk;
+const int _statusNoEvent = inkholeStatusNoEvent;
 
 class InkHoleCoreException implements Exception {
   const InkHoleCoreException(this.status, this.message);
@@ -76,7 +87,7 @@ class _NativeInkHole {
       : _library = _openLibrary(libraryPath) {
     final version = _library
         .lookupFunction<_AbiVersionNative, _AbiVersion>('inkhole_ffi_abi_version');
-    if (version() != 1) {
+    if (version() != inkholeFfiAbiVersion) {
       throw InkHoleCoreException(version(), 'unsupported native ABI version');
     }
     _create = _library.lookupFunction<_CreateNative, _Create>(

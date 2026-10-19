@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:inkhole_mobile/core/scanner.dart';
 import 'package:inkhole_mobile/models.dart';
-import 'package:inkhole_mobile/widgets/settings_dialog.dart';
+import 'package:inkhole_mobile/views/settings_view.dart';
 
 void main() {
   group('扫码短码解析', () {
@@ -91,7 +91,8 @@ void main() {
       expect(formatManualEndpoint(bare), 'fe80::1');
     });
 
-    test('废弃的明文会合点交给核心默认地址', () {      expect(normalizeRendezvousUrl('ws://relay.magic-wormhole.io:4000/v1'), '');
+    test('废弃的明文会合点交给核心默认地址', () {
+      expect(normalizeRendezvousUrl('ws://relay.magic-wormhole.io:4000/v1'), '');
       expect(normalizeRendezvousUrl(''), '');
       expect(
         normalizeRendezvousUrl('wss://relay.example/v1'),
@@ -117,6 +118,8 @@ void main() {
       await tester.tap(find.text('打开设置'));
       await tester.pumpAndSettle();
 
+      await tester.ensureVisible(find.byKey(const Key('manual-peer-host')));
+      await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const Key('manual-peer-host')),
         '100.64.0.7',
@@ -137,7 +140,9 @@ void main() {
         isEmpty,
       );
 
-      await tester.tap(find.widgetWithText(FilledButton, '保存'));
+      await tester.ensureVisible(find.byKey(const Key('save-settings-btn')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('save-settings-btn')));
       await tester.pumpAndSettle();
       expect(saved, isNotNull);
       expect(saved!.manualPeers.single.host, '100.64.0.7');
@@ -151,6 +156,8 @@ void main() {
       await tester.tap(find.text('打开设置'));
       await tester.pumpAndSettle();
 
+      await tester.ensureVisible(find.byKey(const Key('manual-peer-name')));
+      await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const Key('manual-peer-name')),
         '书房台式机',
@@ -163,10 +170,12 @@ void main() {
         find.byKey(const Key('manual-peer-port')),
         '41234',
       );
-      await tester.tap(find.widgetWithText(FilledButton, '保存'));
+      await tester.ensureVisible(find.byKey(const Key('save-settings-btn')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('save-settings-btn')));
       await tester.pumpAndSettle();
 
-      expect(saved, isNotNull, reason: '弹窗必须带着草稿关闭');
+      expect(saved, isNotNull, reason: '保存必须提交输入框中的待定设备');
       expect(saved!.manualPeers, hasLength(1));
       expect(saved!.manualPeers.single.name, '书房台式机');
       expect(saved!.manualPeers.single.host, '100.64.0.7');
@@ -181,11 +190,15 @@ void main() {
       await tester.tap(find.text('打开设置'));
       await tester.pumpAndSettle();
 
+      await tester.ensureVisible(find.byKey(const Key('manual-peer-host')));
+      await tester.pumpAndSettle();
       await tester.enterText(
         find.byKey(const Key('manual-peer-host')),
         '100.64.0.7 备用',
       );
-      await tester.tap(find.widgetWithText(FilledButton, '保存'));
+      await tester.ensureVisible(find.byKey(const Key('save-settings-btn')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('save-settings-btn')));
       await tester.pumpAndSettle();
 
       expect(saved, isNull);
@@ -205,6 +218,8 @@ void main() {
       await tester.tap(find.text('打开设置'));
       await tester.pumpAndSettle();
 
+      await tester.ensureVisible(find.text('书房台式机'));
+      await tester.pumpAndSettle();
       expect(find.text('书房台式机'), findsOneWidget);
       expect(find.text('100.64.0.7:41234'), findsOneWidget);
       expect(find.text('编辑'), findsOneWidget);
@@ -224,7 +239,9 @@ void main() {
       await tester.tap(find.text('保存设备'));
       await tester.pumpAndSettle();
 
-      await tester.tap(find.widgetWithText(FilledButton, '保存'));
+      await tester.ensureVisible(find.byKey(const Key('save-settings-btn')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('save-settings-btn')));
       await tester.pumpAndSettle();
       expect(saved!.manualPeers.single.host, '100.64.0.9');
     });
@@ -244,50 +261,60 @@ void main() {
         ),
         findsOneWidget,
       );
+      expect(find.text('1234abcd5678ef90'), findsOneWidget);
+      expect(find.text('Wormhole 配对服务地址（留空=默认）'), findsOneWidget);
+
+      await tester.ensureVisible(find.text('使用说明'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('使用说明'));
+      await tester.pumpAndSettle();
+      expect(find.text('我知道了'), findsOneWidget);
+      await tester.tap(find.text('我知道了'));
+      await tester.pumpAndSettle();
     });
   });
 }
 
-/// 承载设置弹窗的最小宿主，保存后把草稿交给 [onSaved]。
+/// 承载设置视图的最小测试宿主，保存后把配置交给 [onSaved]。
 Widget _host(void Function(InkSettings) onSaved, List<ManualPeer> peers) {
   return MaterialApp(
     home: Builder(
       builder: (BuildContext context) => TextButton(
-        onPressed: () async {
-          final InkSettings? result = await showDialog<InkSettings>(
-            context: context,
-            builder: (BuildContext dialogContext) => SettingsDialog(
-              initial: InkSettings(
-                peerName: 'Android',
-                listenPort: 0,
-                encryptionEnabled: false,
-                secret: '',
-                manualPeers: peers,
-                rendezvousUrl: '',
-                transitRelay: '',
-                sshEnabled: false,
-                sshHost: '',
-                sshPort: 22,
-                sshUser: '',
-                sshFingerprint: '',
-                sshPrivateKey: '',
-                sshPassphrase: '',
+        onPressed: () {
+          Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (BuildContext routeContext) => SettingsView(
+                initialSettings: InkSettings(
+                  peerName: 'Android',
+                  listenPort: 0,
+                  encryptionEnabled: false,
+                  secret: '',
+                  manualPeers: peers,
+                  rendezvousUrl: '',
+                  transitRelay: '',
+                  sshEnabled: false,
+                  sshHost: '',
+                  sshPort: 22,
+                  sshUser: '',
+                  sshFingerprint: '',
+                  sshPrivateKey: '',
+                  sshPassphrase: '',
+                ),
+                instanceId: '1234abcd5678ef90',
+                actualPort: 41300,
+                inboxPath: '/storage/emulated/0/Download/InkHole',
+                appInboxPath:
+                    '/data/user/0/com.rexvane.inkhole/app_flutter/InkHole',
+                onBack: () => Navigator.of(routeContext).pop(),
+                onSave: (InkSettings settings) async {
+                  onSaved(settings);
+                },
+                onChooseDirectory: () {},
+                onResetDirectory: () {},
+                onOpenSshRelay: () {},
               ),
-              deviceLine: '本机：Android-1234abcd',
-              portLine: '端口：0',
-              inboxPath: '/data/user/0/com.rexvane.inkhole/app_flutter/InkHole',
-              exportPath: '/storage/emulated/0/Download/InkHole',
-              onPickExportDirectory: () async => null,
-              onResetExportDirectory: () async =>
-                  '/storage/emulated/0/Download/InkHole',
-              sshReady: false,
-              onCheckSsh: (InkSettings draft) async => null,
-              onCreateSshPair: () {},
-              onOpenCrossNetwork: () {},
-              onOpenRepository: () {},
             ),
           );
-          if (result != null) onSaved(result);
         },
         child: const Text('打开设置'),
       ),

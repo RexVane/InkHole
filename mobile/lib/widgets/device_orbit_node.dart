@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import '../models.dart';
 import '../theme.dart';
+import 'iconsax.dart';
 
 /// 悬浮在雷达同心圆轨道上的设备节点卡片 (Orbiting Node)
+/// 采用 Iconsax `.con-svg` 超椭圆容器与双色调设备图标
 class DeviceOrbitNode extends StatelessWidget {
   const DeviceOrbitNode({
     super.key,
@@ -35,51 +37,47 @@ class DeviceOrbitNode extends StatelessWidget {
         onTap: onTap,
         behavior: HitTestBehavior.opaque,
         child: AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
           decoration: BoxDecoration(
             color: isSelected
-                ? surfaceActive.withValues(alpha: 0.95)
-                : surfaceContainer.withValues(alpha: 0.90),
-            borderRadius: BorderRadius.circular(14),
+                ? surfaceActive.withValues(alpha: 0.96)
+                : surfaceContainer.withValues(alpha: 0.92),
+            borderRadius: BorderRadius.circular(16),
             border: Border.all(
               color: isSelected ? jade400 : surfaceBorder,
-              width: isSelected ? 1.5 : 1.0,
+              width: isSelected ? 1.4 : 1.0,
             ),
             boxShadow: <BoxShadow>[
               BoxShadow(
                 color: isSelected
-                    ? jade400.withValues(alpha: 0.22)
-                    : Colors.black.withValues(alpha: 0.4),
-                blurRadius: isSelected ? 14 : 8,
-                offset: const Offset(0, 3),
+                    ? jade400.withValues(alpha: 0.24)
+                    : Colors.black.withValues(alpha: 0.45),
+                blurRadius: isSelected ? 16 : 10,
+                offset: const Offset(0, 4),
               ),
             ],
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
-              // 设备图标与右上方在线绿点
+              // Iconsax 超椭圆设备图标与右上方在线绿点
               Stack(
                 clipBehavior: Clip.none,
                 children: <Widget>[
-                  Container(
-                    width: 28,
-                    height: 28,
-                    decoration: BoxDecoration(
-                      color: surfaceHigh,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: isSelected
-                            ? jade400.withValues(alpha: 0.5)
-                            : surfaceBorder,
-                      ),
-                    ),
-                    child: Icon(
-                      _resolveDeviceIcon(peer),
-                      color: isSelected ? jade400 : textMuted,
-                      size: 15,
-                    ),
+                  IconsaxBox(
+                    icon: _resolveDeviceIcon(peer),
+                    size: 30,
+                    iconSize: 16,
+                    borderRadius: 9,
+                    color: isSelected ? jade400 : textMuted,
+                    backgroundColor: isSelected
+                        ? jade400.withValues(alpha: 0.14)
+                        : surfaceHigh,
+                    borderColor: isSelected
+                        ? jade400.withValues(alpha: 0.45)
+                        : surfaceBorder,
                   ),
                   Positioned(
                     top: -2,
@@ -99,7 +97,7 @@ class DeviceOrbitNode extends StatelessWidget {
                   ),
                 ],
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 9),
 
               // 设备名称与网络/延迟
               Column(
@@ -109,8 +107,10 @@ class DeviceOrbitNode extends StatelessWidget {
                   Text(
                     peer.name,
                     style: TextStyle(
-                      color: isSelected ? textPrimary : textPrimary.withValues(alpha: 0.9),
-                      fontSize: 11,
+                      color: isSelected
+                          ? textPrimary
+                          : textPrimary.withValues(alpha: 0.92),
+                      fontSize: 11.5,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -139,15 +139,15 @@ class DeviceOrbitNode extends StatelessWidget {
     );
   }
 
-  IconData _resolveDeviceIcon(PeerView peer) {
-    if (peer.viaSsh) return Icons.cloud_outlined;
+  Iconsax _resolveDeviceIcon(PeerView peer) {
+    if (peer.viaSsh) return Iconsax.cloud;
     final String name = peer.name.toLowerCase();
     if (name.contains('mac') || name.contains('pc') || name.contains('laptop')) {
-      return Icons.laptop_mac;
+      return Iconsax.deviceLaptop;
     }
     if (name.contains('pad') || name.contains('tablet')) {
-      return Icons.tablet_mac;
+      return Iconsax.deviceTablet;
     }
-    return Icons.phone_android;
+    return Iconsax.devicePhone;
   }
 }
