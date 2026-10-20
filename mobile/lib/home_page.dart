@@ -1927,7 +1927,10 @@ class _HomePageState extends State<HomePage> {
     for (final String line in lines) {
       // 新格式是 JSON；旧格式是 `|` 拼接的 5 段文本，读到时顺带迁移。
       final ReceivedFile? parsed = _decodeReceivedRecord(line);
-      if (parsed != null) _received.add(parsed);
+      if (parsed == null) continue;
+      // 旧版「重扫」把核心的断点状态文件也录进来过，这里顺手筛掉。
+      if (isInboxInternalFile(parsed.path)) continue;
+      _received.add(parsed);
     }
   }
 
@@ -1986,6 +1989,7 @@ class _HomePageState extends State<HomePage> {
             in inbox.list(recursive: true, followLinks: false)) {
           if (entity is! File) continue;
           if (known.contains(entity.path)) continue;
+          if (isInboxInternalFile(entity.path)) continue;
           known.add(entity.path);
           final FileStat stat = await entity.stat();
           found.add(ReceivedFile(
@@ -2385,6 +2389,20 @@ class _TransferTelemetry {
   final double speedBytesPerSec;
   final List<double> speedHistory;
   final bool isTransferPaused;
+}
+
+/// 收件目录里的内部文件（断点续传状态、临时分片）不是成品，不能当收件列出来。
+///
+/// 核心把断点状态放在 `<inbox>/.inkhole-transfers/` 下，文件名是 transfer_id，
+/// 结构为 `<id>.json` / `<id>.part`；目录收件时还会多一层 `<分类>/`。
+bool isInboxInternalFile(String path) {
+  final List<String> segments = path.replaceAll('\\', '/').split('/');
+  if (segments.any((String segment) => segment.startsWith('.'))) return true;
+  final String lower = path.toLowerCase();
+  return lower.endsWith('.part') ||
+      lower.endsWith('.json') ||
+      lower.endsWith('.commit') ||
+      lower.endsWith('.metadata');
 }
 
 /// 「清空收件」的确认框：删文件不可恢复，必须让用户明确点一次。
