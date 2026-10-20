@@ -620,6 +620,8 @@ impl JsonService {
             "lan.refresh" => self.lan_peers(decode_params(params)?, true).await,
             "lan.send" => self.lan_send(decode_params(params)?).await,
             "lan.send.cancel" => self.lan_send_cancel(decode_params(params)?).await,
+            "lan.receive.pause" => self.lan_receive_pause(decode_params(params)?).await,
+            "lan.receive.resume" => self.lan_receive_resume(decode_params(params)?).await,
             "wormhole.create" => self.wormhole_create(decode_params(params)?).await,
             "wormhole.join.start" => self.wormhole_join(decode_params(params)?).await,
             "wormhole.accept" => self.wormhole_accept(decode_params(params)?).await,
@@ -1091,6 +1093,39 @@ impl JsonService {
         } else {
             Ok(json!({ "cancelled": false }))
         }
+    }
+
+    /// 暂停/恢复入站接收。
+    ///
+    /// 语义是“停读”：核心不再从 QUIC 流取数据，接收窗口填满后发送端会卡在
+    /// `write_all` 上，对端确实停止发送；恢复后从同一位置继续，不需要重传。
+    /// 连接层每 5 秒一次 keep-alive，暂停超过空闲超时也不会断连。
+    async fn lan_receive_pause(&self, params: SessionParams) -> Result<Value> {
+        let session = self.session(&params.session_id).await?;
+        session.server.pause_incoming();
+        let paused = session.server.incoming_paused();
+        emit_session_event(
+            &self.inner.events,
+            &session.cancellation,
+            &session.session_id,
+            "lan.status",
+            json!({ "message": "已暂停接收，对端会等在这里" }),
+        );
+        Ok(json!({ "paused": paused }))
+    }
+
+    async fn lan_receive_resume(&self, params: SessionParams) -> Result<Value> {
+        let session = self.session(&params.session_id).await?;
+        session.server.resume_incoming();
+        let paused = session.server.incoming_paused();
+        emit_session_event(
+            &self.inner.events,
+            &session.cancellation,
+            &session.session_id,
+            "lan.status",
+            json!({ "message": "已恢复接收" }),
+        );
+        Ok(json!({ "paused": paused }))
     }
 
     async fn session(&self, session_id: &str) -> Result<Arc<LanSession>> {

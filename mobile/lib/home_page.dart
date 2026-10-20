@@ -98,6 +98,14 @@ class _HomePageState extends State<HomePage> {
   bool _isGeneratingPasscode = false;
   bool _isTransferPaused = false;
   bool _pauseInProgress = false;
+  bool _isRefreshingDiscovery = false;
+
+  /// 正在接收的传输（transfer_id）。有它在才能把暂停按钮接到接收背压上。
+  final Set<String> _receivingIds = <String>{};
+
+  /// 接收侧已暂停。与 `_isTransferPaused`（发送侧）分开记：两者的恢复动作
+  /// 完全不同——发送是重发整文件走断点续传，接收是把核心的读闸门打开。
+  bool _isReceivePaused = false;
 
   bool _encryptionEnabled = false;
   List<ManualPeer> _manualPeers = const <ManualPeer>[];
@@ -105,6 +113,7 @@ class _HomePageState extends State<HomePage> {
 
   final List<ReceivedFile> _received = <ReceivedFile>[];
   String _exportPath = '';
+  String _defaultExportPath = '';
   String _exportTreeUri = '';
   final List<String> _sharedFiles = <String>[];
   List<String> _pendingSendPaths = <String>[];
@@ -137,7 +146,7 @@ class _HomePageState extends State<HomePage> {
       activeProgress: active,
       speedBytesPerSec: _speedBytes,
       speedHistory: List<double>.unmodifiable(_speedHistory),
-      isTransferPaused: _isTransferPaused,
+      isTransferPaused: _isTransferPaused || _isReceivePaused,
     );
   }
 
@@ -253,8 +262,15 @@ class _HomePageState extends State<HomePage> {
 
     _inbox = await _resolveInbox();
     final String customExport = _preferences!.getString('export_tree_label') ?? '';
-    _exportPath = customExport.isNotEmpty ? customExport : _inbox;
     _exportTreeUri = _preferences!.getString('export_tree_uri') ?? '';
+    // 收件目录 ≠ 应用内暂存目录：收到文件后会自动导出到系统下载目录
+    // （或用户选的 SAF 目录），私有 inbox 只是导出失败时的兜底。以前这里
+    // 默认显示私有路径，既打不开（沙箱）也早就不放成品文件了。
+    final String? downloadsPath = await ExporterChannel.downloadsPath();
+    _defaultExportPath = downloadsPath ?? '';
+    _exportPath = customExport.isNotEmpty
+        ? customExport
+        : (_defaultExportPath.isNotEmpty ? _defaultExportPath : _inbox);
 
     _identityPrivate = await _secureStorage.read(key: 'identity_private');
 
@@ -297,6 +313,9 @@ class _HomePageState extends State<HomePage> {
       await _startLanSession();
       return;
     }
+    // 连点保护：重扫本身很快，但重复进入会连续刷 toast 且互相覆盖状态。
+    if (_isRefreshingDiscovery) return;
+    setState(() => _isRefreshingDiscovery = true);
     try {
       final Map<String, dynamic> result =
           await _core.call('lan.refresh', <String, dynamic>{
@@ -317,8 +336,15 @@ class _HomePageState extends State<HomePage> {
         }
       });
       _flushPendingSends();
+      // 必须给结果：旧实现只是重发一遍对端列表，对端没变化时界面一动不动，
+      // 用户会以为按钮坏了。
+      _toast(_peers.isEmpty
+          ? '扫描完成，附近暂未发现设备'
+          : '扫描完成，发现 ${_peers.length} 台设备');
     } catch (e) {
       _toast('刷新发现失败: $e');
+    } finally {
+      if (mounted) setState(() => _isRefreshingDiscovery = false);
     }
   }
 
@@ -338,6 +364,10 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _startLanSessionLocked() async {
+    // 新会话 = 新服务器：旧闸门跟着旧会话一起没了，UI 这边必须同步复位，
+    // 否则会显示“已暂停”但实际没有任何东西被暂停。
+    _isReceivePaused = false;
+    _receivingIds.clear();
     // 停掉上一个会话，避免重复启动时端口被自己占住(Windows 上尤其明显)。
     final String? existing = _sessionId;
     if (existing != null) {
@@ -823,6 +853,8 @@ class _HomePageState extends State<HomePage> {
           _sessionId = null;
           _progress.clear();
           _sendIds.clear();
+          _receivingIds.clear();
+          _isReceivePaused = false;
         });
         _publishTelemetry();
         _toast('传输核心已停止: $reason');
@@ -854,6 +886,9 @@ class _HomePageState extends State<HomePage> {
         _calculateSpeed(data['kind']?.toString() ?? 'send', filename, done, total);
 
         if (!mounted) return;
+        if (data['kind']?.toString() == 'recv') {
+          _receivingIds.add(data['transfer_id']?.toString() ?? key);
+        }
         _progress[key] = TransferProgress(filename, done, total);
         _publishTelemetry();
 
@@ -893,6 +928,10 @@ class _HomePageState extends State<HomePage> {
         });
         _publishTelemetry();
         _persistReceivedRecords();
+        _receivingIds.remove(data['transfer_id']?.toString() ?? receiveId ?? '');
+        // 接收已经结束：若还挂着接收暂停，必须把核心闸门打开，
+        // 否则对端下一笔传输会一直卡在窗口上。
+        if (_receivingIds.isEmpty) unawaited(_releaseReceivePause());
         if (path.isNotEmpty) {
           unawaited(_exportReceived(path));
         }
@@ -1395,6 +1434,27 @@ class _HomePageState extends State<HomePage> {
     } catch (_) {}
   }
 
+  /// 打开核心的接收闸门并清掉 UI 暂停态。
+  ///
+  /// 接收结束/取消/换会话时都必须调：闸门是会话级开关，留着不放会让对端
+  /// 下一笔传输永久卡在流控窗口上。
+  Future<void> _releaseReceivePause({bool notify = false}) async {
+    final String? session = _sessionId;
+    final bool wasPaused = _isReceivePaused;
+    if (wasPaused) {
+      if (mounted) setState(() => _isReceivePaused = false);
+      _publishTelemetry();
+    }
+    if (wasPaused && session != null) {
+      try {
+        await _core.call('lan.receive.resume', <String, dynamic>{
+          'session_id': session,
+        });
+      } catch (_) {}
+    }
+    if (notify && wasPaused) _toast('已恢复接收');
+  }
+
   Future<void> _cancelActiveTransfer() async {
     final bool hadWork = _sendIds.isNotEmpty ||
         _activeWormholeSession != null ||
@@ -1418,6 +1478,7 @@ class _HomePageState extends State<HomePage> {
       _trackedSends.clear();
       _pausedSends.clear();
       _progress.clear();
+      _receivingIds.clear();
       _isTransferPaused = false;
       _pauseInProgress = false;
       if (wormhole != null) {
@@ -1426,11 +1487,36 @@ class _HomePageState extends State<HomePage> {
         _passcodeExpiresAt = null;
       }
     });
+    unawaited(_releaseReceivePause());
     _publishTelemetry();
     _toast('已取消传输');
   }
 
   Future<void> _togglePause() async {
+    // 接收暂停优先：此时按钮该做的是把核心的读闸门关上/打开，而不是重发。
+    if (_isReceivePaused) {
+      await _releaseReceivePause(notify: true);
+      return;
+    }
+    if (_receivingIds.isNotEmpty) {
+      final String? session = _sessionId;
+      if (session == null) {
+        _toast('接收服务未就绪');
+        return;
+      }
+      try {
+        await _core.call('lan.receive.pause', <String, dynamic>{
+          'session_id': session,
+        });
+        if (!mounted) return;
+        setState(() => _isReceivePaused = true);
+        _publishTelemetry();
+        _toast('已暂停接收，对端会等在这里');
+      } catch (e) {
+        _toast('暂停接收失败: $e');
+      }
+      return;
+    }
     if (_isTransferPaused) {
       final List<_TrackedSend> jobs = List<_TrackedSend>.of(_pausedSends);
       if (jobs.isEmpty) {
@@ -1715,12 +1801,14 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _resetExportDirectory() async {
     setState(() {
-      _exportPath = _inbox;
+      // 与启动时保持一致：没选自定义目录就是系统下载目录，不是私有 inbox。
+      _exportPath =
+          _defaultExportPath.isNotEmpty ? _defaultExportPath : _inbox;
       _exportTreeUri = '';
     });
     await _preferences?.remove('export_tree_label');
     await _preferences?.remove('export_tree_uri');
-    _toast('收件目录已恢复为应用内收件箱');
+    _toast('收件目录已恢复为系统下载目录');
   }
 
   Future<void> _manualIpConnectDialog() async {
@@ -1785,8 +1873,35 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _exportReceived(String path) async {
-    final File incoming = File(path);
+  /// 「浏览目录」：把还留在应用内暂存的条目补导出，然后打开真正的收件落点。
+  ///
+  /// 收件箱页面显示的路径是收件落点（Download/InkHole 或用户选的 SAF 目录），
+  /// 不是应用私有目录——后者任何文件管理器都无权进入。正常情况下收到文件时
+  /// 已自动导出，这里只处理导出失败/旧版本留下的零星条目。
+  Future<void> _browseInboxDirectory() async {
+    final String? treeUri = _exportTreeUri.isEmpty ? null : _exportTreeUri;
+    int exported = 0;
+    for (final ReceivedFile file in List<ReceivedFile>.of(_received)) {
+      if (file.path.isEmpty) continue;
+      if (!await File(file.path).exists()) continue;
+      final ExportOutcome outcome = await ExporterChannel.export(
+        file.path,
+        treeUri: treeUri,
+      );
+      if (outcome.location.isNotEmpty) exported++;
+    }
+    if (!mounted) return;
+    final bool opened = await ExporterChannel.openInboxFolder(treeUri: treeUri);
+    if (!mounted) return;
+    final String where = _exportPath.isEmpty ? '系统下载目录' : _exportPath;
+    if (!opened) {
+      _toast('收件目录：$where（系统没有可用的文件管理器）');
+      return;
+    }
+    _toast(exported > 0 ? '已导出 $exported 项到 $where' : '已打开 $where');
+  }
+
+  Future<void> _exportReceived(String path) async {    final File incoming = File(path);
     if (!await incoming.exists()) {
       _toast('文件已不在收件箱');
       return;
@@ -2065,6 +2180,7 @@ class _HomePageState extends State<HomePage> {
                   onOpenPairQr: _openScannerPairing,
                   onOpenSettings: () => setState(() => _currentTabIndex = 4),
                   onRefreshDiscovery: () => unawaited(_refreshDiscovery()),
+                  isRefreshing: _isRefreshingDiscovery,
                   onOpenInbox: () => setState(() => _currentTabIndex = 2),
                   onOpenFile: _openFile,
                 );
@@ -2100,10 +2216,7 @@ class _HomePageState extends State<HomePage> {
               inboxPath: _exportPath,
               files: _received,
               onOpenFile: _openFile,
-              onBrowseDirectory: () {
-                Clipboard.setData(ClipboardData(text: _exportPath));
-                _toast('收件目录已复制。应用内文件请从下面的列表打开');
-              },
+              onBrowseDirectory: () => unawaited(_browseInboxDirectory()),
               onClearAll: () {
                 setState(() => _received.clear());
                 _persistReceivedRecords();

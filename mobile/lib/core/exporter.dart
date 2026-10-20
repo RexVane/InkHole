@@ -105,13 +105,32 @@ class ExporterChannel {
   }
 
   /// 默认收件落点的绝对路径;非 Android 平台返回 null。
-  static Future<String?> downloadsPath() async {
-    try {
+  static Future<String?> downloadsPath() async {    try {
       return await _channel.invokeMethod<String>('downloadsPath');
     } on MissingPluginException {
       return null;
     } on PlatformException {
       return null;
+    }
+  }
+
+  /// 打开收件落点目录（自定义 SAF 目录或系统下载界面）。
+  ///
+  /// 返回 false 表示设备上没有能处理该 Intent 的文件管理器，调用方应改为
+  /// 把落点路径告知用户。
+  static Future<bool> openInboxFolder({String? treeUri}) async {
+    try {
+      final bool? opened = await _channel.invokeMethod<bool>(
+        'openInboxFolder',
+        <String, String?>{
+          'treeUri': (treeUri == null || treeUri.isEmpty) ? null : treeUri,
+        },
+      );
+      return opened ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
     }
   }
 

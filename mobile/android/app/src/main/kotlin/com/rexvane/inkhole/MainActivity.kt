@@ -133,6 +133,17 @@ class MainActivity : FlutterActivity() {
                         exportExecutor.execute { openReceived(path, name, treeUri, result) }
                     }
                     "downloadsPath" -> result.success(Opener.downloadsPath())
+                    "openInboxFolder" -> {
+                        val treeUri = call.argument<String>("treeUri")
+                        try {
+                            startActivity(Opener.inboxFolderIntent(treeUri))
+                            result.success(true)
+                        } catch (e: Exception) {
+                            // 设备上没有能处理该 Intent 的文件管理器：回传 false，
+                            // 由 Dart 侧提示用户落点路径。
+                            result.success(false)
+                        }
+                    }
                     "describeTree" -> {
                         val uri = call.argument<String>("uri").orEmpty()
                         if (uri.isEmpty()) {

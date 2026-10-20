@@ -174,6 +174,49 @@ struct IncomingTransferContext {
     events: TransferEventSink,
     on_inbound_peer: Option<InboundPeerCallback>,
     stream_slots: Arc<Semaphore>,
+    gate: Arc<ReceiveGate>,
+}
+
+/// 入站接收的流控闸门。
+///
+/// 暂停时接收循环不再读流，QUIC 接收窗口被填满后发送端会卡在 `write_all`
+/// 上——这是“真暂停”：不仅界面不再跳进度，对端也确实停止发送，不占带宽、
+/// 不丢数据。恢复后从同一位置继续读，不需要重传握手。
+///
+/// 用 `watch` 而不是 `Notify`：暂停/恢复是状态而不是一次性事件，
+/// 循环判断与唤醒之间没有丢通知的窗口。连接层的 keep-alive 每 5 秒一次，
+/// 暂停超过空闲超时也不会断连。
+struct ReceiveGate {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+impl ReceiveGate {
+    fn new() -> Self {
+        Self {
+            sender: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    fn pause(&self) {
+        self.sender.send_replace(true);
+    }
+
+    fn resume(&self) {
+        self.sender.send_replace(false);
+    }
+
+    fn is_paused(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    async fn wait_until_resumed(&self) {
+        let mut receiver = self.sender.subscribe();
+        while *receiver.borrow_and_update() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 pub struct QuicServer {
@@ -183,6 +226,7 @@ pub struct QuicServer {
     cancellation: CancellationToken,
     task: StdMutex<Option<JoinHandle<()>>>,
     events: broadcast::Sender<TransferEvent>,
+    gate: Arc<ReceiveGate>,
 }
 
 impl fmt::Debug for QuicServer {
@@ -213,6 +257,7 @@ impl QuicServer {
         let local_address = endpoint.local_addr()?;
         let cancellation = CancellationToken::new();
         let (events, _) = broadcast::channel(256);
+        let gate = Arc::new(ReceiveGate::new());
         let task = tokio::spawn(run_server(
             endpoint.clone(),
             IncomingTransferContext {
@@ -226,6 +271,7 @@ impl QuicServer {
                 },
                 on_inbound_peer: config.on_inbound_peer,
                 stream_slots: Arc::new(Semaphore::new(MAX_ACTIVE_STREAMS)),
+                gate: gate.clone(),
             },
             cancellation.clone(),
         ));
@@ -236,7 +282,21 @@ impl QuicServer {
             cancellation,
             task: StdMutex::new(Some(task)),
             events,
+            gate,
         })
+    }
+
+    /// 暂停/恢复所有入站接收。当前状态用 [`Self::incoming_paused`] 读。
+    pub fn pause_incoming(&self) {
+        self.gate.pause();
+    }
+
+    pub fn resume_incoming(&self) {
+        self.gate.resume();
+    }
+
+    pub fn incoming_paused(&self) -> bool {
+        self.gate.is_paused()
     }
 
     pub fn local_address(&self) -> SocketAddr {
@@ -917,6 +977,7 @@ async fn handle_stream(
             &manifest,
             &cancellation,
             &context.events,
+            &context.gate,
         )
         .await;
     }
@@ -971,6 +1032,12 @@ async fn handle_stream(
         }));
     let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
     while received < offer.size {
+        // 暂停时停在这里不读流：窗口满后发送端自己会卡住。取消优先级更高，
+        // 否则暂停中永远不能中止。
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+            _ = context.gate.wait_until_resumed() => {}
+        }
         let wanted = usize::try_from((offer.size - received).min(buffer.len() as u64)).unwrap();
         let read = tokio::select! {
             _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
@@ -1024,6 +1091,7 @@ async fn handle_stream(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_folder_stream(
     send: &mut quinn::SendStream,
     receive: &mut quinn::RecvStream,
@@ -1032,6 +1100,7 @@ async fn handle_folder_stream(
     manifest: &FolderManifest,
     cancellation: &CancellationToken,
     events: &TransferEventSink,
+    gate: &ReceiveGate,
 ) -> Result<()> {
     let prepared = match store.prepare_folder(offer, manifest).await {
         Ok(PrepareFolderOutcome::Complete(completed)) => {
@@ -1100,6 +1169,11 @@ async fn handle_folder_stream(
         };
         let mut file_received = offset;
         while file_received < entry.size {
+            // 同文件路径：暂停时停在这里不读，靠 QUIC 流控让发送端阻塞。
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(CoreError::Cancelled),
+                _ = gate.wait_until_resumed() => {}
+            }
             let wanted = usize::try_from((entry.size - file_received).min(buffer.len() as u64))
                 .expect("transfer buffer length fits usize");
             let read = tokio::select! {
@@ -1871,6 +1945,112 @@ mod tests {
             tokio::fs::read(inbox.join("large.bin")).await.unwrap(),
             payload
         );
+        server.close().await.unwrap();
+    }
+    /// 暂停接收必须真的把发送端拦住，恢复后从同一位置接上。
+    ///
+    /// 断言的是「接收端已落盘字节数」（TransferEvent::Progress），不是发送端的
+    /// 写入量：发送端还能往 quinn 的发送窗口里灌一段，所以只有接收进度能证明
+    /// 流控背压真的生效了。
+    #[tokio::test]
+    async fn pausing_incoming_stalls_receiver_until_resumed() {
+        use std::sync::atomic::Ordering;
+
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let source = root.path().join("bulk.bin");
+        const TOTAL: u64 = 64 * 1024 * 1024;
+        {
+            let mut file = tokio::fs::File::create(&source).await.unwrap();
+            let block = vec![0x5a_u8; 1024 * 1024];
+            for _ in 0..64 {
+                file.write_all(&block).await.unwrap();
+            }
+            file.flush().await.unwrap();
+        }
+
+        let receiver = DeviceIdentity::generate(None, "Receiver").unwrap();
+        let sender = DeviceIdentity::generate(None, "Sender").unwrap();
+        let server = QuicServer::bind(QuicServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            inbox: inbox.clone(),
+            inbox_category_roots: InboxCategoryRoots::default(),
+            identity: receiver.clone(),
+            capabilities: vec!["quic-v2".into()],
+            shared_secret: "room secret".into(),
+            on_inbound_peer: None,
+        })
+        .await
+        .unwrap();
+        let peer = PeerEndpoint {
+            address: server.local_address(),
+            certificate_fingerprint: receiver.certificate_fingerprint().to_owned(),
+        };
+
+        // 记录接收端已落盘的最大字节数。
+        let received = Arc::new(AtomicU64::new(0));
+        let mut events = server.subscribe();
+        let received_watch = received.clone();
+        let watcher = tokio::spawn(async move {
+            while let Ok(TransferEvent::Progress(progress)) = events.recv().await {
+                received_watch.fetch_max(progress.done, Ordering::SeqCst);
+            }
+        });
+
+        let send = tokio::spawn(async move {
+            send_file(
+                &sender,
+                &peer,
+                &source,
+                SendFileOptions {
+                    shared_secret: "room secret".into(),
+                    ..SendFileOptions::default()
+                },
+            )
+            .await
+        });
+
+        // 等到确实开始收数据。
+        let mut waited = 0;
+        while received.load(Ordering::SeqCst) == 0 {
+            assert!(waited < 200, "接收端一直没开始收数据");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            waited += 1;
+        }
+        server.pause_incoming();
+        assert!(server.incoming_paused());
+
+        // 让暂停前已读进缓冲的那一拍落地，再取基准。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let paused_at = received.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let after_pause = received.load(Ordering::SeqCst);
+        assert!(
+            after_pause.saturating_sub(paused_at) < 1024 * 1024,
+            "暂停后仍在收数据：{} -> {} 字节",
+            paused_at,
+            after_pause
+        );
+        assert!(server.incoming_paused(), "暂停状态应保持");
+
+        // 恢复后应当继续并完成。
+        server.resume_incoming();
+        assert!(!server.incoming_paused());
+        let receipt = tokio::time::timeout(Duration::from_secs(120), send)
+            .await
+            .expect("恢复后传输应当完成")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.size, TOTAL);
+        assert_eq!(
+            tokio::fs::metadata(inbox.join("bulk.bin"))
+                .await
+                .unwrap()
+                .len(),
+            TOTAL
+        );
+        assert_eq!(received.load(Ordering::SeqCst), TOTAL);
+        watcher.abort();
         server.close().await.unwrap();
     }
 }

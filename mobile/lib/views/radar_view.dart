@@ -26,6 +26,7 @@ class RadarView extends StatelessWidget {
     required this.onRefreshDiscovery,
     required this.onOpenInbox,
     required this.onOpenFile,
+    this.isRefreshing = false,
   });
 
   final int listenPort;
@@ -45,6 +46,9 @@ class RadarView extends StatelessWidget {
   final VoidCallback onRefreshDiscovery;
   final VoidCallback onOpenInbox;
   final ValueChanged<ReceivedFile> onOpenFile;
+
+  /// 雷达重扫进行中：按钮换成转圈并禁用，避免连点与“按了没反应”的错觉。
+  final bool isRefreshing;
 
   @override
   Widget build(BuildContext context) {
@@ -141,22 +145,16 @@ class RadarView extends StatelessWidget {
               // 右侧 Iconsax 操作按钮
               Row(
                 children: <Widget>[
-                  IconButton(
+                  _RefreshAction(
+                    isRefreshing: isRefreshing,
                     onPressed: onRefreshDiscovery,
-                    icon: const IconsaxIcon(
-                      Iconsax.refresh,
-                      size: 20,
-                      color: textMuted,
-                    ),
-                    splashRadius: 18,
-                    tooltip: '刷新雷达扫描',
                   ),
                   IconButton(
                     onPressed: onOpenSettings,
                     icon: const IconsaxIcon(
                       Iconsax.settings,
                       size: 20,
-                      color: textMuted,
+                      color: textPrimary,
                     ),
                     splashRadius: 18,
                     tooltip: '墨洞配置',
@@ -606,6 +604,70 @@ class _TransfersDrawer extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 雷达重扫按钮：点下去图标自己转起来，转的时长就是重扫的时长。
+///
+/// 旧实现只重发一遍对端列表，界面毫无动静，用户会以为按钮坏了；这里用旋转
+/// 把"正在扫描"这个状态显性化，同时兼作点击动效，不引入额外的视觉元素。
+class _RefreshAction extends StatefulWidget {
+  const _RefreshAction({required this.isRefreshing, required this.onPressed});
+
+  final bool isRefreshing;
+  final VoidCallback onPressed;
+
+  @override
+  State<_RefreshAction> createState() => _RefreshActionState();
+}
+
+class _RefreshActionState extends State<_RefreshAction>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spin = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    // 首次构建就处于扫描中时（例如热重启/页面重建）也要接着转。
+    if (widget.isRefreshing) _spin.repeat();
+  }
+
+  @override
+  void didUpdateWidget(covariant _RefreshAction oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isRefreshing) {
+      if (!_spin.isAnimating) _spin.repeat();
+    } else if (_spin.isAnimating) {
+      _spin
+        ..stop()
+        ..value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _spin.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      onPressed: widget.isRefreshing ? null : widget.onPressed,
+      splashRadius: 18,
+      tooltip: '刷新雷达扫描',
+      icon: RotationTransition(
+        turns: _spin,
+        child: const IconsaxIcon(
+          Iconsax.refresh,
+          size: 20,
+          color: textPrimary,
         ),
       ),
     );

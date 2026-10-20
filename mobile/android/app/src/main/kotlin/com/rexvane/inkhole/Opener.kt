@@ -73,6 +73,34 @@ object Opener {
     fun downloadsIntent(): Intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
 
     /**
+     * 收件落点目录的浏览 Intent。
+     *
+     * 自定义 SAF 目录可以直接定位到那棵树的根文档;默认落点
+     * Download/InkHole 在 API 29+ 只是 MediaStore 记录、没有可浏览的文件路径，
+     * 任何文件管理器都拼不出一个能打开它的 file:// URI，因此走系统下载界面
+     * ——那是唯一稳定能看到 InkHole/ 目录的入口。
+     */
+    fun inboxFolderIntent(treeUri: String?): Intent {
+        if (!treeUri.isNullOrEmpty()) {
+            val tree = runCatching { Uri.parse(treeUri) }.getOrNull()
+            val root = runCatching {
+                tree?.let {
+                    DocumentsContract.buildDocumentUriUsingTree(
+                        it,
+                        DocumentsContract.getTreeDocumentId(it),
+                    )
+                }
+            }.getOrNull()
+            if (root != null) {
+                return Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(root, DocumentsContract.Document.MIME_TYPE_DIR)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+        return downloadsIntent()
+    }
+
+    /**
      * 把 SAF 树 URI 解成可读路径:
      * `content://…/tree/primary%3ADocs%2FInk` → `内部存储/Docs/Ink`。
      * 非本机存储的提供方(网盘等)没有真实路径,退回「目录名(文档 ID 尾段)」。

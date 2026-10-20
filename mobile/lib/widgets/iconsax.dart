@@ -422,14 +422,22 @@ class _IconsaxPainter extends CustomPainter {
         canvas.drawLine(const Offset(5.5, 12), const Offset(18.5, 12), stroke);
 
       case Iconsax.settings:
-        canvas.drawCircle(const Offset(12, 12), 8.8, bulkFill);
-        canvas.drawCircle(const Offset(12, 12), 3.2, stroke);
-        for (int i = 0; i < 6; i++) {
-          final double a = i * (math.pi / 3);
+        // 圆滑齿轮：内环 + 8 根「粗短圆头」齿 + 空心轴孔。
+        // 齿用 round cap 与环重叠，缩到 20px 时是圆润的凸起而非尖刺；
+        // 不再铺实心底，否则小尺寸会糊成一个墨点。
+        canvas.drawCircle(const Offset(12, 12), 2.5, stroke);
+        canvas.drawCircle(const Offset(12, 12), 6.5, stroke);
+        final Paint tooth = Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3.1
+          ..strokeCap = StrokeCap.round;
+        for (int i = 0; i < 8; i++) {
+          final double a = i * (math.pi / 4) + math.pi / 8;
           canvas.drawLine(
-            Offset(12 + math.cos(a) * 6.5, 12 + math.sin(a) * 6.5),
-            Offset(12 + math.cos(a) * 9.2, 12 + math.sin(a) * 9.2),
-            stroke,
+            Offset(12 + math.cos(a) * 6.6, 12 + math.sin(a) * 6.6),
+            Offset(12 + math.cos(a) * 8.6, 12 + math.sin(a) * 8.6),
+            tooth,
           );
         }
 
@@ -461,19 +469,34 @@ class _IconsaxPainter extends CustomPainter {
         canvas.drawCircle(const Offset(8.5, 15.5), 1.2, primaryFill);
 
       case Iconsax.refresh:
-        canvas.drawCircle(const Offset(12, 12), 8.5, bulkFill);
+        // 一个不封闭的圆 + 箭头（标准刷新符号）：开口在正上方，箭头落在
+        // 开口左端、顺时针指向右。箭头必须贴在圆上且不超出圆的内室，否则
+        // 缩小后就是一个翘出去的尖猪。
+        const double radius = 7.0;
+        const double arcStartDeg = 290;
+        const double arcSweepDeg = 330;
+        const double arcStart = arcStartDeg * math.pi / 180;
         canvas.drawArc(
-          Rect.fromCircle(center: const Offset(12, 12), radius: 8.2),
-          -math.pi * 0.8,
-          math.pi * 1.45,
+          Rect.fromCircle(center: const Offset(12, 12), radius: radius),
+          arcStart,
+          arcSweepDeg * math.pi / 180,
           false,
           stroke,
         );
-        final Path arrow = Path()
-          ..moveTo(16.2, 4.5)
-          ..lineTo(19.2, 6.8)
-          ..lineTo(15.6, 8.6);
-        canvas.drawPath(arrow, stroke);
+        // 箭头画在弧线末端（顶部稍偏左），切线方向朝右。
+        final double endRad = arcStart + arcSweepDeg * math.pi / 180;
+        final double px = 12 + math.cos(endRad) * radius;
+        final double py = 12 + math.sin(endRad) * radius;
+        final double tx = -math.sin(endRad);
+        final double ty = math.cos(endRad);
+        final double nx = math.cos(endRad);
+        final double ny = math.sin(endRad);
+        final Path head = Path()
+          ..moveTo(px + tx * 2.9, py + ty * 2.9)
+          ..lineTo(px + nx * 2.2 + tx * 0.2, py + ny * 2.2 + ty * 0.2)
+          ..lineTo(px - nx * 2.2 + tx * 0.2, py - ny * 2.2 + ty * 0.2)
+          ..close();
+        canvas.drawPath(head, primaryFill);
 
       case Iconsax.arrowLeft:
         canvas.drawLine(const Offset(19, 12), const Offset(5.5, 12), secStroke);
