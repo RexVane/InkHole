@@ -133,6 +133,29 @@ class MainActivity : FlutterActivity() {
                         exportExecutor.execute { openReceived(path, name, treeUri, result) }
                     }
                     "downloadsPath" -> result.success(Opener.downloadsPath())
+                    "clearReceived" -> {
+                        val paths = call.argument<List<String>>("paths") ?: emptyList()
+                        val names = call.argument<List<String>>("names") ?: emptyList()
+                        val treeUri = call.argument<String>("treeUri")
+                        // 删文件要走 IO，不能堵 UI 线程（大文件夹删除可能几百毫秒）。
+                        exportExecutor.execute {
+                            try {
+                                val outcome = ReceivedCleaner.clear(this, paths, names, treeUri)
+                                runOnUiThread {
+                                    result.success(
+                                        mapOf(
+                                            "deleted" to outcome.deleted,
+                                            "skipped" to outcome.skipped,
+                                        ),
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                runOnUiThread {
+                                    result.error("clear_failed", e.message ?: "删除失败", null)
+                                }
+                            }
+                        }
+                    }
                     "openInboxFolder" -> {
                         val treeUri = call.argument<String>("treeUri")
                         try {

@@ -8,6 +8,14 @@ class ExportOutcome {
   final String location;
 }
 
+/// 清空收件的结果:[deleted] 真删掉的条数,[skipped] 文件已不在或删不掉的条数。
+class ClearOutcome {
+  const ClearOutcome({required this.deleted, required this.skipped});
+
+  final int deleted;
+  final int skipped;
+}
+
 /// SAF 目录选择结果。
 class PickedDirectory {
   const PickedDirectory({required this.uri, required this.label});
@@ -107,6 +115,34 @@ class ExporterChannel {
   /// 默认收件落点的绝对路径;非 Android 平台返回 null。
   static Future<String?> downloadsPath() async {    try {
       return await _channel.invokeMethod<String>('downloadsPath');
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// 清空收件：删掉每条记录对应的实体文件（私有暂存 / SAF 目录 / 下载目录）。
+  ///
+  /// 平台未实现或调用失败时返回 null，调用方据此不要清历史列表——
+  /// 绝不能出现「列表清空了但文件还在」。
+  static Future<ClearOutcome?> clearReceived({
+    required List<String> paths,
+    required List<String> names,
+    String? treeUri,
+  }) async {
+    try {
+      final Map<Object?, Object?>? raw = await _channel.invokeMethod<
+          Map<Object?, Object?>>('clearReceived', <String, Object?>{
+        'paths': paths,
+        'names': names,
+        'treeUri': (treeUri == null || treeUri.isEmpty) ? null : treeUri,
+      });
+      if (raw == null) return null;
+      return ClearOutcome(
+        deleted: (raw['deleted'] as num?)?.toInt() ?? 0,
+        skipped: (raw['skipped'] as num?)?.toInt() ?? 0,
+      );
     } on MissingPluginException {
       return null;
     } on PlatformException {

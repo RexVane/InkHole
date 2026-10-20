@@ -158,6 +158,6 @@ object Opener {
             ?: "application/octet-stream"
     }
 
-    private const val INBOX_FOLDER = "InkHole"
+    internal const val INBOX_FOLDER = "InkHole"
     private const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
 }

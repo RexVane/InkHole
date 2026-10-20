@@ -2029,6 +2029,38 @@ class _HomePageState extends State<HomePage> {
     _toast(note);
   }
 
+  /// 清空收件：确认后连文件一起删（私有暂存 / SAF 目录 / 下载目录）。
+  ///
+  /// 「清空」就该真的清空；以前只清本地历史列表，文件继续躺在磁盘上，
+  /// 用户以为删了其实没删。删不掉时不清列表并如实告知，避免假成功。
+  Future<void> _clearReceivedFiles() async {
+    if (_received.isEmpty) {
+      _toast('没有可清空的收件记录');
+      return;
+    }
+    final int count = _received.length;
+    final bool confirmed = await confirmClearReceivedFiles(context, count);
+    if (!confirmed) return;
+
+    final ClearOutcome? outcome = await ExporterChannel.clearReceived(
+      paths: _received.map((ReceivedFile f) => f.path).toList(growable: false),
+      names: _received.map((ReceivedFile f) => f.name).toList(growable: false),
+      treeUri: _exportTreeUri.isEmpty ? null : _exportTreeUri,
+    );
+    if (!mounted) return;
+    if (outcome == null) {
+      // 原生侧不可用（未实现/抛错）：不能只清列表，否则用户以为文件没了。
+      _toast('删除失败，收件记录未清空');
+      return;
+    }
+    setState(() => _received.clear());
+    _persistReceivedRecords();
+    _publishTelemetry();
+    _toast(outcome.skipped > 0
+        ? '已删除 ${outcome.deleted} 个，${outcome.skipped} 个文件已不在或删不掉'
+        : '已删除 ${outcome.deleted} 个文件');
+  }
+
   void _persistReceivedRecords() {
     final List<String> lines = _received.take(50).map((ReceivedFile f) {
       // 用 JSON 而非 `|` 拼接:文件名可以合法包含 `|`，拼接会让字段错位。
@@ -2257,10 +2289,7 @@ class _HomePageState extends State<HomePage> {
                   isTransferPaused: t.isTransferPaused,
                   onTogglePause: () => unawaited(_togglePause()),
                   onCancelTransfer: _cancelActiveTransfer,
-                  onClearHistory: () {
-                    setState(() => _received.clear());
-                    _persistReceivedRecords();
-                  },
+                  onClearHistory: () => unawaited(_clearReceivedFiles()),
                   onOpenFile: _openFile,
                   onRefresh: () => unawaited(_rescanInbox()),
                   onOpenSettings: () => setState(() => _currentTabIndex = 4),
@@ -2277,10 +2306,7 @@ class _HomePageState extends State<HomePage> {
               onCopyPath: (ReceivedFile file) =>
                   unawaited(_copyReceivedPath(file)),
               onBrowseDirectory: () => unawaited(_browseInboxDirectory()),
-              onClearAll: () {
-                setState(() => _received.clear());
-                _persistReceivedRecords();
-              },
+              onClearAll: () => unawaited(_clearReceivedFiles()),
               onRefresh: () => unawaited(_rescanInbox()),
               onOpenSettings: () => setState(() => _currentTabIndex = 4),
               isRefreshing: _isScanningInbox,
@@ -2359,6 +2385,59 @@ class _TransferTelemetry {
   final double speedBytesPerSec;
   final List<double> speedHistory;
   final bool isTransferPaused;
+}
+
+/// 「清空收件」的确认框：删文件不可恢复，必须让用户明确点一次。
+///
+/// 单独提出来是为了能脱离整页启动流程做 widget 测试——`_boot` 会摸
+/// path_provider/安全存储，测试里跑不通整条启动链路。
+Future<bool> confirmClearReceivedFiles(BuildContext context, int count) async {
+  final bool? confirmed = await showDialog<bool>(
+    context: context,
+    builder: (BuildContext ctx) {
+      return AlertDialog(
+        backgroundColor: surfaceContainer,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(18),
+          side: const BorderSide(color: borderLuminescent),
+        ),
+        title: const Row(
+          children: <Widget>[
+            IconsaxIcon(Iconsax.trash, color: dangerCoral, size: 20),
+            SizedBox(width: 8),
+            Text('清空收件', style: TextStyle(color: textPrimary, fontSize: 16)),
+          ],
+        ),
+        content: Text(
+          '将删除应用内暂存与下载目录里的这 $count 个文件，不可恢复。',
+          style: const TextStyle(color: textMuted, fontSize: 13, height: 1.4),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消', style: TextStyle(color: textMuted)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: dangerContainer,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            child: const Text(
+              '删除',
+              style: TextStyle(
+                color: dangerCoral,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+  return confirmed == true;
 }
 
 class _TrackedSend {
