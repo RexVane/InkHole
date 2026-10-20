@@ -21,6 +21,7 @@ class TransfersView extends StatelessWidget {
     required this.onOpenFile,
     required this.onRefresh,
     required this.onOpenSettings,
+    this.isRefreshing = false,
   });
 
   final TransferProgress? activeProgress;
@@ -36,6 +37,9 @@ class TransfersView extends StatelessWidget {
   final ValueChanged<ReceivedFile> onOpenFile;
   final VoidCallback onRefresh;
   final VoidCallback onOpenSettings;
+
+  /// 重扫收件目录进行中：刷新按钮转圈并禁用，避免"按了没反应"。
+  final bool isRefreshing;
 
   @override
   Widget build(BuildContext context) {
@@ -72,20 +76,30 @@ class TransfersView extends StatelessWidget {
         ),
         actions: <Widget>[
           IconButton(
-            onPressed: onRefresh,
-            icon: const IconsaxIcon(
-              Iconsax.refresh,
-              size: 20,
-              color: textMuted,
-            ),
+            onPressed: isRefreshing ? null : onRefresh,
+            icon: isRefreshing
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.8,
+                      color: jade400,
+                    ),
+                  )
+                : const IconsaxIcon(
+                    Iconsax.refresh,
+                    size: 20,
+                    color: textPrimary,
+                  ),
             splashRadius: 18,
+            tooltip: '重扫收件目录',
           ),
           IconButton(
             onPressed: onOpenSettings,
             icon: const IconsaxIcon(
               Iconsax.settings,
               size: 20,
-              color: textMuted,
+              color: textPrimary,
             ),
             splashRadius: 18,
           ),

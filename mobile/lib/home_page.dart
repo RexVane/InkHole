@@ -99,6 +99,7 @@ class _HomePageState extends State<HomePage> {
   bool _isTransferPaused = false;
   bool _pauseInProgress = false;
   bool _isRefreshingDiscovery = false;
+  bool _isScanningInbox = false;
 
   /// 正在接收的传输（transfer_id）。有它在才能把暂停按钮接到接收背压上。
   final Set<String> _receivingIds = <String>{};
@@ -1968,8 +1969,64 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  void _reloadReceivedRecords() {
-    setState(_loadReceivedRecords);
+  /// 重扫应用内收件目录，把历史里没有的文件补进列表。
+  ///
+  /// 以前的「刷新」只是重读一遍本地 prefs，数据没变化时界面一动不动，
+  /// 看上去就是个死按钮。真正有价值的是扫盘：进程被杀/历史写入失败时，
+  /// 私有收件箱里可能存着没入账的成品文件。
+  Future<void> _rescanInbox() async {
+    if (_isScanningInbox) return;
+    setState(() => _isScanningInbox = true);
+    try {
+      final Set<String> known = _received.map((ReceivedFile f) => f.path).toSet();
+      final List<ReceivedFile> found = <ReceivedFile>[];
+      final Directory inbox = Directory(_inbox);
+      if (_inbox.isNotEmpty && await inbox.exists()) {
+        await for (final FileSystemEntity entity
+            in inbox.list(recursive: true, followLinks: false)) {
+          if (entity is! File) continue;
+          if (known.contains(entity.path)) continue;
+          known.add(entity.path);
+          final FileStat stat = await entity.stat();
+          found.add(ReceivedFile(
+            name: p.basename(entity.path),
+            path: entity.path,
+            size: stat.size,
+            receivedAt: stat.modified,
+            sender: '本机暂存',
+          ));
+        }
+      }
+      if (!mounted) return;
+      if (found.isNotEmpty) {
+        setState(() => _received.insertAll(0, found));
+        _persistReceivedRecords();
+      }
+      _toast(found.isEmpty
+          ? '收件记录已是最新（${_received.length} 项）'
+          : '补录 ${found.length} 个未归档文件');
+    } catch (e) {
+      _toast('重扫收件目录失败: $e');
+    } finally {
+      if (mounted) setState(() => _isScanningInbox = false);
+    }
+  }
+
+  /// 复制收件记录的可用路径：文件还在私有收件箱就复制它，否则复制导出落点。
+  ///
+  /// 收到文件时已自动导出到 Download/InkHole，私有路径随即失效；
+  /// 直接复制它会得到一个粘出去打不开的路径。
+  Future<void> _copyReceivedPath(ReceivedFile file) async {
+    String path = file.path;
+    String note = '文件路径已复制';
+    if (path.isEmpty || !await File(path).exists()) {
+      final String where =
+          _defaultExportPath.isNotEmpty ? _defaultExportPath : 'Download/InkHole';
+      path = p.join(where, file.name);
+      note = '文件已导出，已复制目标路径';
+    }
+    await Clipboard.setData(ClipboardData(text: path));
+    _toast(note);
   }
 
   void _persistReceivedRecords() {
@@ -2205,8 +2262,9 @@ class _HomePageState extends State<HomePage> {
                     _persistReceivedRecords();
                   },
                   onOpenFile: _openFile,
-                  onRefresh: _reloadReceivedRecords,
+                  onRefresh: () => unawaited(_rescanInbox()),
                   onOpenSettings: () => setState(() => _currentTabIndex = 4),
+                  isRefreshing: _isScanningInbox,
                 );
               },
             ),
@@ -2216,13 +2274,16 @@ class _HomePageState extends State<HomePage> {
               inboxPath: _exportPath,
               files: _received,
               onOpenFile: _openFile,
+              onCopyPath: (ReceivedFile file) =>
+                  unawaited(_copyReceivedPath(file)),
               onBrowseDirectory: () => unawaited(_browseInboxDirectory()),
               onClearAll: () {
                 setState(() => _received.clear());
                 _persistReceivedRecords();
               },
-              onRefresh: _reloadReceivedRecords,
+              onRefresh: () => unawaited(_rescanInbox()),
               onOpenSettings: () => setState(() => _currentTabIndex = 4),
+              isRefreshing: _isScanningInbox,
             ),
 
             // Tab 3: 符契 · 配对与二维码

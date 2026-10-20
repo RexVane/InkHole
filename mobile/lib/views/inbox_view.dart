@@ -12,19 +12,28 @@ class InboxView extends StatefulWidget {
     required this.inboxPath,
     required this.files,
     required this.onOpenFile,
+    required this.onCopyPath,
     required this.onBrowseDirectory,
     required this.onClearAll,
     required this.onRefresh,
     required this.onOpenSettings,
+    this.isRefreshing = false,
   });
 
   final String inboxPath;
   final List<ReceivedFile> files;
   final ValueChanged<ReceivedFile> onOpenFile;
+
+  /// 复制一条收件记录的可访问路径。文件已导出时复制导出落点，
+  /// 不再复制那条已经失效的私有路径。
+  final ValueChanged<ReceivedFile> onCopyPath;
   final VoidCallback onBrowseDirectory;
   final VoidCallback onClearAll;
   final VoidCallback onRefresh;
   final VoidCallback onOpenSettings;
+
+  /// 重扫收件目录进行中：刷新按钮转圈并禁用，避免"按了没反应"。
+  final bool isRefreshing;
 
   @override
   State<InboxView> createState() => _InboxViewState();
@@ -105,20 +114,30 @@ class _InboxViewState extends State<InboxView> {
         ),
         actions: <Widget>[
           IconButton(
-            onPressed: widget.onRefresh,
-            icon: const IconsaxIcon(
-              Iconsax.refresh,
-              size: 20,
-              color: textMuted,
-            ),
+            onPressed: widget.isRefreshing ? null : widget.onRefresh,
+            icon: widget.isRefreshing
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.8,
+                      color: jade400,
+                    ),
+                  )
+                : const IconsaxIcon(
+                    Iconsax.refresh,
+                    size: 20,
+                    color: textPrimary,
+                  ),
             splashRadius: 18,
+            tooltip: '重扫收件目录',
           ),
           IconButton(
             onPressed: widget.onOpenSettings,
             icon: const IconsaxIcon(
               Iconsax.settings,
               size: 20,
-              color: textMuted,
+              color: textPrimary,
             ),
             splashRadius: 18,
           ),
@@ -561,15 +580,7 @@ class _InboxViewState extends State<InboxView> {
               mainAxisAlignment: MainAxisAlignment.end,
               children: <Widget>[
                 InkWell(
-                  onTap: () {
-                    Clipboard.setData(ClipboardData(text: file.path));
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('文件路径已复制'),
-                        duration: Duration(seconds: 1),
-                      ),
-                    );
-                  },
+                  onTap: () => widget.onCopyPath(file),
                   child: const Row(
                     children: <Widget>[
                       IconsaxIcon(Iconsax.copy, size: 12, color: textMuted),
