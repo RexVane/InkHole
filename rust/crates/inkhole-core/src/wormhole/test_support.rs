@@ -99,9 +99,13 @@ async fn serve_connection(
     state: Arc<Mutex<ServerState>>,
     cancellation: CancellationToken,
 ) -> TestResult {
-    let websocket = accept_async(stream)
-        .await
-        .map_err(|error| error.to_string())?;
+    // 客户端在握手阶段就放弃（例如发现口令不对、直接断 TCP）不是服务器故障。
+    // 这类断开会以 "Connection reset without closing handshake" 的形式冒出来，
+    // 若当成致命错误会让所有依赖本脚手架的用例随机变红。
+    let websocket = match accept_async(stream).await {
+        Ok(websocket) => websocket,
+        Err(_) => return Ok(()),
+    };
     let (mut writer, mut reader) = websocket.split();
     let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
     let writer_cancellation = cancellation.clone();
@@ -129,8 +133,9 @@ async fn serve_connection(
                 _ = cancellation.cancelled() => break,
                 message = reader.next() => match message {
                     Some(Ok(message)) => message,
-                    Some(Err(error)) => return Err(error.to_string()),
-                    None => break,
+                    // 对端不打招呼就掉线（配对失败后立刻丢弃 WebSocket 就是
+                    // 这种）等价于连接结束，不能算服务器出错。
+                    Some(Err(_)) | None => break,
                 },
             };
             let command = match message {
